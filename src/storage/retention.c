@@ -256,8 +256,6 @@ struct tsdb_retention {
     char              conf_path[4096];
     tsdb_retention_opts_t opts;
 
-    retention_conf_t  conf;
-
     /* Stats — updated under lock, read lock-free via copy. */
     pthread_mutex_t   lock;
     tsdb_retention_stats_t stats;
@@ -325,7 +323,20 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
         /* Remove leftover .gc_* dirs from prior interrupted sweeps. */
         cleanup_stale_gc_dirs(table_dir);
 
-        /* Scan partition directories. */
+        /* Scan partition directories.
+         *
+         * POSIX readdir behaviour during directory mutation:
+         * We rename matching entries out of tdir (to a .gc_* name) while
+         * readdir is iterating over it.  POSIX does not guarantee whether a
+         * renamed entry will be seen again by subsequent readdir calls.  Both
+         * outcomes are safe here:
+         *   - If re-surfaced: the new .gc_* name starts with '.' so the
+         *     leading-dot check below skips it without further processing.
+         *   - If not re-surfaced: nothing to do; it is already gone from the
+         *     visible namespace.
+         * We intentionally do NOT close/reopen tdir mid-scan to avoid O(n^2)
+         * directory traversal for tables with many partitions.
+         */
         DIR *tdir = opendir(table_dir);
         if (!tdir) continue;
 
@@ -472,9 +483,6 @@ int tsdb_retention_start(const char *data_dir,
     pthread_mutex_init(&r->lock, NULL);
     pthread_mutex_init(&r->cond_lock, NULL);
     pthread_cond_init(&r->cond, NULL);
-
-    /* Load conf (non-fatal if missing). */
-    retention_conf_load(r->conf_path, &r->conf);
 
     /* Start background thread. */
     int rc = pthread_create(&r->thread, NULL, retention_thread, r);
