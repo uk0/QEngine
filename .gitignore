@@ -1,0 +1,44 @@
+*_article
+.idea
+.DS_Store
+.claude
+proxy
+.env
+docs
+docx
+doc
+xlsx
+csv
+userdata
+session
+
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+bin/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Data files
+data/
+*.tsdb
+*.dat
+*.idx
+*.wal
+
+# Editor
+*.swp
+*.swo
+.vscode/
+*.log
+
+# Bench output
+bench/results/
+bench/*.csv
