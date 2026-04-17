@@ -2,8 +2,12 @@
 .idea
 .DS_Store
 .claude
+CLAUDE.md
+AGENTS.md
 proxy
 .env
+.envrc
+.direnv
 docs
 docx
 doc
@@ -11,6 +15,19 @@ xlsx
 csv
 userdata
 session
+*.secret
+*.pem
+*.key
+*.crt
+*.private
+.aider*
+.cursor*
+.cursorignore
+.vscode
+memory/
+.anthropic
+.openai
+.tokens
 
 # Build artifacts
 build/

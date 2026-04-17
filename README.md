@@ -1,8 +1,14 @@
-# tsdb
+<div align="center">
+  <img src="assets/logo.png" alt="tsdb logo" width="420"/>
+</div>
+
+# tsdb — QEngine
 
 A production-grade time-series database written in C11. Column-oriented
 storage, SIMD-vectorized execution, clustered with raw-block replication,
 and a purpose-built query language (QTL) with IoT group/device semantics.
+
+> License: MIT · Status: public preview · Contributions welcome.
 
 ```
 tsdb-cli  ──TCP v1──▶  tsdb-server ⇄ cluster (gossip + hashring + autobalance)
