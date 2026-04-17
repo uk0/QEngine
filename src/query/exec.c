@@ -3,6 +3,7 @@
 #include "exec.h"
 #include "parse.h"
 #include "ast.h"
+#include "result_internal.h"
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
@@ -12,6 +13,7 @@
 #include "../exec/agg.h"
 #include "../exec/filter.h"
 #include "../exec/bucket.h"
+#include "../exec/pool.h"
 #include "../../include/tsdb.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -22,23 +24,38 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 
-/* ---- Result structure -------------------------------------------------- */
+/* ---- Global parallel query pool --------------------------------------- */
 
-struct tsdb_result {
-    int           ncols;
-    char        **col_names;
-    tsdb_type_t  *col_types;
+static tsdb_pool_t          *g_query_pool  = NULL;
+static pthread_once_t        g_pool_once   = PTHREAD_ONCE_INIT;
+static volatile int          g_parallel_on = 1; /* toggleable */
+static pthread_mutex_t       g_pool_lock   = PTHREAD_MUTEX_INITIALIZER;
 
-    /* For SYMBOL columns, col_symtab is used to decode uint32 → string.
-     * For all columns, col_data[i] is an array of col_types[i]-width values. */
-    tsdb_symtab_t **col_symtab;
-    void         **col_data;
-    size_t         nrows;
-    size_t         cap_rows;
+static void init_pool(void) {
+    tsdb_pool_new(0, &g_query_pool);
+}
 
-    ssize_t        cur;
-};
+/* Public toggle: 0 = serial, non-zero = parallel. Thread-safe. */
+void tsdb_set_query_parallel(int on) {
+    g_parallel_on = on ? 1 : 0;
+}
+
+/* Resize the global query pool to n threads.
+ * n <= 0 uses hardware concurrency.
+ * Thread-safe; tears down and recreates the pool under a mutex. */
+void tsdb_set_query_pool_size(int n) {
+    pthread_mutex_lock(&g_pool_lock);
+    if (g_query_pool) {
+        tsdb_pool_free(g_query_pool);
+        g_query_pool = NULL;
+    }
+    tsdb_pool_new(n, &g_query_pool);
+    pthread_mutex_unlock(&g_pool_lock);
+}
+
+/* struct tsdb_result is defined in result_internal.h (shared with federation). */
 
 /* Forward declarations */
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -608,6 +625,117 @@ static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx
     ((uint64_t *)r->col_data[col_idx])[r->nrows] = bits;
 }
 
+/* ---- Parallel scan task ----------------------------------------------- */
+
+typedef struct {
+    /* Input (read-only from worker). */
+    scan_src_t    *srcs;
+    size_t         nsrcs;
+    tsdb_schema_t *schema;
+    qast_expr_t   *where;
+    int            need_col[TSDB_MAX_COLS];
+
+    /* Private projection state (worker writes). */
+    proj_t        *projs;
+    int            nprojs;
+
+    /* Error output. */
+    int            rc;
+    char           err[256];
+} par_task_t;
+
+/* Worker function: scan the assigned sources and accumulate into private projs[]. */
+void tsdb_par_scan_task(void *arg) {
+    par_task_t *t = (par_task_t *)arg;
+    t->rc = TSDB_OK;
+
+    for (size_t si = 0; si < t->nsrcs; si++) {
+        scan_src_t *src = &t->srcs[si];
+        size_t n = src->row_count;
+
+        void **bufs = calloc((size_t)t->schema->ncols, sizeof(void *));
+        if (!bufs) { t->rc = TSDB_ERR_NOMEM; return; }
+        tsdb_symtab_t **syms = calloc((size_t)t->schema->ncols, sizeof(tsdb_symtab_t *));
+        if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; return; }
+
+        int load_rc = TSDB_OK;
+        for (int c = 0; c < t->schema->ncols; c++) {
+            if (!t->need_col[c]) continue;
+            syms[c] = t->schema->cols[c].symtab;
+            size_t w = tsdb_type_width(t->schema->cols[c].type);
+            if (src->mem) {
+                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                bufs[c] = malloc(w * n);
+                if (!bufs[c]) { load_rc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                load_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (load_rc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++) {
+                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
+                        hit = &metas[b]; break;
+                    }
+                }
+                if (!hit) { free(metas); load_rc = TSDB_ERR_CORRUPT; break; }
+                load_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
+                free(metas);
+                if (load_rc != TSDB_OK) break;
+            }
+        }
+        if (load_rc != TSDB_OK) {
+            for (int c = 0; c < t->schema->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms);
+            t->rc = load_rc;
+            return;
+        }
+
+        /* Build bitmap. */
+        size_t nw = (n + 63) / 64;
+        uint64_t *bm = malloc(nw * sizeof(uint64_t));
+        if (!bm) {
+            for (int c = 0; c < t->schema->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms);
+            t->rc = TSDB_ERR_NOMEM;
+            return;
+        }
+        for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
+        size_t tail = nw * 64 - n;
+        if (tail) { uint64_t mask = (~(uint64_t)0) >> tail; bm[nw - 1] &= mask; }
+
+        if (t->where) {
+            eval_ctx_t ctx = {0};
+            ctx.schema = t->schema;
+            ctx.col_bufs = bufs;
+            ctx.col_syms = syms;
+            ctx.nrows = n;
+            int frc = apply_filter_expr(&ctx, t->where, bm);
+            if (frc != TSDB_OK) {
+                if (ctx.err[0]) snprintf(t->err, sizeof(t->err), "%s", ctx.err);
+                free(bm);
+                for (int c = 0; c < t->schema->ncols; c++)
+                    if (!src->mem && bufs[c]) free(bufs[c]);
+                free(bufs); free(syms);
+                t->rc = frc;
+                return;
+            }
+        }
+
+        /* Update private aggregate state. */
+        for (int pi = 0; pi < t->nprojs; pi++) {
+            if (t->projs[pi].kind >= PROJ_AGG_SUM && t->projs[pi].kind <= PROJ_AGG_COUNT)
+                agg_update(&t->projs[pi], t->schema, bufs, n, bm);
+        }
+
+        free(bm);
+        for (int c = 0; c < t->schema->ncols; c++)
+            if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+    }
+}
+
 /* ---- Main select execution ------------------------------------------- */
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -658,6 +786,151 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     size_t rows_emitted = 0;
     size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    /* ---- Parallel aggregate path --------------------------------------- */
+    /* Conditions: agg query, no SAMPLE BY, more than 1 source, parallel enabled.
+     * Each worker scans its slice of sources with a private proj_t copy,
+     * then main thread merges all partial states. */
+    pthread_once(&g_pool_once, init_pool);
+
+    int use_parallel = has_agg && !has_sample && plan.nsrcs > 1
+                       && g_parallel_on && g_query_pool != NULL
+                       && tsdb_pool_size(g_query_pool) > 1;
+
+    /* Also check TSDB_QUERY_PARALLEL env var (0 = force serial). */
+    if (use_parallel) {
+        const char *env = getenv("TSDB_QUERY_PARALLEL");
+        if (env && env[0] == '0') use_parallel = 0;
+    }
+
+    if (use_parallel) {
+        int nw = tsdb_pool_size(g_query_pool);
+
+        /* Determine the columns needed (same logic as serial path). */
+        int need_col[TSDB_MAX_COLS];
+        memset(need_col, 0, sizeof(need_col));
+        for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        {
+            qast_expr_t *stk[128]; int tp = 0;
+            if (q->where) stk[tp++] = q->where;
+            while (tp > 0) {
+                qast_expr_t *e = stk[--tp];
+                if (!e) continue;
+                if (e->kind == QAST_IDENT) {
+                    int c = resolve_col(s, e->v.s);
+                    if (c >= 0) need_col[c] = 1;
+                }
+                if (e->lhs && tp < 128) stk[tp++] = e->lhs;
+                if (e->rhs && tp < 128) stk[tp++] = e->rhs;
+                for (int i = 0; i < e->nargs && tp < 128; i++) stk[tp++] = e->args[i];
+            }
+        }
+
+        /* Per-worker task argument. */
+        par_task_t *tasks = calloc((size_t)nw, sizeof(par_task_t));
+        if (!tasks) { rc = TSDB_ERR_NOMEM; goto done; }
+
+        /* Distribute sources into contiguous slices, one per worker. */
+        size_t nsrcs  = plan.nsrcs;
+        size_t slice  = (nsrcs + (size_t)nw - 1) / (size_t)nw;
+
+        int nactive = 0;
+        for (int w = 0; w < nw; w++) {
+            size_t start = (size_t)w * slice;
+            if (start >= nsrcs) break;
+            size_t end = start + slice;
+            if (end > nsrcs) end = nsrcs;
+
+            par_task_t *t = &tasks[w];
+            t->srcs   = &plan.srcs[start];
+            t->nsrcs  = end - start;
+            t->schema = s;
+            t->where  = q->where;
+            memcpy(t->need_col, need_col, sizeof(need_col));
+            t->nprojs = nprojs;
+            t->projs  = malloc((size_t)nprojs * sizeof(proj_t));
+            if (!t->projs) {
+                for (int j = 0; j < w; j++) free(tasks[j].projs);
+                free(tasks);
+                rc = TSDB_ERR_NOMEM;
+                goto done;
+            }
+            memcpy(t->projs, projs, (size_t)nprojs * sizeof(proj_t));
+            nactive++;
+        }
+
+        for (int w = 0; w < nactive; w++)
+            tsdb_pool_submit(g_query_pool, tsdb_par_scan_task, &tasks[w]);
+
+        tsdb_pool_wait(g_query_pool);
+
+        /* Check for errors in any worker. */
+        for (int w = 0; w < nactive; w++) {
+            if (tasks[w].rc != TSDB_OK && rc == TSDB_OK) {
+                rc = tasks[w].rc;
+                if (tasks[w].err[0] && err && errcap)
+                    snprintf(err, errcap, "%s", tasks[w].err);
+            }
+        }
+
+        if (rc == TSDB_OK) {
+            /* Merge per-worker partial states into master projs[]. */
+            for (int w = 0; w < nactive; w++) {
+                proj_t *wp = tasks[w].projs;
+                for (int pi = 0; pi < nprojs; pi++) {
+                    proj_t *mp = &projs[pi];
+                    proj_t *pp = &wp[pi];
+                    switch (mp->kind) {
+                    case PROJ_AGG_COUNT:
+                        mp->agg_count += pp->agg_count;
+                        break;
+                    case PROJ_AGG_SUM:
+                        mp->agg_sum_f += pp->agg_sum_f;
+                        mp->agg_sum_i += pp->agg_sum_i;
+                        mp->agg_count += pp->agg_count;
+                        break;
+                    case PROJ_AGG_AVG:
+                        /* Merge sum+count; agg_write divides at end. */
+                        mp->agg_sum_f += pp->agg_sum_f;
+                        mp->agg_sum_i += pp->agg_sum_i;
+                        mp->agg_count += pp->agg_count;
+                        break;
+                    case PROJ_AGG_MIN:
+                        if (pp->agg_min_f < mp->agg_min_f) mp->agg_min_f = pp->agg_min_f;
+                        if (pp->agg_min_i < mp->agg_min_i) mp->agg_min_i = pp->agg_min_i;
+                        break;
+                    case PROJ_AGG_MAX:
+                        if (pp->agg_max_f > mp->agg_max_f) mp->agg_max_f = pp->agg_max_f;
+                        if (pp->agg_max_i > mp->agg_max_i) mp->agg_max_i = pp->agg_max_i;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                free(wp);
+            }
+            free(tasks);
+
+            /* Write merged aggregates to result. */
+            rc = result_reserve_rows(r, 1);
+            if (rc == TSDB_OK) {
+                for (int pi = 0; pi < nprojs; pi++) agg_write(&projs[pi], s, r, pi);
+                r->nrows = 1;
+            }
+
+            free(projs);
+            scan_plan_free(&plan);
+            return rc;
+        }
+
+        /* Error path: free worker data. */
+        for (int w = 0; w < nactive; w++) free(tasks[w].projs);
+        free(tasks);
+        free(projs);
+        scan_plan_free(&plan);
+        return rc;
+    }
+    /* ---- End parallel path ---------------------------------------------- */
 
     /* Iterate sources. */
     for (size_t si = 0; si < plan.nsrcs && rows_emitted < limit; si++) {

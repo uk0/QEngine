@@ -26,16 +26,20 @@ COMMON    := $(STD) $(OPT) $(WARN) $(ARCH) $(INC)
 CFLAGS    ?= $(COMMON)
 LDFLAGS   ?= $(LIBS)
 
-SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster
+SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster src/federation
 SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
 CLUSTER_TEST_SRCS := tests/test_cluster.c
 CLUSTER_TEST_BINS := $(patsubst tests/%.c,build/test/%,$(CLUSTER_TEST_SRCS))
+
+# Federation integration test.
+FED_TEST_SRCS := tests/test_federation.c
+FED_TEST_BINS := $(patsubst tests/%.c,build/test/%,$(FED_TEST_SRCS))
 
 BENCH_SRCS := $(wildcard bench/*.c)
 BENCH_BINS := $(patsubst bench/%.c,build/bench/%,$(BENCH_SRCS))
@@ -46,10 +50,10 @@ CLI_BIN         := build/tsdb
 CLUSTER_NODE_SRC := src/cluster/tsdb_node_main.c
 CLUSTER_NODE_BIN := build/cluster/tsdb_node
 
-.PHONY: all clean test test-cluster bench cli cluster_node debug
+.PHONY: all clean test test-cluster test-federation bench cli cluster_node debug
 .DEFAULT_GOAL := all
 
-all: lib cli test $(CLUSTER_TEST_BINS)
+all: lib cli test $(CLUSTER_TEST_BINS) $(FED_TEST_BINS)
 
 lib: build/libtsdb.a
 
@@ -73,6 +77,11 @@ test: $(TEST_BINS)
 
 test-cluster: $(CLUSTER_TEST_BINS)
 	@for t in $(CLUSTER_TEST_BINS); do \
+	  echo "--- $$t ---"; $$t || exit 1; \
+	done
+
+test-federation: $(FED_TEST_BINS)
+	@for t in $(FED_TEST_BINS); do \
 	  echo "--- $$t ---"; $$t || exit 1; \
 	done
 
