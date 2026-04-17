@@ -11,9 +11,10 @@
  *   - A per-table compact_mtx (added in db.c) is held during:
  *       a) the entire tsdb_part_flush_ex call inside flush_and_clear_ex(), and
  *       b) the compactor's rename phase.
- *   - Readers (tsdb_part_open) hold compact_mtx briefly for the duration of
- *     open (mmap + sequential read).
- *   - This prevents reading a half-swapped (.col new, .idx old) pair.
+ *   - Readers (tsdb_part_open) do NOT acquire compact_mtx; they access the
+ *     files directly.  The lock only prevents flush from racing the rename.
+ *   - This prevents a concurrent flush from writing into a partially-renamed
+ *     file pair (.col new, .idx still old).
  *   - Workers also skip any partition whose mtime is < 60 s (still hot).
  *
  * Output block size:
@@ -90,13 +91,6 @@ int  tsdb_compactor_run_once(tsdb_compactor_t *c);
 void tsdb_compactor_stats(const tsdb_compactor_t *c, tsdb_compactor_stats_t *out);
 
 /* ---- DB integration helpers (called from db.c) ----------------------------- */
-
-/*
- * Attach / detach a compactor to the db.  Stops any existing compactor.
- * opts == NULL stops without starting a new one.
- * Called from tsdb_db_set_compactor() (public) and tsdb_close().
- */
-int  tsdb_db_set_compactor(tsdb_db_t *db, const tsdb_compactor_opts_t *opts);
 
 /*
  * Acquire / release the per-table compact mutex.

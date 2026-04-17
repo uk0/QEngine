@@ -796,18 +796,12 @@ void tsdb_compactor_stats(const tsdb_compactor_t *c, tsdb_compactor_stats_t *out
 }
 
 /* ---- DB integration ------------------------------------------------------- */
-
-int tsdb_db_set_compactor(tsdb_db_t *db, const tsdb_compactor_opts_t *opts) {
-    if (!db) return TSDB_ERR_INVAL;
-    if (!opts) return TSDB_OK;  /* no-op; caller can stop explicitly */
-
-    tsdb_compactor_t *c = NULL;
-    int rc = tsdb_compactor_start(db, opts, &c);
-    if (rc != TSDB_OK) return rc;
-    (void)c;
-    /* Caller is responsible for keeping *c and calling stop. */
-    return TSDB_OK;
-}
+/*
+ * NOTE: there is no tsdb_db_set_compactor() wrapper.
+ * Callers must use tsdb_compactor_start() / tsdb_compactor_stop() directly
+ * so the handle is not lost and background threads can be joined on teardown.
+ * See the test in tests/test_compaction.c for the canonical usage pattern.
+ */
 
 void tsdb_compact_lock(void *table_internal) {
     if (!table_internal) return;
