@@ -21,13 +21,21 @@ typedef struct {
     tsdb_symtab_t  *symtab;   /* non-NULL only for SYMBOL columns */
 } tsdb_col_info_t;
 
+/* Partition granularity. Chosen at CREATE TABLE time; fixed for the life
+ * of the table. DAY = YYYYMMDD subdirs, HOUR = YYYYMMDDHH subdirs. */
+typedef enum {
+    TSDB_PARTITION_DAY  = 0,   /* default; legacy v1 schemas always decode as DAY */
+    TSDB_PARTITION_HOUR = 1
+} tsdb_partition_unit_t;
+
 /* Table schema. */
 typedef struct {
-    char             name[TSDB_MAX_NAME + 1];
-    tsdb_col_info_t *cols;
-    int              ncols;
-    int              ts_col_idx;   /* index of designated timestamp column */
-    char            *dir;          /* table directory (heap-allocated) */
+    char                   name[TSDB_MAX_NAME + 1];
+    tsdb_col_info_t       *cols;
+    int                    ncols;
+    int                    ts_col_idx;      /* index of designated timestamp column */
+    char                  *dir;              /* table directory (heap-allocated) */
+    tsdb_partition_unit_t  partition_unit;   /* DAY or HOUR */
 } tsdb_schema_t;
 
 /*
@@ -46,6 +54,13 @@ int tsdb_schema_create(const char *dir, const char *name,
                        const tsdb_col_t *cols, int ncols,
                        const char *ts_col,
                        tsdb_schema_t **out);
+
+/* Create a schema with explicit partition granularity. */
+int tsdb_schema_create_ex(const char *dir, const char *name,
+                          const tsdb_col_t *cols, int ncols,
+                          const char *ts_col,
+                          tsdb_partition_unit_t partition_unit,
+                          tsdb_schema_t **out);
 
 /*
  * Open an existing schema from disk.

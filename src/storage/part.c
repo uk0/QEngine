@@ -57,20 +57,54 @@ static inline uint16_t get_u16le(const uint8_t *p)  { return (uint16_t)p[0] | ((
 
 /* ---- Partition directory name from timestamp ----------------------------- */
 
-/* Convert a nanosecond timestamp to YYYYMMDD string (UTC). buf must be >= 9 bytes. */
-static void ts_to_day_str(int64_t ts_ns, char *buf) {
+/*
+ * Stringify a timestamp into its partition directory name, honouring the
+ * schema's partition_unit:
+ *   DAY  -> "YYYYMMDD"        (9 bytes incl. NUL)
+ *   HOUR -> "YYYYMMDDHH"     (11 bytes incl. NUL)
+ * buf must be at least 11 bytes.
+ */
+static void ts_to_part_str(int64_t ts_ns, tsdb_partition_unit_t unit, char *buf) {
     time_t secs = (time_t)(ts_ns / 1000000000LL);
     struct tm tm;
     gmtime_r(&secs, &tm);
-    snprintf(buf, 9, "%04d%02d%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    if (unit == TSDB_PARTITION_HOUR) {
+        snprintf(buf, 11, "%04d%02d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour);
+    } else {
+        snprintf(buf, 11, "%04d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    }
 }
 
-/* Day index (days since epoch) from nanosecond timestamp. */
-static int64_t ts_day_index(int64_t ts_ns) {
-    int64_t ns_per_day = 86400000000000LL;
-    if (ts_ns >= 0) return ts_ns / ns_per_day;
-    return (ts_ns - ns_per_day + 1) / ns_per_day;
+/*
+ * Partition index = unique bucket number covering one row's timestamp.
+ * DAY  -> days since 1970-01-01   (negative OK)
+ * HOUR -> hours since 1970-01-01 00:00 UTC
+ */
+static int64_t ts_part_index(int64_t ts_ns, tsdb_partition_unit_t unit) {
+    int64_t ns_per_unit = (unit == TSDB_PARTITION_HOUR)
+                          ? 3600000000000LL
+                          : 86400000000000LL;
+    if (ts_ns >= 0) return ts_ns / ns_per_unit;
+    return (ts_ns - ns_per_unit + 1) / ns_per_unit;
+}
+
+/*
+ * Pack a partition string into a uint32 integer identifier used by the
+ * cluster's raw-block hook (opaque to consumers). YYYYMMDD fits into
+ * u32. YYYYMMDDHH overflows u32 — for HOUR partitions we compute
+ * day*100+hour*1 packed differently; we encode as (year*1000000 +
+ * month*10000 + day*100 + hour) which fits within u32 through year 4294.
+ */
+static uint32_t part_str_to_int(const char *s, tsdb_partition_unit_t unit) {
+    unsigned y = 0, mo = 0, dy = 0, hh = 0;
+    if (unit == TSDB_PARTITION_HOUR) {
+        sscanf(s, "%4u%2u%2u%2u", &y, &mo, &dy, &hh);
+        return (uint32_t)(y * 1000000u + mo * 10000u + dy * 100u + hh);
+    }
+    sscanf(s, "%4u%2u%2u", &y, &mo, &dy);
+    return (uint32_t)(y * 10000u + mo * 100u + dy);
 }
 
 /* ---- BlockHeader helpers ------------------------------------------------ */
@@ -121,20 +155,56 @@ static int read_block_header(const uint8_t *buf,
 }
 
 /*
- * IdxHeader layout (20 bytes, little-endian):
- *   [0..3]    magic      u32 = TSDB_IDX_MAGIC
- *   [4..7]    count      u32
- *   [8..9]    version    u16
- *   [10..11]  _pad       u16
- *   [12..19]  total_rows u64
+ * IdxHeader v2 layout (36 bytes, little-endian):
+ *   [0..3]    magic        u32 = TSDB_IDX_MAGIC
+ *   [4..7]    count        u32
+ *   [8..9]    version      u16 = 2
+ *   [10..11]  _pad         u16
+ *   [12..19]  total_rows   u64
+ *   [20..27]  file_ts_min  i64   (file-level zone map — new in v2)
+ *   [28..35]  file_ts_max  i64
  */
-static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows) {
+static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows,
+                               int64_t file_ts_min, int64_t file_ts_max) {
     put_u32le(buf + 0,  TSDB_IDX_MAGIC);
     put_u32le(buf + 4,  count);
     put_u16le(buf + 8,  TSDB_IDX_VERSION);
     put_u16le(buf + 10, 0);
     put_u64le(buf + 12, total_rows);
+    put_i64le(buf + 20, file_ts_min);
+    put_i64le(buf + 28, file_ts_max);
     return TSDB_IDX_HEADER_SIZE;
+}
+
+/*
+ * Decode an IdxHeader supporting both v1 and v2.
+ * Returns the number of header bytes consumed (20 for v1, 36 for v2),
+ * or -1 on corruption.
+ */
+static int read_idx_header(const uint8_t *buf, size_t avail,
+                           uint32_t *out_count, uint16_t *out_version,
+                           uint64_t *out_total_rows,
+                           int64_t  *out_file_ts_min, int64_t *out_file_ts_max)
+{
+    if (avail < TSDB_IDX_HEADER_SIZE_V1) return -1;
+    if (get_u32le(buf) != TSDB_IDX_MAGIC) return -1;
+    *out_count      = get_u32le(buf + 4);
+    *out_version    = get_u16le(buf + 8);
+    *out_total_rows = get_u64le(buf + 12);
+
+    if (*out_version == 1) {
+        /* Zone map unknown — caller must fall back. */
+        *out_file_ts_min = INT64_MAX;
+        *out_file_ts_max = INT64_MIN;
+        return (int)TSDB_IDX_HEADER_SIZE_V1;
+    }
+    if (*out_version == 2) {
+        if (avail < TSDB_IDX_HEADER_SIZE) return -1;
+        *out_file_ts_min = get_i64le(buf + 20);
+        *out_file_ts_max = get_i64le(buf + 28);
+        return (int)TSDB_IDX_HEADER_SIZE;
+    }
+    return -1;   /* unknown version */
 }
 
 /*
@@ -172,6 +242,13 @@ typedef struct {
     uint32_t block_count;
     uint64_t total_rows;
 
+    /* File-level zone map accumulated during this flush session.
+     * Seeded from existing v2 idx header if present, else from
+     * per-block metadata in the existing v1 idx. */
+    int64_t  file_ts_min;
+    int64_t  file_ts_max;
+    int      has_zone;      /* 1 if file_ts_min/max are initialized */
+
     uint8_t *idx_entries;  /* accumulated new entries for this flush session */
     size_t   idx_cap;
     size_t   idx_n;
@@ -183,7 +260,7 @@ typedef struct {
     void                *raw_block_ud;
     struct tsdb_db      *raw_block_db;
     const char          *raw_block_table;
-    uint32_t             raw_block_day;   /* YYYYMMDD of partition */
+    uint32_t             raw_block_day;   /* YYYYMMDD or YYYYMMDDHH packed */
     int                  col_idx;
 } col_writer_t;
 
@@ -202,15 +279,43 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     fseek(w->col_fp, 0, SEEK_END);
     w->col_offset = (uint64_t)ftell(w->col_fp);
 
-    /* Read existing idx to prime block_count and total_rows. */
+    /* Read existing idx header to prime block_count, total_rows, and the
+     * file-level zone map (v2 only). */
+    w->has_zone    = 0;
+    w->file_ts_min = INT64_MAX;
+    w->file_ts_max = INT64_MIN;
     {
         FILE *idx_r = fopen(w->idx_path, "rb");
         if (idx_r) {
             uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-            if (fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r) == TSDB_IDX_HEADER_SIZE
-                && get_u32le(hdr) == TSDB_IDX_MAGIC) {
-                w->block_count = get_u32le(hdr + 4);
-                w->total_rows  = get_u64le(hdr + 12);
+            size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r);
+            uint32_t cnt = 0;
+            uint16_t ver = 0;
+            uint64_t tot = 0;
+            int64_t  fmn = INT64_MAX, fmx = INT64_MIN;
+            int hsz = read_idx_header(hdr, n, &cnt, &ver, &tot, &fmn, &fmx);
+            if (hsz > 0) {
+                w->block_count = cnt;
+                w->total_rows  = tot;
+                if (ver >= 2) {
+                    w->file_ts_min = fmn;
+                    w->file_ts_max = fmx;
+                    w->has_zone    = (cnt > 0);
+                } else if (cnt > 0) {
+                    /* v1 idx: derive zone from per-block entries. */
+                    if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
+                        for (uint32_t b = 0; b < cnt; b++) {
+                            uint8_t e[TSDB_IDX_ENTRY_SIZE];
+                            if (fread(e, 1, TSDB_IDX_ENTRY_SIZE, idx_r)
+                                != TSDB_IDX_ENTRY_SIZE) break;
+                            int64_t mn = get_i64le(e + 16);
+                            int64_t mx = get_i64le(e + 24);
+                            if (mn < w->file_ts_min) w->file_ts_min = mn;
+                            if (mx > w->file_ts_max) w->file_ts_max = mx;
+                        }
+                        w->has_zone = 1;
+                    }
+                }
             }
             fclose(idx_r);
         }
@@ -284,6 +389,16 @@ static int col_writer_write_block(col_writer_t *w,
     w->col_offset  += TSDB_BLOCK_HEADER_SIZE + (uint64_t)comp_bytes;
     w->total_rows  += count;
     w->block_count++;
+
+    /* Extend file-level zone map. */
+    if (!w->has_zone) {
+        w->file_ts_min = ts_min;
+        w->file_ts_max = ts_max;
+        w->has_zone = 1;
+    } else {
+        if (ts_min < w->file_ts_min) w->file_ts_min = ts_min;
+        if (ts_max > w->file_ts_max) w->file_ts_max = ts_max;
+    }
     return TSDB_OK;
 }
 
@@ -297,7 +412,8 @@ static int col_writer_close(col_writer_t *w) {
     }
 
     if (w->idx_n > 0 && rc == TSDB_OK) {
-        /* Read all existing entries from old idx (if any). */
+        /* Read all existing entries from old idx (if any). Handles both
+         * v1 (20-byte) and v2 (36-byte) headers transparently. */
         uint8_t *old_entries = NULL;
         uint32_t old_count   = 0;
 
@@ -305,18 +421,26 @@ static int col_writer_close(col_writer_t *w) {
             FILE *idx_r = fopen(w->idx_path, "rb");
             if (idx_r) {
                 uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-                if (fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r) == TSDB_IDX_HEADER_SIZE
-                    && get_u32le(hdr) == TSDB_IDX_MAGIC) {
-                    old_count = get_u32le(hdr + 4);
+                size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r);
+                uint32_t cnt = 0;
+                uint16_t ver = 0;
+                uint64_t tot = 0;
+                int64_t  fmn = 0, fmx = 0;
+                int hsz = read_idx_header(hdr, n, &cnt, &ver, &tot, &fmn, &fmx);
+                if (hsz > 0) {
+                    old_count = cnt;
                     if (old_count > 0) {
-                        old_entries = malloc((size_t)old_count * TSDB_IDX_ENTRY_SIZE);
-                        if (old_entries) {
-                            if (fread(old_entries, 1,
-                                      (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_r)
-                                != (size_t)old_count * TSDB_IDX_ENTRY_SIZE) {
-                                free(old_entries);
-                                old_entries = NULL;
-                                old_count   = 0;
+                        /* Seek past whatever header size the old file has. */
+                        if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
+                            old_entries = malloc((size_t)old_count * TSDB_IDX_ENTRY_SIZE);
+                            if (old_entries) {
+                                if (fread(old_entries, 1,
+                                          (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_r)
+                                    != (size_t)old_count * TSDB_IDX_ENTRY_SIZE) {
+                                    free(old_entries);
+                                    old_entries = NULL;
+                                    old_count   = 0;
+                                }
                             }
                         }
                     }
@@ -325,15 +449,17 @@ static int col_writer_close(col_writer_t *w) {
             }
         }
 
-        /* Rewrite idx atomically. */
+        /* Rewrite idx atomically (always in v2 format). */
         FILE *idx_w = fopen(w->idx_path, "wb");
         if (!idx_w) {
             free(old_entries);
             rc = TSDB_ERR_IO;
         } else {
             uint32_t total_count = old_count + (uint32_t)w->idx_n;
+            int64_t  fmn = w->has_zone ? w->file_ts_min : 0;
+            int64_t  fmx = w->has_zone ? w->file_ts_max : 0;
             uint8_t  hdr[TSDB_IDX_HEADER_SIZE];
-            write_idx_header(hdr, total_count, w->total_rows);
+            write_idx_header(hdr, total_count, w->total_rows, fmn, fmx);
             fwrite(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_w);
             if (old_count > 0 && old_entries) {
                 fwrite(old_entries, 1, (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_w);
@@ -386,11 +512,13 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
     days = malloc((size_t)days_cap * sizeof(int64_t));
     if (!days) return TSDB_ERR_NOMEM;
 
+    const tsdb_partition_unit_t part_unit = s->partition_unit;
+
     for (size_t r = 0; r < nrows; r++) {
-        int64_t day = ts_day_index(ts_buf[r]);
+        int64_t bucket = ts_part_index(ts_buf[r], part_unit);
         int found = 0;
         for (int d = 0; d < ndays; d++) {
-            if (days[d] == day) { found = 1; break; }
+            if (days[d] == bucket) { found = 1; break; }
         }
         if (!found) {
             if (ndays >= days_cap) {
@@ -399,36 +527,31 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                 if (!nb) { free(days); return TSDB_ERR_NOMEM; }
                 days = nb;
             }
-            days[ndays++] = day;
+            days[ndays++] = bucket;
         }
     }
 
     for (int d = 0; d < ndays; d++) {
-        int64_t day = days[d];
+        int64_t bucket = days[d];
 
-        /* Collect row indices for this day. */
+        /* Collect row indices for this partition bucket. */
         size_t *row_idx = malloc(nrows * sizeof(size_t));
         if (!row_idx) { free(days); return TSDB_ERR_NOMEM; }
         size_t day_nrows = 0;
         for (size_t r = 0; r < nrows; r++) {
-            if (ts_day_index(ts_buf[r]) == day) row_idx[day_nrows++] = r;
+            if (ts_part_index(ts_buf[r], part_unit) == bucket) row_idx[day_nrows++] = r;
         }
         if (day_nrows == 0) { free(row_idx); continue; }
 
-        /* Build partition directory. */
-        char day_str[9];
-        ts_to_day_str(ts_buf[row_idx[0]], day_str);
+        /* Build partition directory name (DAY: 8 chars, HOUR: 10 chars). */
+        char part_name[11];
+        ts_to_part_str(ts_buf[row_idx[0]], part_unit, part_name);
 
-        /* Compute YYYYMMDD integer for raw-block hook. */
-        uint32_t part_day_int = 0;
-        {
-            unsigned y = 0, mo = 0, dy = 0;
-            sscanf(day_str, "%4u%2u%2u", &y, &mo, &dy);
-            part_day_int = y * 10000u + mo * 100u + dy;
-        }
+        /* Pack partition identifier for the cluster raw-block hook. */
+        uint32_t part_day_int = part_str_to_int(part_name, part_unit);
 
         char part_dir[4096];
-        snprintf(part_dir, sizeof(part_dir), "%s/%s", s->dir, day_str);
+        snprintf(part_dir, sizeof(part_dir), "%s/%s", s->dir, part_name);
         if (tsdb_mkdir_p(part_dir) < 0) { free(row_idx); free(days); return TSDB_ERR_IO; }
 
         /* Write each column. */
@@ -518,6 +641,13 @@ struct tsdb_part {
 
     tsdb_block_meta_t *col_metas[TSDB_MAX_COLS];
     size_t             col_meta_n[TSDB_MAX_COLS];
+
+    /* File-level zone map aggregated across all columns of this partition.
+     * Populated on open from v2 idx headers; falls back to per-block
+     * ts column metadata for v1 idx files. */
+    int64_t            zone_ts_min;
+    int64_t            zone_ts_max;
+    int                zone_valid;
 };
 
 int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out) {
@@ -528,6 +658,9 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
 
     p->schema = s;
     snprintf(p->dir, sizeof(p->dir), "%s", partition_dir);
+    p->zone_ts_min = INT64_MAX;
+    p->zone_ts_max = INT64_MIN;
+    p->zone_valid  = 0;
 
     for (int i = 0; i < s->ncols; i++)
         p->col_maps[i].fd = -1;
@@ -559,14 +692,30 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         if (!idx_f) continue;
 
         uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-        if (fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_f) != TSDB_IDX_HEADER_SIZE
-            || get_u32le(hdr) != TSDB_IDX_MAGIC) {
-            fclose(idx_f);
-            continue;
+        size_t hdr_n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_f);
+        uint32_t block_count  = 0;
+        uint16_t idx_version  = 0;
+        uint64_t total_rows_u = 0;
+        int64_t  fmn = 0, fmx = 0;
+        int      hdr_size = read_idx_header(hdr, hdr_n,
+                                            &block_count, &idx_version,
+                                            &total_rows_u, &fmn, &fmx);
+        if (hdr_size < 0) { fclose(idx_f); continue; }
+        if (block_count == 0) { fclose(idx_f); continue; }
+
+        /* Seek past whichever header size the file actually uses. */
+        if (fseek(idx_f, (long)hdr_size, SEEK_SET) != 0) {
+            fclose(idx_f); continue;
         }
 
-        uint32_t block_count = get_u32le(hdr + 4);
-        if (block_count == 0) { fclose(idx_f); continue; }
+        /* Merge v2 file-level zone map into the per-partition aggregate.
+         * All columns cover the same rows (and thus same row timestamps),
+         * so taking the union is safe and idempotent. */
+        if (idx_version >= 2) {
+            if (fmn < p->zone_ts_min) p->zone_ts_min = fmn;
+            if (fmx > p->zone_ts_max) p->zone_ts_max = fmx;
+            p->zone_valid = 1;
+        }
 
         p->col_metas[ci] = malloc((size_t)block_count * sizeof(tsdb_block_meta_t));
         if (!p->col_metas[ci]) { fclose(idx_f); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
@@ -674,4 +823,33 @@ void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,
     if (col_idx < 0 || col_idx >= p->schema->ncols) return;
     *out_map = p->col_maps[col_idx].map;
     *out_len = p->col_maps[col_idx].map_size;
+}
+
+int tsdb_part_zone_map(tsdb_part_t *p, int64_t *out_ts_min, int64_t *out_ts_max) {
+    if (!p || !out_ts_min || !out_ts_max) return TSDB_ERR_INVAL;
+
+    if (p->zone_valid) {
+        *out_ts_min = p->zone_ts_min;
+        *out_ts_max = p->zone_ts_max;
+        return TSDB_OK;
+    }
+
+    /* v1-idx fallback: compute from the ts column's per-block metadata. */
+    int ts_col = p->schema->ts_col_idx;
+    if (ts_col < 0 || ts_col >= p->schema->ncols) return TSDB_ERR_NOTFOUND;
+    if (p->col_meta_n[ts_col] == 0) return TSDB_ERR_NOTFOUND;
+
+    int64_t mn = INT64_MAX, mx = INT64_MIN;
+    for (size_t b = 0; b < p->col_meta_n[ts_col]; b++) {
+        if (p->col_metas[ts_col][b].ts_min < mn) mn = p->col_metas[ts_col][b].ts_min;
+        if (p->col_metas[ts_col][b].ts_max > mx) mx = p->col_metas[ts_col][b].ts_max;
+    }
+    /* Memoize for subsequent calls. */
+    p->zone_ts_min = mn;
+    p->zone_ts_max = mx;
+    p->zone_valid  = 1;
+
+    *out_ts_min = mn;
+    *out_ts_max = mx;
+    return TSDB_OK;
 }

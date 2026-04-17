@@ -8,13 +8,21 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-/* Binary schema format:
- * [magic u32][version u16][ncols u16][ts_col_idx u32]
- * [name: TSDB_MAX_NAME+1 bytes]
- * per-col: [type u8][_pad u8][name: TSDB_MAX_NAME+1 bytes]
+/* Binary schema format.
+ *
+ * v1 (legacy):
+ *   [magic u32][version u16][ncols u16][ts_col_idx u32]
+ *   [name: TSDB_MAX_NAME+1 bytes]
+ *   per-col: [type u8][_pad u8][name: TSDB_MAX_NAME+1 bytes]
+ *
+ * v2 (2026-04):
+ *   ... v1 fields ...
+ *   [partition_unit u8][_pad u8×3]   -- appended; defaults to DAY on v1 read
+ *
+ * Readers accept both; on v1, partition_unit silently defaults to DAY.
  */
 #define SCHEMA_MAGIC   0x53434D41u  /* "SCMA" */
-#define SCHEMA_VERSION 1
+#define SCHEMA_VERSION 2
 
 /* ---- portable mkdir-p -------------------------------------------------- */
 
@@ -75,6 +83,14 @@ static int schema_save(tsdb_schema_t *s) {
         WR(&pad,  1);
         WR(s->cols[i].name, TSDB_MAX_NAME + 1);
     }
+
+    /* v2 tail: partition_unit + 3 bytes reserved pad. */
+    {
+        uint8_t part_unit = (uint8_t)s->partition_unit;
+        uint8_t reserved[3] = {0, 0, 0};
+        WR(&part_unit, 1);
+        WR(reserved,  3);
+    }
 #undef WR
 
     fclose(f);
@@ -97,7 +113,19 @@ int tsdb_schema_create(const char *dir, const char *name,
                        const char *ts_col,
                        tsdb_schema_t **out)
 {
+    return tsdb_schema_create_ex(dir, name, cols, ncols, ts_col,
+                                  TSDB_PARTITION_DAY, out);
+}
+
+int tsdb_schema_create_ex(const char *dir, const char *name,
+                          const tsdb_col_t *cols, int ncols,
+                          const char *ts_col,
+                          tsdb_partition_unit_t partition_unit,
+                          tsdb_schema_t **out)
+{
     if (!dir || !name || !cols || ncols <= 0 || ncols > TSDB_MAX_COLS || !ts_col || !out)
+        return TSDB_ERR_INVAL;
+    if (partition_unit != TSDB_PARTITION_DAY && partition_unit != TSDB_PARTITION_HOUR)
         return TSDB_ERR_INVAL;
 
     if (strlen(name) > TSDB_MAX_NAME)
@@ -121,9 +149,10 @@ int tsdb_schema_create(const char *dir, const char *name,
     if (!s) return TSDB_ERR_NOMEM;
 
     strncpy(s->name, name, TSDB_MAX_NAME);
-    s->ncols      = ncols;
-    s->ts_col_idx = ts_idx;
-    s->dir        = strdup(dir);
+    s->ncols          = ncols;
+    s->ts_col_idx     = ts_idx;
+    s->partition_unit = partition_unit;
+    s->dir            = strdup(dir);
     if (!s->dir) { free(s); return TSDB_ERR_NOMEM; }
 
     s->cols = calloc((size_t)ncols, sizeof(tsdb_col_info_t));
@@ -180,7 +209,8 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     RD(&magic,    4);
     if (magic != SCHEMA_MAGIC) { fclose(f); return TSDB_ERR_CORRUPT; }
     RD(&version, 2);
-    if (version != SCHEMA_VERSION) { fclose(f); return TSDB_ERR_UNSUPPORTED; }
+    /* Accept v1 and v2. Higher versions are unknown. */
+    if (version != 1 && version != 2) { fclose(f); return TSDB_ERR_UNSUPPORTED; }
     RD(&ncols_raw, 2);
     RD(&ts_idx,    4);
     RD(tbl_name,   TSDB_MAX_NAME + 1);
@@ -194,9 +224,10 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     if (!s) { fclose(f); return TSDB_ERR_NOMEM; }
 
     memcpy(s->name, tbl_name, TSDB_MAX_NAME + 1);
-    s->ncols      = ncols;
-    s->ts_col_idx = (int)ts_idx;
-    s->dir        = strdup(dir);
+    s->ncols          = ncols;
+    s->ts_col_idx     = (int)ts_idx;
+    s->partition_unit = TSDB_PARTITION_DAY;   /* v1 default; v2 overrides below */
+    s->dir            = strdup(dir);
     if (!s->dir) { free(s); fclose(f); return TSDB_ERR_NOMEM; }
 
     s->cols = calloc((size_t)ncols, sizeof(tsdb_col_info_t));
@@ -209,6 +240,21 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
         RD(s->cols[i].name, TSDB_MAX_NAME + 1);
         s->cols[i].type   = (tsdb_type_t)type_raw;
         s->cols[i].symtab = NULL;
+    }
+
+    /* v2 tail: partition_unit + 3 reserved bytes. Missing on v1 files. */
+    if (rc == TSDB_OK && version >= 2) {
+        uint8_t part_unit = 0;
+        uint8_t reserved[3];
+        RD(&part_unit, 1);
+        RD(reserved,  3);
+        if (rc == TSDB_OK) {
+            if (part_unit != TSDB_PARTITION_DAY && part_unit != TSDB_PARTITION_HOUR) {
+                rc = TSDB_ERR_CORRUPT;
+            } else {
+                s->partition_unit = (tsdb_partition_unit_t)part_unit;
+            }
+        }
     }
 #undef RD
     fclose(f);

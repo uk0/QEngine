@@ -67,11 +67,28 @@ typedef struct {
 int tsdb_open(const char *data_dir, tsdb_db_t **out);
 void tsdb_close(tsdb_db_t *db);
 
+/* Partition granularity chosen at CREATE TABLE time.
+ * Fixed for the lifetime of the table. DAY is the default.
+ * HOUR improves block-skip selectivity 24x for queries that hit a
+ * narrow time range, at the cost of more subdirectories on disk. */
+typedef enum {
+    TSDB_CREATE_PART_DAY  = 0,
+    TSDB_CREATE_PART_HOUR = 1
+} tsdb_create_partition_t;
+
 /* Table lifecycle */
 int tsdb_create_table(tsdb_db_t *db,
                       const char *name,
                       const tsdb_col_t *cols, size_t ncols,
                       const char *ts_col);
+
+/* Extended variant with partition granularity option. */
+int tsdb_create_table_ex(tsdb_db_t *db,
+                         const char *name,
+                         const tsdb_col_t *cols, size_t ncols,
+                         const char *ts_col,
+                         tsdb_create_partition_t partition);
+
 int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out);
 int tsdb_drop_table(tsdb_db_t *db, const char *name);
 

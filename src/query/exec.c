@@ -161,7 +161,9 @@ static int scan_plan_push_part(scan_plan_t *p, tsdb_part_t *part) {
     return TSDB_OK;
 }
 
-/* Collect every partition directory under a table dir, sorted ascending. */
+/* Collect every partition directory under a table dir, sorted ascending.
+ * Accepts both YYYYMMDD (8 chars, DAY partitions) and YYYYMMDDHH (10 chars,
+ * HOUR partitions) names. Non-numeric entries are skipped. */
 static int list_partitions(const char *table_dir, char ***out, size_t *n_out) {
     DIR *d = opendir(table_dir);
     if (!d) { *out = NULL; *n_out = 0; return TSDB_OK; }
@@ -170,7 +172,14 @@ static int list_partitions(const char *table_dir, char ***out, size_t *n_out) {
     size_t n = 0, cap = 0;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-        if (strlen(ent->d_name) != 8) continue; /* YYYYMMDD */
+        size_t nl = strlen(ent->d_name);
+        if (nl != 8 && nl != 10) continue;
+        /* All characters must be digits. */
+        int all_digit = 1;
+        for (size_t i = 0; i < nl; i++) {
+            if (ent->d_name[i] < '0' || ent->d_name[i] > '9') { all_digit = 0; break; }
+        }
+        if (!all_digit) continue;
         if (n + 1 > cap) {
             cap = cap ? cap * 2 : 8;
             char **nn = realloc(names, cap * sizeof(char *));
@@ -192,7 +201,13 @@ static int list_partitions(const char *table_dir, char ***out, size_t *n_out) {
     return TSDB_OK;
 }
 
-static int scan_plan_build(scan_plan_t *p, tsdb_table_internal_t *t) {
+/* Forward decls for zone-map-aware scan plan construction. */
+typedef struct ts_range ts_range_t_fwd;
+static int  ts_range_excludes_fwd(const void *r, int64_t ts_min, int64_t ts_max);
+
+static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
+                              const void *zone_prune)
+{
     memset(p, 0, sizeof(*p));
 
     tsdb_schema_t *s = tsdb_tbl_schema(t);
@@ -207,6 +222,20 @@ static int scan_plan_build(scan_plan_t *p, tsdb_table_internal_t *t) {
         tsdb_part_t *part = NULL;
         rc = tsdb_part_open(s, dirs[i], &part);
         if (rc != TSDB_OK) { free(dirs[i]); continue; }
+
+        /* File-level zone-map prune: if the whole partition's [ts_min, ts_max]
+         * is outside the caller's WHERE predicate range, skip it entirely —
+         * no block metadata walk, no column decode. This is the Step-1 win. */
+        if (zone_prune) {
+            int64_t zmn = 0, zmx = 0;
+            if (tsdb_part_zone_map(part, &zmn, &zmx) == TSDB_OK
+                && ts_range_excludes_fwd(zone_prune, zmn, zmx)) {
+                tsdb_part_close(part);
+                free(dirs[i]);
+                continue;
+            }
+        }
+
         tsdb_block_meta_t *metas = NULL; size_t nb = 0;
         rc = tsdb_part_col_blocks(part, ts_col, &metas, &nb);
         if (rc != TSDB_OK) { tsdb_part_close(part); free(dirs[i]); continue; }
@@ -242,6 +271,11 @@ static int scan_plan_build(scan_plan_t *p, tsdb_table_internal_t *t) {
         scan_plan_push(p, sc);
     }
     return TSDB_OK;
+}
+
+/* Legacy shim: no zone prune. Kept for callers that don't have WHERE bounds. */
+static int scan_plan_build(scan_plan_t *p, tsdb_table_internal_t *t) {
+    return scan_plan_build_ex(p, t, NULL);
 }
 
 /* ---- Expr evaluation on vectors --------------------------------------- */
@@ -327,6 +361,12 @@ static int ts_range_excludes(const ts_range_t *r, int64_t ts_min, int64_t ts_max
     if (r->has_hi && ts_min > r->hi) return 1;
     if (r->has_lo && ts_max < r->lo) return 1;
     return 0;
+}
+
+/* Wrapper exposed to scan_plan_build_ex (which is defined earlier, before
+ * ts_range_t). Using void* keeps the build dependency one-way. */
+static int ts_range_excludes_fwd(const void *r, int64_t ts_min, int64_t ts_max) {
+    return ts_range_excludes((const ts_range_t *)r, ts_min, ts_max);
 }
 
 /* Evaluate a *scalar* constant expression (WHERE rhs). */
@@ -911,8 +951,16 @@ static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
         }
     }
 
+    /* LATEST ON may have a WHERE clause too — apply the zone-map prune so we
+     * don't reverse-scan partitions entirely outside the range. */
+    ts_range_t latest_ts_prune;
+    ts_range_init(&latest_ts_prune);
+    if (q->where) extract_ts_bounds(q->where, s, &latest_ts_prune);
+
     scan_plan_t plan = {0};
-    int rc = scan_plan_build(&plan, tbl);
+    int rc = scan_plan_build_ex(&plan, tbl,
+                                 (latest_ts_prune.has_lo || latest_ts_prune.has_hi)
+                                 ? &latest_ts_prune : NULL);
     if (rc != TSDB_OK) return rc;
 
     /* Columns to load: projections + partition cols. */
@@ -1084,9 +1132,18 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         return lrc;
     }
 
-    /* Build scan plan */
+    /* Extract ts bounds from WHERE once, so both file-level zone-map prune
+     * (via scan_plan_build_ex) and per-block skip (in the worker loops) see
+     * the same range. */
+    ts_range_t plan_ts_prune;
+    ts_range_init(&plan_ts_prune);
+    if (q->where) extract_ts_bounds(q->where, s, &plan_ts_prune);
+
+    /* Build scan plan with zone-map prune. */
     scan_plan_t plan = {0};
-    rc = scan_plan_build(&plan, tbl);
+    rc = scan_plan_build_ex(&plan, tbl,
+                             (plan_ts_prune.has_lo || plan_ts_prune.has_hi)
+                             ? &plan_ts_prune : NULL);
     if (rc != TSDB_OK) { free(projs); return rc; }
 
     /* Special case: SAMPLE BY + has_agg: handle bucket-grouped aggregation. */

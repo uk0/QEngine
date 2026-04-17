@@ -157,6 +157,7 @@ static int create_table_impl(tsdb_db_t *db,
                               const char *name,
                               const tsdb_col_t *cols, size_t ncols,
                               const char *ts_col,
+                              tsdb_partition_unit_t part_unit,
                               int suppress_hook)
 {
     if (!db || !name || !cols || ncols == 0 || !ts_col) return TSDB_ERR_INVAL;
@@ -179,7 +180,8 @@ static int create_table_impl(tsdb_db_t *db,
     table_dir(db->data_dir, name, dir, sizeof(dir));
 
     tsdb_schema_t *schema = NULL;
-    int rc = tsdb_schema_create(dir, name, cols, (int)ncols, ts_col, &schema);
+    int rc = tsdb_schema_create_ex(dir, name, cols, (int)ncols, ts_col,
+                                    part_unit, &schema);
     if (rc != TSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return rc;
@@ -234,7 +236,20 @@ int tsdb_create_table(tsdb_db_t *db,
                       const tsdb_col_t *cols, size_t ncols,
                       const char *ts_col)
 {
-    return create_table_impl(db, name, cols, ncols, ts_col, 0 /* sync */);
+    return create_table_impl(db, name, cols, ncols, ts_col,
+                             TSDB_PARTITION_DAY, 0 /* sync */);
+}
+
+int tsdb_create_table_ex(tsdb_db_t *db,
+                         const char *name,
+                         const tsdb_col_t *cols, size_t ncols,
+                         const char *ts_col,
+                         tsdb_create_partition_t partition)
+{
+    tsdb_partition_unit_t unit = (partition == TSDB_CREATE_PART_HOUR)
+                                  ? TSDB_PARTITION_HOUR
+                                  : TSDB_PARTITION_DAY;
+    return create_table_impl(db, name, cols, ncols, ts_col, unit, 0 /* sync */);
 }
 
 int tsdb_create_table_local(tsdb_db_t *db,
@@ -242,7 +257,8 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              const tsdb_col_t *cols, size_t ncols,
                              const char *ts_col)
 {
-    return create_table_impl(db, name, cols, ncols, ts_col, 1 /* no sync */);
+    return create_table_impl(db, name, cols, ncols, ts_col,
+                             TSDB_PARTITION_DAY, 1 /* no sync */);
 }
 
 /* ---- tsdb_open_table ---------------------------------------------------- */

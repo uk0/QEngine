@@ -137,20 +137,31 @@ static void rawblk_write_header(uint8_t *hdr,
     rb_put_u32(hdr + 28, data_size);
 }
 
-/* ---- IDX helpers (mirrors part.c) ----------------------------------------- */
+/* ---- IDX helpers (mirrors part.c's v2 layout) ------------------------------
+ *
+ * IdxHeader v2 (36 bytes): magic(4) + count(4) + version(2) + pad(2) +
+ *                          total_rows(8) + file_ts_min(8) + file_ts_max(8).
+ * We accept v1 (20 bytes) on read for backward compatibility and always
+ * write v2 on apply. Zone-map fields are inherited from any prior apply
+ * and extended with the new block's [ts_min, ts_max]. */
 
-#define RAWBLK_IDX_MAGIC    0x31584449u /* "IDX1" */
-#define RAWBLK_IDX_VER      1
-#define RAWBLK_IDX_HDR_SIZE 20u
-#define RAWBLK_IDX_ENT_SIZE 40u
+#define RAWBLK_IDX_MAGIC       0x31584449u /* "IDX1" */
+#define RAWBLK_IDX_VER         2
+#define RAWBLK_IDX_HDR_SIZE_V1 20u
+#define RAWBLK_IDX_HDR_SIZE    36u
+#define RAWBLK_IDX_ENT_SIZE    40u
 
-static void rawblk_write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows) {
+static void rawblk_write_idx_header(uint8_t *buf, uint32_t count,
+                                    uint64_t total_rows,
+                                    int64_t  file_ts_min,
+                                    int64_t  file_ts_max) {
     rb_put_u32(buf + 0,  RAWBLK_IDX_MAGIC);
     rb_put_u32(buf + 4,  count);
     rb_put_u16(buf + 8,  RAWBLK_IDX_VER);
     rb_put_u16(buf + 10, 0);
-    /* total_rows as u64 LE */
     for (int i = 0; i < 8; i++) buf[12+i] = (uint8_t)((total_rows >> (i*8)) & 0xFF);
+    rb_put_i64(buf + 20, file_ts_min);
+    rb_put_i64(buf + 28, file_ts_max);
 }
 
 static void rawblk_write_idx_entry(uint8_t *buf,
@@ -201,17 +212,20 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
 
-    /* --- Idempotency: skip if last idx entry matches --- */
+    /* --- Idempotency: skip if last idx entry matches. Reads either v1 or v2. */
     {
         FILE *idx_r = fopen(idx_path, "rb");
         if (idx_r) {
             uint8_t hdr[RAWBLK_IDX_HDR_SIZE];
-            if (fread(hdr, 1, RAWBLK_IDX_HDR_SIZE, idx_r) == RAWBLK_IDX_HDR_SIZE
+            size_t  hdr_n = fread(hdr, 1, RAWBLK_IDX_HDR_SIZE, idx_r);
+            if (hdr_n >= RAWBLK_IDX_HDR_SIZE_V1
                 && rb_get_u32(hdr) == RAWBLK_IDX_MAGIC) {
                 uint32_t cnt = rb_get_u32(hdr + 4);
+                uint16_t ver = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);
+                size_t   hsz = (ver >= 2) ? RAWBLK_IDX_HDR_SIZE
+                                          : RAWBLK_IDX_HDR_SIZE_V1;
                 if (cnt > 0) {
-                    /* Seek to last entry. */
-                    long off = (long)(RAWBLK_IDX_HDR_SIZE + (uint64_t)(cnt - 1) * RAWBLK_IDX_ENT_SIZE);
+                    long off = (long)(hsz + (uint64_t)(cnt - 1) * RAWBLK_IDX_ENT_SIZE);
                     if (fseek(idx_r, off, SEEK_SET) == 0) {
                         uint8_t ent[RAWBLK_IDX_ENT_SIZE];
                         if (fread(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_r) == RAWBLK_IDX_ENT_SIZE) {
@@ -258,30 +272,52 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     fflush(col_fp);
     fclose(col_fp);
 
-    /* --- Rewrite .idx --- */
-    /* Read existing entries. */
+    /* --- Rewrite .idx (always write v2). Read either v1 or v2 existing. */
     uint8_t *old_entries = NULL;
     uint32_t old_count   = 0;
     uint64_t old_total   = 0;
+    int64_t  old_fmn     = INT64_MAX;
+    int64_t  old_fmx     = INT64_MIN;
+    int      have_old_zone = 0;
 
     {
         FILE *idx_r = fopen(idx_path, "rb");
         if (idx_r) {
             uint8_t ih[RAWBLK_IDX_HDR_SIZE];
-            if (fread(ih, 1, RAWBLK_IDX_HDR_SIZE, idx_r) == RAWBLK_IDX_HDR_SIZE
+            size_t  ih_n = fread(ih, 1, RAWBLK_IDX_HDR_SIZE, idx_r);
+            if (ih_n >= RAWBLK_IDX_HDR_SIZE_V1
                 && rb_get_u32(ih) == RAWBLK_IDX_MAGIC) {
                 old_count = rb_get_u32(ih + 4);
-                /* total_rows */
+                uint16_t ver = (uint16_t)ih[8] | ((uint16_t)ih[9] << 8);
+                size_t   hsz = (ver >= 2) ? RAWBLK_IDX_HDR_SIZE
+                                          : RAWBLK_IDX_HDR_SIZE_V1;
                 uint64_t tr = 0;
                 for (int i = 7; i >= 0; i--) tr = (tr << 8) | ih[12+i];
                 old_total = tr;
+                if (ver >= 2 && ih_n >= RAWBLK_IDX_HDR_SIZE) {
+                    old_fmn = rb_get_i64(ih + 20);
+                    old_fmx = rb_get_i64(ih + 28);
+                    have_old_zone = (old_count > 0);
+                }
                 if (old_count > 0) {
-                    old_entries = malloc((size_t)old_count * RAWBLK_IDX_ENT_SIZE);
-                    if (old_entries) {
-                        if (fread(old_entries, 1,
-                                  (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_r)
-                            != (size_t)old_count * RAWBLK_IDX_ENT_SIZE) {
-                            free(old_entries); old_entries = NULL; old_count = 0;
+                    if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
+                        old_entries = malloc((size_t)old_count * RAWBLK_IDX_ENT_SIZE);
+                        if (old_entries) {
+                            if (fread(old_entries, 1,
+                                      (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_r)
+                                != (size_t)old_count * RAWBLK_IDX_ENT_SIZE) {
+                                free(old_entries); old_entries = NULL; old_count = 0;
+                            } else if (!have_old_zone) {
+                                /* v1 fallback: derive zone from per-block entries. */
+                                for (uint32_t b = 0; b < old_count; b++) {
+                                    uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
+                                    int64_t mn = rb_get_i64(e + 16);
+                                    int64_t mx = rb_get_i64(e + 24);
+                                    if (mn < old_fmn) old_fmn = mn;
+                                    if (mx > old_fmx) old_fmx = mx;
+                                }
+                                have_old_zone = 1;
+                            }
                         }
                     }
                 }
@@ -296,8 +332,14 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     uint32_t new_count = old_count + 1;
     uint64_t new_total = old_total + r->count;
 
+    /* Extend the file-level zone map with this block's [ts_min, ts_max]. */
+    int64_t  new_fmn = have_old_zone ? old_fmn : r->ts_min;
+    int64_t  new_fmx = have_old_zone ? old_fmx : r->ts_max;
+    if (r->ts_min < new_fmn) new_fmn = r->ts_min;
+    if (r->ts_max > new_fmx) new_fmx = r->ts_max;
+
     uint8_t ih[RAWBLK_IDX_HDR_SIZE];
-    rawblk_write_idx_header(ih, new_count, new_total);
+    rawblk_write_idx_header(ih, new_count, new_total, new_fmn, new_fmx);
     fwrite(ih, 1, RAWBLK_IDX_HDR_SIZE, idx_w);
 
     if (old_count > 0 && old_entries)
