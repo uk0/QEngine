@@ -30,7 +30,7 @@ SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster sr
 SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c tests/test_retention.c tests/test_v06_e2e.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
