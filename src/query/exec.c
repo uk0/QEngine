@@ -11,6 +11,7 @@
 #include "../core/arena.h"
 #include "../core/symbol.h"
 #include "../exec/agg.h"
+#include "../exec/tdigest.h"
 #include "../exec/filter.h"
 #include "../exec/bucket.h"
 #include "../exec/pool.h"
@@ -545,7 +546,27 @@ static int apply_filter_expr(eval_ctx_t *ctx, qast_expr_t *e, uint64_t *bm) {
 /* ---- Projection -------------------------------------------------------- */
 
 /* A "projection" tells how to get values for an output column from a block. */
-typedef enum { PROJ_COL, PROJ_TS_BUCKET, PROJ_AGG_SUM, PROJ_AGG_AVG, PROJ_AGG_MIN, PROJ_AGG_MAX, PROJ_AGG_COUNT } proj_kind_t;
+typedef enum {
+    PROJ_COL,
+    PROJ_TS_BUCKET,
+    PROJ_AGG_SUM,
+    PROJ_AGG_AVG,
+    PROJ_AGG_MIN,
+    PROJ_AGG_MAX,
+    PROJ_AGG_COUNT,
+    /* T-digest based approximate quantiles and stddev */
+    PROJ_AGG_P50,
+    PROJ_AGG_P90,
+    PROJ_AGG_P99,
+    PROJ_AGG_PERCENTILE,  /* percentile(col, q) — user-specified q */
+    PROJ_AGG_STDDEV,
+} proj_kind_t;
+
+/* Sentinel: all PROJ_AGG_* kinds from SUM through STDDEV */
+#define PROJ_AGG_FIRST PROJ_AGG_SUM
+#define PROJ_AGG_LAST  PROJ_AGG_STDDEV
+/* T-digest kinds start at P50 */
+#define PROJ_AGG_TDIGEST_FIRST PROJ_AGG_P50
 
 typedef struct {
     proj_kind_t kind;
@@ -560,14 +581,30 @@ typedef struct {
     double      agg_min_f, agg_max_f;
     int64_t     agg_min_i, agg_max_i;
     uint64_t    agg_count;
+    /* T-digest state for PROJ_AGG_P50/P90/P99/PERCENTILE/STDDEV */
+    tsdb_tdigest_t *tdigest;        /* NULL unless this is a tdigest kind */
+    double          percentile_q;   /* q for PROJ_AGG_PERCENTILE [0,1] */
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
     if (!e || e->kind != QAST_CALL) return 0;
     const char *n = e->v.s;
-    return strcasecmp(n, "sum") == 0 || strcasecmp(n, "avg") == 0 ||
-           strcasecmp(n, "min") == 0 || strcasecmp(n, "max") == 0 ||
-           strcasecmp(n, "count") == 0;
+    return strcasecmp(n, "sum") == 0       || strcasecmp(n, "avg") == 0   ||
+           strcasecmp(n, "min") == 0       || strcasecmp(n, "max") == 0   ||
+           strcasecmp(n, "count") == 0     ||
+           strcasecmp(n, "p50") == 0       || strcasecmp(n, "p90") == 0   ||
+           strcasecmp(n, "p99") == 0       || strcasecmp(n, "percentile") == 0 ||
+           strcasecmp(n, "stddev") == 0;
+}
+
+/* Helper: allocate a fresh tdigest and store into proj; NULLs on failure. */
+static int proj_tdigest_init(proj_t *p) {
+    return tsdb_tdigest_new(100.0, &p->tdigest);
+}
+
+/* Free a proj's tdigest (idempotent). */
+static void proj_tdigest_free(proj_t *p) {
+    if (p->tdigest) { tsdb_tdigest_free(p->tdigest); p->tdigest = NULL; }
 }
 
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
@@ -608,13 +645,20 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             has_agg = 1;
             const char *name = e->v.s;
             proj_kind_t k = PROJ_AGG_SUM;
-            if      (strcasecmp(name, "sum") == 0) k = PROJ_AGG_SUM;
-            else if (strcasecmp(name, "avg") == 0) k = PROJ_AGG_AVG;
-            else if (strcasecmp(name, "min") == 0) k = PROJ_AGG_MIN;
-            else if (strcasecmp(name, "max") == 0) k = PROJ_AGG_MAX;
-            else if (strcasecmp(name, "count") == 0) k = PROJ_AGG_COUNT;
+            if      (strcasecmp(name, "sum") == 0)        k = PROJ_AGG_SUM;
+            else if (strcasecmp(name, "avg") == 0)        k = PROJ_AGG_AVG;
+            else if (strcasecmp(name, "min") == 0)        k = PROJ_AGG_MIN;
+            else if (strcasecmp(name, "max") == 0)        k = PROJ_AGG_MAX;
+            else if (strcasecmp(name, "count") == 0)      k = PROJ_AGG_COUNT;
+            else if (strcasecmp(name, "p50") == 0)        k = PROJ_AGG_P50;
+            else if (strcasecmp(name, "p90") == 0)        k = PROJ_AGG_P90;
+            else if (strcasecmp(name, "p99") == 0)        k = PROJ_AGG_P99;
+            else if (strcasecmp(name, "percentile") == 0) k = PROJ_AGG_PERCENTILE;
+            else if (strcasecmp(name, "stddev") == 0)     k = PROJ_AGG_STDDEV;
             arr[n].kind = k;
-            if (e->nargs == 1 && e->args[0]->kind == QAST_IDENT) {
+
+            /* Resolve column argument. */
+            if (e->nargs >= 1 && e->args[0]->kind == QAST_IDENT) {
                 int c = resolve_col(s, e->args[0]->v.s);
                 if (c < 0 && k != PROJ_AGG_COUNT) {
                     eset(err, errcap, "unknown column in aggregate: %s", e->args[0]->v.s);
@@ -623,14 +667,42 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                 arr[n].col = c;
             } else if (k == PROJ_AGG_COUNT && (e->nargs == 0 || (e->nargs == 1 && e->args[0]->kind == QAST_STAR))) {
                 arr[n].col = s->ts_col_idx; /* count uses row count */
-            } else {
+            } else if (k < PROJ_AGG_TDIGEST_FIRST) {
                 eset(err, errcap, "unsupported aggregate argument");
                 free(arr); return TSDB_ERR_UNSUPPORTED;
             }
-            /* COUNT always int64; AVG always float64; SUM/MIN/MAX take source type */
-            if (k == PROJ_AGG_COUNT) arr[n].out_type = TSDB_TYPE_INT64;
-            else if (k == PROJ_AGG_AVG) arr[n].out_type = TSDB_TYPE_FLOAT64;
+
+            /* For percentile(col, q): parse q from second argument. */
+            if (k == PROJ_AGG_PERCENTILE) {
+                if (e->nargs != 2) {
+                    eset(err, errcap, "percentile() requires 2 arguments: percentile(col, q)");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                double q = 0.5;
+                qast_expr_t *qarg = e->args[1];
+                if (qarg->kind == QAST_LIT_FLOAT)     q = qarg->v.f;
+                else if (qarg->kind == QAST_LIT_INT)  q = (double)qarg->v.i;
+                else {
+                    eset(err, errcap, "percentile() second argument must be a numeric literal");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                if (q < 0.0) q = 0.0;
+                if (q > 1.0) q = 1.0;
+                arr[n].percentile_q = q;
+            } else {
+                /* Set default q for fixed-quantile helpers. */
+                if      (k == PROJ_AGG_P50) arr[n].percentile_q = 0.50;
+                else if (k == PROJ_AGG_P90) arr[n].percentile_q = 0.90;
+                else if (k == PROJ_AGG_P99) arr[n].percentile_q = 0.99;
+            }
+
+            /* Output type */
+            if (k == PROJ_AGG_COUNT)                  arr[n].out_type = TSDB_TYPE_INT64;
+            else if (k >= PROJ_AGG_TDIGEST_FIRST)     arr[n].out_type = TSDB_TYPE_FLOAT64;
+            else if (k == PROJ_AGG_AVG)               arr[n].out_type = TSDB_TYPE_FLOAT64;
             else arr[n].out_type = (arr[n].col >= 0) ? s->cols[arr[n].col].type : TSDB_TYPE_FLOAT64;
+
+            /* Build output column name. */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else {
                 if (arr[n].col >= 0)
@@ -642,6 +714,13 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             arr[n].agg_max_f = -INFINITY;
             arr[n].agg_min_i = INT64_MAX;
             arr[n].agg_max_i = INT64_MIN;
+
+            /* Allocate tdigest for tdigest-kind projections. */
+            if (k >= PROJ_AGG_TDIGEST_FIRST) {
+                if (proj_tdigest_init(&arr[n]) != 0) {
+                    free(arr); return TSDB_ERR_NOMEM;
+                }
+            }
         } else if (e->kind == QAST_CALL && strcasecmp(e->v.s, "time_bucket") == 0) {
             /* time_bucket(ts, interval) */
             if (e->nargs != 2 || e->args[0]->kind != QAST_IDENT || e->args[1]->kind != QAST_LIT_INT) {
@@ -684,6 +763,39 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     /* Determine selectivity once per block so we can take the all-set fast path. */
     uint64_t popcnt = tsdb_bitmap_popcount(bm, n);
     if (popcnt == 0) return;
+
+    /* ---- T-digest path (always f64 gathered) ---- */
+    if (p->kind >= PROJ_AGG_TDIGEST_FIRST) {
+        if (!p->tdigest) return;
+        const double *src;
+        size_t cn;
+        /* For non-f64 columns: gather into scratch as f64 via cast. */
+        if (t == TSDB_TYPE_FLOAT64) {
+            const double *v = (const double *)bufs[p->col];
+            if (popcnt == n) {
+                src = v; cn = n;
+            } else {
+                double *tmp = (double *)scratch;
+                cn = tsdb_bitmap_gather_f64(bm, v, n, tmp);
+                src = tmp;
+            }
+        } else {
+            /* int64 / timestamp → cast to double */
+            const int64_t *iv = (const int64_t *)bufs[p->col];
+            double *tmp = (double *)scratch;
+            if (popcnt == n) {
+                for (size_t i = 0; i < n; i++) tmp[i] = (double)iv[i];
+                src = tmp; cn = n;
+            } else {
+                int64_t *itmp = (int64_t *)scratch;
+                size_t icn = tsdb_bitmap_gather_i64(bm, iv, n, itmp);
+                for (size_t i = 0; i < icn; i++) tmp[i] = (double)itmp[i];
+                src = tmp; cn = icn;
+            }
+        }
+        tsdb_tdigest_add_bulk(p->tdigest, src, cn, NULL);
+        return;
+    }
 
     if (t == TSDB_TYPE_FLOAT64) {
         const double *v = (const double *)bufs[p->col];
@@ -784,6 +896,16 @@ static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx
     case PROJ_AGG_MAX:
         if (src_t == TSDB_TYPE_FLOAT64) out_f = p->agg_max_f;
         else                            out_i = p->agg_max_i;
+        break;
+    /* T-digest quantile/stddev kinds — always float64. */
+    case PROJ_AGG_P50:
+    case PROJ_AGG_P90:
+    case PROJ_AGG_P99:
+    case PROJ_AGG_PERCENTILE:
+        out_f = p->tdigest ? tsdb_tdigest_quantile(p->tdigest, p->percentile_q) : 0.0 / 0.0;
+        break;
+    case PROJ_AGG_STDDEV:
+        out_f = p->tdigest ? tsdb_tdigest_stddev(p->tdigest) : 0.0 / 0.0;
         break;
     default: return;
     }
@@ -913,7 +1035,7 @@ void tsdb_par_scan_task(void *arg) {
 
         /* Update private aggregate state. */
         for (int pi = 0; pi < t->nprojs; pi++) {
-            if (t->projs[pi].kind >= PROJ_AGG_SUM && t->projs[pi].kind <= PROJ_AGG_COUNT)
+            if (t->projs[pi].kind >= PROJ_AGG_FIRST && t->projs[pi].kind <= PROJ_AGG_LAST)
                 agg_update(&t->projs[pi], t->schema, bufs, n, bm, agg_scratch);
         }
 
@@ -1094,6 +1216,424 @@ out:
     return rc;
 }
 
+/* Forward declaration for DDL helper used by ASOF JOIN right SYMBOL columns. */
+static tsdb_symtab_t *result_new_owned_symtab(tsdb_result_t *r);
+
+/* ---- ASOF JOIN execution -----------------------------------------------
+ *
+ * SELECT ... FROM L ASOF JOIN R ON lk1=rk1 [, lk2=rk2]
+ *
+ * For each left row (ascending ts), find the right row with the largest
+ * right.ts <= left.ts among rows where all ON key pairs match.
+ * Right columns are encoded as 0 (NULL) when no match exists.
+ *
+ * Algorithm: materialise right table, then two-pointer with a per-key
+ * cursor hashmap.  O(N log N) sort + O(N+M) scan.
+ */
+/* Per-key cursor: scan_pos is how far into the right table we've scanned
+ * (advances monotonically as left_ts grows); best is the index of the
+ * best-matching right row seen so far for this key (SIZE_MAX = no match). */
+typedef struct { uint64_t key; size_t best; } asof_cursor_t;
+
+typedef struct {
+    size_t         nrows, ncols;
+    int            ts_col;
+    int64_t       *ts_buf;
+    void         **col_bufs;
+    tsdb_type_t   *col_types;
+    tsdb_symtab_t **col_syms;
+} right_mat_t;
+
+static void right_mat_free(right_mat_t *m) {
+    if (!m) return;
+    free(m->ts_buf);
+    if (m->col_bufs) { for (size_t c = 0; c < m->ncols; c++) free(m->col_bufs[c]); free(m->col_bufs); }
+    free(m->col_types); free(m->col_syms);
+}
+
+static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs, size_t off) {
+    size_t n = src->row_count;
+    for (size_t c = 0; c < m->ncols; c++) {
+        size_t w = tsdb_type_width(rs->cols[c].type);
+        if (src->mem) {
+            memcpy((char *)m->col_bufs[c] + off * w, tsdb_memtable_col(src->mem, (int)c), n * w);
+        } else {
+            tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+            int rc = tsdb_part_col_blocks(src->part, (int)c, &metas, &nb);
+            if (rc != TSDB_OK) return rc;
+            tsdb_block_meta_t *hit = NULL;
+            for (size_t b = 0; b < nb; b++)
+                if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count)
+                    { hit = &metas[b]; break; }
+            if (!hit) { free(metas); return TSDB_ERR_CORRUPT; }
+            rc = tsdb_part_read_block(src->part, (int)c, hit, (char *)m->col_bufs[c] + off * w);
+            free(metas);
+            if (rc != TSDB_OK) return rc;
+        }
+    }
+    return TSDB_OK;
+}
+
+static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m) {
+    tsdb_schema_t *rs = tsdb_tbl_schema(rtbl);
+    m->ncols = (size_t)rs->ncols; m->ts_col = rs->ts_col_idx;
+    m->col_types = calloc(m->ncols, sizeof(tsdb_type_t));
+    m->col_syms  = calloc(m->ncols, sizeof(tsdb_symtab_t *));
+    m->col_bufs  = calloc(m->ncols, sizeof(void *));
+    m->ts_buf = NULL; m->nrows = 0;
+    if (!m->col_types || !m->col_syms || !m->col_bufs) return TSDB_ERR_NOMEM;
+
+    scan_plan_t rplan; memset(&rplan, 0, sizeof(rplan));
+    int rc = scan_plan_build(&rplan, rtbl);
+    if (rc != TSDB_OK) { right_mat_free(m); return rc; }
+
+    size_t total = 0;
+    for (size_t si = 0; si < rplan.nsrcs; si++) total += rplan.srcs[si].row_count;
+    m->nrows = total;
+    if (total == 0) { scan_plan_free(&rplan); return TSDB_OK; }
+
+    for (size_t c = 0; c < m->ncols; c++) {
+        m->col_types[c] = rs->cols[c].type; m->col_syms[c] = rs->cols[c].symtab;
+        m->col_bufs[c] = malloc(tsdb_type_width(rs->cols[c].type) * total);
+        if (!m->col_bufs[c]) { scan_plan_free(&rplan); right_mat_free(m); return TSDB_ERR_NOMEM; }
+    }
+    size_t off = 0;
+    for (size_t si = 0; si < rplan.nsrcs; si++) {
+        rc = right_mat_load_src(m, &rplan.srcs[si], rs, off);
+        if (rc != TSDB_OK) { scan_plan_free(&rplan); right_mat_free(m); return rc; }
+        off += rplan.srcs[si].row_count;
+    }
+    scan_plan_free(&rplan);
+
+    m->ts_buf = malloc(total * sizeof(int64_t));
+    if (!m->ts_buf) { right_mat_free(m); return TSDB_ERR_NOMEM; }
+    memcpy(m->ts_buf, m->col_bufs[m->ts_col], total * sizeof(int64_t));
+
+    /* Sort columns together by ts if not already sorted. */
+    int sorted = 1;
+    for (size_t i = 1; i < total; i++) if (m->ts_buf[i] < m->ts_buf[i-1]) { sorted = 0; break; }
+    if (!sorted) {
+        size_t *idx = malloc(total * sizeof(size_t));
+        if (!idx) { right_mat_free(m); return TSDB_ERR_NOMEM; }
+        for (size_t i = 0; i < total; i++) idx[i] = i;
+        int64_t *ts = m->ts_buf;
+        for (size_t i = 1; i < total; i++) {   /* insertion sort, fast for nearly-sorted */
+            size_t x = idx[i]; int64_t tv = ts[x]; size_t j = i;
+            while (j > 0 && ts[idx[j-1]] > tv) { idx[j] = idx[j-1]; j--; }
+            idx[j] = x;
+        }
+        void *tmp = malloc(total * 8);
+        if (!tmp) { free(idx); right_mat_free(m); return TSDB_ERR_NOMEM; }
+        for (size_t c = 0; c < m->ncols; c++) {
+            size_t w = tsdb_type_width(m->col_types[c]);
+            for (size_t i = 0; i < total; i++)
+                memcpy((char *)tmp + i * w, (char *)m->col_bufs[c] + idx[i] * w, w);
+            memcpy(m->col_bufs[c], tmp, total * w);
+        }
+        memcpy(m->ts_buf, m->col_bufs[m->ts_col], total * sizeof(int64_t));
+        free(tmp); free(idx);
+    }
+    return TSDB_OK;
+}
+
+static uint64_t asof_rkey_hash(right_mat_t *m, size_t row, int *rcol_idx, int nkeys) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int k = 0; k < nkeys; k++) {
+        int c = rcol_idx[k]; tsdb_type_t t = m->col_types[c]; size_t w = tsdb_type_width(t);
+        if (t == TSDB_TYPE_SYMBOL && m->col_syms[c]) {
+            uint32_t code; memcpy(&code, (const uint8_t *)m->col_bufs[c] + row * w, 4);
+            const char *s = tsdb_symtab_str(m->col_syms[c], code); if (!s) s = "";
+            for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
+            h ^= 0u; h *= 1099511628211ULL;
+        } else {
+            const uint8_t *p = (const uint8_t *)m->col_bufs[c] + row * w;
+            for (size_t i = 0; i < w; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+        }
+    }
+    return h ? h : 1;
+}
+
+static uint64_t asof_lkey_hash(tsdb_schema_t *ls, void **lb, size_t row, int *lcol_idx, int nkeys) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int k = 0; k < nkeys; k++) {
+        int c = lcol_idx[k]; tsdb_type_t t = ls->cols[c].type; size_t w = tsdb_type_width(t);
+        if (t == TSDB_TYPE_SYMBOL && ls->cols[c].symtab) {
+            uint32_t code; memcpy(&code, (const uint8_t *)lb[c] + row * w, 4);
+            const char *s = tsdb_symtab_str(ls->cols[c].symtab, code); if (!s) s = "";
+            for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
+            h ^= 0u; h *= 1099511628211ULL;
+        } else {
+            const uint8_t *p = (const uint8_t *)lb[c] + row * w;
+            for (size_t i = 0; i < w; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+        }
+    }
+    return h ? h : 1;
+}
+
+static int asof_keys_eq(tsdb_schema_t *ls, void **lb, size_t lr, int *lcol_idx,
+                         right_mat_t *m, size_t rr, int *rcol_idx, int nkeys) {
+    for (int k = 0; k < nkeys; k++) {
+        int lc = lcol_idx[k], rc2 = rcol_idx[k];
+        tsdb_type_t lt = ls->cols[lc].type, rt = m->col_types[rc2];
+        size_t lw = tsdb_type_width(lt), rw = tsdb_type_width(rt);
+        if (lt == TSDB_TYPE_SYMBOL && rt == TSDB_TYPE_SYMBOL) {
+            uint32_t a, b2;
+            memcpy(&a, (const uint8_t *)lb[lc] + lr * lw, 4);
+            memcpy(&b2, (const uint8_t *)m->col_bufs[rc2] + rr * rw, 4);
+            const char *sa = tsdb_symtab_str(ls->cols[lc].symtab, a); if (!sa) sa = "";
+            const char *sb = tsdb_symtab_str(m->col_syms[rc2], b2); if (!sb) sb = "";
+            if (strcmp(sa, sb) != 0) return 0;
+        } else {
+            if (memcmp((const uint8_t *)lb[lc] + lr * lw,
+                       (const uint8_t *)m->col_bufs[rc2] + rr * rw,
+                       lw < rw ? lw : rw) != 0) return 0;
+        }
+    }
+    return 1;
+}
+
+static asof_cursor_t *asof_slot(asof_cursor_t *map, size_t cap, uint64_t key) {
+    size_t pos = (size_t)key & (cap - 1);
+    while (map[pos].key && map[pos].key != key) pos = (pos + 1) & (cap - 1);
+    return &map[pos];
+}
+
+static int asof_grow(asof_cursor_t **pm, size_t *pc) {
+    size_t nc = (*pc) * 2;
+    asof_cursor_t *nm = calloc(nc, sizeof(asof_cursor_t));
+    if (!nm) return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < *pc; i++)
+        if ((*pm)[i].key) *asof_slot(nm, nc, (*pm)[i].key) = (*pm)[i];
+    free(*pm); *pm = nm; *pc = nc;
+    return TSDB_OK;
+}
+
+/* Flag for right-side projection columns encoded in proj_t.col. */
+#define PROJ_RFLAG  0x8000
+#define PROJ_IS_R(p) ((p)->col & PROJ_RFLAG)
+#define PROJ_RC(p)   ((p)->col & ~PROJ_RFLAG)
+
+static int build_projs_asof(qast_query_t *q, tsdb_schema_t *ls, tsdb_schema_t *rs,
+                             proj_t **out, int *out_n, char *err, size_t errcap) {
+    proj_t *arr = NULL; int cap = 0, n = 0;
+    for (int i = 0; i < q->nsel; i++) {
+        qast_sel_item_t *si = &q->sel[i];
+        if (si->is_star) {
+            for (int c = 0; c < ls->ncols; c++) {
+                if (n >= cap) { cap = cap ? cap*2 : 8; arr = realloc(arr, (size_t)cap*sizeof(*arr)); }
+                memset(&arr[n], 0, sizeof(arr[n]));
+                arr[n].kind = PROJ_COL; arr[n].col = c; arr[n].out_type = ls->cols[c].type;
+                snprintf(arr[n].name, sizeof(arr[n].name), "%s", ls->cols[c].name); n++;
+            }
+            for (int c = 0; c < rs->ncols; c++) {
+                if (n >= cap) { cap = cap ? cap*2 : 8; arr = realloc(arr, (size_t)cap*sizeof(*arr)); }
+                memset(&arr[n], 0, sizeof(arr[n]));
+                arr[n].kind = PROJ_COL; arr[n].col = c | PROJ_RFLAG; arr[n].out_type = rs->cols[c].type;
+                snprintf(arr[n].name, sizeof(arr[n].name), "%s", rs->cols[c].name); n++;
+            }
+            continue;
+        }
+        if (n >= cap) { cap = cap ? cap*2 : 8; arr = realloc(arr, (size_t)cap*sizeof(*arr)); }
+        memset(&arr[n], 0, sizeof(arr[n]));
+        qast_expr_t *e = si->expr;
+        if (e->kind != QAST_IDENT) { eset(err, errcap, "ASOF JOIN: only column references supported"); free(arr); return TSDB_ERR_UNSUPPORTED; }
+        int lc = resolve_col(ls, e->v.s);
+        if (lc >= 0) {
+            arr[n].kind = PROJ_COL; arr[n].col = lc; arr[n].out_type = ls->cols[lc].type;
+            snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias ? si->alias : ls->cols[lc].name);
+        } else {
+            int rc2 = resolve_col(rs, e->v.s);
+            if (rc2 < 0) { eset(err, errcap, "unknown column '%s'", e->v.s); free(arr); return TSDB_ERR_SCHEMA; }
+            arr[n].kind = PROJ_COL; arr[n].col = rc2 | PROJ_RFLAG; arr[n].out_type = rs->cols[rc2].type;
+            snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias ? si->alias : rs->cols[rc2].name);
+        }
+        n++;
+    }
+    *out = arr; *out_n = n;
+    return TSDB_OK;
+}
+
+static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
+                          qast_query_t *q, tsdb_result_t *r,
+                          char *err, size_t errcap) {
+    tsdb_schema_t *ls = tsdb_tbl_schema(ltbl);
+    int rc = TSDB_OK;
+
+    tsdb_table_internal_t *rtbl = tsdb_db_find_table(db, q->asof_table);
+    if (!rtbl) {
+        tsdb_table_t *h = NULL;
+        rc = tsdb_open_table(db, q->asof_table, &h);
+        if (rc != TSDB_OK) { eset(err, errcap, "ASOF JOIN: right table '%s' not found", q->asof_table); return rc; }
+        rtbl = tsdb_db_find_table(db, q->asof_table);
+        if (!rtbl) { eset(err, errcap, "ASOF JOIN: right table '%s' not found", q->asof_table); return TSDB_ERR_NOTFOUND; }
+    }
+    tsdb_schema_t *rs = tsdb_tbl_schema(rtbl);
+
+    int nkeys = q->asof_n_keys, lcol_idx[32], rcol_idx[32];
+    for (int k = 0; k < nkeys; k++) {
+        lcol_idx[k] = resolve_col(ls, q->asof_on_keys_l[k]);
+        rcol_idx[k] = resolve_col(rs, q->asof_on_keys_r[k]);
+        if (lcol_idx[k] < 0) { eset(err, errcap, "ASOF ON: unknown left column '%s'", q->asof_on_keys_l[k]); return TSDB_ERR_SCHEMA; }
+        if (rcol_idx[k] < 0) { eset(err, errcap, "ASOF ON: unknown right column '%s'", q->asof_on_keys_r[k]); return TSDB_ERR_SCHEMA; }
+    }
+
+    proj_t *projs = NULL; int nprojs = 0;
+    rc = build_projs_asof(q, ls, rs, &projs, &nprojs, err, errcap);
+    if (rc != TSDB_OK) return rc;
+
+    rc = result_reserve_cols(r, nprojs);
+    if (rc != TSDB_OK) { free(projs); return rc; }
+    for (int i = 0; i < nprojs; i++) {
+        int is_r = PROJ_IS_R(&projs[i]);
+        tsdb_schema_t *sch = is_r ? rs : ls;
+        int ci = is_r ? PROJ_RC(&projs[i]) : projs[i].col;
+        tsdb_symtab_t *sym = (sch->cols[ci].type == TSDB_TYPE_SYMBOL) ? sch->cols[ci].symtab : NULL;
+        if (is_r && sym) {
+            tsdb_symtab_t *owned = result_new_owned_symtab(r);
+            if (!owned) { free(projs); return TSDB_ERR_NOMEM; }
+            rc = result_set_col(r, i, projs[i].name, projs[i].out_type, owned);
+        } else {
+            rc = result_set_col(r, i, projs[i].name, projs[i].out_type, sym);
+        }
+        if (rc != TSDB_OK) { free(projs); return rc; }
+    }
+
+    right_mat_t rm; memset(&rm, 0, sizeof(rm));
+    rc = right_mat_build(rtbl, &rm);
+    if (rc != TSDB_OK) { free(projs); return rc; }
+
+    scan_plan_t lplan; memset(&lplan, 0, sizeof(lplan));
+    rc = scan_plan_build(&lplan, ltbl);
+    if (rc != TSDB_OK) { right_mat_free(&rm); free(projs); return rc; }
+
+    size_t cursor_cap = 256;
+    asof_cursor_t *cursor_map = calloc(cursor_cap, sizeof(asof_cursor_t));
+    if (!cursor_map) { rc = TSDB_ERR_NOMEM; goto done; }
+    size_t cursor_n = 0;
+    /* Global scan pointer into right table — advances monotonically as left_ts grows. */
+    size_t rscan = 0;
+
+    int need_lcol[TSDB_MAX_COLS]; memset(need_lcol, 0, sizeof(need_lcol));
+    for (int i = 0; i < nprojs; i++)
+        if (!PROJ_IS_R(&projs[i]) && projs[i].col >= 0) need_lcol[projs[i].col] = 1;
+    for (int k = 0; k < nkeys; k++) need_lcol[lcol_idx[k]] = 1;
+    need_lcol[ls->ts_col_idx] = 1;
+
+    size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    for (size_t si = 0; si < lplan.nsrcs && r->nrows < limit; si++) {
+        scan_src_t *src = &lplan.srcs[si];
+        size_t ln = src->row_count;
+
+        void **lbufs = calloc((size_t)ls->ncols, sizeof(void *));
+        if (!lbufs) { rc = TSDB_ERR_NOMEM; goto done; }
+        int lrc = TSDB_OK;
+        for (int c = 0; c < ls->ncols; c++) {
+            if (!need_lcol[c]) continue;
+            size_t w = tsdb_type_width(ls->cols[c].type);
+            if (src->mem) {
+                lbufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                lbufs[c] = malloc(w * ln);
+                if (!lbufs[c]) { lrc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (lrc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++)
+                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count)
+                        { hit = &metas[b]; break; }
+                if (!hit) { free(metas); lrc = TSDB_ERR_CORRUPT; break; }
+                lrc = tsdb_part_read_block(src->part, c, hit, lbufs[c]);
+                free(metas);
+                if (lrc != TSDB_OK) break;
+            }
+        }
+        if (lrc != TSDB_OK) {
+            for (int c = 0; c < ls->ncols; c++) if (!src->mem && lbufs[c]) free(lbufs[c]);
+            free(lbufs); rc = lrc; goto done;
+        }
+
+        const int64_t *lts = (const int64_t *)lbufs[ls->ts_col_idx];
+
+        for (size_t li = 0; li < ln && r->nrows < limit; li++) {
+            int64_t left_ts = lts[li];
+            uint64_t khash = (nkeys > 0)
+                ? asof_lkey_hash(ls, lbufs, li, lcol_idx, nkeys)
+                : 0xababababababababULL;
+
+            /* Advance global rscan pointer up to left_ts, updating per-key best match. */
+            while (rscan < rm.nrows && rm.ts_buf[rscan] <= left_ts) {
+                /* Compute key hash for this right row. */
+                uint64_t rkhash = (nkeys > 0)
+                    ? asof_rkey_hash(&rm, rscan, rcol_idx, nkeys)
+                    : 0xababababababababULL;
+                /* Look up or create cursor entry for this right key. */
+                if (cursor_n * 2 >= cursor_cap) {
+                    int grc = asof_grow(&cursor_map, &cursor_cap);
+                    if (grc != TSDB_OK) { rc = grc; goto free_lbufs; }
+                }
+                asof_cursor_t *rslot = asof_slot(cursor_map, cursor_cap, rkhash);
+                if (!rslot->key) { rslot->key = rkhash; rslot->best = SIZE_MAX; cursor_n++; }
+                rslot->best = rscan;  /* always take the latest row (higher ts is better) */
+                rscan++;
+            }
+
+            /* Look up cursor for this left row's key hash. */
+            if (cursor_n * 2 >= cursor_cap) {
+                int grc = asof_grow(&cursor_map, &cursor_cap);
+                if (grc != TSDB_OK) { rc = grc; goto free_lbufs; }
+            }
+            asof_cursor_t *slot = asof_slot(cursor_map, cursor_cap, khash);
+            if (!slot->key) { slot->key = khash; slot->best = SIZE_MAX; cursor_n++; }
+
+            size_t rpos = slot->best;
+            int have_match = (rpos != SIZE_MAX && rm.ts_buf[rpos] <= left_ts &&
+                ((nkeys == 0) ? 1 : asof_keys_eq(ls, lbufs, li, lcol_idx, &rm, rpos, rcol_idx, nkeys)));
+
+            rc = result_reserve_rows(r, r->nrows + 1);
+            if (rc != TSDB_OK) goto free_lbufs;
+
+            for (int pi = 0; pi < nprojs; pi++) {
+                proj_t *p = &projs[pi];
+                if (p->kind != PROJ_COL) { result_append_cell(r, pi, 0); continue; }
+                if (!PROJ_IS_R(p)) {
+                    int lc = p->col; size_t w = tsdb_type_width(ls->cols[lc].type);
+                    uint64_t bits = 0;
+                    if (w == 8) bits = ((const uint64_t *)lbufs[lc])[li];
+                    else if (w == 4) bits = ((const uint32_t *)lbufs[lc])[li];
+                    result_append_cell(r, pi, bits);
+                } else {
+                    if (!have_match) { result_append_cell(r, pi, 0); continue; }
+                    int rc2 = PROJ_RC(p); tsdb_type_t rt = rm.col_types[rc2]; size_t w = tsdb_type_width(rt);
+                    if (rt == TSDB_TYPE_SYMBOL && rm.col_syms[rc2]) {
+                        uint32_t rcode; memcpy(&rcode, (const uint8_t *)rm.col_bufs[rc2] + rpos * w, 4);
+                        const char *s = tsdb_symtab_str(rm.col_syms[rc2], rcode);
+                        uint32_t ocode = tsdb_symtab_intern(r->col_symtab[pi], s ? s : "");
+                        result_append_cell(r, pi, (uint64_t)ocode);
+                    } else {
+                        uint64_t bits = 0;
+                        if (w == 8) memcpy(&bits, (const uint8_t *)rm.col_bufs[rc2] + rpos * 8, 8);
+                        else if (w == 4) { uint32_t v; memcpy(&v, (const uint8_t *)rm.col_bufs[rc2] + rpos * 4, 4); bits = v; }
+                        result_append_cell(r, pi, bits);
+                    }
+                }
+            }
+            r->nrows++;
+        }
+free_lbufs:
+        for (int c = 0; c < ls->ncols; c++) if (!src->mem && lbufs[c]) free(lbufs[c]);
+        free(lbufs);
+        if (rc != TSDB_OK) goto done;
+    }
+done:
+    free(cursor_map);
+    right_mat_free(&rm);
+    scan_plan_free(&lplan);
+    free(projs);
+    return rc;
+}
+
 /* ---- Main select execution ------------------------------------------- */
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -1108,6 +1648,11 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (!tbl) { eset(err, errcap, "table '%s' not found", q->from); return TSDB_ERR_NOTFOUND; }
     }
     tsdb_schema_t *s = tsdb_tbl_schema(tbl);
+
+    /* ASOF JOIN dispatch — handles its own projection, schema, and result setup. */
+    if (q->has_asof_join) {
+        return exec_asof_join(db, tbl, q, r, err, errcap);
+    }
 
     /* Build projections. */
     proj_t *projs = NULL; int nprojs = 0, has_agg = 0;
@@ -1227,12 +1772,33 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             t->nprojs = nprojs;
             t->projs  = malloc((size_t)nprojs * sizeof(proj_t));
             if (!t->projs) {
-                for (int j = 0; j < w; j++) free(tasks[j].projs);
+                for (int j = 0; j < w; j++) {
+                    for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&tasks[j].projs[pi]);
+                    free(tasks[j].projs);
+                }
                 free(tasks);
                 rc = TSDB_ERR_NOMEM;
                 goto done;
             }
             memcpy(t->projs, projs, (size_t)nprojs * sizeof(proj_t));
+            /* Deep-copy tdigest pointers — each worker needs its own empty digest. */
+            for (int pi = 0; pi < nprojs; pi++) {
+                if (t->projs[pi].kind >= PROJ_AGG_TDIGEST_FIRST) {
+                    t->projs[pi].tdigest = NULL; /* clear shallow-copied pointer */
+                    if (proj_tdigest_init(&t->projs[pi]) != 0) {
+                        /* cleanup all already allocated */
+                        for (int pk = 0; pk < pi; pk++) proj_tdigest_free(&t->projs[pk]);
+                        free(t->projs);
+                        for (int j = 0; j < w; j++) {
+                            for (int pk = 0; pk < nprojs; pk++) proj_tdigest_free(&tasks[j].projs[pk]);
+                            free(tasks[j].projs);
+                        }
+                        free(tasks);
+                        rc = TSDB_ERR_NOMEM;
+                        goto done;
+                    }
+                }
+            }
             nactive++;
         }
 
@@ -1280,6 +1846,16 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         if (pp->agg_max_f > mp->agg_max_f) mp->agg_max_f = pp->agg_max_f;
                         if (pp->agg_max_i > mp->agg_max_i) mp->agg_max_i = pp->agg_max_i;
                         break;
+                    case PROJ_AGG_P50:
+                    case PROJ_AGG_P90:
+                    case PROJ_AGG_P99:
+                    case PROJ_AGG_PERCENTILE:
+                    case PROJ_AGG_STDDEV:
+                        /* Merge worker tdigest into master; free worker copy. */
+                        if (mp->tdigest && pp->tdigest)
+                            tsdb_tdigest_merge(mp->tdigest, pp->tdigest);
+                        proj_tdigest_free(pp);
+                        break;
                     default:
                         break;
                     }
@@ -1295,14 +1871,20 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 r->nrows = 1;
             }
 
+            /* Free master tdigests now that we've written results. */
+            for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
             free(projs);
             scan_plan_free(&plan);
             return rc;
         }
 
-        /* Error path: free worker data. */
-        for (int w = 0; w < nactive; w++) free(tasks[w].projs);
+        /* Error path: free worker tdigests and data. */
+        for (int w = 0; w < nactive; w++) {
+            for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&tasks[w].projs[pi]);
+            free(tasks[w].projs);
+        }
         free(tasks);
+        for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
         free(projs);
         scan_plan_free(&plan);
         return rc;
@@ -1424,7 +2006,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (has_agg && !has_sample) {
             /* Single-row aggregate over all rows matching. */
             for (int pi = 0; pi < nprojs; pi++) {
-                if (projs[pi].kind >= PROJ_AGG_SUM && projs[pi].kind <= PROJ_AGG_COUNT)
+                if (projs[pi].kind >= PROJ_AGG_FIRST && projs[pi].kind <= PROJ_AGG_LAST)
                     agg_update(&projs[pi], s, bufs, n, bm, serial_agg_scratch);
             }
         } else if (has_agg && has_sample) {
@@ -1456,7 +2038,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 }
                 /* Update this bucket with each projection that needs it */
                 for (int pi = 0; pi < nprojs; pi++) {
-                    if (projs[pi].kind < PROJ_AGG_SUM || projs[pi].kind > PROJ_AGG_COUNT) continue;
+                    if (projs[pi].kind < PROJ_AGG_FIRST || projs[pi].kind > PROJ_AGG_COUNT) continue;
                     int col = projs[pi].col;
                     if (projs[pi].kind == PROJ_AGG_COUNT) { bkts[nbkt - 1].count++; continue; }
                     if (col < 0) continue;
@@ -1516,6 +2098,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (rc != TSDB_OK) goto done;
         for (int pi = 0; pi < nprojs; pi++) agg_write(&projs[pi], s, r, pi);
         r->nrows = 1;
+        /* tdigests freed by the done: path */
     } else if (has_agg && has_sample) {
         rc = result_reserve_rows(r, nbkt);
         if (rc != TSDB_OK) { free(bkts); goto done; }
@@ -1565,7 +2148,10 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     (void)cmp_u64;
 done:
     free(serial_agg_scratch);
-    free(projs);
+    if (projs) {
+        for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
+        free(projs);
+    }
     free(bkts);
     scan_plan_free(&plan);
     return rc;

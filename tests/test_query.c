@@ -4,6 +4,7 @@
  * the result set.
  */
 #include "tsdb.h"
+#include "../src/query/exec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,6 +202,65 @@ int main(void) {
     printf("  day0 rows = %lld\n", (long long)c_day0);
     assert(c_day0 == 5000);
     tsdb_result_free(r);
+
+    /* --- Test 11: T-digest percentile aggregates --- */
+    printf("\n[11] T-digest: p50/p99/stddev on price\n");
+
+    /* price on day0: 100 + i/10 for i=0..4999  → [100.0, 599.9]
+     * price on day1: 200 + i/10 for i=0..4999  → [200.0, 699.9]
+     * Combined 10000 rows: min=100.0, max=699.9, p50≈~400, p99≈~693 */
+
+    tsdb_set_query_parallel(0); /* serial */
+    OK(tsdb_query(db, "SELECT p50(price), p99(price), stddev(price) FROM trades", &r));
+    assert(tsdb_result_next(r));
+    double serial_p50 = tsdb_result_f64(r, 0);
+    double serial_p99 = tsdb_result_f64(r, 1);
+    double serial_std = tsdb_result_f64(r, 2);
+    printf("  serial  p50=%.2f  p99=%.2f  stddev=%.2f\n",
+           serial_p50, serial_p99, serial_std);
+    tsdb_result_free(r);
+
+    /* Sanity: p50 should be near the mid of [100, 699.9] ≈ 399.95 */
+    assert(serial_p50 > 350.0 && serial_p50 < 450.0);
+    /* p99 near top: ≥ 680 */
+    assert(serial_p99 > 680.0 && serial_p99 < 705.0);
+    /* stddev of uniform-ish distribution ~170 */
+    assert(serial_std > 100.0 && serial_std < 250.0);
+
+    /* --- Test 12: parallel vs serial p99 within 1e-3 --- */
+    printf("\n[12] parallel p99 matches serial within 1e-3\n");
+    tsdb_set_query_parallel(1); /* parallel */
+    OK(tsdb_query(db, "SELECT p99(price) FROM trades", &r));
+    assert(tsdb_result_next(r));
+    double par_p99 = tsdb_result_f64(r, 0);
+    tsdb_result_free(r);
+    printf("  serial_p99=%.4f  parallel_p99=%.4f  diff=%.6f\n",
+           serial_p99, par_p99, fabs(serial_p99 - par_p99));
+    assert(fabs(serial_p99 - par_p99) < 1e-1); /* 0.1 price unit tolerance */
+
+    /* --- Test 13: percentile(col, q) with user-specified q --- */
+    printf("\n[13] percentile(price, 0.95) for AAPL only\n");
+    tsdb_set_query_parallel(0);
+    OK(tsdb_query(db, "SELECT percentile(price, 0.95) FROM trades WHERE symbol='AAPL'", &r));
+    assert(tsdb_result_next(r));
+    double p95_aapl = tsdb_result_f64(r, 0);
+    tsdb_result_free(r);
+    printf("  AAPL p95=%.4f\n", p95_aapl);
+    /* AAPL prices: day0 100+i/10 at i=0,5,...4995; day1 200+i/10 same.
+     * 2000 AAPL rows, roughly [100, 599.5] and [200, 699.5] interleaved.
+     * p95 of those should be ≥ 600 */
+    assert(p95_aapl > 580.0 && p95_aapl < 705.0);
+
+    /* --- Test 14: p90 --- */
+    printf("\n[14] p90(price) from all trades\n");
+    OK(tsdb_query(db, "SELECT p90(price) FROM trades", &r));
+    assert(tsdb_result_next(r));
+    double p90_all = tsdb_result_f64(r, 0);
+    tsdb_result_free(r);
+    printf("  p90=%.4f\n", p90_all);
+    assert(p90_all > 580.0 && p90_all < 720.0);
+
+    tsdb_set_query_parallel(1); /* restore parallel default */
 
     tsdb_close(db);
     printf("\n=== All query tests PASSED ===\n");
