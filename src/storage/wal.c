@@ -29,14 +29,7 @@ static void crc32_init(void) {
     crc32_table_ready = 1;
 }
 
-static uint32_t crc32(const void *data, size_t n) {
-    crc32_init();
-    const uint8_t *p = (const uint8_t *)data;
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++)
-        c = crc32_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
+/* crc32 is inlined in append/replay via table; no standalone function needed. */
 
 /* ---- WAL struct --------------------------------------------------------- */
 

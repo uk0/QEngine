@@ -90,7 +90,7 @@ static void test_dod_neg_delta(void)
     /* Mixed negative deltas. */
     src[0] = 0;
     for (size_t i = 1; i < N; i++)
-        src[i] = src[i - 1] + (int64_t)i % 3 == 0 ? -100 : 200;
+        src[i] = src[i - 1] + ((int64_t)(i % 3 == 0) ? -100 : 200);
 
     size_t out_bytes = 0;
     int rc = tsdb_dod_encode(src, N, g_buf, sizeof(g_buf), &out_bytes);

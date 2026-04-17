@@ -1,0 +1,130 @@
+/* ast.h — QTL abstract syntax tree.
+ *
+ * QTL (Query Time-series Language) grammar:
+ *
+ *   query     := SELECT sel_list FROM ident
+ *                [ WHERE expr ]
+ *                [ SAMPLE BY interval [ FILL (fill) ] ]
+ *                [ LATEST ON ident [ PARTITION BY ident_list ] ]
+ *                [ GROUP BY ident_list ]
+ *                [ ORDER BY ident [ ASC | DESC ] ]
+ *                [ LIMIT N ]
+ *   sel_list  := sel_item ( ',' sel_item )*
+ *   sel_item  := '*' | expr [ AS ident ]
+ *   expr      := or_expr
+ *   or_expr   := and_expr ( OR and_expr )*
+ *   and_expr  := cmp_expr ( AND cmp_expr )*
+ *   cmp_expr  := add_expr [ ('=' | '!=' | '<' | '<=' | '>' | '>=') add_expr ]
+ *   add_expr  := mul_expr ( ('+'|'-') mul_expr )*
+ *   mul_expr  := unary_expr ( ('*'|'/'|'%') unary_expr )*
+ *   unary_expr:= [ '-' | NOT ] primary
+ *   primary   := literal | ident | call | '(' expr ')'
+ *   call      := ident '(' [ expr (',' expr)* ] ')'
+ *   literal   := NUMBER | STRING | TIMESTAMP
+ *   interval  := NUMBER unit            ; unit: ns, us, ms, s, m, h, d
+ *   fill      := PREV | NULL | NUMBER
+ */
+#ifndef TSDB_QUERY_AST_H
+#define TSDB_QUERY_AST_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "../core/arena.h"
+#include "../../include/tsdb.h"
+
+typedef enum {
+    /* Literals */
+    QAST_LIT_INT,
+    QAST_LIT_FLOAT,
+    QAST_LIT_STR,
+    QAST_LIT_TS,
+    QAST_LIT_NULL,
+    /* References */
+    QAST_IDENT,
+    QAST_STAR,
+    /* Operators */
+    QAST_NEG,
+    QAST_NOT,
+    QAST_ADD, QAST_SUB, QAST_MUL, QAST_DIV, QAST_MOD,
+    QAST_EQ, QAST_NE, QAST_LT, QAST_LE, QAST_GT, QAST_GE,
+    QAST_AND, QAST_OR,
+    /* Call */
+    QAST_CALL
+} qast_kind_t;
+
+typedef struct qast_expr qast_expr_t;
+
+struct qast_expr {
+    qast_kind_t kind;
+    union {
+        int64_t  i;
+        double   f;
+        char    *s;        /* ident / string / call-name */
+        tsdb_ts_t ts;
+    } v;
+    qast_expr_t *lhs;      /* also used as first operand for unary */
+    qast_expr_t *rhs;
+    qast_expr_t **args;    /* for QAST_CALL */
+    int          nargs;
+};
+
+typedef struct {
+    qast_expr_t *expr;     /* NULL for '*' */
+    char        *alias;    /* may be NULL */
+    int          is_star;
+} qast_sel_item_t;
+
+typedef enum { QAST_FILL_NONE, QAST_FILL_NULL, QAST_FILL_PREV, QAST_FILL_CONST } qast_fill_kind_t;
+
+typedef struct {
+    qast_fill_kind_t kind;
+    double           const_v;
+} qast_fill_t;
+
+typedef struct {
+    int64_t ns;
+} qast_interval_t;
+
+typedef enum { QAST_ORDER_ASC, QAST_ORDER_DESC } qast_order_dir_t;
+
+typedef struct {
+    qast_sel_item_t *sel;
+    int              nsel;
+
+    char            *from;
+
+    qast_expr_t     *where;
+
+    int              has_sample_by;
+    qast_interval_t  sample_by;
+    qast_fill_t      fill;
+
+    int              has_latest_on;
+    char            *latest_on_col;
+    char           **latest_part_cols;
+    int              nlatest_part;
+
+    char           **group_by;
+    int              ngroup_by;
+
+    int              has_order;
+    char            *order_col;
+    qast_order_dir_t order_dir;
+
+    int              has_limit;
+    int64_t          limit;
+} qast_query_t;
+
+/* Convenience builders (all allocate from arena). */
+qast_expr_t *qast_mk_int(tsdb_arena_t *a, int64_t v);
+qast_expr_t *qast_mk_float(tsdb_arena_t *a, double v);
+qast_expr_t *qast_mk_str(tsdb_arena_t *a, const char *s);
+qast_expr_t *qast_mk_ts(tsdb_arena_t *a, tsdb_ts_t v);
+qast_expr_t *qast_mk_ident(tsdb_arena_t *a, const char *s);
+qast_expr_t *qast_mk_star(tsdb_arena_t *a);
+qast_expr_t *qast_mk_null(tsdb_arena_t *a);
+qast_expr_t *qast_mk_unary(tsdb_arena_t *a, qast_kind_t k, qast_expr_t *x);
+qast_expr_t *qast_mk_binop(tsdb_arena_t *a, qast_kind_t k, qast_expr_t *l, qast_expr_t *r);
+qast_expr_t *qast_mk_call(tsdb_arena_t *a, const char *name, qast_expr_t **args, int nargs);
+
+#endif

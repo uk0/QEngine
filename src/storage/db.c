@@ -424,20 +424,19 @@ void tsdb_batch_discard(tsdb_batch_t *b) {
     free(b);
 }
 
-/* ---- Query stubs (not implemented; query module handles these) ----------- */
+/* ---- Internal accessors for query module ------------------------------- */
 
-int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
-    (void)db; (void)qtl; (void)out;
-    return TSDB_ERR_UNSUPPORTED;
+const char *tsdb_db_data_dir(tsdb_db_t *db) { return db ? db->data_dir : NULL; }
+
+tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return NULL;
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = db_find_table(db, name);
+    pthread_mutex_unlock(&db->lock);
+    return t;
 }
 
-void tsdb_result_free(tsdb_result_t *r) { (void)r; }
-int  tsdb_result_ncols(tsdb_result_t *r) { (void)r; return 0; }
-const char *tsdb_result_col_name(tsdb_result_t *r, int i) { (void)r; (void)i; return NULL; }
-tsdb_type_t tsdb_result_col_type(tsdb_result_t *r, int i) { (void)r; (void)i; return 0; }
-int tsdb_result_next(tsdb_result_t *r) { (void)r; return 0; }
-tsdb_ts_t tsdb_result_ts(tsdb_result_t *r, int col) { (void)r; (void)col; return 0; }
-int64_t tsdb_result_i64(tsdb_result_t *r, int col) { (void)r; (void)col; return 0; }
-double  tsdb_result_f64(tsdb_result_t *r, int col) { (void)r; (void)col; return 0.0; }
-const char *tsdb_result_sym(tsdb_result_t *r, int col) { (void)r; (void)col; return NULL; }
-bool tsdb_result_is_null(tsdb_result_t *r, int col) { (void)r; (void)col; return true; }
+tsdb_schema_t   *tsdb_tbl_schema(tsdb_table_internal_t *t)   { return t ? t->schema : NULL; }
+tsdb_memtable_t *tsdb_tbl_memtable(tsdb_table_internal_t *t) { return t ? t->memtable : NULL; }
+const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->schema) ? t->schema->dir : NULL; }
+const char      *tsdb_tbl_name(tsdb_table_internal_t *t)     { return t ? t->name : NULL; }

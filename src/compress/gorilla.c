@@ -7,9 +7,13 @@
  *     '10' + meaningful : reuse previous (leading, trailing) window.
  *     '11' + 5b leading + 6b len + meaningful bits : new window.
  *
- * Convention: stored meaningful_len == 0 means 64 (to distinguish from no
- * meaningful bits, which is the xor==0 case handled separately).
- * leading is clamped to [0, 63]; trailing = 64 - leading - meaningful.
+ * Convention: stored meaningful_len == 0 means 64.
+ * leading is clamped to [0, 31].
+ *
+ * NOTE: tsdb_br_get has a known limitation: reading more than 56 bits in a
+ * single call may produce incorrect results when the reader's internal scratch
+ * register has 1..7 remaining bits. To work around this, we split any
+ * meaningful-bits read/write into <=32 bit halves.
  */
 #include "gorilla.h"
 #include "../core/bits.h"
@@ -17,7 +21,6 @@
 #include <string.h>
 #include <stdint.h>
 
-/* Reinterpret double <-> uint64 without UB. */
 static inline uint64_t f64_to_u64(double v)
 {
     uint64_t u;
@@ -32,6 +35,29 @@ static inline double u64_to_f64(uint64_t u)
     return v;
 }
 
+/* Write `n` bits of `val` in at most 32-bit chunks to avoid bits.h overflow. */
+static void bw_put_safe(tsdb_bw_t *bw, uint64_t val, unsigned n)
+{
+    if (n == 0) return;
+    if (n <= 32) {
+        tsdb_bw_put(bw, val, n);
+        return;
+    }
+    /* Split: low 32, then remainder. */
+    tsdb_bw_put(bw, val & 0xFFFFFFFFULL, 32);
+    tsdb_bw_put(bw, val >> 32, n - 32);
+}
+
+/* Read `n` bits in at most 32-bit chunks. */
+static uint64_t br_get_safe(tsdb_br_t *br, unsigned n)
+{
+    if (n == 0) return 0;
+    if (n <= 32) return tsdb_br_get(br, n);
+    uint64_t lo = tsdb_br_get(br, 32);
+    uint64_t hi = tsdb_br_get(br, n - 32);
+    return lo | (hi << 32);
+}
+
 int tsdb_gorilla_encode(const double *in, size_t n, uint8_t *out, size_t cap, size_t *out_bytes)
 {
     if (!out_bytes) return TSDB_ERR_INVAL;
@@ -40,7 +66,6 @@ int tsdb_gorilla_encode(const double *in, size_t n, uint8_t *out, size_t cap, si
     if (!in || !out) return TSDB_ERR_INVAL;
     if (cap < 8) return TSDB_ERR_OVERFLOW;
 
-    /* Write first value as raw little-endian. */
     size_t pos = 0;
     uint64_t u0 = f64_to_u64(in[0]);
     for (int i = 0; i < 8; i++) out[pos++] = (uint8_t)(u0 >> (8 * i));
@@ -71,30 +96,26 @@ int tsdb_gorilla_encode(const double *in, size_t n, uint8_t *out, size_t cap, si
         unsigned leading = tsdb_clz64(xor_val);
         unsigned trailing = tsdb_ctz64(xor_val);
 
-        /* Clamp leading to 5-bit representable range (0..31). */
         if (leading > 31) leading = 31;
 
         unsigned meaningful = 64 - leading - trailing;
 
-        /* If we have a previous window and the meaningful bits fit inside it,
-         * reuse the window (must have meaningful <= prev_meaningful). */
         if (has_prev_window) {
             unsigned prev_meaningful = 64 - prev_leading - prev_trailing;
             if (leading >= prev_leading && trailing >= prev_trailing) {
-                /* Reuse: '10' + meaningful bits from prev_leading position. */
-                tsdb_bw_put(&bw, 0x2, 2); /* bits: 01 (LSB first -> '10') */
-                tsdb_bw_put(&bw, xor_val >> prev_trailing, prev_meaningful);
+                /* Reuse: '10' prefix: bit0=1, bit1=0 => value=1 in 2 bits */
+                tsdb_bw_put(&bw, 1, 2);
+                bw_put_safe(&bw, xor_val >> prev_trailing, prev_meaningful);
                 continue;
             }
         }
 
-        /* New window: '11' + 5b leading + 6b meaningful_len + bits. */
-        tsdb_bw_put(&bw, 0x3, 2); /* bits: 11 */
+        /* New window: '11' prefix: bit0=1, bit1=1 => value=3 in 2 bits */
+        tsdb_bw_put(&bw, 3, 2);
         tsdb_bw_put(&bw, (uint64_t)leading, 5);
-        /* Stored meaningful_len: 0 means 64. */
         uint64_t stored_len = (meaningful == 64) ? 0 : meaningful;
         tsdb_bw_put(&bw, stored_len, 6);
-        tsdb_bw_put(&bw, xor_val >> trailing, meaningful);
+        bw_put_safe(&bw, xor_val >> trailing, meaningful);
 
         prev_leading = leading;
         prev_trailing = trailing;
@@ -114,7 +135,6 @@ int tsdb_gorilla_decode(const uint8_t *in, size_t n_bytes, double *out, size_t n
     if (!in || !out) return TSDB_ERR_INVAL;
     if (n_bytes < 8) return TSDB_ERR_CORRUPT;
 
-    /* Read first value. */
     size_t pos = 0;
     uint64_t u0 = 0;
     for (int i = 0; i < 8; i++) u0 |= (uint64_t)in[pos++] << (8 * i);
@@ -139,18 +159,15 @@ int tsdb_gorilla_decode(const uint8_t *in, size_t n_bytes, double *out, size_t n
         } else {
             uint64_t b1 = tsdb_br_get(&br, 1);
             if (b1 == 0) {
-                /* '10': reuse previous window. */
                 if (!has_prev_window) return TSDB_ERR_CORRUPT;
-                xor_val = tsdb_br_get(&br, prev_meaningful) << prev_trailing;
+                xor_val = br_get_safe(&br, prev_meaningful) << prev_trailing;
             } else {
-                /* '11': new window. */
                 unsigned leading = (unsigned)tsdb_br_get(&br, 5);
                 unsigned stored_len = (unsigned)tsdb_br_get(&br, 6);
                 unsigned meaningful = (stored_len == 0) ? 64 : stored_len;
                 unsigned trailing = 64 - leading - meaningful;
                 if (leading + meaningful > 64) return TSDB_ERR_CORRUPT;
-                xor_val = tsdb_br_get(&br, meaningful) << trailing;
-                (void)leading; /* leading is implicitly baked into trailing */
+                xor_val = br_get_safe(&br, meaningful) << trailing;
                 prev_trailing = trailing;
                 prev_meaningful = meaningful;
                 has_prev_window = 1;

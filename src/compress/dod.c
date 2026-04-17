@@ -89,28 +89,28 @@ int tsdb_dod_encode(const int64_t *in, size_t n, uint8_t *out, size_t cap, size_
         prev_delta = delta;
 
         if (D == 0) {
+            /* prefix '0': bit0=0 */
             tsdb_bw_put(&bw, 0, 1);
         } else if (D >= -63 && D <= 64) {
-            /* '10' + 7-bit biased (stored = D + 63) */
-            tsdb_bw_put(&bw, 0x2, 2);   /* bits: 01 (LSB-first = 10 prefix) */
+            /* prefix '10': bit0=1, bit1=0 => LSB-first value=1 in 2 bits */
+            tsdb_bw_put(&bw, 1, 2);
             uint64_t stored = (uint64_t)(D + 63);
             tsdb_bw_put(&bw, stored, 7);
         } else if (D >= -255 && D <= 256) {
-            /* '110' + 9-bit biased (stored = D + 255) */
-            tsdb_bw_put(&bw, 0x6, 3);   /* bits: 011 */
+            /* prefix '110': bit0=1, bit1=1, bit2=0 => LSB-first value=3 in 3 bits */
+            tsdb_bw_put(&bw, 3, 3);
             uint64_t stored = (uint64_t)(D + 255);
             tsdb_bw_put(&bw, stored, 9);
         } else if (D >= -2047 && D <= 2048) {
-            /* '1110' + 12-bit biased (stored = D + 2047) */
-            tsdb_bw_put(&bw, 0xE, 4);   /* bits: 0111 */
+            /* prefix '1110': bit0=1,bit1=1,bit2=1,bit3=0 => value=7 in 4 bits */
+            tsdb_bw_put(&bw, 7, 4);
             uint64_t stored = (uint64_t)(D + 2047);
             tsdb_bw_put(&bw, stored, 12);
         } else {
-            /* '1111' + 32-bit zigzag fallback */
-            /* Check |D| fits in zigzag32 */
-            if (D < -(int64_t)0x7FFFFFFF || D > (int64_t)0x80000000)
+            /* prefix '1111': bit0=1,bit1=1,bit2=1,bit3=1 => value=15 in 4 bits */
+            if (D < -(int64_t)0x80000000LL || D > (int64_t)0x7FFFFFFFLL)
                 return TSDB_ERR_OVERFLOW;
-            tsdb_bw_put(&bw, 0xF, 4);   /* bits: 1111 */
+            tsdb_bw_put(&bw, 15, 4);
             uint64_t zz = tsdb_zigzag_enc(D);
             tsdb_bw_put(&bw, zz & 0xFFFFFFFF, 32);
         }

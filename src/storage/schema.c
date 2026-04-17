@@ -170,9 +170,9 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     FILE *f = fopen(path, "rb");
     if (!f) return TSDB_ERR_NOTFOUND;
 
-    uint32_t magic;
-    uint16_t version, ncols_raw;
-    uint32_t ts_idx;
+    uint32_t magic   = 0;
+    uint16_t version = 0, ncols_raw = 0;
+    uint32_t ts_idx  = 0;
     char     tbl_name[TSDB_MAX_NAME + 1];
 
     int rc = TSDB_OK;
@@ -203,7 +203,7 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     if (!s->cols) { free(s->dir); free(s); fclose(f); return TSDB_ERR_NOMEM; }
 
     for (int i = 0; i < ncols && !rc; i++) {
-        uint8_t type_raw, pad;
+        uint8_t type_raw = 0, pad = 0;
         RD(&type_raw, 1);
         RD(&pad, 1);
         RD(s->cols[i].name, TSDB_MAX_NAME + 1);
