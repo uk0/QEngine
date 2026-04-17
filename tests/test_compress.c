@@ -9,7 +9,9 @@
 #include "../src/compress/codec.h"
 #include "../src/compress/dod.h"
 #include "../src/compress/gorilla.h"
+#include "../src/compress/chimp.h"
 #include "../src/compress/dict.h"
+#include "../src/core/types.h"
 #include "../include/tsdb.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -286,6 +288,173 @@ static void test_gorilla_ratio(void)
     free(src); free(dst);
 }
 
+/* ---------------------------------------------------------------- Chimp tests */
+
+static void test_chimp_constant(void)
+{
+    const size_t N = 1000;
+    double *src = malloc(N * sizeof(double));
+    double *dst = malloc(N * sizeof(double));
+    CHECK(src && dst, "alloc");
+
+    for (size_t i = 0; i < N; i++)
+        src[i] = 3.14159265358979;
+
+    size_t out_bytes = 0;
+    int rc = tsdb_chimp_encode(src, N, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK, "chimp_encode const");
+
+    rc = tsdb_chimp_decode(g_buf, out_bytes, dst, N);
+    CHECK(rc == TSDB_OK, "chimp_decode const");
+
+    for (size_t i = 0; i < N; i++) {
+        uint64_t a, b;
+        memcpy(&a, &src[i], 8); memcpy(&b, &dst[i], 8);
+        CHECK(a == b, "chimp const round-trip");
+    }
+
+    /* Compare with Gorilla on same data. */
+    size_t gorilla_bytes = 0;
+    rc = tsdb_gorilla_encode(src, N, g_buf + (1 << 18), (1 << 18), &gorilla_bytes);
+    CHECK(rc == TSDB_OK, "gorilla_encode const (for comparison)");
+
+    double bpp_chimp   = (double)out_bytes    / N;
+    double bpp_gorilla = (double)gorilla_bytes / N;
+    double improvement = 100.0 * (1.0 - bpp_chimp / bpp_gorilla);
+    printf("[Chimp] constant          N=%-6zu  %zu bytes  %.3f bytes/point"
+           "  (Gorilla %.3f, Chimp %.1f%% %s)\n",
+           N, out_bytes, bpp_chimp, bpp_gorilla,
+           improvement >= 0 ? improvement : -improvement,
+           improvement >= 0 ? "smaller" : "larger");
+
+    free(src); free(dst);
+}
+
+static void test_chimp_monotone(void)
+{
+    const size_t N = 1000;
+    double *src = malloc(N * sizeof(double));
+    double *dst = malloc(N * sizeof(double));
+    CHECK(src && dst, "alloc");
+
+    for (size_t i = 0; i < N; i++)
+        src[i] = (double)(i + 1);   /* 1.0 .. 1000.0 as double */
+
+    size_t out_bytes = 0;
+    int rc = tsdb_chimp_encode(src, N, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK, "chimp_encode mono");
+
+    rc = tsdb_chimp_decode(g_buf, out_bytes, dst, N);
+    CHECK(rc == TSDB_OK, "chimp_decode mono");
+
+    for (size_t i = 0; i < N; i++) {
+        uint64_t a, b;
+        memcpy(&a, &src[i], 8); memcpy(&b, &dst[i], 8);
+        CHECK(a == b, "chimp mono round-trip");
+    }
+
+    /* Compare with Gorilla on same data. */
+    size_t gorilla_bytes = 0;
+    rc = tsdb_gorilla_encode(src, N, g_buf + (1 << 18), (1 << 18), &gorilla_bytes);
+    CHECK(rc == TSDB_OK, "gorilla_encode mono (for comparison)");
+
+    double bpp_chimp   = (double)out_bytes    / N;
+    double bpp_gorilla = (double)gorilla_bytes / N;
+    double improvement = 100.0 * (1.0 - bpp_chimp / bpp_gorilla);
+    printf("[Chimp] monotone (1..N)   N=%-6zu  %zu bytes  %.3f bytes/point"
+           "  (Gorilla %.3f, Chimp %.1f%% %s)\n",
+           N, out_bytes, bpp_chimp, bpp_gorilla,
+           improvement >= 0 ? improvement : -improvement,
+           improvement >= 0 ? "smaller" : "larger");
+
+    free(src); free(dst);
+}
+
+static void test_chimp_sinusoidal(void)
+{
+    const size_t N = 1000;
+    double *src = malloc(N * sizeof(double));
+    double *dst = malloc(N * sizeof(double));
+    CHECK(src && dst, "alloc");
+
+    /* Simulate real time-series: sin wave with slight amplitude variation. */
+    for (size_t i = 0; i < N; i++)
+        src[i] = 100.0 * sin((double)i * 0.1) + (double)i * 0.01;
+
+    size_t out_bytes = 0;
+    int rc = tsdb_chimp_encode(src, N, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK, "chimp_encode sin");
+
+    rc = tsdb_chimp_decode(g_buf, out_bytes, dst, N);
+    CHECK(rc == TSDB_OK, "chimp_decode sin");
+
+    for (size_t i = 0; i < N; i++) {
+        uint64_t a, b;
+        memcpy(&a, &src[i], 8); memcpy(&b, &dst[i], 8);
+        CHECK(a == b, "chimp sin round-trip");
+    }
+
+    /* Compare with Gorilla on same data. */
+    size_t gorilla_bytes = 0;
+    rc = tsdb_gorilla_encode(src, N, g_buf + (1 << 18), (1 << 18), &gorilla_bytes);
+    CHECK(rc == TSDB_OK, "gorilla_encode sin (for comparison)");
+
+    double bpp_chimp   = (double)out_bytes    / N;
+    double bpp_gorilla = (double)gorilla_bytes / N;
+    double improvement = 100.0 * (1.0 - bpp_chimp / bpp_gorilla);
+    printf("[Chimp] sinusoidal        N=%-6zu  %zu bytes  %.3f bytes/point"
+           "  (Gorilla %.3f, Chimp %.1f%% %s)\n",
+           N, out_bytes, bpp_chimp, bpp_gorilla,
+           improvement >= 0 ? improvement : -improvement,
+           improvement >= 0 ? "smaller" : "larger");
+
+    free(src); free(dst);
+}
+
+static void test_chimp_edges(void)
+{
+    /* n == 0 */
+    size_t out_bytes = 99;
+    int rc = tsdb_chimp_encode(NULL, 0, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK && out_bytes == 0, "chimp empty encode");
+
+    double dummy = 0;
+    rc = tsdb_chimp_decode(g_buf, 0, &dummy, 0);
+    CHECK(rc == TSDB_OK, "chimp empty decode");
+
+    /* n == 1 */
+    double one = 2.718281828;
+    rc = tsdb_chimp_encode(&one, 1, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK && out_bytes == 8, "chimp n=1 encode");
+
+    double got = 0;
+    rc = tsdb_chimp_decode(g_buf, out_bytes, &got, 1);
+    CHECK(rc == TSDB_OK && got == one, "chimp n=1 decode");
+
+    /* NaN round-trip */
+    const size_t N = 100;
+    double src[100], dst[100];
+    for (size_t i = 0; i < N; i++) {
+        if (i % 10 == 0) {
+            uint64_t nan_bits = 0x7FF8000000000001ULL;
+            memcpy(&src[i], &nan_bits, 8);
+        } else {
+            src[i] = (double)i;
+        }
+    }
+    rc = tsdb_chimp_encode(src, N, g_buf, sizeof(g_buf), &out_bytes);
+    CHECK(rc == TSDB_OK, "chimp_encode nan");
+    rc = tsdb_chimp_decode(g_buf, out_bytes, dst, N);
+    CHECK(rc == TSDB_OK, "chimp_decode nan");
+    for (size_t i = 0; i < N; i++) {
+        uint64_t a, b;
+        memcpy(&a, &src[i], 8); memcpy(&b, &dst[i], 8);
+        CHECK(a == b, "chimp nan round-trip");
+    }
+
+    printf("[Chimp] edge cases: OK\n");
+}
+
 /* ---------------------------------------------------------------- Dict tests */
 
 static void test_dict_simple(void)
@@ -359,21 +528,25 @@ static void test_codec_dispatch(void)
     double *fl_out = malloc(N * sizeof(double));
     for (size_t i = 0; i < N; i++) fl[i] = (double)i * 1.1;
     bytes = tsdb_codec_encode(TSDB_TYPE_FLOAT64, fl, N, g_buf, sizeof(g_buf), &codec);
-    CHECK(bytes > 0 && codec == TSDB_CODEC_GORILLA, "codec dispatch FLOAT64->GORILLA");
+    CHECK(bytes > 0 && (codec == TSDB_CODEC_CHIMP || codec == TSDB_CODEC_GORILLA),
+          "codec dispatch FLOAT64->CHIMP or GORILLA");
     CHECK(tsdb_codec_decode(codec, TSDB_TYPE_FLOAT64, g_buf, (size_t)bytes, fl_out, N) == TSDB_OK, "decode fl");
     for (size_t i = 0; i < N; i++) CHECK(fl[i] == fl_out[i], "codec float round-trip");
-    printf("[Codec] FLOAT64->GORILLA: %d bytes\n", bytes);
+    printf("[Codec] FLOAT64->%s: %d bytes\n",
+           codec == TSDB_CODEC_CHIMP ? "CHIMP" : "GORILLA", bytes);
     free(fl); free(fl_out);
 
-    /* SYMBOL -> DICT */
+    /* SYMBOL -> DICT or PFOR (best of two) */
     uint32_t *sym = malloc(N * sizeof(uint32_t));
     uint32_t *sym_out = malloc(N * sizeof(uint32_t));
     for (size_t i = 0; i < N; i++) sym[i] = (uint32_t)(i % 50);
     bytes = tsdb_codec_encode(TSDB_TYPE_SYMBOL, sym, N, g_buf, sizeof(g_buf), &codec);
-    CHECK(bytes > 0 && codec == TSDB_CODEC_DICT, "codec dispatch SYMBOL->DICT");
+    CHECK(bytes > 0 && (codec == TSDB_CODEC_DICT || codec == TSDB_CODEC_PFOR),
+          "codec dispatch SYMBOL->DICT or PFOR");
     CHECK(tsdb_codec_decode(codec, TSDB_TYPE_SYMBOL, g_buf, (size_t)bytes, sym_out, N) == TSDB_OK, "decode sym");
     for (size_t i = 0; i < N; i++) CHECK(sym[i] == sym_out[i], "codec sym round-trip");
-    printf("[Codec] SYMBOL->DICT:    %d bytes\n", bytes);
+    printf("[Codec] SYMBOL->%s:    %d bytes\n",
+           codec == TSDB_CODEC_PFOR ? "PFOR" : "DICT", bytes);
     free(sym); free(sym_out);
 }
 
@@ -396,6 +569,12 @@ int main(void)
     test_gorilla_nan();
     test_gorilla_edges();
     test_gorilla_ratio();
+
+    printf("\n--- Chimp ---\n");
+    test_chimp_constant();
+    test_chimp_monotone();
+    test_chimp_sinusoidal();
+    test_chimp_edges();
 
     printf("\n--- Dict ---\n");
     test_dict_simple();
