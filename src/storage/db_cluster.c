@@ -1,13 +1,17 @@
 /* db_cluster.c — Cluster extension entry points.
  *
  * Provides the tsdb_open_cluster / tsdb_cluster_* public API.
- * Uses a global registry (db_ptr -> cluster_ptr) to avoid modifying
- * the tsdb_db struct defined in db.c.
+ * Uses db hooks (tsdb_db_set_hooks) so cluster replication fires from
+ * tsdb_batch_commit and tsdb_create_table without modifying db.c's logic.
  */
 
 #include "db.h"
+#include "schema.h"
+#include "memtable.h"
 #include "../cluster/cluster.h"
+#include "../cluster/node.h"
 #include "../../include/tsdb_cluster.h"
+#include "../core/types.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +71,86 @@ static void cluster_remove(tsdb_db_t *db) {
         }
     }
     pthread_mutex_unlock(&g_cluster_lock);
+}
+
+/* ---- Hook implementations ------------------------------------------------ */
+
+/*
+ * on_replicate: called from flush_and_clear (before each local memtable flush).
+ * userdata is the tsdb_cluster_t *.
+ * We extract columnar data from the memtable and fan-out via tsdb_cluster_write.
+ */
+static int cluster_on_replicate(void *ud, tsdb_db_t *db,
+                                  const char *table_name,
+                                  tsdb_schema_t *schema,
+                                  tsdb_memtable_t *memtable)
+{
+    (void)db;
+    tsdb_cluster_t *c = (tsdb_cluster_t *)ud;
+    if (!c || !schema || !memtable) return TSDB_OK;
+
+    int nrows = (int)tsdb_memtable_rows(memtable);
+    if (nrows == 0) return TSDB_OK;
+
+    int ncols = schema->ncols;
+
+    /* Build col_types and col_data arrays from schema + memtable. */
+    int col_types[TSDB_MAX_COLS];
+    const void *col_data[TSDB_MAX_COLS];
+
+    for (int c_idx = 0; c_idx < ncols; c_idx++) {
+        col_types[c_idx] = (int)schema->cols[c_idx].type;
+        col_data[c_idx]  = tsdb_memtable_col(memtable, c_idx);
+    }
+
+    return tsdb_cluster_write(c, table_name,
+                              ncols, col_types,
+                              nrows, col_data);
+}
+
+/*
+ * on_create: called from tsdb_create_table after local success.
+ * Fans schema out to all other known ALIVE nodes.
+ */
+static int cluster_on_create(void *ud, tsdb_db_t *db,
+                               const char *table_name,
+                               tsdb_schema_t *schema)
+{
+    (void)db;
+    tsdb_cluster_t *c = (tsdb_cluster_t *)ud;
+    if (!c || !schema) return TSDB_OK;
+
+    int ncols = schema->ncols;
+    const char *col_names[TSDB_MAX_COLS];
+    int col_types[TSDB_MAX_COLS];
+    int ts_col_idx = 0;
+
+    for (int i = 0; i < ncols; i++) {
+        col_names[i] = schema->cols[i].name;
+        col_types[i] = (int)schema->cols[i].type;
+        if (schema->cols[i].type == TSDB_TYPE_TIMESTAMP) ts_col_idx = i;
+    }
+
+    /* Get all alive nodes except self. */
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    tsdb_node_info_t nodes[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, nodes, TSDB_CLUSTER_MAX_NODES);
+
+    tsdb_node_id_t target_ids[TSDB_CLUSTER_MAX_NODES];
+    int ntargets = 0;
+    tsdb_node_id_t local_id = tsdb_cluster_local_id(c);
+
+    for (int i = 0; i < n; i++) {
+        if (nodes[i].id != local_id && nodes[i].state == TSDB_NODE_ALIVE) {
+            target_ids[ntargets++] = nodes[i].id;
+        }
+    }
+
+    if (ntargets == 0) return TSDB_OK;
+
+    return tsdb_cluster_sync_schema(c, table_name,
+                                    ncols, col_names, col_types, ts_col_idx,
+                                    target_ids, ntargets);
 }
 
 /* ---- Node ID generation -------------------------------------------------- */
@@ -129,6 +213,10 @@ int tsdb_open_cluster(const char *data_dir,
         tsdb_close(db);
         return TSDB_ERR_IO;
     }
+
+    /* Register hooks so tsdb_batch_commit and tsdb_create_table trigger
+     * replication without db.c needing to know about the cluster module. */
+    tsdb_db_set_hooks(db, cluster_on_replicate, cluster_on_create, cluster);
 
     cluster_set(db, cluster);
     *out = db;

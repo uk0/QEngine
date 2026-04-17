@@ -1,20 +1,21 @@
 /* test_cluster.c — end-to-end cluster test.
  *
- * Starts 3 tsdb nodes using fork() on localhost ports:
- *   Node A: RPC 28081, Gossip 28080
- *   Node B: RPC 28082, Gossip 28081 (UDP/TCP separate namespaces, ok)
- *   Node C: RPC 28083, Gossip 28082
+ * Architecture: parent IS node0 (rpc=28081, gossip=28080).
+ * Two children run node1 (rpc=28082, gossip=28081) and
+ * node2 (rpc=28083, gossip=28082).
  *
  * Test sequence:
- *   1. Fork 3 child processes, each runs a cluster node.
- *   2. Parent waits until all 3 nodes can accept TCP connections.
- *   3. Node A: create table, insert 10000 rows.
- *   4. Wait for replication to propagate.
- *   5. Node B: query row count, verify >= 10000.
- *   6. Kill Node C.
- *   7. Write another 1000 rows on A (W=2 should succeed with A+B).
- *   8. Node C restart + backfill: TODO (mark as skipped).
- *   9. Cleanup.
+ *   1. Fork node1 and node2 child processes.
+ *   2. Parent opens tsdb_open_cluster on node0 ports.
+ *   3. Wait for all 3 RPC ports to accept connections.
+ *   4. Let gossip converge (2s).
+ *   5. Create table 'metrics', insert 10000 rows (auto-replicates via hook).
+ *   6. Wait 2s for replication to land on node1/node2.
+ *   7. Read node1's data dir directly (plain tsdb_open) — expect >= 10000 rows.
+ *   8. Kill node2.
+ *   9. Write another 1000 rows (W=2 with node0+node1 should succeed).
+ *  10. Read node1 again — expect >= 11000 rows.
+ *  11. Cleanup.
  */
 
 #include "../include/tsdb.h"
@@ -60,19 +61,19 @@
 
 /* ---- Node configuration -------------------------------------------------- */
 
-#define N_NODES 3
+#define N_CHILDREN 2   /* node1, node2 */
+#define N_NODES    3   /* including parent=node0 */
 
 typedef struct {
     int    node_idx;
     char   data_dir[256];
     char   rpc_addr[64];
-    char   gossip_addr[64];
     char   seeds[256];
 } node_cfg_t;
 
 /* ---- Global child PIDs for cleanup --------------------------------------- */
 
-static pid_t g_child_pids[N_NODES];
+static pid_t g_child_pids[N_CHILDREN];
 static int   g_n_children = 0;
 static char  g_tmp_dirs[N_NODES][256];
 
@@ -127,7 +128,6 @@ static void run_node(const node_cfg_t *cfg) {
     sigemptyset(&ss);
     for (;;) {
         sigsuspend(&ss);
-        /* We'll only be woken by a signal; clean exit on SIGTERM. */
         break;
     }
 
@@ -146,7 +146,6 @@ static int tcp_can_connect(const char *host, int port, int timeout_ms) {
     sa.sin_port   = htons((uint16_t)port);
     inet_aton(host, &sa.sin_addr);
 
-    /* Non-blocking connect. */
     int flags = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -204,18 +203,31 @@ static void write_rows(tsdb_db_t *db, const char *table_name, int start, int cou
     ASSERT_OK(tsdb_batch_commit(b));
 }
 
-/* ---- Count rows via query ------------------------------------------------ */
+/* ---- Count rows via query on a plain (non-cluster) db handle ------------- */
 
-static int64_t count_rows(tsdb_db_t *db, const char *table_name) {
+static int64_t count_rows_plain(const char *data_dir, const char *table_name) {
+    tsdb_db_t *db = NULL;
+    int rc = tsdb_open(data_dir, &db);
+    if (rc != TSDB_OK) {
+        fprintf(stderr, "[count_rows] tsdb_open(%s) failed: %s\n",
+                data_dir, tsdb_errstr(rc));
+        return -1;
+    }
+
     char qtl[256];
     snprintf(qtl, sizeof(qtl), "SELECT ts FROM %s", table_name);
     tsdb_result_t *r = NULL;
-    int rc = tsdb_query(db, qtl, &r);
-    if (rc != TSDB_OK) return -1;
+    rc = tsdb_query(db, qtl, &r);
+    if (rc != TSDB_OK) {
+        fprintf(stderr, "[count_rows] query failed: %s\n", tsdb_errstr(rc));
+        tsdb_close(db);
+        return -1;
+    }
 
     int64_t n = 0;
     while (tsdb_result_next(r) == 1) n++;
     tsdb_result_free(r);
+    tsdb_close(db);
     return n;
 }
 
@@ -233,25 +245,26 @@ int main(void) {
                  "/tmp/tsdb_test_cluster_%d_%d", (int)getpid(), i);
     }
 
-    /* Node configurations. */
-    node_cfg_t cfgs[N_NODES];
-    /* Gossip port = RPC port - 1:
-     *   Node0: rpc=28081 gossip=28080
-     *   Node1: rpc=28082 gossip=28081 (UDP, so no conflict with TCP 28081)
-     *   Node2: rpc=28083 gossip=28082
+    /* Node configurations.
+     * Gossip port = RPC port - 1:
+     *   Node0 (parent): rpc=28081 gossip=28080
+     *   Node1 (child):  rpc=28082 gossip=28081
+     *   Node2 (child):  rpc=28083 gossip=28082
      */
-    for (int i = 0; i < N_NODES; i++) {
-        cfgs[i].node_idx = i;
-        snprintf(cfgs[i].data_dir,    sizeof(cfgs[i].data_dir),    "%s", g_tmp_dirs[i]);
-        snprintf(cfgs[i].rpc_addr,    sizeof(cfgs[i].rpc_addr),    "127.0.0.1:%d", 28081 + i);
-        snprintf(cfgs[i].gossip_addr, sizeof(cfgs[i].gossip_addr), "127.0.0.1:%d", 28080 + i);
-        /* All nodes seed to node 0's gossip port. */
-        snprintf(cfgs[i].seeds, sizeof(cfgs[i].seeds),
-                 "127.0.0.1:28080,127.0.0.1:28081,127.0.0.1:28082");
+    const char *seeds = "127.0.0.1:28080,127.0.0.1:28081,127.0.0.1:28082";
+
+    node_cfg_t child_cfgs[N_CHILDREN];
+    for (int i = 0; i < N_CHILDREN; i++) {
+        child_cfgs[i].node_idx = i + 1;  /* node1, node2 */
+        snprintf(child_cfgs[i].data_dir, sizeof(child_cfgs[i].data_dir),
+                 "%s", g_tmp_dirs[i + 1]);
+        snprintf(child_cfgs[i].rpc_addr,  sizeof(child_cfgs[i].rpc_addr),
+                 "127.0.0.1:%d", 28082 + i);
+        snprintf(child_cfgs[i].seeds, sizeof(child_cfgs[i].seeds), "%s", seeds);
     }
 
-    /* Fork 3 child processes. */
-    for (int i = 0; i < N_NODES; i++) {
+    /* Fork node1 and node2. */
+    for (int i = 0; i < N_CHILDREN; i++) {
         pid_t pid = fork();
         if (pid < 0) {
             perror("fork");
@@ -259,51 +272,55 @@ int main(void) {
             exit(1);
         }
         if (pid == 0) {
-            /* Child process: run the node. */
-            /* Reset signal handlers. */
             signal(SIGINT, SIG_DFL);
             signal(SIGTERM, SIG_DFL);
-            run_node(&cfgs[i]);
-            /* run_node never returns. */
+            run_node(&child_cfgs[i]);
             exit(0);
         }
         g_child_pids[i] = pid;
         g_n_children++;
         printf("[test] forked node%d  pid=%d  rpc=%s\n",
-               i, (int)pid, cfgs[i].rpc_addr);
+               i + 1, (int)pid, child_cfgs[i].rpc_addr);
     }
 
-    /* Wait for all 3 RPC ports to be ready. */
-    printf("[test] waiting for cluster nodes to start...\n");
-    for (int i = 0; i < N_NODES; i++) {
-        wait_for_port("127.0.0.1", 28081 + i, 10000);
-        printf("[test] node%d RPC port ready\n", i);
-    }
-
-    /* Let gossip converge (~2s). */
-    printf("[test] waiting for gossip convergence (2s)...\n");
-    sleep(2);
-
-    /* ---- Open node A (local) for writes. ---------------------------------- */
-    printf("[test] opening node A database for writes...\n");
+    /* Parent becomes node0: open cluster on its own ports. */
+    printf("[test] parent opening node0 cluster (rpc=127.0.0.1:28081)...\n");
     tsdb_db_t *db_a = NULL;
     ASSERT_OK(tsdb_open_cluster(g_tmp_dirs[0],
                                 "127.0.0.1:28081",
-                                "127.0.0.1:28080,127.0.0.1:28081,127.0.0.1:28082",
+                                seeds,
                                 &db_a));
+    printf("[test] node0 (parent) cluster started\n");
 
-    /* Wait until node A sees at least 1 other node. */
+    /* Wait for all 3 RPC ports to be ready. */
+    printf("[test] waiting for all 3 nodes to start...\n");
+    for (int i = 0; i < N_NODES; i++) {
+        wait_for_port("127.0.0.1", 28081 + i, 10000);
+        printf("[test] node%d RPC port 2808%d ready\n", i, 1 + i);
+    }
+
+    /* Let gossip converge. */
+    printf("[test] waiting for gossip convergence (3s)...\n");
+    sleep(3);
+
+    /* Wait until node0 sees at least 2 alive nodes. */
     tsdb_cluster_wait_ready(db_a, 2, 5000);
 
     int alive_a = tsdb_cluster_alive_count(db_a);
-    printf("[test] node A sees %d alive node(s)\n", alive_a);
+    printf("[test] node0 sees %d alive node(s)\n", alive_a);
 
     char stats_buf[4096];
     tsdb_cluster_stats(db_a, stats_buf, sizeof(stats_buf));
     printf("[test] cluster view: %s\n", stats_buf);
 
-    /* ---- Create table on node A (schema sync to peers). ------------------- */
-    printf("[test] creating table 'metrics' on node A...\n");
+    if (alive_a < 2) {
+        fprintf(stderr, "[test] FAIL: not enough alive nodes (%d < 2)\n", alive_a);
+        test_cleanup();
+        exit(1);
+    }
+
+    /* ---- Create table on node0 (schema sync to peers). ------------------- */
+    printf("[test] creating table 'metrics' on node0...\n");
     tsdb_col_t cols[] = {
         { "ts",     TSDB_TYPE_TIMESTAMP },
         { "value",  TSDB_TYPE_FLOAT64   },
@@ -317,60 +334,49 @@ int main(void) {
     }
 
     /* Allow schema to propagate. */
-    sleep(1);
+    printf("[test] waiting 2s for schema propagation...\n");
+    sleep(2);
 
-    /* ---- Write 10000 rows on node A. -------------------------------------- */
-    printf("[test] writing 10000 rows on node A...\n");
+    /* ---- Write 10000 rows on node0 (replication fires via batch_commit). -- */
+    printf("[test] writing 10000 rows on node0...\n");
     int64_t t0 = (int64_t)time(NULL);
     write_rows(db_a, "metrics", 0, 10000);
     int64_t t1 = (int64_t)time(NULL);
     printf("[test] 10000 rows written in %llds\n", (long long)(t1 - t0));
 
-    /* ---- Wait for replication to propagate. ------------------------------- */
-    printf("[test] waiting 2s for replication...\n");
-    sleep(2);
+    /* ---- Wait for replication to land on node1. -------------------------- */
+    printf("[test] waiting 3s for replication...\n");
+    sleep(3);
 
-    /* ---- Open node B and query. ------------------------------------------- */
-    printf("[test] opening node B for queries...\n");
-    tsdb_db_t *db_b = NULL;
-    ASSERT_OK(tsdb_open_cluster(g_tmp_dirs[1],
-                                "127.0.0.1:28082",
-                                "127.0.0.1:28080,127.0.0.1:28081,127.0.0.1:28082",
-                                &db_b));
-
-    /* Wait for node B to see the table. */
-    sleep(1);
-
-    int64_t rows_b = count_rows(db_b, "metrics");
-    printf("[test] node B row count: %lld (expected ~10000)\n", (long long)rows_b);
+    /* ---- Count rows on node1 via direct data dir read. ------------------- */
+    printf("[test] counting rows in node1 data dir...\n");
+    int64_t rows_b = count_rows_plain(g_tmp_dirs[1], "metrics");
+    printf("[test] node1 row count: %lld (expected >= 10000)\n", (long long)rows_b);
     ASSERT(rows_b >= 10000);
-    printf("[test] PASS: node B has replicated data\n");
+    printf("[test] PASS: node1 has replicated data\n");
 
-    /* ---- Kill node C. ----------------------------------------------------- */
-    printf("[test] killing node C (pid=%d)...\n", (int)g_child_pids[2]);
-    kill(g_child_pids[2], SIGTERM);
+    /* ---- Kill node2. ----------------------------------------------------- */
+    printf("[test] killing node2 (pid=%d)...\n", (int)g_child_pids[1]);
+    kill(g_child_pids[1], SIGTERM);
     {
         int st;
-        waitpid(g_child_pids[2], &st, 0);
+        waitpid(g_child_pids[1], &st, 0);
     }
-    g_child_pids[2] = 0;
+    g_child_pids[1] = 0;
     sleep(1);
 
-    /* ---- Write 1000 more rows on A (W=2 with A+B should succeed). --------- */
-    printf("[test] writing 1000 more rows on A with C dead (W=2 test)...\n");
+    /* ---- Write 1000 more rows on node0 (W=2 with node0+node1). ----------- */
+    printf("[test] writing 1000 more rows on node0 with node2 dead (W=2 test)...\n");
     write_rows(db_a, "metrics", 10000, 1000);
     printf("[test] PASS: W=2 write succeeded with one node down\n");
 
-    /* ---- Verify total on node B. ------------------------------------------ */
-    sleep(1);
-    int64_t rows_b2 = count_rows(db_b, "metrics");
-    printf("[test] node B row count after second write: %lld (expected ~11000)\n",
+    /* ---- Verify total on node1. ------------------------------------------ */
+    sleep(2);
+    int64_t rows_b2 = count_rows_plain(g_tmp_dirs[1], "metrics");
+    printf("[test] node1 row count after second write: %lld (expected >= 11000)\n",
            (long long)rows_b2);
     ASSERT(rows_b2 >= 11000);
-    printf("[test] PASS: replication after node C failure\n");
-
-    /* ---- TODO: restart C and verify backfill. ----------------------------- */
-    printf("[test] TODO: node C restart + backfill not implemented\n");
+    printf("[test] PASS: replication after node2 failure\n");
 
     /* ---- Cluster stats. --------------------------------------------------- */
     tsdb_cluster_stats(db_a, stats_buf, sizeof(stats_buf));
@@ -378,10 +384,8 @@ int main(void) {
 
     /* ---- Cleanup. --------------------------------------------------------- */
     tsdb_close(db_a);
-    tsdb_close(db_b);
 
-    /* Kill remaining children. */
-    for (int i = 0; i < N_NODES; i++) {
+    for (int i = 0; i < N_CHILDREN; i++) {
         if (g_child_pids[i] > 0) {
             kill(g_child_pids[i], SIGTERM);
             int st;
@@ -389,7 +393,7 @@ int main(void) {
             g_child_pids[i] = 0;
         }
     }
-    /* Remove temp data. */
+
     for (int i = 0; i < N_NODES; i++) {
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "rm -rf %s", g_tmp_dirs[i]);

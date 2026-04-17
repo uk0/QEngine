@@ -30,6 +30,7 @@ typedef struct tsdb_table_internal {
     tsdb_memtable_t *memtable;
     tsdb_wal_t      *wal;
     char             name[TSDB_MAX_NAME + 1];
+    tsdb_db_t       *db;   /* owning db (set at creation/open) */
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -42,6 +43,11 @@ struct tsdb_db {
 
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
     int                    ntables;
+
+    /* Cluster hooks (NULL for standalone mode). */
+    tsdb_on_replicate_fn on_replicate;
+    tsdb_on_create_fn    on_create;
+    void                *hook_ud;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -51,8 +57,10 @@ struct tsdb_db {
  * (and tracking in-progress row state).
  */
 struct tsdb_batch {
+    tsdb_db_t             *db;        /* owning database (needed for cluster hook) */
     tsdb_table_internal_t *tbl;
     int                    in_row;
+    int                    local_only; /* 1 = skip replication hook (replica recv) */
 };
 
 /* ---- Path helpers ------------------------------------------------------- */
@@ -127,10 +135,12 @@ static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {
 
 /* ---- tsdb_create_table -------------------------------------------------- */
 
-int tsdb_create_table(tsdb_db_t *db,
-                      const char *name,
-                      const tsdb_col_t *cols, size_t ncols,
-                      const char *ts_col)
+/* Internal: create table with optional hook suppression. */
+static int create_table_impl(tsdb_db_t *db,
+                              const char *name,
+                              const tsdb_col_t *cols, size_t ncols,
+                              const char *ts_col,
+                              int suppress_hook)
 {
     if (!db || !name || !cols || ncols == 0 || !ts_col) return TSDB_ERR_INVAL;
     if (strlen(name) > TSDB_MAX_NAME) return TSDB_ERR_INVAL;
@@ -166,6 +176,7 @@ int tsdb_create_table(tsdb_db_t *db,
     }
     strncpy(t->name, name, TSDB_MAX_NAME);
     t->schema = schema;
+    t->db     = db;
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
@@ -185,8 +196,36 @@ int tsdb_create_table(tsdb_db_t *db,
     }
 
     db->tables[db->ntables++] = t;
+
+    /* Snapshot hook pointers under lock, then call after unlock to avoid
+     * deadlock if the hook re-enters any db operation. */
+    tsdb_on_create_fn on_create = suppress_hook ? NULL : db->on_create;
+    void *hook_ud = db->hook_ud;
+
     pthread_mutex_unlock(&db->lock);
+
+    /* Cluster schema-sync hook (if registered and not suppressed). */
+    if (on_create) {
+        on_create(hook_ud, db, name, schema);
+    }
+
     return TSDB_OK;
+}
+
+int tsdb_create_table(tsdb_db_t *db,
+                      const char *name,
+                      const tsdb_col_t *cols, size_t ncols,
+                      const char *ts_col)
+{
+    return create_table_impl(db, name, cols, ncols, ts_col, 0 /* sync */);
+}
+
+int tsdb_create_table_local(tsdb_db_t *db,
+                             const char *name,
+                             const tsdb_col_t *cols, size_t ncols,
+                             const char *ts_col)
+{
+    return create_table_impl(db, name, cols, ncols, ts_col, 1 /* no sync */);
 }
 
 /* ---- tsdb_open_table ---------------------------------------------------- */
@@ -227,6 +266,7 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     }
     strncpy(t->name, name, TSDB_MAX_NAME);
     t->schema = schema;
+    t->db     = db;
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
@@ -325,17 +365,30 @@ int tsdb_batch_begin(tsdb_table_t *tbl, tsdb_batch_t **out) {
     tsdb_batch_t *b = calloc(1, sizeof(*b));
     if (!b) return TSDB_ERR_NOMEM;
 
-    b->tbl    = (tsdb_table_internal_t *)tbl;
+    tsdb_table_internal_t *ti = (tsdb_table_internal_t *)tbl;
+    b->db     = ti->db;
+    b->tbl    = ti;
     b->in_row = 0;
     *out = b;
     return TSDB_OK;
 }
 
 /*
- * Internal: flush memtable and clear it.
+ * Internal: call replicate hook (if any), flush memtable to partition, clear.
  * Must be called with table's resources available.
+ * Only flushes if the memtable has at least one row.
+ * skip_replicate=1 suppresses the cluster hook (used for replica-received writes).
  */
-static int flush_and_clear(tsdb_table_internal_t *t) {
+static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
+    if (tsdb_memtable_rows(t->memtable) == 0) return TSDB_OK;
+
+    /* Cluster replication: fan out BEFORE local flush so data is in memtable. */
+    if (!skip_replicate && t->db && t->db->on_replicate) {
+        t->db->on_replicate(t->db->hook_ud, t->db, t->name,
+                            t->schema, t->memtable);
+        /* Errors are logged by the hook but do not abort the local write. */
+    }
+
     int rc = tsdb_part_flush(t->schema, t->memtable);
     if (rc == TSDB_OK) {
         tsdb_memtable_clear(t->memtable);
@@ -347,10 +400,11 @@ static int flush_and_clear(tsdb_table_internal_t *t) {
 
 /*
  * Auto-flush if memtable is full. Called before row_begin.
+ * skip_replicate mirrors the batch's local_only flag.
  */
-static int maybe_flush(tsdb_table_internal_t *t) {
+static int maybe_flush_b(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_is_full(t->memtable)) {
-        return flush_and_clear(t);
+        return flush_and_clear_ex(t, skip_replicate);
     }
     return TSDB_OK;
 }
@@ -361,7 +415,7 @@ int tsdb_batch_row_ts(tsdb_batch_t *b, tsdb_ts_t ts) {
 
     if (!b->in_row) {
         /* Auto-flush if full, then begin row. */
-        int rc = maybe_flush(t);
+        int rc = maybe_flush_b(t, b->local_only);
         if (rc != TSDB_OK) return rc;
 
         rc = tsdb_memtable_row_begin(t->memtable);
@@ -403,8 +457,9 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
         b->in_row = 0;
     }
 
-    /* Flush if full. */
-    int rc = maybe_flush(t);
+    /* Replicate (if cluster hook) + flush any remaining rows.
+     * flush_and_clear_ex skips hook when local_only=1 (replica received write). */
+    int rc = flush_and_clear_ex(t, b->local_only);
     if (rc != TSDB_OK) return rc;
 
     /* Sync WAL. */
@@ -422,6 +477,25 @@ void tsdb_batch_discard(tsdb_batch_t *b) {
         b->in_row = 0;
     }
     free(b);
+}
+
+void tsdb_batch_set_local_only(tsdb_batch_t *b) {
+    if (b) b->local_only = 1;
+}
+
+/* ---- Cluster hook registration ----------------------------------------- */
+
+void tsdb_db_set_hooks(tsdb_db_t *db,
+                        tsdb_on_replicate_fn on_replicate,
+                        tsdb_on_create_fn on_create,
+                        void *userdata)
+{
+    if (!db) return;
+    pthread_mutex_lock(&db->lock);
+    db->on_replicate = on_replicate;
+    db->on_create    = on_create;
+    db->hook_ud      = userdata;
+    pthread_mutex_unlock(&db->lock);
 }
 
 /* ---- Internal accessors for query module ------------------------------- */

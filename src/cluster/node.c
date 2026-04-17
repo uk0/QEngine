@@ -252,6 +252,18 @@ tsdb_hashring_t *tsdb_node_manager_ring(tsdb_node_manager_t *mgr) {
     return mgr ? mgr->ring : NULL;
 }
 
+int tsdb_node_manager_ring_owner(tsdb_node_manager_t *mgr,
+                                  const char *key,
+                                  int max_replicas,
+                                  tsdb_node_id_t *out_nodes)
+{
+    if (!mgr || !key || !out_nodes || max_replicas <= 0) return 0;
+    pthread_mutex_lock(&mgr->lock);
+    int n = tsdb_hashring_owner_str(mgr->ring, key, max_replicas, out_nodes);
+    pthread_mutex_unlock(&mgr->lock);
+    return n;
+}
+
 int tsdb_node_manager_alive_count(tsdb_node_manager_t *mgr) {
     if (!mgr) return 0;
     pthread_mutex_lock(&mgr->lock);

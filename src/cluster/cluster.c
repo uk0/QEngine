@@ -129,35 +129,39 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
 {
     if (!c || !table_name || nrows == 0) return TSDB_OK;
 
-    tsdb_hashring_t *ring = tsdb_cluster_ring(c);
-    if (!ring || tsdb_hashring_node_count(ring) == 0) return TSDB_OK;
-
-    /* Determine the 3 replica nodes for this table/shard. */
+    /* Determine replica nodes under node_mgr lock for thread safety.
+     * The hashring is modified by gossip threads; we must snapshot it
+     * while holding the same mutex. */
     tsdb_node_id_t all_replicas[3];
-    int nreplicas = tsdb_hashring_owner_str(ring, table_name, 3, all_replicas);
+    int nreplicas = tsdb_node_manager_ring_owner(c->node_mgr, table_name, 3, all_replicas);
+    if (nreplicas == 0) return TSDB_OK;
 
-    /* Separate: are we the primary? Are we a replica? */
-    int is_primary = 0, is_replica = 0;
+    /* Determine our role.
+     *
+     * With N=R=3, every node is a replica of every shard, so the writer
+     * is always in the replica set.  We treat the writer as the "primary"
+     * for this particular write (acting primary).  The hash-determined
+     * primary matters only for routing writes received from a non-replica
+     * (forwarding — not yet implemented, not needed for N=R=3 tests).
+     *
+     * The on_replicate hook is set to skip_replicate=1 on replicas (via
+     * tsdb_batch_set_local_only), so re-replication loops are impossible.
+     */
+    int is_replica = 0;
     for (int i = 0; i < nreplicas; i++) {
         if (all_replicas[i] == c->local_id) {
-            if (i == 0) is_primary = 1;
             is_replica = 1;
             break;
         }
     }
 
     if (!is_replica) {
-        /* TODO: forward to primary. For N=R=3 this never happens in tests. */
+        /* Not responsible for this shard.  TODO: forward to primary. */
         return TSDB_OK;
     }
 
-    if (!is_primary) {
-        /* We are a replica that already applied locally; nothing more to do.
-         * Re-replication from replica would cause infinite loops. */
-        return TSDB_OK;
-    }
-
-    /* We are primary: replicate to the other replicas. */
+    /* We are in the replica set and received a write — act as coordinator.
+     * Fan out to the other replicas in the set. */
     /* Collect the remote replica IDs (excluding self). */
     tsdb_node_id_t remote_replicas[3];
     int nremote = 0;

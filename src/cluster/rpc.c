@@ -279,8 +279,8 @@ static void *connection_handler(void *arg) {
                     }
                     const char *ts_name = (ts_col_idx >= 0 && ts_col_idx < ncols)
                                          ? col_names[ts_col_idx] : col_names[0];
-                    /* Ignore TSDB_ERR_EXISTS — already applied. */
-                    tsdb_create_table(db, table_name, cols, ncols, ts_name);
+                    /* Use _local variant to avoid re-syncing to other nodes. */
+                    tsdb_create_table_local(db, table_name, cols, ncols, ts_name);
                 }
                 send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             } else {
@@ -306,6 +306,8 @@ static void *connection_handler(void *arg) {
                     if (tsdb_open_table(db, table_name, &tbl) == TSDB_OK && tbl) {
                         tsdb_batch_t *batch = NULL;
                         if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
+                            /* Mark as local-only to prevent re-replication loop. */
+                            tsdb_batch_set_local_only(batch);
                             for (int row = 0; row < nrows; row++) {
                                 /* Compute per-col offsets. */
                                 int col_off[64];

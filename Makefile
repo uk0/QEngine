@@ -40,10 +40,13 @@ CLUSTER_TEST_BINS := $(patsubst tests/%.c,build/test/%,$(CLUSTER_TEST_SRCS))
 BENCH_SRCS := $(wildcard bench/*.c)
 BENCH_BINS := $(patsubst bench/%.c,build/bench/%,$(BENCH_SRCS))
 
-CLI_SRC   := cli/tsdb_cli.c
-CLI_BIN   := build/tsdb
+CLI_SRC         := cli/tsdb_cli.c
+CLI_BIN         := build/tsdb
 
-.PHONY: all clean test test-cluster bench cli debug
+CLUSTER_NODE_SRC := src/cluster/tsdb_node_main.c
+CLUSTER_NODE_BIN := build/cluster/tsdb_node
+
+.PHONY: all clean test test-cluster bench cli cluster_node debug
 .DEFAULT_GOAL := all
 
 all: lib cli test $(CLUSTER_TEST_BINS)
@@ -93,6 +96,13 @@ cli: $(CLI_BIN)
 $(CLI_BIN): $(CLI_SRC) $(OBJS)
 	@mkdir -p build
 	@$(CC) $(CFLAGS) -o $@ $(CLI_SRC) $(OBJS) $(LDFLAGS)
+	@echo "LD  $@"
+
+cluster_node: $(CLUSTER_NODE_BIN)
+
+$(CLUSTER_NODE_BIN): $(CLUSTER_NODE_SRC) $(OBJS)
+	@mkdir -p build/cluster
+	@$(CC) $(CFLAGS) -o $@ $(CLUSTER_NODE_SRC) $(OBJS) $(LDFLAGS)
 	@echo "LD  $@"
 
 clean:

@@ -97,6 +97,15 @@ int tsdb_node_manager_random_alive(tsdb_node_manager_t *mgr,
 /* Return the shared hashring (updated whenever membership changes). */
 tsdb_hashring_t *tsdb_node_manager_ring(tsdb_node_manager_t *mgr);
 
+/*
+ * Thread-safe ring lookup: holds mgr->lock while calling tsdb_hashring_owner_str.
+ * Returns the number of replica node IDs written to out_nodes (up to max_replicas).
+ */
+int tsdb_node_manager_ring_owner(tsdb_node_manager_t *mgr,
+                                  const char *key,
+                                  int max_replicas,
+                                  tsdb_node_id_t *out_nodes);
+
 /* Return number of ALIVE nodes (including self). */
 int tsdb_node_manager_alive_count(tsdb_node_manager_t *mgr);
 
