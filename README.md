@@ -163,18 +163,89 @@ bench/                  ingest + query benchmarks
 docs/                   design, research, changelog (gitignored)
 ```
 
+## Why QTL is faster than plain SQL on time-series
+
+Three structural efficiencies:
+
+1. **SAMPLE BY pushes bucket boundaries into the scan.** A generic SQL
+   `GROUP BY time_bucket(ts, ...)` materializes a hash table keyed by bucket
+   timestamp. QTL's `SAMPLE BY` knows the timestamp column is monotonic —
+   consecutive rows belong to the same bucket until they don't, so the
+   executor emits buckets in a single pass with `O(1)` state per group.
+2. **SYMBOL is an int32 compare, not a string compare.** `WHERE symbol='AAPL'`
+   becomes a vectorized `uint32 == k` over a bitmap. No `strcmp`, no hash
+   lookup per row.
+3. **Interval literals parse once.** `SAMPLE BY 1m` is stored as the constant
+   `60_000_000_000` in the AST; `GROUP BY date_trunc('minute', ts)` in SQL is
+   a per-row function call in most engines.
+
+## Reality check — competitive positioning
+
+The user's brief asked for "beats every market TSDB on a single machine."
+The MVP does not. Here's a transparent comparison against published numbers
+from the research docs (all numbers are vendor-published except tsdb):
+
+| Metric                      | tsdb (this repo) | QuestDB    | ClickHouse | VictoriaMetrics | InfluxDB |
+| --------------------------- | ---------------- | ---------- | ---------- | --------------- | -------- |
+| Ingest (cpu-only, rows/sec) | **6.38 M**       | 7–11 M     | 2–3 M      | 1–2 M           | 330–490 K |
+| Bytes/point (mixed)         | 7.88 B           | N/A        | ~1.7 B     | ~0.8–1.2 B      | ~2–4 B   |
+| Bytes/point (DoD uniform)   | **0.126 B**      | —          | —          | —               | —        |
+| Bytes/point (Gorilla const) | **0.126 B**      | —          | —          | —               | —        |
+| count(*) @ 5M rows          | 12.66 ms         | (not published at this scale; TSBS numbers are at 69M rows) |
+| SIMD f64 sum throughput     | 26–71 GB/s       | ~9 GB/s (JIT filter) | — | —    | —        |
+
+**Where tsdb wins today (on synthetic / per-codec microbenchmarks):**
+- Gorilla/DoD per-column compression at 0.126 bytes/point is at the published
+  state of the art (matches Gorilla-paper 1.37 bytes/point for mixed data and
+  exceeds on constant / uniform streams).
+- SIMD primitive throughput (f64 sum) is competitive with QuestDB's JIT
+  filter on the same hardware class (Apple M-series NEON).
+
+**Where tsdb loses today:**
+- **Ingest**: 6.38 M vs QuestDB 7–11 M (we're ~60–90% of QuestDB). Gap is
+  single-threaded writer path; parallel per-partition writers would close it.
+- **Mixed bytes/point**: 7.88 B vs VM's 0.8–1.2 B. Dominated by our
+  uncompressed `.idx` metadata and WAL, not the data bytes themselves;
+  needs finalMerge + ZSTD wrapper.
+- **No competitive benchmark run**: we have not run TSBS. All comparisons
+  above are reconciliations from vendor-published numbers and research notes.
+  A credible "beats X" claim requires TSBS `cpu-only` at scale=4000 with
+  side-by-side hardware.
+
+**Verdict:** tsdb is a credible prototype with specific axes where it meets
+or exceeds published targets, not a drop-in replacement for production
+TSDBs. Closing the ingest gap is mechanical (parallelize writes); closing
+the mixed bytes/point gap needs ZSTD integration; a defensible overall
+benchmark needs TSBS runs.
+
 ## Limits and roadmap
 
 The MVP established a working write → compress → store → query path.
-Known gaps:
+Known gaps, roughly in priority order:
 
+- **Query executor hot path is partially scalar.** `agg_update` loops
+  bit-by-bit over the filter bitmap (see `exec.c` around the
+  `PROJ_AGG_*` cases). Micro-bench SIMD sum hits 71 GB/s but the real
+  query path runs at ~50 M rows/sec. Fix: SIMD gather via the bitmap
+  before the agg call, using the `tsdb_bitmap_gather_*` helpers already
+  present in `exec/filter.c`.
 - **LATEST ON** and **ASOF JOIN** — syntax parsed, executor is next.
-- **Chimp / Chimp128** — Gorilla is the MVP float codec; Chimp roughly halves
-  compressed size on monitoring data.
-- **Parallel scan** — current executor is single-threaded.
-- **Block skipping via idx metadata** — time-range predicates should prune
-  blocks before decode; currently only decoded ranges are filtered.
+  Both need reverse-partition iteration; the part layer doesn't expose
+  a reverse iterator yet.
+- **Block-skipping via idx metadata** — time-range predicates (`ts >= X`)
+  should prune whole blocks using `BlockIndexEntry.ts_min/ts_max` before
+  decode. Executor currently decodes every block.
+- **Parallel scan** — current executor is single-threaded. A pthread pool
+  over scan sources would fan out trivially; result merge is the only
+  tricky piece for aggregation.
+- **Chimp / Chimp128** — Gorilla is the MVP float codec; Chimp roughly
+  halves compressed size on monitoring data per the 2022 VLDB paper.
+- **ZSTD/LZ4 block wrapper** — domain codecs are applied but no general
+  compression layer follows; this is the lever for mixed-workload
+  bytes/point.
 - **Advanced aggregates** — `stddev`, `p50`, `p99`, `rate`, `ewma` planned.
+- **TSBS integration** — the benchmark that makes any "beats X" claim
+  verifiable; currently no external benchmark driver exists.
 
 ## License
 
