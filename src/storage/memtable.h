@@ -63,6 +63,12 @@ int  tsdb_memtable_is_full(tsdb_memtable_t *m);
 void tsdb_memtable_clear(tsdb_memtable_t *m);
 
 /*
+ * Abort an in-progress row (reset in_row and col_set state).
+ * Safe to call even when no row is in progress.
+ */
+void tsdb_memtable_row_abort(tsdb_memtable_t *m);
+
+/*
  * Return a read-only pointer to the contiguous value array for the
  * given column. Valid until next write operation.
  */

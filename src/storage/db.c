@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <pthread.h>
 
 /* Forward declaration of mkdir_p from schema.c. */
@@ -396,10 +397,9 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
     if (!b) return TSDB_ERR_INVAL;
     tsdb_table_internal_t *t = b->tbl;
 
-    /* If in a partial row, close it first. */
+    /* If in a partial row, abort it — don't persist incomplete data. */
     if (b->in_row) {
-        /* Discard partial row — don't persist incomplete data. */
-        /* Can't roll back a partial row; just mark as done. */
+        tsdb_memtable_row_abort(t->memtable);
         b->in_row = 0;
     }
 
@@ -418,7 +418,7 @@ void tsdb_batch_discard(tsdb_batch_t *b) {
     if (!b) return;
     /* Clear any partial row state in the memtable. */
     if (b->in_row) {
-        /* The partial row is already in memtable col_set; we reset state. */
+        tsdb_memtable_row_abort(b->tbl->memtable);
         b->in_row = 0;
     }
     free(b);

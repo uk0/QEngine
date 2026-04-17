@@ -200,6 +200,15 @@ void tsdb_memtable_clear(tsdb_memtable_t *m) {
     pthread_mutex_unlock(&m->lock);
 }
 
+void tsdb_memtable_row_abort(tsdb_memtable_t *m) {
+    if (!m) return;
+    pthread_mutex_lock(&m->lock);
+    m->in_row = 0;
+    m->ts_set = 0;
+    memset(m->col_set, 0, (size_t)m->schema->ncols);
+    pthread_mutex_unlock(&m->lock);
+}
+
 const void *tsdb_memtable_col(tsdb_memtable_t *m, int col) {
     if (!m || col < 0 || col >= m->schema->ncols) return NULL;
     /* No lock needed for read after flush (caller responsibility). */
