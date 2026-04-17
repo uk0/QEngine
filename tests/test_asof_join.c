@@ -1,0 +1,448 @@
+/* test_asof_join.c — ASOF JOIN executor tests.
+ *
+ * Schema:
+ *   trades(ts TIMESTAMP, sym SYMBOL, px FLOAT64)
+ *   quotes(ts TIMESTAMP, sym SYMBOL, bid FLOAT64, ask FLOAT64)
+ *
+ * All tests verify correctness of the two-pointer ASOF JOIN algorithm.
+ * The final test checks large-scale performance (100K × 100K).
+ */
+#include "tsdb.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <time.h>
+
+#define FAIL(fmt, ...) do { \
+    fprintf(stderr, "FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, __VA_ARGS__); \
+    abort(); \
+} while (0)
+
+#define FAIL0(msg) do { \
+    fprintf(stderr, "FAIL %s:%d: " msg "\n", __FILE__, __LINE__); \
+    abort(); \
+} while (0)
+
+#define OK(rc) do { \
+    int _rc = (rc); \
+    if (_rc != TSDB_OK) { \
+        fprintf(stderr, "FAIL %s:%d: rc=%d (%s)\n", __FILE__, __LINE__, _rc, tsdb_errstr(_rc)); \
+        abort(); \
+    } \
+} while (0)
+
+/* Recursive remove. */
+static void rm_rf(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) { remove(path); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[4096]; snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
+        rm_rf(p);
+    }
+    closedir(d); rmdir(path);
+}
+
+/* Monotonic wall clock in nanoseconds. */
+static int64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* Convert a simple integer offset in nanoseconds to a timestamp. */
+static tsdb_ts_t mts(int64_t ns_offset) {
+    /* Use a fixed epoch: 2026-01-01T00:00:00Z */
+    return (tsdb_ts_t)(1767225600000000000LL + ns_offset);
+}
+
+/* Count and collect rows via tsdb_result_next. */
+typedef struct {
+    double  bid[16384];
+    double  ask[16384];
+    double  px[16384];
+    int     n;
+} collected_t;
+
+static collected_t collect(tsdb_result_t *r,
+                            int c_bid, int c_ask, int c_px) {
+    collected_t c; c.n = 0;
+    while (tsdb_result_next(r)) {
+        if (c.n < 16384) {
+            c.bid[c.n] = (c_bid >= 0) ? tsdb_result_f64(r, c_bid) : 0.0;
+            c.ask[c.n] = (c_ask >= 0) ? tsdb_result_f64(r, c_ask) : 0.0;
+            c.px[c.n]  = (c_px  >= 0) ? tsdb_result_f64(r, c_px)  : 0.0;
+            c.n++;
+        } else {
+            c.n++;  /* just count */
+        }
+    }
+    return c;
+}
+
+static int col_idx(tsdb_result_t *r, const char *name) {
+    int n = tsdb_result_ncols(r);
+    for (int i = 0; i < n; i++)
+        if (strcmp(tsdb_result_col_name(r, i), name) == 0) return i;
+    return -1;
+}
+
+/* ======================================================================== */
+
+static const char *TESTDIR = "/tmp/tsdb_test_asof_join";
+
+int main(void) {
+    rm_rf(TESTDIR);
+
+    printf("=== ASOF JOIN tests ===\n");
+
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(TESTDIR, &db));
+
+    tsdb_table_t *trd = NULL, *qot = NULL;
+
+    /* ---------- Create tables ---------- */
+    {
+        tsdb_col_t tc[] = {
+            {"ts",  TSDB_TYPE_TIMESTAMP},
+            {"sym", TSDB_TYPE_SYMBOL},
+            {"px",  TSDB_TYPE_FLOAT64},
+        };
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+    }
+    {
+        tsdb_col_t qc[] = {
+            {"ts",  TSDB_TYPE_TIMESTAMP},
+            {"sym", TSDB_TYPE_SYMBOL},
+            {"bid", TSDB_TYPE_FLOAT64},
+            {"ask", TSDB_TYPE_FLOAT64},
+        };
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "quotes", &qot));
+    }
+
+    /* ======================================================================
+     * TEST 1: Basic correctness — single-key ASOF JOIN.
+     *
+     *  quotes:  t=50  AAPL  bid=9.0   ask=10.0
+     *           t=100 AAPL  bid=9.5   ask=10.5
+     *           t=200 AAPL  bid=9.8   ask=10.8
+     *
+     *  trades:  t=30  AAPL  → NO match (before all quotes)
+     *           t=80  AAPL  → quote@t=50  bid=9.0
+     *           t=120 AAPL  → quote@t=100 bid=9.5
+     *           t=250 AAPL  → quote@t=200 bid=9.8
+     * ====================================================================== */
+    printf("\n[1] Basic correctness — single key ASOF JOIN\n");
+    {
+        tsdb_batch_t *b = NULL;
+        OK(tsdb_batch_begin(qot, &b));
+        OK(tsdb_batch_row_ts(b, mts(50)));  OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.0));  OK(tsdb_batch_row_f64(b,3,10.0)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(100))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.5));  OK(tsdb_batch_row_f64(b,3,10.5)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(200))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.8));  OK(tsdb_batch_row_f64(b,3,10.8)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+
+        OK(tsdb_batch_begin(trd, &b));
+        OK(tsdb_batch_row_ts(b, mts(30)));  OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.1)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(80)));  OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.2)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(120))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.6)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(250))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,9.9)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+    }
+
+    {
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db,
+            "SELECT ts, px, bid, ask FROM trades ASOF JOIN quotes ON sym=sym",
+            &r));
+
+        int c_bid = col_idx(r, "bid");
+        int c_ask = col_idx(r, "ask");
+        int c_px  = col_idx(r, "px");
+        assert(c_bid >= 0 && c_ask >= 0 && c_px >= 0);
+
+        collected_t res = collect(r, c_bid, c_ask, c_px);
+        assert(res.n == 4 && "expected 4 result rows");
+
+        /* Row 0: t=30, no quote → bid=0 (NULL) */
+        assert(res.bid[0] == 0.0 && "t=30 should have NULL bid");
+        assert(res.ask[0] == 0.0 && "t=30 should have NULL ask");
+
+        /* Row 1: t=80 → quote@t=50 bid=9.0 */
+        assert(fabs(res.bid[1] - 9.0) < 1e-9 && "t=80 bid should be 9.0");
+        assert(fabs(res.ask[1] - 10.0) < 1e-9 && "t=80 ask should be 10.0");
+
+        /* Row 2: t=120 → quote@t=100 bid=9.5 */
+        assert(fabs(res.bid[2] - 9.5) < 1e-9 && "t=120 bid should be 9.5");
+        assert(fabs(res.ask[2] - 10.5) < 1e-9 && "t=120 ask should be 10.5");
+
+        /* Row 3: t=250 → quote@t=200 bid=9.8 */
+        assert(fabs(res.bid[3] - 9.8) < 1e-9 && "t=250 bid should be 9.8");
+        assert(fabs(res.ask[3] - 10.8) < 1e-9 && "t=250 ask should be 10.8");
+
+        tsdb_result_free(r);
+        printf("  PASS: basic single-key ASOF JOIN correctness\n");
+    }
+
+    /* ======================================================================
+     * TEST 2: Per-key isolation — AAPL and MSFT quotes are independent.
+     * ====================================================================== */
+    printf("\n[2] Per-key isolation (AAPL vs MSFT)\n");
+    {
+        tsdb_close(db);
+        rm_rf(TESTDIR);
+        OK(tsdb_open(TESTDIR, &db));
+
+        tsdb_col_t tc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"px",TSDB_TYPE_FLOAT64}};
+        tsdb_col_t qc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"bid",TSDB_TYPE_FLOAT64},{"ask",TSDB_TYPE_FLOAT64}};
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+        OK(tsdb_open_table(db, "quotes", &qot));
+
+        tsdb_batch_t *b = NULL;
+        OK(tsdb_batch_begin(qot, &b));
+        OK(tsdb_batch_row_ts(b, mts(10)));  OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,1.0));   OK(tsdb_batch_row_f64(b,3,1.1));   OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(10)));  OK(tsdb_batch_row_sym(b,1,"MSFT")); OK(tsdb_batch_row_f64(b,2,100.0)); OK(tsdb_batch_row_f64(b,3,100.1)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(20)));  OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,2.0));   OK(tsdb_batch_row_f64(b,3,2.1));   OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(20)));  OK(tsdb_batch_row_sym(b,1,"MSFT")); OK(tsdb_batch_row_f64(b,2,200.0)); OK(tsdb_batch_row_f64(b,3,200.1)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+
+        OK(tsdb_batch_begin(trd, &b));
+        OK(tsdb_batch_row_ts(b, mts(15))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,1.5));   OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(15))); OK(tsdb_batch_row_sym(b,1,"MSFT")); OK(tsdb_batch_row_f64(b,2,105.0)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(25))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,2.5));   OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(25))); OK(tsdb_batch_row_sym(b,1,"MSFT")); OK(tsdb_batch_row_f64(b,2,205.0)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db,
+            "SELECT ts, sym, px, bid FROM trades ASOF JOIN quotes ON sym=sym",
+            &r));
+
+        int c_bid = col_idx(r, "bid");
+        assert(c_bid >= 0);
+
+        collected_t res = collect(r, c_bid, -1, -1);
+        assert(res.n == 4 && "expected 4 rows");
+
+        /* Row 0: t=15, AAPL → bid=1.0 */
+        assert(fabs(res.bid[0] - 1.0) < 1e-9 && "AAPL@t=15 bid=1.0");
+        /* Row 1: t=15, MSFT → bid=100.0 */
+        assert(fabs(res.bid[1] - 100.0) < 1e-9 && "MSFT@t=15 bid=100.0");
+        /* Row 2: t=25, AAPL → bid=2.0 */
+        assert(fabs(res.bid[2] - 2.0) < 1e-9 && "AAPL@t=25 bid=2.0");
+        /* Row 3: t=25, MSFT → bid=200.0 */
+        assert(fabs(res.bid[3] - 200.0) < 1e-9 && "MSFT@t=25 bid=200.0");
+
+        tsdb_result_free(r);
+        printf("  PASS: per-key isolation\n");
+    }
+
+    /* ======================================================================
+     * TEST 3: Edge case — trade before ALL quotes → NULL right cols.
+     * ====================================================================== */
+    printf("\n[3] Edge case: trade before all quotes → NULL right cols\n");
+    {
+        tsdb_close(db);
+        rm_rf(TESTDIR);
+        OK(tsdb_open(TESTDIR, &db));
+
+        tsdb_col_t tc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"px",TSDB_TYPE_FLOAT64}};
+        tsdb_col_t qc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"bid",TSDB_TYPE_FLOAT64},{"ask",TSDB_TYPE_FLOAT64}};
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+        OK(tsdb_open_table(db, "quotes", &qot));
+
+        tsdb_batch_t *b = NULL;
+        OK(tsdb_batch_begin(qot, &b));
+        OK(tsdb_batch_row_ts(b, mts(1000))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,5.0)); OK(tsdb_batch_row_f64(b,3,5.5)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+
+        OK(tsdb_batch_begin(trd, &b));
+        OK(tsdb_batch_row_ts(b, mts(5)));    OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,4.0)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_row_ts(b, mts(2000))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,4.5)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db,
+            "SELECT ts, px, bid FROM trades ASOF JOIN quotes ON sym=sym",
+            &r));
+
+        int c_bid = col_idx(r, "bid");
+        assert(c_bid >= 0);
+        collected_t res = collect(r, c_bid, -1, -1);
+        assert(res.n == 2 && "expected 2 rows");
+
+        /* Row 0: t=5, before any quote → bid=0.0 (NULL) */
+        assert(res.bid[0] == 0.0 && "t=5 should have NULL bid");
+        /* Row 1: t=2000, after quote@t=1000 → bid=5.0 */
+        assert(fabs(res.bid[1] - 5.0) < 1e-9 && "t=2000 bid should be 5.0");
+
+        tsdb_result_free(r);
+        printf("  PASS: NULL right columns before first quote\n");
+    }
+
+    /* ======================================================================
+     * TEST 4: Empty right table → all right cols NULL.
+     * ====================================================================== */
+    printf("\n[4] Edge case: empty right table\n");
+    {
+        tsdb_close(db);
+        rm_rf(TESTDIR);
+        OK(tsdb_open(TESTDIR, &db));
+
+        tsdb_col_t tc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"px",TSDB_TYPE_FLOAT64}};
+        tsdb_col_t qc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"bid",TSDB_TYPE_FLOAT64},{"ask",TSDB_TYPE_FLOAT64}};
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+        OK(tsdb_open_table(db, "quotes", &qot));
+
+        tsdb_batch_t *b = NULL;
+        OK(tsdb_batch_begin(trd, &b));
+        OK(tsdb_batch_row_ts(b, mts(100))); OK(tsdb_batch_row_sym(b,1,"AAPL")); OK(tsdb_batch_row_f64(b,2,10.0)); OK(tsdb_batch_row_end(b));
+        OK(tsdb_batch_commit(b));
+        /* quotes table is empty — no rows inserted */
+
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db,
+            "SELECT ts, px, bid FROM trades ASOF JOIN quotes ON sym=sym",
+            &r));
+
+        int c_bid = col_idx(r, "bid");
+        assert(c_bid >= 0);
+        collected_t res = collect(r, c_bid, -1, -1);
+        assert(res.n == 1 && "expected 1 row");
+        assert(res.bid[0] == 0.0 && "empty right → bid=NULL/0");
+
+        tsdb_result_free(r);
+        printf("  PASS: empty right table\n");
+    }
+
+    /* ======================================================================
+     * TEST 5: Parser acceptance — verify ASOF JOIN syntax is accepted.
+     * ====================================================================== */
+    printf("\n[5] Parser acceptance test\n");
+    {
+        tsdb_close(db);
+        rm_rf(TESTDIR);
+        OK(tsdb_open(TESTDIR, &db));
+
+        tsdb_col_t tc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"px",TSDB_TYPE_FLOAT64}};
+        tsdb_col_t qc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"bid",TSDB_TYPE_FLOAT64},{"ask",TSDB_TYPE_FLOAT64}};
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+        OK(tsdb_open_table(db, "quotes", &qot));
+
+        /* Empty tables — just verify parse + exec without error. */
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT * FROM trades ASOF JOIN quotes ON sym=sym", &r));
+        /* Expect 0 rows from empty tables. */
+        int cnt = 0;
+        while (tsdb_result_next(r)) cnt++;
+        assert(cnt == 0);
+        tsdb_result_free(r);
+
+        printf("  PASS: parser accepts ASOF JOIN ON syntax\n");
+    }
+
+    /* ======================================================================
+     * TEST 6: Large-scale performance — 100K trades × 100K quotes.
+     *
+     * Two symbols (AAPL, MSFT), interleaved.
+     * Expected: correctness + wall time < 1 second.
+     * ====================================================================== */
+    printf("\n[6] Large-scale: 100K trades x 100K quotes (2 symbols)\n");
+    {
+        tsdb_close(db);
+        rm_rf(TESTDIR);
+        OK(tsdb_open(TESTDIR, &db));
+
+        tsdb_col_t tc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"px",TSDB_TYPE_FLOAT64}};
+        tsdb_col_t qc[] = {{"ts",TSDB_TYPE_TIMESTAMP},{"sym",TSDB_TYPE_SYMBOL},{"bid",TSDB_TYPE_FLOAT64},{"ask",TSDB_TYPE_FLOAT64}};
+        OK(tsdb_create_table(db, "trades", tc, 3, "ts"));
+        OK(tsdb_create_table(db, "quotes", qc, 4, "ts"));
+        OK(tsdb_open_table(db, "trades", &trd));
+        OK(tsdb_open_table(db, "quotes", &qot));
+
+        const int N = 100000;
+        const char *syms2[2] = {"AAPL", "MSFT"};
+
+        /* quotes: interleaved AAPL/MSFT at even ns offsets. */
+        {
+            tsdb_batch_t *b = NULL;
+            OK(tsdb_batch_begin(qot, &b));
+            for (int i = 0; i < N; i++) {
+                int64_t t = (int64_t)i * 2;
+                OK(tsdb_batch_row_ts(b, mts(t)));
+                OK(tsdb_batch_row_sym(b, 1, syms2[i % 2]));
+                OK(tsdb_batch_row_f64(b, 2, 100.0 + (double)i));
+                OK(tsdb_batch_row_f64(b, 3, 101.0 + (double)i));
+                OK(tsdb_batch_row_end(b));
+            }
+            OK(tsdb_batch_commit(b));
+        }
+
+        /* trades: interleaved AAPL/MSFT at odd ns offsets. */
+        {
+            tsdb_batch_t *b = NULL;
+            OK(tsdb_batch_begin(trd, &b));
+            for (int i = 0; i < N; i++) {
+                int64_t t = (int64_t)i * 2 + 1;
+                OK(tsdb_batch_row_ts(b, mts(t)));
+                OK(tsdb_batch_row_sym(b, 1, syms2[i % 2]));
+                OK(tsdb_batch_row_f64(b, 2, 200.0 + (double)i));
+                OK(tsdb_batch_row_end(b));
+            }
+            OK(tsdb_batch_commit(b));
+        }
+
+        int64_t t0 = now_ns();
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db,
+            "SELECT ts, sym, px, bid, ask FROM trades ASOF JOIN quotes ON sym=sym",
+            &r));
+        int64_t elapsed_ns = now_ns() - t0;
+        double elapsed_ms = (double)elapsed_ns / 1e6;
+
+        /* Count rows and spot-check first. */
+        int nrows = 0;
+        double first_bid = -1.0;
+        int c_bid = col_idx(r, "bid");
+        assert(c_bid >= 0);
+
+        while (tsdb_result_next(r)) {
+            if (nrows == 0) first_bid = tsdb_result_f64(r, c_bid);
+            nrows++;
+        }
+        assert(nrows == N && "expected 100K result rows");
+
+        /* First trade (i=0): AAPL, t=1.  Quote AAPL t=0, bid=100.0. */
+        assert(fabs(first_bid - 100.0) < 1e-9 && "first trade bid should be 100.0");
+
+        tsdb_result_free(r);
+
+        printf("  100K x 100K ASOF JOIN wall time: %.1f ms\n", elapsed_ms);
+        if (elapsed_ms >= 1000.0) {
+            fprintf(stderr, "  WARNING: elapsed %.1f ms exceeds 1000 ms target\n", elapsed_ms);
+        } else {
+            printf("  PASS: performance < 1 second (%.1f ms)\n", elapsed_ms);
+        }
+    }
+
+    tsdb_close(db);
+    rm_rf(TESTDIR);
+
+    printf("\n=== ALL ASOF JOIN TESTS PASSED ===\n");
+    return 0;
+}

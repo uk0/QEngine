@@ -40,6 +40,9 @@ typedef enum {
     QTOK_RETENTION, QTOK_PROFILE, QTOK_REGION,
     QTOK_REPLICA, QTOK_FACTOR,
 
+    /* ASOF JOIN keywords */
+    QTOK_ASOF, QTOK_JOIN,
+
     QTOK_ERR
 } qtok_kind_t;
 

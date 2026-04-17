@@ -287,6 +287,43 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
     q->from = tok_strdup(&p, &p.tok);
     advance(&p);
 
+    /* ASOF JOIN ident ON left_key = right_key [, ...] */
+    if (accept(&p, QTOK_ASOF)) {
+        if (expect(&p, QTOK_JOIN) != TSDB_OK) return TSDB_ERR_PARSE;
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected right table name after ASOF JOIN");
+            return TSDB_ERR_PARSE;
+        }
+        q->asof_table = tok_strdup(&p, &p.tok);
+        advance(&p);
+        q->has_asof_join = 1;
+
+        if (accept(&p, QTOK_ON)) {
+            char *lkeys[32], *rkeys[32];
+            int nk = 0;
+            for (;;) {
+                if (nk >= 32) { perr(&p, "too many ASOF JOIN ON keys"); return TSDB_ERR_PARSE; }
+                if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected column name in ASOF JOIN ON"); return TSDB_ERR_PARSE; }
+                lkeys[nk] = tok_strdup(&p, &p.tok);
+                advance(&p);
+                if (expect(&p, QTOK_EQ) != TSDB_OK) return TSDB_ERR_PARSE;
+                if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected column name after '=' in ASOF JOIN ON"); return TSDB_ERR_PARSE; }
+                rkeys[nk] = tok_strdup(&p, &p.tok);
+                advance(&p);
+                nk++;
+                if (!accept(&p, QTOK_COMMA)) break;
+            }
+            q->asof_n_keys = nk;
+            q->asof_on_keys_l = tsdb_arena_alloc(p.arena, sizeof(char *) * (size_t)nk);
+            q->asof_on_keys_r = tsdb_arena_alloc(p.arena, sizeof(char *) * (size_t)nk);
+            if (!q->asof_on_keys_l || !q->asof_on_keys_r) return TSDB_ERR_NOMEM;
+            for (int i = 0; i < nk; i++) {
+                q->asof_on_keys_l[i] = lkeys[i];
+                q->asof_on_keys_r[i] = rkeys[i];
+            }
+        }
+    }
+
     if (accept(&p, QTOK_WHERE)) {
         q->where = parse_expr(&p);
         if (!q->where) return TSDB_ERR_PARSE;

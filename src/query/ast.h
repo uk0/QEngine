@@ -3,6 +3,7 @@
  * QTL (Query Time-series Language) grammar:
  *
  *   query     := SELECT sel_list FROM ident
+ *                [ ASOF JOIN ident ON key=key [, key=key]* ]
  *                [ WHERE expr ]
  *                [ SAMPLE BY interval [ FILL (fill) ] ]
  *                [ LATEST ON ident [ PARTITION BY ident_list ] ]
@@ -94,6 +95,16 @@ typedef struct {
     int              nsel;
 
     char            *from;
+
+    /* ASOF JOIN: optional right-side table join.
+     * Semantics: for each left row, find the right row with the largest
+     * right.ts <= left.ts, among rows where all ON key pairs match.
+     * Right columns are NULL when no such row exists. */
+    int              has_asof_join;
+    char            *asof_table;       /* right table name */
+    char           **asof_on_keys_l;   /* left  key column names [asof_n_keys] */
+    char           **asof_on_keys_r;   /* right key column names [asof_n_keys] */
+    int              asof_n_keys;      /* number of ON key pairs (may be 0) */
 
     qast_expr_t     *where;
 

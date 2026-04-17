@@ -27,6 +27,8 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"device",    QTOK_DEVICE},
     {"retention", QTOK_RETENTION},{"profile",   QTOK_PROFILE},   {"region",    QTOK_REGION},
     {"replica",   QTOK_REPLICA},  {"factor",    QTOK_FACTOR},
+    /* ASOF JOIN */
+    {"asof",      QTOK_ASOF},    {"join",      QTOK_JOIN},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -65,6 +67,8 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_RETENTION: return "RETENTION"; case QTOK_PROFILE: return "PROFILE";
     case QTOK_REGION: return "REGION"; case QTOK_REPLICA: return "REPLICA";
     case QTOK_FACTOR: return "FACTOR";
+    case QTOK_ASOF: return "ASOF";
+    case QTOK_JOIN: return "JOIN";
     case QTOK_ERR: return "<error>";
     }
     return "?";

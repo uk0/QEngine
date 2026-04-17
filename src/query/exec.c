@@ -1564,15 +1564,15 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
 
             /* Advance global rscan pointer up to left_ts, updating per-key best match. */
             while (rscan < rm.nrows && rm.ts_buf[rscan] <= left_ts) {
-                /* Compute key hash for this right row. */
-                uint64_t rkhash = (nkeys > 0)
-                    ? asof_rkey_hash(&rm, rscan, rcol_idx, nkeys)
-                    : 0xababababababababULL;
-                /* Look up or create cursor entry for this right key. */
+                /* Grow before lookup, not after, to avoid stale pointer. */
                 if (cursor_n * 2 >= cursor_cap) {
                     int grc = asof_grow(&cursor_map, &cursor_cap);
                     if (grc != TSDB_OK) { rc = grc; goto free_lbufs; }
                 }
+                /* Compute key hash for this right row. */
+                uint64_t rkhash = (nkeys > 0)
+                    ? asof_rkey_hash(&rm, rscan, rcol_idx, nkeys)
+                    : 0xababababababababULL;
                 asof_cursor_t *rslot = asof_slot(cursor_map, cursor_cap, rkhash);
                 if (!rslot->key) { rslot->key = rkhash; rslot->best = SIZE_MAX; cursor_n++; }
                 rslot->best = rscan;  /* always take the latest row (higher ts is better) */
