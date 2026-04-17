@@ -8,6 +8,7 @@
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "retention.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,11 +29,13 @@ extern int tsdb_mkdir_p(const char *path);
  * The public tsdb_table_t * aliases this.
  */
 typedef struct tsdb_table_internal {
-    tsdb_schema_t   *schema;
-    tsdb_memtable_t *memtable;
-    tsdb_wal_t      *wal;
-    char             name[TSDB_MAX_NAME + 1];
-    tsdb_db_t       *db;   /* owning db (set at creation/open) */
+    tsdb_schema_t       *schema;
+    tsdb_memtable_t     *memtable;
+    tsdb_wal_t          *wal;
+    tsdb_group_commit_t *gc;          /* NULL when group-commit disabled */
+    char                 name[TSDB_MAX_NAME + 1];
+    tsdb_db_t           *db;          /* owning db (set at creation/open) */
+    pthread_mutex_t      compact_mtx; /* serialises flush vs. compactor swap */
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -57,6 +60,12 @@ struct tsdb_db {
 
     /* Catalog (Group/Device metadata). Opened in tsdb_open. */
     tsdb_catalog_t      *catalog;
+
+    /* Retention GC (NULL when not configured). Stopped in tsdb_close(). */
+    struct tsdb_retention *retention;
+
+    /* Group-commit window (0 = disabled). Applied to all table WALs. */
+    int64_t              group_commit_window_ns;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -114,6 +123,8 @@ void tsdb_close(tsdb_db_t *db) {
             tsdb_part_flush(t->schema, t->memtable);
         }
 
+        /* Stop group-commit bg thread before closing WAL. */
+        if (t->gc) { tsdb_group_commit_stop(t->gc); t->gc = NULL; }
         if (t->wal) { tsdb_wal_sync(t->wal); tsdb_wal_close(t->wal); }
         if (t->memtable) tsdb_memtable_free(t->memtable);
 
@@ -130,14 +141,34 @@ void tsdb_close(tsdb_db_t *db) {
             }
             tsdb_schema_free(t->schema);
         }
+        pthread_mutex_destroy(&t->compact_mtx);
         free(t);
     }
 
     if (db->catalog) tsdb_catalog_close(db->catalog);
 
+    /* Stop retention GC before destroying the mutex. */
+    struct tsdb_retention *ret = db->retention;
+    db->retention = NULL;
+
     pthread_mutex_unlock(&db->lock);
+
+    /* Retention stop may block briefly for the current sweep to finish. */
+    if (ret) tsdb_retention_stop(ret);
+
     pthread_mutex_destroy(&db->lock);
     free(db);
+}
+
+/* ---- Retention GC attachment -------------------------------------------- */
+
+void tsdb_db_attach_retention(tsdb_db_t *db, struct tsdb_retention *r) {
+    if (!db) return;
+    pthread_mutex_lock(&db->lock);
+    struct tsdb_retention *old = db->retention;
+    db->retention = r;
+    pthread_mutex_unlock(&db->lock);
+    if (old) tsdb_retention_stop(old);
 }
 
 /* ---- Table lookup (must hold db->lock) ---------------------------------- */
@@ -149,6 +180,11 @@ static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {
     }
     return NULL;
 }
+
+/* ---- Forward declarations ----------------------------------------------- */
+
+/* Defined at end of file; called from create_table_impl and open_table. */
+static void maybe_start_gc_for_table(tsdb_db_t *db, tsdb_table_internal_t *t);
 
 /* ---- tsdb_create_table -------------------------------------------------- */
 
@@ -196,9 +232,11 @@ static int create_table_impl(tsdb_db_t *db,
     strncpy(t->name, name, TSDB_MAX_NAME);
     t->schema = schema;
     t->db     = db;
+    pthread_mutex_init(&t->compact_mtx, NULL);
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
+        pthread_mutex_destroy(&t->compact_mtx);
         tsdb_schema_free(schema);
         free(t);
         pthread_mutex_unlock(&db->lock);
@@ -215,6 +253,9 @@ static int create_table_impl(tsdb_db_t *db,
     }
 
     db->tables[db->ntables++] = t;
+
+    /* Start per-table group-commit if db-level GC is active. */
+    maybe_start_gc_for_table(db, t);
 
     /* Snapshot hook pointers under lock, then call after unlock to avoid
      * deadlock if the hook re-enters any db operation. */
@@ -300,9 +341,11 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     strncpy(t->name, name, TSDB_MAX_NAME);
     t->schema = schema;
     t->db     = db;
+    pthread_mutex_init(&t->compact_mtx, NULL);
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
+        pthread_mutex_destroy(&t->compact_mtx);
         tsdb_schema_free(schema);
         free(t);
         pthread_mutex_unlock(&db->lock);
@@ -319,6 +362,10 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     }
 
     db->tables[db->ntables++] = t;
+
+    /* Start per-table group-commit if db-level GC is active. */
+    maybe_start_gc_for_table(db, t);
+
     *out = (tsdb_table_t *)t;
     pthread_mutex_unlock(&db->lock);
     return TSDB_OK;
@@ -365,9 +412,12 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
 
     if (idx >= 0) {
         tsdb_table_internal_t *t = db->tables[idx];
+        /* Stop group-commit bg thread before closing WAL. */
+        if (t->gc)       { tsdb_group_commit_stop(t->gc); t->gc = NULL; }
         if (t->wal)      tsdb_wal_close(t->wal);
         if (t->memtable) tsdb_memtable_free(t->memtable);
         if (t->schema)   tsdb_schema_free(t->schema);
+        pthread_mutex_destroy(&t->compact_mtx);
         free(t);
 
         /* Compact table array. */
@@ -428,9 +478,13 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     /* Raw-block replication is triggered from inside tsdb_part_flush_ex
      * after each block encode — pass db + table_name so the hook has context.
      * For replica-received writes (skip_replicate=1) pass NULL to suppress. */
+    /* Hold compact_mtx so the compactor cannot swap .col/.idx while
+     * we are appending new blocks to them. */
+    pthread_mutex_lock(&t->compact_mtx);
     int rc = tsdb_part_flush_ex(t->schema, t->memtable,
                                  skip_replicate ? NULL : t->db,
                                  t->name);
+    pthread_mutex_unlock(&t->compact_mtx);
     if (rc == TSDB_OK) {
         tsdb_memtable_clear(t->memtable);
         /* Truncate WAL after successful flush. */
@@ -503,8 +557,19 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
     int rc = flush_and_clear_ex(t, b->local_only);
     if (rc != TSDB_OK) return rc;
 
-    /* Sync WAL. */
-    if (t->wal) tsdb_wal_sync(t->wal);
+    /* Sync WAL — direct fsync or via group-commit batcher. */
+    if (t->wal) {
+        int sync_rc;
+        if (t->gc) {
+            /* Group-commit path: write a commit marker then wait for batch fsync.
+             * The 4-byte magic lets WAL replay skip these control records. */
+            uint32_t magic = 0x434D5457u;  /* "WTMC" */
+            sync_rc = tsdb_wal_append_sync(t->wal, t->gc, &magic, sizeof(magic));
+        } else {
+            sync_rc = tsdb_wal_sync(t->wal);
+        }
+        if (sync_rc != TSDB_OK) return sync_rc;
+    }
 
     free(b);
     return TSDB_OK;
@@ -582,3 +647,43 @@ tsdb_memtable_t *tsdb_tbl_memtable(tsdb_table_internal_t *t) { return t ? t->mem
 const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->schema) ? t->schema->dir : NULL; }
 const char      *tsdb_tbl_name(tsdb_table_internal_t *t)     { return t ? t->name : NULL; }
 tsdb_catalog_t  *tsdb_db_catalog(tsdb_db_t *db)              { return db ? db->catalog : NULL; }
+pthread_mutex_t *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t) { return t ? &t->compact_mtx : NULL; }
+/* ---- Group-commit DB-level API ------------------------------------------ */
+
+/*
+ * Internal: start or restart group-commit on a table.
+ * Caller must hold db->lock.
+ */
+static int table_start_gc(tsdb_table_internal_t *t, int64_t window_ns) {
+    if (t->gc) {
+        tsdb_group_commit_stop(t->gc);
+        t->gc = NULL;
+    }
+    if (window_ns <= 0 || !t->wal) return TSDB_OK;
+    return tsdb_group_commit_start(t->wal, window_ns, &t->gc);
+}
+
+int tsdb_db_set_group_commit(tsdb_db_t *db, int64_t batch_window_ns) {
+    if (!db) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&db->lock);
+    db->group_commit_window_ns = batch_window_ns;
+
+    int rc = TSDB_OK;
+    for (int i = 0; i < db->ntables && rc == TSDB_OK; i++) {
+        if (db->tables[i])
+            rc = table_start_gc(db->tables[i], batch_window_ns);
+    }
+    pthread_mutex_unlock(&db->lock);
+    return rc;
+}
+
+/*
+ * Internal: start group-commit on a newly registered table if db-level
+ * GC is active.  Caller must hold db->lock.
+ */
+static void maybe_start_gc_for_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
+    if (db->group_commit_window_ns > 0 && t->wal && !t->gc) {
+        tsdb_group_commit_start(t->wal, db->group_commit_window_ns, &t->gc);
+    }
+}

@@ -12,7 +12,9 @@
 #include "schema.h"
 #include "memtable.h"
 #include "part.h"
+#include "wal.h"
 #include "../catalog/group.h"
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +35,13 @@ tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_dir(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_name(tsdb_table_internal_t *t);
+
+/*
+ * Return the per-table compaction mutex.  Held by flush_and_clear_ex() and
+ * by the compactor's rename phase to prevent reading a half-swapped file pair.
+ * Defined in db.c because it accesses the opaque tsdb_table_internal_t layout.
+ */
+pthread_mutex_t        *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t);
 
 /* ---- Cluster hooks -------------------------------------------------------
  *
@@ -119,6 +128,46 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              const char *name,
                              const tsdb_col_t *cols, size_t ncols,
                              const char *ts_col);
+
+/*
+ * Enable group-commit for the database.  All subsequent tsdb_batch_commit()
+ * calls will route WAL fsync through the group-commit batcher instead of
+ * calling fsync() directly.
+ *
+ * batch_window_ns: maximum time (nanoseconds) a commit waits for coalescing.
+ *   0 disables group-commit (reverts to direct fsync on each commit).
+ *   Recommended: 500_000 (0.5 ms) to 2_000_000 (2 ms).
+ *
+ * Returns TSDB_OK or TSDB_ERR_*.
+ */
+int tsdb_db_set_group_commit(tsdb_db_t *db, int64_t batch_window_ns);
+
+/*
+ * Attach a retention GC handle to this db instance.
+ * The handle is stopped and freed automatically in tsdb_close().
+ * Called by tsdb_db_set_retention() in retention.c.
+ */
+struct tsdb_retention;
+void tsdb_db_attach_retention(tsdb_db_t *db, struct tsdb_retention *r);
+
+/*
+ * Return the per-table compaction mutex.  Held by flush_and_clear_ex() and
+ * by the compactor's rename phase to prevent reading a half-swapped file pair.
+ * Defined in db.c because it accesses the opaque tsdb_table_internal_t layout.
+ */
+pthread_mutex_t        *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t);
+
+/*
+ * Enable group-commit for the database.  All subsequent tsdb_batch_commit()
+ * calls route WAL fsync through a background batcher instead of direct fsync.
+ *
+ * batch_window_ns: max wait time (ns) before forcing an fsync.
+ *   0 disables (direct fsync per commit).
+ *   Recommended: 500_000 (0.5 ms) to 2_000_000 (2 ms).
+ *
+ * Returns TSDB_OK or TSDB_ERR_*.
+ */
+int tsdb_db_set_group_commit(tsdb_db_t *db, int64_t batch_window_ns);
 
 #ifdef __cplusplus
 }
