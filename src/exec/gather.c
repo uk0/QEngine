@@ -75,7 +75,8 @@ static size_t gather_i64_scalar(const uint64_t *bm, const int64_t *src,
 
 #if defined(__AVX512F__)
 
-__attribute__((target("avx512f,avx512vbmi2")))
+/* _mm512_mask_compressstoreu_pd requires AVX-512F only (not VBMI2). */
+__attribute__((target("avx512f")))
 static size_t gather_f64_avx512(const uint64_t *bm, const double *src,
                                   size_t n, double *dst) {
     size_t out = 0;
