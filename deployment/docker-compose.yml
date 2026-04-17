@@ -1,0 +1,126 @@
+# docker-compose.yml — 3-node tsdb cluster on a dedicated bridge network.
+#
+# Each node exposes:
+#   28090/tcp  client port  (wire protocol v1) — mapped to host 28091-28093
+#   28081/tcp  cluster RPC  (peer-to-peer only, not mapped to host)
+#   28080/udp  gossip       (peer-to-peer only, not mapped to host)
+#
+# Usage:
+#   cd deployment
+#   docker compose up -d
+#   docker compose logs -f node1
+#   docker compose exec node1 tsdb-cli --host node1 --port 28090
+#   docker compose down          # keep volumes
+#   docker compose down -v       # nuke volumes
+# --------------------------------------------------------------------------
+
+services:
+
+  # ---------------------------------------------------------------------
+  # node1 — the bootstrap node, has no seeds
+  # ---------------------------------------------------------------------
+  node1:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: tsdb:0.5.0
+    hostname: node1
+    container_name: tsdb-node1
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      # node1 has no seeds — it IS the seed
+    ports:
+      - "28091:28090"       # client → node1
+    volumes:
+      - node1-data:/var/lib/tsdb
+    networks:
+      tsdb-net:
+        aliases: [node1]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 28090 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # node2 — seeds from node1
+  # ---------------------------------------------------------------------
+  node2:
+    image: tsdb:0.5.0
+    hostname: node2
+    container_name: tsdb-node2
+    depends_on:
+      node1:
+        condition: service_healthy
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    node1:28081
+    ports:
+      - "28092:28090"       # client → node2
+    volumes:
+      - node2-data:/var/lib/tsdb
+    networks:
+      tsdb-net:
+        aliases: [node2]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 28090 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # node3 — seeds from node1 (can also seed from node2)
+  # ---------------------------------------------------------------------
+  node3:
+    image: tsdb:0.5.0
+    hostname: node3
+    container_name: tsdb-node3
+    depends_on:
+      node1:
+        condition: service_healthy
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    node1:28081,node2:28081
+    ports:
+      - "28093:28090"       # client → node3
+    volumes:
+      - node3-data:/var/lib/tsdb
+    networks:
+      tsdb-net:
+        aliases: [node3]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 28090 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+# --------------------------------------------------------------------------
+# Networks — isolated bridge so gossip/RPC traffic stays internal.
+# --------------------------------------------------------------------------
+networks:
+  tsdb-net:
+    driver: bridge
+    name: tsdb-net
+
+# --------------------------------------------------------------------------
+# Volumes — named so they survive `docker compose down` (without -v).
+# --------------------------------------------------------------------------
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -1,0 +1,159 @@
+# docker-compose.federation.yml — two 3-node clusters + federation CLI
+#
+# Layout:
+#   cluster-east: east-1, east-2, east-3   (28181-28183 on host)
+#   cluster-west: west-1, west-2, west-3   (28281-28283 on host)
+#   federator:    one-off CLI container with the federation library linked;
+#                 run interactively to query across clusters.
+#
+# Usage:
+#   cd deployment
+#   docker compose -f docker-compose.federation.yml up -d
+#
+#   # write to east cluster
+#   docker compose -f docker-compose.federation.yml exec east-1 \
+#     tsdb-cli --host east-1 --port 28090
+#
+#   # fan-out query (federator has both cluster coordinators in its config)
+#   docker compose -f docker-compose.federation.yml run --rm federator \
+#     sh -c 'tsdb-fed "east=east-1:28090,west=west-1:28090|*->*" \
+#                    "SELECT count(*) FROM cpu"'
+#
+# Tear down:
+#   docker compose -f docker-compose.federation.yml down -v
+# --------------------------------------------------------------------------
+
+x-cluster-node-common: &cluster-node-common
+  image: tsdb:0.5.0
+  environment:
+    TSDB_ROLE:     cluster-node
+    TSDB_DATA_DIR: /var/lib/tsdb
+    TSDB_BIND:     0.0.0.0:28090
+    TSDB_RPC_BIND: 0.0.0.0:28081
+  healthcheck:
+    test: ["CMD", "sh", "-c", "nc -z localhost 28090 || exit 1"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+  restart: unless-stopped
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Cluster east
+  # ═══════════════════════════════════════════════════════════════════════
+  east-1:
+    <<: *cluster-node-common
+    build: { context: .., dockerfile: deployment/Dockerfile }
+    hostname: east-1
+    container_name: tsdb-east-1
+    ports: ["28181:28090"]
+    volumes: [east-1-data:/var/lib/tsdb]
+    networks: [east-net, fed-net]
+
+  east-2:
+    <<: *cluster-node-common
+    hostname: east-2
+    container_name: tsdb-east-2
+    depends_on: { east-1: { condition: service_healthy } }
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    east-1:28081
+    ports: ["28182:28090"]
+    volumes: [east-2-data:/var/lib/tsdb]
+    networks: [east-net]
+
+  east-3:
+    <<: *cluster-node-common
+    hostname: east-3
+    container_name: tsdb-east-3
+    depends_on: { east-1: { condition: service_healthy } }
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    east-1:28081,east-2:28081
+    ports: ["28183:28090"]
+    volumes: [east-3-data:/var/lib/tsdb]
+    networks: [east-net]
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Cluster west
+  # ═══════════════════════════════════════════════════════════════════════
+  west-1:
+    <<: *cluster-node-common
+    hostname: west-1
+    container_name: tsdb-west-1
+    ports: ["28281:28090"]
+    volumes: [west-1-data:/var/lib/tsdb]
+    networks: [west-net, fed-net]
+
+  west-2:
+    <<: *cluster-node-common
+    hostname: west-2
+    container_name: tsdb-west-2
+    depends_on: { west-1: { condition: service_healthy } }
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    west-1:28081
+    ports: ["28282:28090"]
+    volumes: [west-2-data:/var/lib/tsdb]
+    networks: [west-net]
+
+  west-3:
+    <<: *cluster-node-common
+    hostname: west-3
+    container_name: tsdb-west-3
+    depends_on: { west-1: { condition: service_healthy } }
+    environment:
+      TSDB_ROLE:     cluster-node
+      TSDB_DATA_DIR: /var/lib/tsdb
+      TSDB_BIND:     0.0.0.0:28090
+      TSDB_RPC_BIND: 0.0.0.0:28081
+      TSDB_SEEDS:    west-1:28081,west-2:28081
+    ports: ["28283:28090"]
+    volumes: [west-3-data:/var/lib/tsdb]
+    networks: [west-net]
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Federator — CLI + federation config pre-baked
+  # ═══════════════════════════════════════════════════════════════════════
+  federator:
+    image: tsdb:0.5.0
+    container_name: tsdb-federator
+    entrypoint: ["tail","-f","/dev/null"]    # idle; interact via `docker exec`
+    environment:
+      TSDB_FEDERATION_CONFIG: |
+        east=east-1:28090,west=west-1:28090|*->*
+    depends_on:
+      east-1: { condition: service_healthy }
+      west-1: { condition: service_healthy }
+    networks: [fed-net]
+
+networks:
+  east-net:
+    name: tsdb-east
+    driver: bridge
+  west-net:
+    name: tsdb-west
+    driver: bridge
+  # fed-net connects the federator to one seed in each cluster.
+  fed-net:
+    name: tsdb-fed
+    driver: bridge
+
+volumes:
+  east-1-data:
+  east-2-data:
+  east-3-data:
+  west-1-data:
+  west-2-data:
+  west-3-data:
