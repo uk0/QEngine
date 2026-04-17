@@ -30,7 +30,9 @@ typedef enum {
     TSDB_CODEC_GORILLA = 2, /* XOR float64 */
     TSDB_CODEC_FOR     = 3, /* frame of reference integer */
     TSDB_CODEC_DICT    = 4, /* dictionary-encoded uint32 payload */
-    TSDB_CODEC_RAW     = 5  /* raw copy, used for debugging/fallback */
+    TSDB_CODEC_RAW     = 5, /* raw copy, used for debugging/fallback */
+    TSDB_CODEC_CHIMP   = 6, /* Chimp XOR float64 (VLDB 2022) */
+    TSDB_CODEC_LZLITE  = 7  /* LZ77-style block wrapper (optional outer layer) */
 } tsdb_codec_t;
 
 /* Size in bytes of a physical value for a given type (fixed-width columns). */

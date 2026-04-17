@@ -17,7 +17,7 @@ SRC_DIRS  := src/core src/compress src/storage src/exec src/query
 SRCS      := $(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 BENCH_SRCS := $(wildcard bench/*.c)
