@@ -26,12 +26,16 @@ COMMON    := $(STD) $(OPT) $(WARN) $(ARCH) $(INC)
 CFLAGS    ?= $(COMMON)
 LDFLAGS   ?= $(LIBS)
 
-SRC_DIRS  := src/core src/compress src/storage src/exec src/query
-SRCS      := $(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c))
+SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster
+SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
+
+# Cluster integration test: built by default but run separately.
+CLUSTER_TEST_SRCS := tests/test_cluster.c
+CLUSTER_TEST_BINS := $(patsubst tests/%.c,build/test/%,$(CLUSTER_TEST_SRCS))
 
 BENCH_SRCS := $(wildcard bench/*.c)
 BENCH_BINS := $(patsubst bench/%.c,build/bench/%,$(BENCH_SRCS))
@@ -39,10 +43,10 @@ BENCH_BINS := $(patsubst bench/%.c,build/bench/%,$(BENCH_SRCS))
 CLI_SRC   := cli/tsdb_cli.c
 CLI_BIN   := build/tsdb
 
-.PHONY: all clean test bench cli debug
+.PHONY: all clean test test-cluster bench cli debug
 .DEFAULT_GOAL := all
 
-all: lib cli test
+all: lib cli test $(CLUSTER_TEST_BINS)
 
 lib: build/libtsdb.a
 
@@ -61,6 +65,11 @@ debug: all
 
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do \
+	  echo "--- $$t ---"; $$t || exit 1; \
+	done
+
+test-cluster: $(CLUSTER_TEST_BINS)
+	@for t in $(CLUSTER_TEST_BINS); do \
 	  echo "--- $$t ---"; $$t || exit 1; \
 	done
 

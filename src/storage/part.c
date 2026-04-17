@@ -206,13 +206,14 @@ static int col_writer_write_block(col_writer_t *w,
     if (!comp_buf) return TSDB_ERR_NOMEM;
 
     tsdb_codec_t codec_used = TSDB_CODEC_NONE;
-    int comp_bytes = tsdb_codec_encode(type, raw_vals, count,
-                                       comp_buf, MAX_COMPRESSED_BLOCK,
-                                       &codec_used);
+    uint16_t     blk_flags  = 0;
+    int comp_bytes = tsdb_codec_encode_adaptive(type, raw_vals, count,
+                                                comp_buf, MAX_COMPRESSED_BLOCK,
+                                                &codec_used, &blk_flags);
     if (comp_bytes < 0) { free(comp_buf); return TSDB_ERR_INTERNAL; }
 
     uint8_t hdr[TSDB_BLOCK_HEADER_SIZE];
-    write_block_header(hdr, (uint8_t)codec_used, 0,
+    write_block_header(hdr, (uint8_t)codec_used, blk_flags,
                        (uint32_t)count, ts_min, ts_max,
                        (uint32_t)comp_bytes);
 
@@ -521,6 +522,7 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                                       &codec, &flags, &count,
                                       &tmin, &tmax, &dsz) == TSDB_OK) {
                     p->col_metas[ci][b].codec = codec;
+                    p->col_metas[ci][b].flags = flags;
                 }
             }
         }
@@ -576,7 +578,7 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
     int64_t  ts_min = 0, ts_max = 0;
     int rc = read_block_header(hdr_ptr, &codec, &flags, &count,
                                &ts_min, &ts_max, &data_size);
-    (void)flags; (void)ts_min; (void)ts_max;
+    (void)ts_min; (void)ts_max;
     if (rc != TSDB_OK) return rc;
 
     if (off + TSDB_BLOCK_HEADER_SIZE + data_size > map_sz) return TSDB_ERR_CORRUPT;
@@ -584,7 +586,7 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
     const uint8_t *data_ptr = hdr_ptr + TSDB_BLOCK_HEADER_SIZE;
     tsdb_type_t type = p->schema->cols[col_idx].type;
 
-    return tsdb_codec_decode((tsdb_codec_t)codec, type,
-                             data_ptr, data_size,
-                             out_buf, count);
+    return tsdb_codec_decode_adaptive((tsdb_codec_t)codec, type, flags,
+                                      data_ptr, data_size,
+                                      out_buf, count);
 }

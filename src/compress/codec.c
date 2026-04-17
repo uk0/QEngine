@@ -3,14 +3,19 @@
 #include "dod.h"
 #include "gorilla.h"
 #include "chimp.h"
+#include "chimp128.h"
 #include "dict.h"
 #include "pfor.h"
+#include "lzlite.h"
 #include "../core/types.h"
 #include "../../include/tsdb.h"
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+
+/* Minimum byte saving required to accept lzlite outer-wrapper. */
+#define OUTER_LZ_MIN_GAIN 16
 
 /*
  * Routing:
@@ -41,24 +46,30 @@ int tsdb_codec_encode(tsdb_type_t type,
         return (int)out_bytes;
     }
     case TSDB_TYPE_INT64: {
-        /* INT64: try DoD first (into out), then PFOR-Delta (into tmp); pick smaller. */
+        /*
+         * INT64: try DoD first (into out), then PFOR-Delta (into tmp); pick smaller.
+         * DoD can fail with TSDB_ERR_OVERFLOW on data with extreme delta-of-deltas;
+         * treat that as non-fatal and use PFOR only.
+         */
         rc = tsdb_dod_encode((const int64_t *)in, in_count, out, out_cap, &out_bytes);
-        if (rc) return rc;
-        size_t dod_bytes = out_bytes;
+        size_t dod_bytes = (rc == TSDB_OK) ? out_bytes : (size_t)-1;
 
         /* Try PFOR into a temp buffer. */
         size_t tmp_cap = out_cap + 64;
         uint8_t *tmp = malloc(tmp_cap);
         if (!tmp) {
-            /* malloc failed; use DoD result already in out. */
-            *out_codec = TSDB_CODEC_DOD;
-            return (int)dod_bytes;
+            if (dod_bytes != (size_t)-1) {
+                *out_codec = TSDB_CODEC_DOD;
+                return (int)dod_bytes;
+            }
+            return TSDB_ERR_NOMEM;
         }
         size_t pfor_bytes = 0;
         int pfor_rc = tsdb_pfor_encode_i64((const int64_t *)in, in_count,
                                             tmp, tmp_cap, &pfor_bytes);
-        if (pfor_rc == TSDB_OK && pfor_bytes < dod_bytes) {
-            /* PFOR is smaller: copy into out. */
+        if (pfor_rc == TSDB_OK &&
+            (dod_bytes == (size_t)-1 || pfor_bytes < dod_bytes)) {
+            /* PFOR is smaller (or DoD failed): use PFOR. */
             if (pfor_bytes <= out_cap) {
                 memcpy(out, tmp, pfor_bytes);
                 free(tmp);
@@ -67,55 +78,71 @@ int tsdb_codec_encode(tsdb_type_t type,
             }
         }
         free(tmp);
+        if (dod_bytes == (size_t)-1) return rc; /* both failed */
         *out_codec = TSDB_CODEC_DOD;
         return (int)dod_bytes;
     }
     case TSDB_TYPE_FLOAT64: {
         /*
-         * Try both Gorilla and Chimp; pick the smaller result.
+         * Try Gorilla, Chimp, and Chimp128; pick the smallest result.
          * Gorilla wins on constant/monotone integer doubles;
-         * Chimp wins on irregular real-valued time series.
-         * We allocate a temporary buffer for the losing candidate.
+         * Chimp/Chimp128 win on irregular real-valued time series.
+         *
+         * Worst-case per value for Chimp128: 3+7+3+6+64 = 83 bits < 11 bytes.
+         * We allocate temp buffers of size max(out_cap+64, n*11+64) for candidates.
          */
-        size_t chimp_bytes = 0, gorilla_bytes = 0;
+        size_t tmp_cap = in_count * 11 + 64;
+        if (tmp_cap < out_cap + 64) tmp_cap = out_cap + 64;
 
-        /* First: try Chimp directly into out. */
-        rc = tsdb_chimp_encode((const double *)in, in_count, out, out_cap, &chimp_bytes);
-        if (rc) return rc;
-
-        /* Second: try Gorilla into a heap buffer. */
-        size_t tmp_cap = out_cap + 16;
-        uint8_t *tmp = malloc(tmp_cap);
-        if (!tmp) {
-            /* malloc failed; fall back to Chimp-only result already in out. */
+        uint8_t *tmp1 = malloc(tmp_cap); /* Gorilla */
+        uint8_t *tmp2 = malloc(tmp_cap); /* Chimp */
+        uint8_t *tmp3 = malloc(tmp_cap); /* Chimp128 */
+        if (!tmp1 || !tmp2 || !tmp3) {
+            free(tmp1); free(tmp2); free(tmp3);
+            /* malloc failed; fall back to Chimp directly into out. */
+            size_t chimp_bytes = 0;
+            rc = tsdb_chimp_encode((const double *)in, in_count, out, out_cap, &chimp_bytes);
+            if (rc) return rc;
             *out_codec = TSDB_CODEC_CHIMP;
             return (int)chimp_bytes;
         }
 
-        rc = tsdb_gorilla_encode((const double *)in, in_count, tmp, tmp_cap, &gorilla_bytes);
-        if (rc != TSDB_OK) {
-            free(tmp);
-            /* Gorilla failed; use Chimp result already in out. */
-            *out_codec = TSDB_CODEC_CHIMP;
-            return (int)chimp_bytes;
+        size_t gorilla_bytes = 0, chimp_bytes = 0, chimp128_bytes = 0;
+        int gorilla_rc = tsdb_gorilla_encode((const double *)in, in_count,
+                                              tmp1, tmp_cap, &gorilla_bytes);
+        int chimp_rc   = tsdb_chimp_encode((const double *)in, in_count,
+                                            tmp2, tmp_cap, &chimp_bytes);
+        int c128_rc    = tsdb_chimp128_encode((const double *)in, in_count,
+                                               tmp3, tmp_cap, &chimp128_bytes);
+
+        /* Select winner: smallest successful result. */
+        size_t best_bytes = (size_t)-1;
+        tsdb_codec_t best_codec = TSDB_CODEC_CHIMP;
+        uint8_t *best_tmp = NULL;
+
+        if (chimp_rc == TSDB_OK) {
+            best_bytes = chimp_bytes;  best_codec = TSDB_CODEC_CHIMP;   best_tmp = tmp2;
+        }
+        if (gorilla_rc == TSDB_OK && gorilla_bytes < best_bytes) {
+            best_bytes = gorilla_bytes; best_codec = TSDB_CODEC_GORILLA; best_tmp = tmp1;
+        }
+        if (c128_rc == TSDB_OK && chimp128_bytes < best_bytes) {
+            best_bytes = chimp128_bytes; best_codec = TSDB_CODEC_CHIMP128; best_tmp = tmp3;
         }
 
-        if (gorilla_bytes < chimp_bytes) {
-            /* Gorilla is smaller: copy its output over out. */
-            if (gorilla_bytes > out_cap) {
-                free(tmp);
-                return TSDB_ERR_OVERFLOW;
-            }
-            memcpy(out, tmp, gorilla_bytes);
-            free(tmp);
-            *out_codec = TSDB_CODEC_GORILLA;
-            return (int)gorilla_bytes;
+        if (best_tmp == NULL) {
+            free(tmp1); free(tmp2); free(tmp3);
+            return TSDB_ERR_INVAL;
+        }
+        if (best_bytes > out_cap) {
+            free(tmp1); free(tmp2); free(tmp3);
+            return TSDB_ERR_OVERFLOW;
         }
 
-        /* Chimp is smaller (or equal): result already in out. */
-        free(tmp);
-        *out_codec = TSDB_CODEC_CHIMP;
-        return (int)chimp_bytes;
+        memcpy(out, best_tmp, best_bytes);
+        free(tmp1); free(tmp2); free(tmp3);
+        *out_codec = best_codec;
+        return (int)best_bytes;
     }
     case TSDB_TYPE_SYMBOL: {
         /* SYMBOL: try DICT first (into out), then PFOR (into tmp); pick smaller. */
@@ -165,6 +192,8 @@ int tsdb_codec_decode(tsdb_codec_t codec,
         return tsdb_gorilla_decode(in, in_bytes, (double *)out, out_count);
     case TSDB_CODEC_CHIMP:
         return tsdb_chimp_decode(in, in_bytes, (double *)out, out_count);
+    case TSDB_CODEC_CHIMP128:
+        return tsdb_chimp128_decode(in, in_bytes, (double *)out, out_count);
     case TSDB_CODEC_DICT:
         return tsdb_dict_decode(in, in_bytes, (uint32_t *)out, out_count);
     case TSDB_CODEC_PFOR:
@@ -187,4 +216,99 @@ int tsdb_codec_decode(tsdb_codec_t codec,
     default:
         return TSDB_ERR_UNSUPPORTED;
     }
+}
+
+/* ---- Adaptive encode ---------------------------------------------------- */
+
+int tsdb_codec_encode_adaptive(tsdb_type_t type,
+                               const void *in, size_t in_count,
+                               uint8_t *out, size_t out_cap,
+                               tsdb_codec_t *out_codec,
+                               uint16_t *out_flags)
+{
+    if (!out_codec || !out_flags) return TSDB_ERR_INVAL;
+
+    /* Step 1: domain-codec selection (existing logic). */
+    tsdb_codec_t codec = TSDB_CODEC_NONE;
+    int domain_bytes = tsdb_codec_encode(type, in, in_count, out, out_cap, &codec);
+    if (domain_bytes < 0) return domain_bytes;
+
+    *out_codec  = codec;
+    *out_flags  = 0;
+
+    /* Step 2: try lzlite over the domain-codec output. */
+    size_t lz_cap = tsdb_lzlite_max_output((size_t)domain_bytes);
+    /* Wire format: [u32 LE orig_size][lz bytes] — need 4 extra bytes for header. */
+    size_t wrapped_cap = lz_cap + 4;
+    uint8_t *lz_buf = malloc(wrapped_cap);
+    if (!lz_buf) {
+        /* malloc failed; use plain domain-codec result. */
+        return domain_bytes;
+    }
+
+    size_t lz_bytes = 0;
+    int lz_rc = tsdb_lzlite_encode(out, (size_t)domain_bytes,
+                                   lz_buf + 4, lz_cap, &lz_bytes);
+    if (lz_rc >= 0) {
+        size_t wrapped_bytes = 4 + lz_bytes;
+        int gain = (int)domain_bytes - (int)wrapped_bytes;
+        if (gain >= OUTER_LZ_MIN_GAIN && wrapped_bytes <= out_cap) {
+            /* Write the 4-byte orig_size header then lz bytes into out. */
+            uint32_t orig_u32 = (uint32_t)domain_bytes;
+            out[0] = (uint8_t)(orig_u32 & 0xFF);
+            out[1] = (uint8_t)((orig_u32 >> 8) & 0xFF);
+            out[2] = (uint8_t)((orig_u32 >> 16) & 0xFF);
+            out[3] = (uint8_t)((orig_u32 >> 24) & 0xFF);
+            memcpy(out + 4, lz_buf + 4, lz_bytes);
+            free(lz_buf);
+            *out_flags = TSDB_BF_OUTER_LZ;
+            return (int)wrapped_bytes;
+        }
+    }
+
+    free(lz_buf);
+    /* No lz gain: return plain domain-codec result already in out. */
+    return domain_bytes;
+}
+
+/* ---- Adaptive decode ---------------------------------------------------- */
+
+int tsdb_codec_decode_adaptive(tsdb_codec_t codec,
+                               tsdb_type_t type,
+                               uint16_t flags,
+                               const uint8_t *in, size_t in_bytes,
+                               void *out, size_t out_count)
+{
+    if (!(flags & TSDB_BF_OUTER_LZ)) {
+        /* Legacy path: no outer LZ wrapper. */
+        return tsdb_codec_decode(codec, type, in, in_bytes, out, out_count);
+    }
+
+    /* Outer-LZ path: decode 4-byte orig_size, lzlite-decode into temp, then domain-decode. */
+    if (in_bytes < 4) return TSDB_ERR_CORRUPT;
+
+    uint32_t orig_size = (uint32_t)in[0]
+                       | ((uint32_t)in[1] <<  8)
+                       | ((uint32_t)in[2] << 16)
+                       | ((uint32_t)in[3] << 24);
+    if (orig_size == 0 || orig_size > 64u * 1024u * 1024u) return TSDB_ERR_CORRUPT;
+
+    uint8_t *tmp = malloc(orig_size);
+    if (!tmp) return TSDB_ERR_NOMEM;
+
+    size_t decoded_bytes = 0;
+    int lz_rc = tsdb_lzlite_decode(in + 4, in_bytes - 4,
+                                   tmp, orig_size, &decoded_bytes);
+    if (lz_rc != TSDB_OK) {
+        free(tmp);
+        return TSDB_ERR_CORRUPT;
+    }
+    if (decoded_bytes != orig_size) {
+        free(tmp);
+        return TSDB_ERR_CORRUPT;
+    }
+
+    int rc = tsdb_codec_decode(codec, type, tmp, decoded_bytes, out, out_count);
+    free(tmp);
+    return rc;
 }

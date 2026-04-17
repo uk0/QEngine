@@ -33,6 +33,7 @@ typedef enum {
     TSDB_CODEC_RAW     = 5, /* raw copy, used for debugging/fallback */
     TSDB_CODEC_CHIMP   = 6, /* Chimp XOR float64 (VLDB 2022) */
     TSDB_CODEC_LZLITE  = 7, /* LZ77-style block wrapper (optional outer layer) */
+    TSDB_CODEC_CHIMP128 = 8, /* Chimp128: Chimp + 128-elem ring buffer (VLDB 2022) */
     TSDB_CODEC_BP128   = 9, /* SIMD-BP128 bit-packing (Lemire & Boytsov) */
     TSDB_CODEC_PFOR    = 10 /* PFOR-Delta (patched frame of reference) */
 } tsdb_codec_t;

@@ -66,6 +66,7 @@ typedef struct {
     int64_t  ts_min;
     int64_t  ts_max;
     uint8_t  codec;
+    uint16_t flags;    /* TSDB_BF_* bitmask from block header */
 } tsdb_block_meta_t;
 
 /*
