@@ -13,6 +13,23 @@
 #include <unistd.h>
 #include <time.h>
 
+/*
+ * Raw-block hook type local to part.c (mirrors db.h's tsdb_on_raw_block_fn,
+ * but avoids a circular include since db.h includes part.h).
+ * tsdb_db_get_raw_block_hook is defined in db.c.
+ */
+typedef int (*part_raw_block_fn_t)(void *ud, struct tsdb_db *db,
+                                    const char *table_name,
+                                    uint32_t part_day,
+                                    uint16_t col_idx,
+                                    const tsdb_block_meta_t *meta,
+                                    const uint8_t *block_bytes,
+                                    size_t block_bytes_len);
+/* out_fn is void** (function pointer via void*) to avoid typedef mismatch. */
+extern void tsdb_db_get_raw_block_hook(struct tsdb_db *db,
+                                        void **out_fn,
+                                        void **out_ud);
+
 /* Forward declaration of mkdir_p from schema.c. */
 extern int tsdb_mkdir_p(const char *path);
 
@@ -160,6 +177,14 @@ typedef struct {
     size_t   idx_n;
 
     char     idx_path[4096];
+
+    /* Raw-block hook (optional, set by tsdb_part_flush_ex). */
+    part_raw_block_fn_t  raw_block_fn;
+    void                *raw_block_ud;
+    struct tsdb_db      *raw_block_db;
+    const char          *raw_block_table;
+    uint32_t             raw_block_day;   /* YYYYMMDD of partition */
+    int                  col_idx;
 } col_writer_t;
 
 static int col_writer_open(col_writer_t *w, const char *part_dir,
@@ -224,6 +249,24 @@ static int col_writer_write_block(col_writer_t *w,
         fwrite(comp_buf, 1, (size_t)comp_bytes, w->col_fp) != (size_t)comp_bytes) {
         free(comp_buf); return TSDB_ERR_IO;
     }
+
+    /* Raw-block replication hook: fire BEFORE freeing comp_buf. */
+    if (w->raw_block_fn) {
+        tsdb_block_meta_t meta;
+        meta.offset = w->col_offset;  /* offset of this block's header */
+        meta.size   = (uint32_t)comp_bytes;
+        meta.count  = (uint32_t)count;
+        meta.ts_min = ts_min;
+        meta.ts_max = ts_max;
+        meta.codec  = (uint8_t)codec_used;
+        meta.flags  = blk_flags;
+        w->raw_block_fn(w->raw_block_ud, w->raw_block_db,
+                        w->raw_block_table, w->raw_block_day,
+                        (uint16_t)w->col_idx, &meta,
+                        comp_buf, (size_t)comp_bytes);
+        /* Errors are intentionally ignored here — local write must proceed. */
+    }
+
     free(comp_buf);
 
     /* Grow idx_entries buffer if needed. */
@@ -307,10 +350,25 @@ static int col_writer_close(col_writer_t *w) {
     return rc;
 }
 
-/* ---- tsdb_part_flush ---------------------------------------------------- */
+/* ---- tsdb_part_flush / tsdb_part_flush_ex --------------------------------- */
 
 int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m) {
+    return tsdb_part_flush_ex(s, m, NULL, NULL);
+}
+
+int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
+                       struct tsdb_db *db, const char *table_name)
+{
     if (!s || !m) return TSDB_ERR_INVAL;
+
+    /* Retrieve raw-block hook (may be NULL for standalone mode). */
+    part_raw_block_fn_t raw_fn = NULL;
+    void *raw_ud = NULL;
+    if (db) {
+        void *fn_ptr = NULL;
+        tsdb_db_get_raw_block_hook(db, &fn_ptr, &raw_ud);
+        __builtin_memcpy(&raw_fn, &fn_ptr, sizeof(raw_fn));
+    }
 
     size_t nrows = tsdb_memtable_rows(m);
     if (nrows == 0) return TSDB_OK;
@@ -361,6 +419,14 @@ int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m) {
         char day_str[9];
         ts_to_day_str(ts_buf[row_idx[0]], day_str);
 
+        /* Compute YYYYMMDD integer for raw-block hook. */
+        uint32_t part_day_int = 0;
+        {
+            unsigned y = 0, mo = 0, dy = 0;
+            sscanf(day_str, "%4u%2u%2u", &y, &mo, &dy);
+            part_day_int = y * 10000u + mo * 100u + dy;
+        }
+
         char part_dir[4096];
         snprintf(part_dir, sizeof(part_dir), "%s/%s", s->dir, day_str);
         if (tsdb_mkdir_p(part_dir) < 0) { free(row_idx); free(days); return TSDB_ERR_IO; }
@@ -375,6 +441,14 @@ int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m) {
             col_writer_t w;
             int rc = col_writer_open(&w, part_dir, s->cols[ci].name);
             if (rc != TSDB_OK) { free(row_idx); free(days); return rc; }
+
+            /* Wire up raw-block hook if available. */
+            w.raw_block_fn    = raw_fn;
+            w.raw_block_ud    = raw_ud;
+            w.raw_block_db    = db;
+            w.raw_block_table = table_name;
+            w.raw_block_day   = part_day_int;
+            w.col_idx         = ci;
 
             /* Write in chunks of TSDB_BLOCK_POINTS. */
             size_t base = 0;
@@ -589,4 +663,15 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
     return tsdb_codec_decode_adaptive((tsdb_codec_t)codec, type, flags,
                                       data_ptr, data_size,
                                       out_buf, count);
+}
+
+void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,
+                        const uint8_t **out_map, size_t *out_len)
+{
+    if (!p || !out_map || !out_len) return;
+    *out_map = NULL;
+    *out_len = 0;
+    if (col_idx < 0 || col_idx >= p->schema->ncols) return;
+    *out_map = p->col_maps[col_idx].map;
+    *out_len = p->col_maps[col_idx].map_size;
 }

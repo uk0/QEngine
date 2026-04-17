@@ -41,12 +41,20 @@
 #define SUB_TABLE_MAX  64
 #define SUBS_MAX       256
 
+/*
+ * Optional equality filter: match rows where col_name equals filter_val
+ * (string comparison for SYMBOL; decimal parse for INT64).
+ * If filter_col is empty, no filtering is applied.
+ */
 typedef struct tsdb_sub {
     uint64_t        sub_id;
     char            table[64];
     int             conn_fd;    /* -1 if removed */
     uint64_t        req_id;
     pthread_mutex_t lock;       /* protects conn_fd */
+    /* Optional row filter (equality on one column). */
+    char            filter_col[64];  /* column name, empty = no filter */
+    char            filter_val[256]; /* expected value as string */
 } tsdb_sub_t;
 
 typedef struct {

@@ -73,8 +73,13 @@ typedef struct {
  * Flush the memtable to disk.
  * Creates partition subdirectories as needed; groups rows by day.
  * Each group is chunked into blocks of at most TSDB_BLOCK_POINTS points.
+ *
+ * db / table_name are only used for the on_raw_block hook.
+ * Pass (NULL, NULL) for standalone (non-cluster) usage.
  */
 int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m);
+int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
+                       struct tsdb_db *db, const char *table_name);
 
 /* Opaque partition handle (for reading). */
 typedef struct tsdb_part tsdb_part_t;
@@ -98,6 +103,14 @@ int tsdb_part_col_blocks(tsdb_part_t *p, int col_idx,
  */
 int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
                          const tsdb_block_meta_t *meta, void *out_buf);
+
+/*
+ * Return a read-only pointer to the mmap'd .col file for a column.
+ * *out_map / *out_len are set to NULL/0 if the column file is not mapped.
+ * Caller must NOT free the returned pointer — it is owned by the partition.
+ */
+void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,
+                        const uint8_t **out_map, size_t *out_len);
 
 #ifdef __cplusplus
 }

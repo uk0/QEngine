@@ -10,6 +10,7 @@
 #include "memtable.h"
 #include "../cluster/cluster.h"
 #include "../cluster/node.h"
+#include "../cluster/rawblock.h"
 #include "../../include/tsdb_cluster.h"
 #include "../core/types.h"
 
@@ -153,6 +154,31 @@ static int cluster_on_create(void *ud, tsdb_db_t *db,
                                     target_ids, ntargets);
 }
 
+/* ---- Raw-block replication hook ------------------------------------------ */
+
+/*
+ * cluster_on_raw_block: called by tsdb_part_flush_ex after each block encode.
+ * Activated when TSDB_REPLICATION_MODE=raw.
+ * Forwards the compressed block bytes to all ALIVE peers via
+ * TSDB_RPC_RAW_BLOCK_PUSH, one block at a time, concurrently.
+ */
+static int cluster_on_raw_block(void *ud, tsdb_db_t *db,
+                                  const char *table_name,
+                                  uint32_t part_day,
+                                  uint16_t col_idx,
+                                  const tsdb_block_meta_t *meta,
+                                  const uint8_t *block_bytes,
+                                  size_t block_bytes_len)
+{
+    (void)db;
+    tsdb_cluster_t *c = (tsdb_cluster_t *)ud;
+    if (!c || !table_name || !meta) return TSDB_OK;
+
+    /* quorum_w=2: local write counts as 1, need 1 remote ACK. */
+    return tsdb_rawblock_replicate(c, table_name, part_day, col_idx,
+                                   meta, block_bytes, block_bytes_len, 2);
+}
+
 /* ---- Node ID generation -------------------------------------------------- */
 
 static tsdb_node_id_t generate_node_id(const char *addr) {
@@ -215,8 +241,26 @@ int tsdb_open_cluster(const char *data_dir,
     }
 
     /* Register hooks so tsdb_batch_commit and tsdb_create_table trigger
-     * replication without db.c needing to know about the cluster module. */
-    tsdb_db_set_hooks(db, cluster_on_replicate, cluster_on_create, cluster);
+     * replication without db.c needing to know about the cluster module.
+     *
+     * Replication mode selection:
+     *   TSDB_REPLICATION_MODE=raw  → raw-block path (encode-once, send bytes)
+     *   TSDB_REPLICATION_MODE=row  → row-level WRITE_BATCH (default)
+     */
+    {
+        const char *rep_mode = getenv("TSDB_REPLICATION_MODE");
+        int use_raw = rep_mode && (rep_mode[0] == 'r' && rep_mode[1] == 'a');
+
+        /* Always register on_create for schema sync. */
+        tsdb_db_set_hooks(db,
+                          use_raw ? NULL : cluster_on_replicate,
+                          cluster_on_create,
+                          cluster);
+
+        if (use_raw) {
+            tsdb_db_set_raw_block_hook(db, cluster_on_raw_block, cluster);
+        }
+    }
 
     cluster_set(db, cluster);
     *out = db;

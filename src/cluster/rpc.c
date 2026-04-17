@@ -5,6 +5,7 @@
  */
 
 #include "rpc.h"
+#include "rawblock.h"
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
@@ -424,6 +425,23 @@ static void *connection_handler(void *arg) {
                 } else {
                     send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
+        case TSDB_RPC_RAW_BLOCK_PUSH:
+            /* Replica receive: parse block, write verbatim to .col/.idx. */
+            if (db && msg.payload_len > 0) {
+                tsdb_rawblock_push_t rb;
+                int rc = tsdb_rawblock_parse(msg.payload, msg.payload_len, &rb);
+                if (rc == TSDB_OK) {
+                    rc = tsdb_rawblock_apply(db, &rb);
+                }
+                if (rc == TSDB_OK)
+                    send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                else
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             } else {
                 send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
