@@ -26,11 +26,11 @@ COMMON    := $(STD) $(OPT) $(WARN) $(ARCH) $(INC)
 CFLAGS    ?= $(COMMON)
 LDFLAGS   ?= $(LIBS)
 
-SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster src/federation
+SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster src/federation src/server src/catalog
 SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
@@ -47,13 +47,34 @@ BENCH_BINS := $(patsubst bench/%.c,build/bench/%,$(BENCH_SRCS))
 CLI_SRC         := cli/tsdb_cli.c
 CLI_BIN         := build/tsdb
 
+# TCP client CLI — standalone, links only against cli/tsdb_wire.c (no libtsdb)
+TCP_CLI_SRCS    := cli/tsdb_client.c cli/tsdb_wire.c
+TCP_CLI_BIN     := build/tsdb-cli
+
+# Detect readline; fallback to fgets if absent
+READLINE_FLAGS  := $(shell pkg-config --cflags readline 2>/dev/null)
+READLINE_LIBS   := $(shell pkg-config --libs   readline 2>/dev/null)
+ifneq ($(READLINE_LIBS),)
+  TCP_CLI_CFLAGS  := -DHAVE_READLINE $(READLINE_FLAGS)
+  TCP_CLI_LDFLAGS := $(READLINE_LIBS)
+else
+  TCP_CLI_CFLAGS  :=
+  TCP_CLI_LDFLAGS :=
+endif
+
+# Wire object (shared by tsdb-cli and test_client, no libtsdb needed)
+WIRE_OBJ        := cli/tsdb_wire.o
+
+SERVER_CLI_SRC  := cli/tsdb_server_main.c
+SERVER_CLI_BIN  := build/tsdb-server
+
 CLUSTER_NODE_SRC := src/cluster/tsdb_node_main.c
 CLUSTER_NODE_BIN := build/cluster/tsdb_node
 
-.PHONY: all clean test test-cluster test-federation bench cli cluster_node debug
+.PHONY: all clean test test-client test-cluster test-federation bench cli tcp_cli server_cli cluster_node debug
 .DEFAULT_GOAL := all
 
-all: lib cli test $(CLUSTER_TEST_BINS) $(FED_TEST_BINS)
+all: lib cli tcp_cli server_cli test $(CLUSTER_TEST_BINS) $(FED_TEST_BINS)
 
 lib: build/libtsdb.a
 
@@ -105,6 +126,35 @@ cli: $(CLI_BIN)
 $(CLI_BIN): $(CLI_SRC) $(OBJS)
 	@mkdir -p build
 	@$(CC) $(CFLAGS) -o $@ $(CLI_SRC) $(OBJS) $(LDFLAGS)
+	@echo "LD  $@"
+
+# TCP client REPL (tsdb-cli): standalone, no libtsdb dependency
+tcp_cli: $(TCP_CLI_BIN)
+
+$(WIRE_OBJ): cli/tsdb_wire.c cli/tsdb_wire.h
+	@$(CC) $(CFLAGS) -Icli -c -o $@ cli/tsdb_wire.c
+	@echo "CC  cli/tsdb_wire.c"
+
+$(TCP_CLI_BIN): $(TCP_CLI_SRCS) cli/tsdb_wire.h
+	@mkdir -p build
+	@$(CC) $(CFLAGS) $(TCP_CLI_CFLAGS) -Icli -o $@ $(TCP_CLI_SRCS) -lpthread -lm $(TCP_CLI_LDFLAGS)
+	@echo "LD  $@"
+
+# test_client: links against tsdb_wire.o only (no full libtsdb)
+build/test/test_client: tests/test_client.c $(WIRE_OBJ)
+	@mkdir -p build/test
+	@$(CC) $(CFLAGS) -Icli -o $@ tests/test_client.c $(WIRE_OBJ) -lpthread
+	@echo "LD  build/test/test_client"
+
+test-client: build/test/test_client
+	@echo "--- build/test/test_client ---"
+	@build/test/test_client
+
+server_cli: $(SERVER_CLI_BIN)
+
+$(SERVER_CLI_BIN): $(SERVER_CLI_SRC) $(OBJS)
+	@mkdir -p build
+	@$(CC) $(CFLAGS) -o $@ $(SERVER_CLI_SRC) $(OBJS) $(LDFLAGS)
 	@echo "LD  $@"
 
 cluster_node: $(CLUSTER_NODE_BIN)
