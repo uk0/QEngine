@@ -59,6 +59,31 @@ int tsdb_hashring_owner_str(const tsdb_hashring_t *ring,
                             int replica_count,
                             tsdb_node_id_t *out_nodes);
 
+/*
+ * Add a node to the ring with a custom virtual-node count (weight).
+ * vn_count must be in [1, TSDB_RING_VN_MAX].  Nodes added with tsdb_hashring_add()
+ * get the default weight TSDB_RING_VN.
+ * Idempotent: if the node is already present, this is a no-op (use set_weight
+ * to change the weight of an existing node).
+ */
+int tsdb_hashring_add_weighted(tsdb_hashring_t *ring,
+                               tsdb_node_id_t node_id, int vn_count);
+
+/*
+ * Update the virtual-node count (weight) for an existing node.
+ * If the node is not in the ring, it is added with the given weight.
+ * vn_count clamped to [1, TSDB_RING_VN_MAX].
+ * Returns 0 on success, -1 on capacity error.
+ */
+int tsdb_hashring_set_weight(tsdb_hashring_t *ring,
+                             tsdb_node_id_t node_id, int vn_count);
+
+/* Return the current virtual-node count for a node (0 if not in ring). */
+int tsdb_hashring_get_weight(const tsdb_hashring_t *ring, tsdb_node_id_t node_id);
+
+/* Maximum virtual nodes per node for weighted rings. */
+#define TSDB_RING_VN_MAX  512
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,11 +1,13 @@
 /* cluster.c — cluster node lifecycle and write routing. */
 
 #include "cluster.h"
+#include "autobalance.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <stddef.h>
 
 struct tsdb_cluster {
     tsdb_node_id_t       local_id;
@@ -13,6 +15,8 @@ struct tsdb_cluster {
     tsdb_gossip_t        *gossip;
     tsdb_rpc_server_t    *rpc_server;
     tsdb_replica_mgr_t   *replica_mgr;
+    tsdb_autobalance_t   *autobalance;
+    char                  data_dir[4096]; /* for autobalance storage scan */
 };
 
 /* ---- Helper: split seeds string ------------------------------------------ */
@@ -89,6 +93,13 @@ tsdb_cluster_t *tsdb_cluster_new(tsdb_db_t *db,
     /* Bootstrap: add seed nodes. */
     parse_seeds(c, c->gossip, seeds);
 
+    /* Auto-balance controller — data_dir defaults to empty (storage scan disabled). */
+    const char *data_dir = getenv("TSDB_DATA_DIR");
+    if (data_dir) snprintf(c->data_dir, sizeof(c->data_dir), "%s", data_dir);
+    c->autobalance = tsdb_autobalance_new(c->node_mgr, local_id,
+                                          c->data_dir[0] ? c->data_dir : NULL);
+    /* Non-fatal if autobalance fails (e.g. in unit tests). */
+
     printf("[cluster] node %llu started  rpc=%s  gossip=%s\n",
            (unsigned long long)local_id, rpc_addr, gossip_addr);
 
@@ -97,11 +108,16 @@ tsdb_cluster_t *tsdb_cluster_new(tsdb_db_t *db,
 
 void tsdb_cluster_free(tsdb_cluster_t *c) {
     if (!c) return;
+    tsdb_autobalance_free(c->autobalance);
     tsdb_replica_mgr_free(c->replica_mgr);
     tsdb_gossip_stop(c->gossip);
     tsdb_rpc_server_stop(c->rpc_server);
     tsdb_node_manager_free(c->node_mgr);
     free(c);
+}
+
+tsdb_autobalance_t *tsdb_cluster_autobalance(tsdb_cluster_t *c) {
+    return c ? c->autobalance : NULL;
 }
 
 tsdb_node_id_t tsdb_cluster_local_id(tsdb_cluster_t *c) {
@@ -171,6 +187,9 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
         }
     }
 
+    /* Track write load for the auto-balancer. */
+    tsdb_autobalance_record_write(c->autobalance, (uint64_t)nrows);
+
     if (nremote == 0) return TSDB_OK; /* single-node cluster */
 
     return tsdb_replica_write(c->replica_mgr,
@@ -217,7 +236,20 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
                             snap[i].addr, sname,
                             (unsigned long long)snap[i].version);
     }
-    written += snprintf(buf + written, cap - written, "]}");
+    written += snprintf(buf + written, cap - written, "]");
+
+    /* Append autobalance stats if available. */
+    if (c->autobalance && (size_t)written < cap - 2) {
+        char ab_buf[1024];
+        int ab_len = tsdb_autobalance_stats_str(c->autobalance, ab_buf, sizeof(ab_buf));
+        if (ab_len > 0) {
+            written += snprintf(buf + written, cap - written,
+                                ",\"autobalance\":%s", ab_buf);
+        }
+    }
+
+    if ((size_t)written < cap - 1)
+        written += snprintf(buf + written, cap - written, "}");
     return written;
 }
 

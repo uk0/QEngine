@@ -43,12 +43,13 @@ static int vnode_cmp(const void *a, const void *b) {
 /* ---- Ring struct --------------------------------------------------------- */
 
 struct tsdb_hashring {
-    /* sorted array of virtual nodes */
-    vnode_t     vnodes[TSDB_RING_MAX_NODES * TSDB_RING_VN];
+    /* sorted array of virtual nodes — sized for max weight */
+    vnode_t     vnodes[TSDB_RING_MAX_NODES * TSDB_RING_VN_MAX];
     int         nvnodes;
 
-    /* physical nodes we know about (for dedup) */
+    /* physical nodes we know about (for dedup + weight tracking) */
     tsdb_node_id_t nodes[TSDB_RING_MAX_NODES];
+    int            vn_counts[TSDB_RING_MAX_NODES]; /* per-node vn count */
     int            nnodes;
 
     int         sorted; /* whether vnodes[] is sorted */
@@ -65,33 +66,92 @@ void tsdb_hashring_free(tsdb_hashring_t *ring) {
     free(ring);
 }
 
-int tsdb_hashring_add(tsdb_hashring_t *ring, tsdb_node_id_t node_id) {
-    if (!ring) return -1;
-
-    /* Idempotent: check if already present. */
-    for (int i = 0; i < ring->nnodes; i++) {
-        if (ring->nodes[i] == node_id) return 0;
-    }
-
-    if (ring->nnodes >= TSDB_RING_MAX_NODES) return -1;
-
-    ring->nodes[ring->nnodes++] = node_id;
-
-    /* Place TSDB_RING_VN virtual nodes. */
-    for (int v = 0; v < TSDB_RING_VN; v++) {
+/* Internal: place vn_count virtual nodes for node_id starting at logical index base. */
+static void place_vnodes(tsdb_hashring_t *ring, tsdb_node_id_t node_id,
+                          int base, int vn_count)
+{
+    for (int v = base; v < base + vn_count; v++) {
+        if (ring->nvnodes >= TSDB_RING_MAX_NODES * TSDB_RING_VN_MAX) break;
         uint8_t buf[16];
         uint64_t nid = node_id;
         uint32_t vidx = (uint32_t)v;
         memcpy(buf,     &nid,  8);
         memcpy(buf + 8, &vidx, 4);
         uint64_t h = fnv1a_64(buf, 12);
-
         ring->vnodes[ring->nvnodes].hash    = h;
         ring->vnodes[ring->nvnodes].node_id = node_id;
         ring->nvnodes++;
     }
+}
 
+int tsdb_hashring_add(tsdb_hashring_t *ring, tsdb_node_id_t node_id) {
+    return tsdb_hashring_add_weighted(ring, node_id, TSDB_RING_VN);
+}
+
+int tsdb_hashring_add_weighted(tsdb_hashring_t *ring,
+                                tsdb_node_id_t node_id, int vn_count) {
+    if (!ring) return -1;
+    if (vn_count < 1) vn_count = 1;
+    if (vn_count > TSDB_RING_VN_MAX) vn_count = TSDB_RING_VN_MAX;
+
+    /* Idempotent: if already present, don't change weight (use set_weight). */
+    for (int i = 0; i < ring->nnodes; i++) {
+        if (ring->nodes[i] == node_id) return 0;
+    }
+
+    if (ring->nnodes >= TSDB_RING_MAX_NODES) return -1;
+
+    int idx = ring->nnodes;
+    ring->nodes[idx]     = node_id;
+    ring->vn_counts[idx] = vn_count;
+    ring->nnodes++;
+
+    place_vnodes(ring, node_id, 0, vn_count);
     ring->sorted = 0;
+    return 0;
+}
+
+int tsdb_hashring_set_weight(tsdb_hashring_t *ring,
+                              tsdb_node_id_t node_id, int vn_count)
+{
+    if (!ring) return -1;
+    if (vn_count < 1) vn_count = 1;
+    if (vn_count > TSDB_RING_VN_MAX) vn_count = TSDB_RING_VN_MAX;
+
+    /* Find existing entry. */
+    int idx = -1;
+    for (int i = 0; i < ring->nnodes; i++) {
+        if (ring->nodes[i] == node_id) { idx = i; break; }
+    }
+
+    if (idx < 0) {
+        /* Not present: add it. */
+        return tsdb_hashring_add_weighted(ring, node_id, vn_count);
+    }
+
+    int old_vn = ring->vn_counts[idx];
+    if (old_vn == vn_count) return 0; /* no change */
+
+    /* Remove all existing vnodes for this node. */
+    int w = 0;
+    for (int i = 0; i < ring->nvnodes; i++) {
+        if (ring->vnodes[i].node_id != node_id)
+            ring->vnodes[w++] = ring->vnodes[i];
+    }
+    ring->nvnodes = w;
+
+    /* Place new vnode count. */
+    ring->vn_counts[idx] = vn_count;
+    place_vnodes(ring, node_id, 0, vn_count);
+    ring->sorted = 0;
+    return 0;
+}
+
+int tsdb_hashring_get_weight(const tsdb_hashring_t *ring, tsdb_node_id_t node_id) {
+    if (!ring) return 0;
+    for (int i = 0; i < ring->nnodes; i++) {
+        if (ring->nodes[i] == node_id) return ring->vn_counts[i];
+    }
     return 0;
 }
 
@@ -102,7 +162,10 @@ void tsdb_hashring_remove(tsdb_hashring_t *ring, tsdb_node_id_t node_id) {
     int found = 0;
     for (int i = 0; i < ring->nnodes; i++) {
         if (ring->nodes[i] == node_id) {
-            ring->nodes[i] = ring->nodes[--ring->nnodes];
+            int last = ring->nnodes - 1;
+            ring->nodes[i]     = ring->nodes[last];
+            ring->vn_counts[i] = ring->vn_counts[last];
+            ring->nnodes--;
             found = 1;
             break;
         }

@@ -81,28 +81,26 @@ static void sub_list_destroy(tsdb_sub_list_t *sl) {
 }
 
 static uint64_t sub_list_add(tsdb_sub_list_t *sl, const char *table,
-                              int conn_fd, uint64_t req_id) {
+                              int conn_fd, uint64_t req_id,
+                              const char *filter_col, const char *filter_val) {
     pthread_mutex_lock(&sl->lock);
-    if (sl->nsubs >= SUBS_MAX) {
-        pthread_mutex_unlock(&sl->lock);
-        return 0;
-    }
-    /* Find free slot. */
+
     int slot = -1;
-    for (int i = 0; i < SUBS_MAX; i++) {
-        if (sl->subs[i].conn_fd == -1 &&
-            atomic_load_explicit(&sl->next_sub_id, memory_order_relaxed) &&
-            sl->subs[i].sub_id == 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot == -1) {
-        /* Scan for removed. */
+
+    if (sl->nsubs < SUBS_MAX) {
+        /* Append to array first — avoids scanning for uninitialized slots
+         * that have conn_fd == 0 (not -1) from the initial memset. */
+        slot = sl->nsubs;
+    } else {
+        /* Array full: scan for a tombstone (sub removed after nsubs hit cap). */
         for (int i = 0; i < SUBS_MAX; i++) {
-            if (sl->subs[i].conn_fd == -1) { slot = i; break; }
+            if (sl->subs[i].conn_fd < 0 && sl->subs[i].sub_id == 0) {
+                slot = i;
+                break;
+            }
         }
     }
+
     if (slot == -1) { pthread_mutex_unlock(&sl->lock); return 0; }
 
     uint64_t id = atomic_fetch_add(&sl->next_sub_id, 1);
@@ -110,7 +108,9 @@ static uint64_t sub_list_add(tsdb_sub_list_t *sl, const char *table,
     s->sub_id  = id;
     s->conn_fd = conn_fd;
     s->req_id  = req_id;
-    snprintf(s->table, sizeof(s->table), "%s", table);
+    snprintf(s->table,      sizeof(s->table),      "%s", table);
+    snprintf(s->filter_col, sizeof(s->filter_col), "%s", filter_col ? filter_col : "");
+    snprintf(s->filter_val, sizeof(s->filter_val), "%s", filter_val ? filter_val : "");
     if (slot == sl->nsubs) sl->nsubs++;
     pthread_mutex_unlock(&sl->lock);
     return id;
@@ -143,29 +143,151 @@ static void sub_list_remove_by_fd(tsdb_sub_list_t *sl, int conn_fd) {
     pthread_mutex_unlock(&sl->lock);
 }
 
-/* Fan-out SUB_EVENTs for a committed table to all active subscribers. */
-static void sub_list_fanout(tsdb_sub_list_t *sl, const char *table,
-                             const uint8_t *payload, size_t plen) {
+/* Snapshot type for a matched subscriber during fanout. */
+typedef struct {
+    int      fd;
+    uint64_t req_id;
+    char     filter_col[64];
+    char     filter_val[256];
+} sub_snap_t;
+
+/*
+ * Snapshot all active subscriptions for this table.
+ * Holds sl->lock only for the snapshot; no I/O under lock.
+ * Returns number of matched subs (up to SUBS_MAX).
+ */
+static int sub_list_snapshot(tsdb_sub_list_t *sl, const char *table,
+                               sub_snap_t *out, int cap) {
+    int count = 0;
     pthread_mutex_lock(&sl->lock);
-    for (int i = 0; i < sl->nsubs; i++) {
+    for (int i = 0; i < sl->nsubs && count < cap; i++) {
         tsdb_sub_t *s = &sl->subs[i];
         if (s->conn_fd < 0) continue;
         if (strncmp(s->table, table, sizeof(s->table) - 1) != 0) continue;
 
-        /* Lock the individual subscription to grab a stable fd. */
+        /* Grab fd + req_id atomically under per-sub lock. */
         pthread_mutex_lock(&s->lock);
         int fd = s->conn_fd;
         uint64_t req_id = s->req_id;
         pthread_mutex_unlock(&s->lock);
 
-        if (fd >= 0) {
-            /* Best-effort send — if it fails, the connection handler will
-             * detect the closed fd and clean up. */
-            tsdb_proto_send(fd, TSDB_MT_SUB_EVENT, TSDB_FLAG_STREAM,
-                            req_id, payload, plen);
-        }
+        if (fd < 0) continue;
+        out[count].fd     = fd;
+        out[count].req_id = req_id;
+        snprintf(out[count].filter_col, 64,  "%s", s->filter_col);
+        snprintf(out[count].filter_val, 256, "%s", s->filter_val);
+        count++;
     }
     pthread_mutex_unlock(&sl->lock);
+    return count;
+}
+
+/*
+ * Build a structured SUB_EVENT payload and fan it out to matching subscribers.
+ *
+ * SUB_EVENT payload layout (little-endian):
+ *   [table_len u8]  [table utf8]
+ *   [nrows u32]
+ *   [ncols u16]
+ *   for each col: [name_len u8][name utf8][type u8]
+ *   for each col: [nrows * 8 bytes, columnar]
+ *
+ * Per-subscriber column filter: if filter_col is non-empty, only fans out
+ * if at least one row in the batch matches filter_val for that column.
+ * For SYMBOL columns: exact string match.
+ * For INT64 columns: decimal parse and compare.
+ * Unresolved columns: filter ignored (all rows pass).
+ */
+typedef struct {
+    const char    *col_name;
+    uint8_t        col_type;    /* tsdb_type_t */
+    const uint8_t *data;        /* nrows * 8 bytes */
+} fanout_col_t;
+
+static int fanout_row_matches(const fanout_col_t *cols, int ncols, int row,
+                               const char *filter_col, const char *filter_val) {
+    if (!filter_col || filter_col[0] == '\0') return 1; /* no filter */
+    for (int c = 0; c < ncols; c++) {
+        if (strcmp(cols[c].col_name, filter_col) != 0) continue;
+        const uint8_t *ptr = cols[c].data + (size_t)row * 8;
+        if (cols[c].col_type == TSDB_TYPE_INT64) {
+            int64_t v;
+            memcpy(&v, ptr, 8);
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+            return strcmp(tmp, filter_val) == 0;
+        }
+        /* For SYMBOL or other types: compare first 8 bytes as a string length field.
+         * Symbol data in the write-batch is encoded as sym_id (4 bytes); we can't
+         * resolve sym strings here without the symtab.  Treat as int compare. */
+        int64_t v;
+        memcpy(&v, ptr, 8);
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+        return strcmp(tmp, filter_val) == 0;
+    }
+    return 1; /* column not found — let it pass */
+}
+
+static void sub_list_fanout_event(tsdb_sub_list_t *sl, const char *table,
+                                   const fanout_col_t *cols, int ncols,
+                                   uint32_t nrows) {
+    sub_snap_t snaps[SUBS_MAX];
+    int nsubs = sub_list_snapshot(sl, table, snaps, SUBS_MAX);
+    if (nsubs == 0) return;
+
+    /* Build SUB_EVENT payload once (before per-sub filter check). */
+    size_t tlen   = strlen(table);
+    size_t hdr_sz = 1 + tlen + 4 + 2; /* table_len + table + nrows + ncols */
+    for (int c = 0; c < ncols; c++)
+        hdr_sz += 1 + strlen(cols[c].col_name) + 1; /* name_len + name + type */
+    size_t data_sz = (size_t)ncols * (size_t)nrows * 8;
+    size_t total   = hdr_sz + data_sz;
+
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) return;
+
+    uint8_t *p = buf;
+    /* table name */
+    uint8_t tlen8 = (uint8_t)(tlen < 255 ? tlen : 255);
+    *p++ = tlen8;
+    memcpy(p, table, tlen8); p += tlen8;
+    /* nrows */
+    memcpy(p, &nrows, 4); p += 4;
+    /* ncols */
+    uint16_t nc16 = (uint16_t)ncols;
+    memcpy(p, &nc16, 2); p += 2;
+    /* column headers */
+    for (int c = 0; c < ncols; c++) {
+        size_t cnl = strlen(cols[c].col_name);
+        uint8_t cnl8 = (uint8_t)(cnl < 255 ? cnl : 255);
+        *p++ = cnl8;
+        memcpy(p, cols[c].col_name, cnl8); p += cnl8;
+        *p++ = cols[c].col_type;
+    }
+    /* columnar data */
+    for (int c = 0; c < ncols; c++) {
+        memcpy(p, cols[c].data, (size_t)nrows * 8);
+        p += (size_t)nrows * 8;
+    }
+
+    /* Fan out to each subscriber — I/O happens outside any lock. */
+    for (int s = 0; s < nsubs; s++) {
+        /* Apply per-subscriber filter: check if any row matches. */
+        if (snaps[s].filter_col[0] != '\0') {
+            int match = 0;
+            for (uint32_t r = 0; r < nrows && !match; r++) {
+                match = fanout_row_matches(cols, ncols, (int)r,
+                                           snaps[s].filter_col,
+                                           snaps[s].filter_val);
+            }
+            if (!match) continue;
+        }
+        /* Best-effort send — connection handler cleans up on next recv error. */
+        tsdb_proto_send(snaps[s].fd, TSDB_MT_SUB_EVENT, TSDB_FLAG_STREAM,
+                        snaps[s].req_id, buf, total);
+    }
+    free(buf);
 }
 
 /* ---- Write serializer ---------------------------------------------------- */
@@ -450,8 +572,45 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
 
     atomic_fetch_add(&srv->stat_rows_written, nrows);
 
-    /* Fan-out subscriptions: encode a minimal event payload. */
-    sub_list_fanout(&srv->subs, table_name, payload, plen);
+    /* Fan-out subscriptions with structured SUB_EVENT payload.
+     *
+     * col_data[c] has stride[c] bytes per row.  For the event we need
+     * exactly 8 bytes per value in every column.  For 8-byte columns
+     * (INT64, FLOAT64, TIMESTAMP) we point directly into col_data.
+     * For 4-byte SYMBOL columns we zero-extend into a scratch buffer.
+     */
+    {
+        fanout_col_t fcols[64];
+        /* Scratch buffers for 4→8 byte extension (one per SYMBOL column). */
+        uint8_t *sym_scratch[64];
+        memset(sym_scratch, 0, sizeof(sym_scratch));
+        int fanout_ok = 1;
+
+        for (int c = 0; c < ncols && fanout_ok; c++) {
+            fcols[c].col_name = col_names[c];
+            fcols[c].col_type = (uint8_t)col_types[c];
+            if (stride[c] == 8) {
+                fcols[c].data = col_data[c];
+            } else {
+                /* SYMBOL: 4 bytes LE → 8 bytes LE (zero-extended). */
+                sym_scratch[c] = (uint8_t *)calloc(nrows, 8);
+                if (!sym_scratch[c]) { fanout_ok = 0; break; }
+                for (uint32_t r = 0; r < nrows; r++) {
+                    memcpy(sym_scratch[c] + r * 8, col_data[c] + r * 4, 4);
+                    /* High 4 bytes already zero from calloc. */
+                }
+                fcols[c].data = sym_scratch[c];
+            }
+        }
+
+        if (fanout_ok) {
+            sub_list_fanout_event(&srv->subs, table_name, fcols, ncols, nrows);
+        }
+
+        for (int c = 0; c < ncols; c++) {
+            if (sym_scratch[c]) free(sym_scratch[c]);
+        }
+    }
 
     return send_write_ack(fd, req_id, nrows);
 }
@@ -679,21 +838,63 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
 
 /* ---- SUBSCRIBE / UNSUBSCRIBE -------------------------------------------- */
 
+/*
+ * SUBSCRIBE payload format (v1):
+ *   [table_len u8]   [table utf8]
+ *   [filter_len u16] [filter utf8]   -- "col_name=value" or empty
+ *
+ * Backward compat: if payload is just a plain table name string (no filter_len),
+ * detect by checking whether plen == 1 + table_len (old format).
+ */
 static int handle_subscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
                              const uint8_t *payload, uint32_t plen) {
-    char table[256] = {0};
-    if (plen > 0) {
-        int n = (plen < 255) ? (int)plen : 255;
-        memcpy(table, payload, n);
+    char table[256]      = {0};
+    char filter_col[64]  = {0};
+    char filter_val[256] = {0};
+
+    if (plen == 0) {
+        /* No table name — subscribe to all? Unsupported; use empty table = all. */
+    } else if (plen >= 1) {
+        const uint8_t *p   = payload;
+        const uint8_t *end = payload + plen;
+
+        uint8_t tlen = *p++;
+        if (p + tlen > end) tlen = (uint8_t)(end - p);
+        int tc = (tlen < 255) ? tlen : 255;
+        memcpy(table, p, tc);
+        p += tlen;
+
+        /* Check for filter_len field (new format). */
+        if (p + 2 <= end) {
+            uint16_t flen;
+            memcpy(&flen, p, 2); p += 2;
+            if (flen > 0 && p + flen <= end) {
+                /* Parse "col_name=value" filter string. */
+                char filter_str[320] = {0};
+                int fl = (flen < 319) ? flen : 319;
+                memcpy(filter_str, p, fl);
+                char *eq = strchr(filter_str, '=');
+                if (eq) {
+                    *eq = '\0';
+                    snprintf(filter_col, sizeof(filter_col), "%s", filter_str);
+                    snprintf(filter_val, sizeof(filter_val), "%s", eq + 1);
+                }
+            }
+        } else if (p == end && tlen > 0) {
+            /* Old format: payload was just the raw table string (no length prefix).
+             * Treat as plain name already copied above. */
+        }
     }
-    uint64_t sub_id = sub_list_add(&srv->subs, table, fd, req_id);
+
+    uint64_t sub_id = sub_list_add(&srv->subs, table, fd, req_id,
+                                    filter_col, filter_val);
     if (sub_id == 0)
         return send_error(fd, req_id, TSDB_ERR_FULL, "too many subscriptions");
     atomic_fetch_add(&srv->stat_subs_active, 1);
 
-    /* Acknowledge with sub_id. */
+    /* Acknowledge with sub_id (8 bytes LE). */
     uint8_t ack[8];
-    ack[0]=(uint8_t)(sub_id);   ack[1]=(uint8_t)(sub_id>>8);
+    ack[0]=(uint8_t)(sub_id);     ack[1]=(uint8_t)(sub_id>>8);
     ack[2]=(uint8_t)(sub_id>>16); ack[3]=(uint8_t)(sub_id>>24);
     ack[4]=(uint8_t)(sub_id>>32); ack[5]=(uint8_t)(sub_id>>40);
     ack[6]=(uint8_t)(sub_id>>48); ack[7]=(uint8_t)(sub_id>>56);

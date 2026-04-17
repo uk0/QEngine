@@ -13,6 +13,7 @@
 #include "rpc.h"
 #include "replica.h"
 #include "hashring.h"
+#include "autobalance.h"
 #include "../../include/tsdb.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -53,6 +54,9 @@ tsdb_hashring_t *tsdb_cluster_ring(tsdb_cluster_t *c);
 
 /* Return the replica manager. */
 tsdb_replica_mgr_t *tsdb_cluster_replica_mgr(tsdb_cluster_t *c);
+
+/* Return the auto-balance controller (may be NULL if not started). */
+tsdb_autobalance_t *tsdb_cluster_autobalance(tsdb_cluster_t *c);
 
 /*
  * Called by db.c batch commit when cluster is active.
