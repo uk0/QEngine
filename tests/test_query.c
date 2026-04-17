@@ -163,6 +163,45 @@ int main(void) {
     assert(tsdb_query(db, "SELECT * FROM nonexistent", &r) < 0);
     printf("  parse errors rejected as expected\n");
 
+    /* --- Test 8: LATEST ON without partition (single latest row) --- */
+    printf("\n[8] SELECT * FROM trades LATEST ON ts\n");
+    OK(tsdb_query(db, "SELECT * FROM trades LATEST ON ts", &r));
+    int rows = 0;
+    tsdb_ts_t latest_ts = 0;
+    while (tsdb_result_next(r)) {
+        latest_ts = tsdb_result_ts(r, 0);
+        rows++;
+    }
+    assert(rows == 1);
+    /* Newest row is day1 i=4999 → ts_at(1, 4999) */
+    assert(latest_ts == ts_at(1, 4999));
+    printf("  latest_ts=%lld (expected=%lld)  PASS\n",
+           (long long)latest_ts, (long long)ts_at(1, 4999));
+    tsdb_result_free(r);
+
+    /* --- Test 9: LATEST ON with PARTITION BY symbol (one row per symbol) --- */
+    printf("\n[9] SELECT * FROM trades LATEST ON ts PARTITION BY symbol\n");
+    OK(tsdb_query(db, "SELECT * FROM trades LATEST ON ts PARTITION BY symbol", &r));
+    rows = 0;
+    while (tsdb_result_next(r)) {
+        printf("  symbol=%s ts=%lld price=%.2f\n",
+               tsdb_result_sym(r, 1),
+               (long long)tsdb_result_ts(r, 0),
+               tsdb_result_f64(r, 2));
+        rows++;
+    }
+    assert(rows == 5); /* 5 distinct symbols */
+    tsdb_result_free(r);
+
+    /* --- Test 10: block skipping via ts range filter --- */
+    printf("\n[10] block-skip: WHERE ts < '2026-01-02'\n");
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE ts < '2026-01-02'", &r));
+    assert(tsdb_result_next(r));
+    int64_t c_day0 = tsdb_result_i64(r, 0);
+    printf("  day0 rows = %lld\n", (long long)c_day0);
+    assert(c_day0 == 5000);
+    tsdb_result_free(r);
+
     tsdb_close(db);
     printf("\n=== All query tests PASSED ===\n");
     rm_rf(dir);

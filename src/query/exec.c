@@ -259,6 +259,74 @@ static int resolve_col(tsdb_schema_t *s, const char *name) {
     return tsdb_schema_col_idx(s, name);
 }
 
+/* ---- Timestamp range extraction (for block-level skipping) ------------- */
+
+typedef struct {
+    int64_t lo;       /* valid rows satisfy ts >= lo */
+    int64_t hi;       /* valid rows satisfy ts <= hi */
+    int     has_lo;
+    int     has_hi;
+} ts_range_t;
+
+static void ts_range_init(ts_range_t *r) {
+    r->lo = INT64_MIN; r->hi = INT64_MAX;
+    r->has_lo = 0; r->has_hi = 0;
+}
+
+/* Walk an AND-connected predicate tree and narrow [lo, hi] based on the ts
+ * column comparisons. OR / NOT subtrees are skipped (conservative: those
+ * blocks stay in the scan plan). */
+static void extract_ts_bounds(qast_expr_t *e, tsdb_schema_t *s, ts_range_t *out) {
+    if (!e) return;
+    if (e->kind == QAST_AND) {
+        extract_ts_bounds(e->lhs, s, out);
+        extract_ts_bounds(e->rhs, s, out);
+        return;
+    }
+    if (!e->lhs || !e->rhs) return;
+    if (e->lhs->kind != QAST_IDENT) return;
+
+    int col = resolve_col(s, e->lhs->v.s);
+    if (col != s->ts_col_idx) return;
+
+    int64_t rhs;
+    if (e->rhs->kind == QAST_LIT_INT) rhs = e->rhs->v.i;
+    else if (e->rhs->kind == QAST_LIT_TS) rhs = e->rhs->v.ts;
+    else return;
+
+    switch (e->kind) {
+    case QAST_GE:
+        if (rhs > out->lo || !out->has_lo) { out->lo = rhs; out->has_lo = 1; }
+        break;
+    case QAST_GT: {
+        int64_t v = (rhs == INT64_MAX) ? INT64_MAX : rhs + 1;
+        if (v > out->lo || !out->has_lo) { out->lo = v; out->has_lo = 1; }
+        break;
+    }
+    case QAST_LE:
+        if (rhs < out->hi || !out->has_hi) { out->hi = rhs; out->has_hi = 1; }
+        break;
+    case QAST_LT: {
+        int64_t v = (rhs == INT64_MIN) ? INT64_MIN : rhs - 1;
+        if (v < out->hi || !out->has_hi) { out->hi = v; out->has_hi = 1; }
+        break;
+    }
+    case QAST_EQ:
+        if (rhs > out->lo || !out->has_lo) { out->lo = rhs; out->has_lo = 1; }
+        if (rhs < out->hi || !out->has_hi) { out->hi = rhs; out->has_hi = 1; }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Return 1 if a block with [ts_min, ts_max] definitely has zero matches. */
+static int ts_range_excludes(const ts_range_t *r, int64_t ts_min, int64_t ts_max) {
+    if (r->has_hi && ts_min > r->hi) return 1;
+    if (r->has_lo && ts_max < r->lo) return 1;
+    return 0;
+}
+
 /* Evaluate a *scalar* constant expression (WHERE rhs). */
 typedef enum { V_I64, V_F64, V_STR } vkind_t;
 typedef struct { vkind_t k; int64_t i; double f; const char *s; } vval_t;
@@ -558,35 +626,94 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
 
 /* ---- Aggregation helpers over a block --------------------------------- */
 
-static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n, const uint64_t *bm) {
-    /* Iterate set bits of bm. */
+/* scratch must point to a buffer of at least TSDB_BLOCK_POINTS*8 bytes,
+ * alignment 32 preferred. Used as gather destination when bm is not all-set.
+ * Passing the scratch in from the caller avoids per-block malloc/free and
+ * keeps the hot path allocation-free. */
+static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
+                       const uint64_t *bm, void *scratch) {
     tsdb_type_t t = (p->col >= 0) ? s->cols[p->col].type : TSDB_TYPE_INT64;
 
     if (p->kind == PROJ_AGG_COUNT) {
-        uint64_t c = tsdb_bitmap_popcount(bm, n);
-        p->agg_count += c;
+        p->agg_count += tsdb_bitmap_popcount(bm, n);
         return;
     }
 
+    /* Determine selectivity once per block so we can take the all-set fast path. */
+    uint64_t popcnt = tsdb_bitmap_popcount(bm, n);
+    if (popcnt == 0) return;
+
     if (t == TSDB_TYPE_FLOAT64) {
         const double *v = (const double *)bufs[p->col];
-        for (size_t i = 0; i < n; i++) {
-            if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
-            double x = v[i];
-            if (p->kind == PROJ_AGG_SUM || p->kind == PROJ_AGG_AVG) p->agg_sum_f += x;
-            if (p->kind == PROJ_AGG_MIN && x < p->agg_min_f) p->agg_min_f = x;
-            if (p->kind == PROJ_AGG_MAX && x > p->agg_max_f) p->agg_max_f = x;
-            p->agg_count++;
+        const double *src;
+        size_t cn;
+        if (popcnt == n) {
+            src = v; cn = n;
+        } else {
+            double *tmp = (double *)scratch;
+            cn = tsdb_bitmap_gather_f64(bm, v, n, tmp);
+            src = tmp;
+        }
+        switch (p->kind) {
+        case PROJ_AGG_SUM:
+        case PROJ_AGG_AVG: {
+            double out; uint64_t ncnt;
+            tsdb_agg_sum_f64(src, cn, NULL, &out, &ncnt);
+            p->agg_sum_f += out;
+            p->agg_count += cn;
+            break;
+        }
+        case PROJ_AGG_MIN: {
+            double m;
+            tsdb_agg_min_f64(src, cn, NULL, &m);
+            if (m < p->agg_min_f) p->agg_min_f = m;
+            p->agg_count += cn;
+            break;
+        }
+        case PROJ_AGG_MAX: {
+            double m;
+            tsdb_agg_max_f64(src, cn, NULL, &m);
+            if (m > p->agg_max_f) p->agg_max_f = m;
+            p->agg_count += cn;
+            break;
+        }
+        default: break;
         }
     } else if (t == TSDB_TYPE_INT64 || t == TSDB_TYPE_TIMESTAMP) {
         const int64_t *v = (const int64_t *)bufs[p->col];
-        for (size_t i = 0; i < n; i++) {
-            if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
-            int64_t x = v[i];
-            if (p->kind == PROJ_AGG_SUM || p->kind == PROJ_AGG_AVG) p->agg_sum_i += x;
-            if (p->kind == PROJ_AGG_MIN && x < p->agg_min_i) p->agg_min_i = x;
-            if (p->kind == PROJ_AGG_MAX && x > p->agg_max_i) p->agg_max_i = x;
-            p->agg_count++;
+        const int64_t *src;
+        size_t cn;
+        if (popcnt == n) {
+            src = v; cn = n;
+        } else {
+            int64_t *tmp = (int64_t *)scratch;
+            cn = tsdb_bitmap_gather_i64(bm, v, n, tmp);
+            src = tmp;
+        }
+        switch (p->kind) {
+        case PROJ_AGG_SUM:
+        case PROJ_AGG_AVG: {
+            int64_t out; uint64_t ncnt;
+            tsdb_agg_sum_i64(src, cn, NULL, &out, &ncnt);
+            p->agg_sum_i += out;
+            p->agg_count += cn;
+            break;
+        }
+        case PROJ_AGG_MIN: {
+            int64_t m;
+            tsdb_agg_min_i64(src, cn, NULL, &m);
+            if (m < p->agg_min_i) p->agg_min_i = m;
+            p->agg_count += cn;
+            break;
+        }
+        case PROJ_AGG_MAX: {
+            int64_t m;
+            tsdb_agg_max_i64(src, cn, NULL, &m);
+            if (m > p->agg_max_i) p->agg_max_i = m;
+            p->agg_count += cn;
+            break;
+        }
+        default: break;
         }
     }
 }
@@ -649,14 +776,30 @@ void tsdb_par_scan_task(void *arg) {
     par_task_t *t = (par_task_t *)arg;
     t->rc = TSDB_OK;
 
+    /* Per-worker scratch for SIMD gather (64 KB). Allocated once per task,
+     * reused across every block this worker processes. */
+    void *agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
+    if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
+
+    /* Extract ts bounds once per worker; used to skip blocks entirely. */
+    ts_range_t ts_r;
+    ts_range_init(&ts_r);
+    if (t->where) extract_ts_bounds(t->where, t->schema, &ts_r);
+
     for (size_t si = 0; si < t->nsrcs; si++) {
         scan_src_t *src = &t->srcs[si];
         size_t n = src->row_count;
 
+        /* Block skip: if the whole source's [ts_min, ts_max] falls outside
+         * the WHERE's ts range, skip without ever decoding. */
+        if ((ts_r.has_lo || ts_r.has_hi) &&
+            ts_range_excludes(&ts_r, src->ts_min, src->ts_max))
+            continue;
+
         void **bufs = calloc((size_t)t->schema->ncols, sizeof(void *));
-        if (!bufs) { t->rc = TSDB_ERR_NOMEM; return; }
+        if (!bufs) { t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
         tsdb_symtab_t **syms = calloc((size_t)t->schema->ncols, sizeof(tsdb_symtab_t *));
-        if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; return; }
+        if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
 
         int load_rc = TSDB_OK;
         for (int c = 0; c < t->schema->ncols; c++) {
@@ -688,6 +831,7 @@ void tsdb_par_scan_task(void *arg) {
                 if (!src->mem && bufs[c]) free(bufs[c]);
             free(bufs); free(syms);
             t->rc = load_rc;
+            free(agg_scratch);
             return;
         }
 
@@ -699,6 +843,7 @@ void tsdb_par_scan_task(void *arg) {
                 if (!src->mem && bufs[c]) free(bufs[c]);
             free(bufs); free(syms);
             t->rc = TSDB_ERR_NOMEM;
+            free(agg_scratch);
             return;
         }
         for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
@@ -719,6 +864,7 @@ void tsdb_par_scan_task(void *arg) {
                     if (!src->mem && bufs[c]) free(bufs[c]);
                 free(bufs); free(syms);
                 t->rc = frc;
+                free(agg_scratch);
                 return;
             }
         }
@@ -726,7 +872,7 @@ void tsdb_par_scan_task(void *arg) {
         /* Update private aggregate state. */
         for (int pi = 0; pi < t->nprojs; pi++) {
             if (t->projs[pi].kind >= PROJ_AGG_SUM && t->projs[pi].kind <= PROJ_AGG_COUNT)
-                agg_update(&t->projs[pi], t->schema, bufs, n, bm);
+                agg_update(&t->projs[pi], t->schema, bufs, n, bm, agg_scratch);
         }
 
         free(bm);
@@ -734,6 +880,168 @@ void tsdb_par_scan_task(void *arg) {
             if (!src->mem && bufs[c]) free(bufs[c]);
         free(bufs); free(syms);
     }
+    free(agg_scratch);
+}
+
+/* ---- LATEST ON execution ---------------------------------------------
+ *
+ *   SELECT cols FROM t LATEST ON ts [PARTITION BY a, b, ...]
+ *
+ * Semantics: return the row with the maximum ts per unique partition key.
+ * Implementation: iterate scan sources in reverse order (newest partition
+ * first, then in-memory memtable rows in reverse), iterate rows in reverse
+ * within each source, and keep the first occurrence of each partition key
+ * hash. Early-exit when LIMIT is met or no-partition case finds one row.
+ */
+static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
+                          tsdb_result_t *r, proj_t *projs, int nprojs,
+                          char *err, size_t errcap) {
+    tsdb_schema_t *s = tsdb_tbl_schema(tbl);
+
+    int part_idx[TSDB_MAX_COLS];
+    int npart = q->nlatest_part;
+    for (int i = 0; i < npart; i++) {
+        part_idx[i] = resolve_col(s, q->latest_part_cols[i]);
+        if (part_idx[i] < 0) {
+            eset(err, errcap, "unknown partition column '%s'",
+                 q->latest_part_cols[i]);
+            return TSDB_ERR_SCHEMA;
+        }
+    }
+
+    scan_plan_t plan = {0};
+    int rc = scan_plan_build(&plan, tbl);
+    if (rc != TSDB_OK) return rc;
+
+    /* Columns to load: projections + partition cols. */
+    int need_col[TSDB_MAX_COLS];
+    memset(need_col, 0, sizeof(need_col));
+    for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+    for (int i = 0; i < npart; i++) need_col[part_idx[i]] = 1;
+
+    /* Seen-set: open-addressing linear probe of 64-bit hashes.
+     * Value 0 = empty slot, so hash=0 is remapped to 1. */
+    size_t cap = 256;
+    uint64_t *seen = calloc(cap, sizeof(uint64_t));
+    size_t seen_n = 0;
+    size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    for (ssize_t si = (ssize_t)plan.nsrcs - 1; si >= 0 && r->nrows < limit; si--) {
+        scan_src_t *src = &plan.srcs[si];
+        size_t n = src->row_count;
+
+        void **bufs = calloc((size_t)s->ncols, sizeof(void *));
+        tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
+        if (!bufs || !syms) { free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto out; }
+
+        int lrc = TSDB_OK;
+        for (int c = 0; c < s->ncols; c++) {
+            if (!need_col[c]) continue;
+            syms[c] = s->cols[c].symtab;
+            size_t w = tsdb_type_width(s->cols[c].type);
+            if (src->mem) {
+                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                bufs[c] = malloc(w * n);
+                if (!bufs[c]) { lrc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (lrc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++)
+                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
+                        hit = &metas[b]; break;
+                    }
+                if (!hit) { free(metas); lrc = TSDB_ERR_CORRUPT; break; }
+                lrc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
+                free(metas);
+                if (lrc != TSDB_OK) break;
+            }
+        }
+        if (lrc != TSDB_OK) {
+            for (int c = 0; c < s->ncols; c++) if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms);
+            rc = lrc; goto out;
+        }
+
+        for (ssize_t row = (ssize_t)n - 1; row >= 0 && r->nrows < limit; row--) {
+            /* Compute partition key hash via FNV-1a over packed column bytes. */
+            uint64_t key = 14695981039346656037ULL;
+            if (npart == 0) {
+                key = 0x00ababababababab; /* single bucket sentinel */
+            } else {
+                for (int i = 0; i < npart; i++) {
+                    int ci = part_idx[i];
+                    size_t w = tsdb_type_width(s->cols[ci].type);
+                    const uint8_t *p = (const uint8_t *)bufs[ci] + (size_t)row * w;
+                    for (size_t b = 0; b < w; b++) {
+                        key ^= p[b];
+                        key *= 1099511628211ULL;
+                    }
+                }
+            }
+            if (key == 0) key = 1;
+
+            /* Grow set if load factor exceeds 0.5. */
+            if (seen_n * 2 >= cap) {
+                size_t ncap = cap * 2;
+                uint64_t *ns = calloc(ncap, sizeof(uint64_t));
+                if (!ns) { rc = TSDB_ERR_NOMEM; goto free_bufs; }
+                for (size_t i = 0; i < cap; i++) {
+                    if (!seen[i]) continue;
+                    size_t pos = (size_t)seen[i] & (ncap - 1);
+                    while (ns[pos]) pos = (pos + 1) & (ncap - 1);
+                    ns[pos] = seen[i];
+                }
+                free(seen); seen = ns; cap = ncap;
+            }
+
+            size_t pos = (size_t)key & (cap - 1);
+            int dup = 0;
+            while (seen[pos]) {
+                if (seen[pos] == key) { dup = 1; break; }
+                pos = (pos + 1) & (cap - 1);
+            }
+            if (dup) continue;
+            seen[pos] = key; seen_n++;
+
+            /* Emit row. */
+            rc = result_reserve_rows(r, r->nrows + 1);
+            if (rc != TSDB_OK) goto free_bufs;
+
+            for (int pi = 0; pi < nprojs; pi++) {
+                proj_t *p = &projs[pi];
+                if (p->kind == PROJ_COL) {
+                    size_t w = tsdb_type_width(s->cols[p->col].type);
+                    uint64_t bits = 0;
+                    if (w == 8) bits = ((uint64_t *)bufs[p->col])[row];
+                    else if (w == 4) bits = ((uint32_t *)bufs[p->col])[row];
+                    result_append_cell(r, pi, bits);
+                } else {
+                    result_append_cell(r, pi, 0);
+                }
+            }
+            r->nrows++;
+
+            /* No-partition case: a single row is enough. */
+            if (npart == 0) { rc = TSDB_OK; goto free_bufs_done; }
+        }
+
+free_bufs:
+        for (int c = 0; c < s->ncols; c++) if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+        if (rc != TSDB_OK) goto out;
+        continue;
+free_bufs_done:
+        for (int c = 0; c < s->ncols; c++) if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+        goto out;
+    }
+
+out:
+    free(seen);
+    scan_plan_free(&plan);
+    return rc;
 }
 
 /* ---- Main select execution ------------------------------------------- */
@@ -767,6 +1075,13 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (rc != TSDB_OK) { free(projs); return rc; }
     }
 
+    /* LATEST ON dispatch — reverse-scan with per-partition-key early-exit. */
+    if (q->has_latest_on) {
+        int lrc = exec_latest_on(tbl, q, r, projs, nprojs, err, errcap);
+        free(projs);
+        return lrc;
+    }
+
     /* Build scan plan */
     scan_plan_t plan = {0};
     rc = scan_plan_build(&plan, tbl);
@@ -786,6 +1101,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     size_t rows_emitted = 0;
     size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    /* Scratch declared up front so all goto-done paths can free it. */
+    void *serial_agg_scratch = NULL;
 
     /* ---- Parallel aggregate path --------------------------------------- */
     /* Conditions: agg query, no SAMPLE BY, more than 1 source, parallel enabled.
@@ -932,10 +1250,26 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     }
     /* ---- End parallel path ---------------------------------------------- */
 
+    /* Extract ts bounds once for serial block skipping. */
+    ts_range_t ts_r;
+    ts_range_init(&ts_r);
+    if (q->where) extract_ts_bounds(q->where, s, &ts_r);
+
+    /* SIMD gather scratch (64 KB), reused across blocks for the serial path. */
+    if (has_agg) {
+        serial_agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
+        if (!serial_agg_scratch) { rc = TSDB_ERR_NOMEM; goto done; }
+    }
+
     /* Iterate sources. */
     for (size_t si = 0; si < plan.nsrcs && rows_emitted < limit; si++) {
         scan_src_t *src = &plan.srcs[si];
         size_t n = src->row_count;
+
+        /* Block skip via extracted ts bounds. */
+        if ((ts_r.has_lo || ts_r.has_hi) &&
+            ts_range_excludes(&ts_r, src->ts_min, src->ts_max))
+            continue;
 
         /* Allocate per-column decode buffers for this source. */
         void **bufs = calloc((size_t)s->ncols, sizeof(void *));
@@ -1032,7 +1366,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             /* Single-row aggregate over all rows matching. */
             for (int pi = 0; pi < nprojs; pi++) {
                 if (projs[pi].kind >= PROJ_AGG_SUM && projs[pi].kind <= PROJ_AGG_COUNT)
-                    agg_update(&projs[pi], s, bufs, n, bm);
+                    agg_update(&projs[pi], s, bufs, n, bm, serial_agg_scratch);
             }
         } else if (has_agg && has_sample) {
             /* Bucket aggregation over the ts column (int64). */
@@ -1171,6 +1505,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     (void)cmp_u64;
 done:
+    free(serial_agg_scratch);
     free(projs);
     free(bkts);
     scan_plan_free(&plan);
