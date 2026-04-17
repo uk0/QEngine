@@ -47,7 +47,9 @@ typedef enum {
     TSDB_RPC_SCHEMA_SYNC  = 5,
     TSDB_RPC_ACK          = 6,
     TSDB_RPC_ERR          = 7,
-    TSDB_RPC_FED_QUERY    = 8   /* federation query: QTL → encoded result */
+    TSDB_RPC_FED_QUERY       = 8,  /* federation query: QTL → encoded result */
+    TSDB_RPC_RAW_BLOCK_PUSH  = 9,  /* raw compressed block replica sync */
+    TSDB_RPC_RAW_BLOCK_ACK   = 10  /* per-block ack */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
