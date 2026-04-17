@@ -1,8 +1,8 @@
 <div align="center">
-  <img src="assets/logo.png" alt="tsdb logo" width="420"/>
+  <img src="assets/logo.png" alt="QEngine logo" width="420"/>
 </div>
 
-# tsdb — QEngine
+# QEngine  <sub>(Q)</sub>
 
 A production-grade time-series database written in C11. Column-oriented
 storage, SIMD-vectorized execution, clustered with raw-block replication,
