@@ -658,6 +658,155 @@ static void bench_write(int port) {
     close(fd);
 }
 
+/* ---- Concurrent aggregate throughput benchmark --------------------------- */
+
+typedef struct {
+    int     port;
+    int     client_id;
+    int     nbatches;
+    int     rows_per_batch;
+    double  elapsed_sec;  /* out */
+    int     ok;
+} bench_concurrent_arg_t;
+
+static void *bench_concurrent_worker(void *arg) {
+    bench_concurrent_arg_t *a = (bench_concurrent_arg_t *)arg;
+    a->ok = 0;
+
+    int fd = client_connect(a->port);
+    if (fd < 0) { a->ok = -1; return NULL; }
+
+    /* HELLO */
+    tsdb_proto_send(fd, TSDB_MT_HELLO, 0, 1, NULL, 0);
+    tsdb_frame_hdr_t hdr; uint8_t *pl = NULL;
+    recv_frame(fd, &hdr, &pl); free(pl); pl = NULL;
+
+    uint8_t *wbuf = (uint8_t *)malloc(2 * 1024 * 1024);
+    if (!wbuf) { close(fd); a->ok = -2; return NULL; }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    for (int b = 0; b < a->nbatches; b++) {
+        /* Build 2-column batch (ts + val) inline. */
+        uint8_t *p = wbuf;
+        const char *tn = "bench_concurrent_tbl";
+        uint8_t tnl = (uint8_t)strlen(tn);
+        *p++ = tnl; memcpy(p, tn, tnl); p += tnl;
+
+        int ROWS = a->rows_per_batch;
+        uint16_t nc = 2; memcpy(p, &nc, 2); p += 2;
+        uint32_t nr = (uint32_t)ROWS; memcpy(p, &nr, 4); p += 4;
+
+        /* ts col */
+        const char *cn0 = "ts"; *p++ = 2; memcpy(p, cn0, 2); p += 2;
+        *p++ = TSDB_TYPE_TIMESTAMP; *p++ = 0;
+        uint32_t csz0 = (uint32_t)(ROWS * 8); memcpy(p, &csz0, 4); p += 4;
+        /* unique base: client_id * (nbatches*ROWS) + b*ROWS, scaled to ns */
+        int64_t ts_base = (int64_t)a->client_id * (int64_t)(a->nbatches) * ROWS * 1000LL
+                        + (int64_t)b * ROWS * 1000LL
+                        + 4000000000000000000LL;
+        for (int i = 0; i < ROWS; i++) {
+            int64_t ts = ts_base + i;
+            memcpy(p, &ts, 8); p += 8;
+        }
+
+        /* val col */
+        const char *cn1 = "val"; *p++ = 3; memcpy(p, cn1, 3); p += 3;
+        *p++ = TSDB_TYPE_FLOAT64; *p++ = 0;
+        uint32_t csz1 = (uint32_t)(ROWS * 8); memcpy(p, &csz1, 4); p += 4;
+        for (int i = 0; i < ROWS; i++) {
+            double v = (double)(a->client_id * a->nbatches * ROWS + b * ROWS + i);
+            memcpy(p, &v, 8); p += 8;
+        }
+
+        size_t wsz = (size_t)(p - wbuf);
+        int rc = tsdb_proto_send(fd, TSDB_MT_WRITE_BATCH, 0,
+                                 (uint64_t)(a->client_id * 1000 + b + 100),
+                                 wbuf, wsz);
+        if (rc != TSDB_OK) { free(wbuf); close(fd); a->ok = -3; return NULL; }
+
+        uint8_t *resp = NULL;
+        recv_frame(fd, &hdr, &resp);
+        free(resp);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    free(wbuf);
+    close(fd);
+
+    a->elapsed_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    a->ok = 1;
+    return NULL;
+}
+
+static void bench_concurrent(int port) {
+    /* Create the bench table first. */
+    int fd = client_connect(port);
+    if (fd < 0) { printf("bench_concurrent: connect failed\n"); return; }
+
+    tsdb_proto_send(fd, TSDB_MT_HELLO, 0, 1, NULL, 0);
+    tsdb_frame_hdr_t hdr; uint8_t *pl = NULL;
+    recv_frame(fd, &hdr, &pl); free(pl); pl = NULL;
+
+    const char *col_names[] = { "ts", "val" };
+    int col_types[] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_FLOAT64 };
+    uint8_t cbuf[256];
+    size_t csz = build_create_table(cbuf, sizeof(cbuf), "bench_concurrent_tbl", "ts",
+                                     2, col_names, col_types);
+    tsdb_proto_send(fd, TSDB_MT_CREATE_TABLE, 0, 2, cbuf, csz);
+    recv_frame(fd, &hdr, &pl); free(pl); pl = NULL;
+    close(fd);
+
+    #define BENCH_NCLIENTS  10
+    #define BENCH_NBATCHES  10
+    #define BENCH_ROWS_PER_BATCH 10000
+
+    pthread_t tids[BENCH_NCLIENTS];
+    bench_concurrent_arg_t args[BENCH_NCLIENTS];
+
+    /* Record wall-clock for aggregate measure. */
+    struct timespec wall0, wall1;
+    clock_gettime(CLOCK_MONOTONIC, &wall0);
+
+    for (int i = 0; i < BENCH_NCLIENTS; i++) {
+        args[i].port          = port;
+        args[i].client_id     = i;
+        args[i].nbatches      = BENCH_NBATCHES;
+        args[i].rows_per_batch = BENCH_ROWS_PER_BATCH;
+        args[i].elapsed_sec   = 0.0;
+        args[i].ok            = -1;
+        pthread_create(&tids[i], NULL, bench_concurrent_worker, &args[i]);
+    }
+
+    int all_ok = 1;
+    for (int i = 0; i < BENCH_NCLIENTS; i++) {
+        pthread_join(tids[i], NULL);
+        if (args[i].ok != 1) { all_ok = 0; }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &wall1);
+    double wall_elapsed = (wall1.tv_sec - wall0.tv_sec)
+                        + (wall1.tv_nsec - wall0.tv_nsec) * 1e-9;
+
+    long long total_rows = (long long)BENCH_NCLIENTS * BENCH_NBATCHES * BENCH_ROWS_PER_BATCH;
+    double aggregate_rps = (all_ok && wall_elapsed > 0.0)
+                         ? (double)total_rows / wall_elapsed
+                         : 0.0;
+
+    printf("bench_concurrent: %d clients × %d batches × %d rows = %lld rows total\n",
+           BENCH_NCLIENTS, BENCH_NBATCHES, BENCH_ROWS_PER_BATCH, total_rows);
+    printf("bench_concurrent: wall time %.3f s  →  aggregate %.0f rows/sec\n",
+           wall_elapsed, aggregate_rps);
+
+    if (!all_ok)
+        printf("bench_concurrent: WARNING — some workers failed\n");
+
+    #undef BENCH_NCLIENTS
+    #undef BENCH_NBATCHES
+    #undef BENCH_ROWS_PER_BATCH
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void) {
@@ -696,8 +845,11 @@ int main(void) {
     printf("\n--- Test 7: Bad magic → connection close ---\n");
     test_bad_magic(port);
 
-    printf("\n--- Benchmarks ---\n");
+    printf("\n--- Benchmarks (single connection) ---\n");
     bench_write(port);
+
+    printf("\n--- Benchmarks (10-client concurrent aggregate) ---\n");
+    bench_concurrent(port);
 
     teardown_server();
 

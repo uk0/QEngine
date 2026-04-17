@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* ---- CRC32C (software, 8-bytes-at-a-time Sarwate) ----------------------- */
 
@@ -18,7 +19,7 @@
 #define CRC32C_POLY 0x82F63B78u
 
 static uint32_t crc32c_table[8][256];
-static volatile int crc32c_table_inited = 0;
+static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
 
 static void crc32c_init_table(void) {
     for (uint32_t i = 0; i < 256; i++) {
@@ -34,12 +35,10 @@ static void crc32c_init_table(void) {
             crc32c_table[s][i] = c;
         }
     }
-    crc32c_table_inited = 1;
 }
 
 uint32_t tsdb_crc32c(const void *data, size_t n) {
-    if (!crc32c_table_inited)
-        crc32c_init_table();
+    pthread_once(&crc32c_once, crc32c_init_table);
 
     const uint8_t *p = (const uint8_t *)data;
     uint32_t crc = 0xFFFFFFFFu;
@@ -197,7 +196,7 @@ int tsdb_proto_send(int fd, uint8_t type, uint16_t flags, uint64_t req_id,
     tsdb_frame_write_hdr(&hdr, raw_hdr);
 
     /* Compute CRC32C incrementally over header[4..24) + payload. */
-    if (!crc32c_table_inited) crc32c_init_table();
+    pthread_once(&crc32c_once, crc32c_init_table);
     uint32_t running = 0xFFFFFFFFu;
     {
         const uint8_t *hp = raw_hdr + 4;
@@ -261,7 +260,7 @@ int tsdb_proto_recv(int fd, tsdb_frame_hdr_t *hdr, uint8_t **out_payload) {
                         | ((uint32_t)crc_bytes[3] << 24);
 
     /* Compute expected CRC over header[4..24) + payload. */
-    if (!crc32c_table_inited) crc32c_init_table();
+    pthread_once(&crc32c_once, crc32c_init_table);
     uint32_t running = 0xFFFFFFFFu;
     const uint8_t *hp = raw_hdr + 4;
     for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
