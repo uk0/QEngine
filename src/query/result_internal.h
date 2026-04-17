@@ -28,6 +28,11 @@ struct tsdb_result {
     size_t         cap_rows;
 
     ssize_t        cur;
+
+    /* Owned symtabs: allocated by DDL (LIST) results; freed by result_free.
+     * Regular SELECT results reference schema-owned symtabs and set this NULL. */
+    tsdb_symtab_t **owned_symtabs;
+    int             n_owned_symtabs;
 };
 
 #endif /* TSDB_RESULT_INTERNAL_H */

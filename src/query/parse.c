@@ -1,9 +1,12 @@
 #include "parse.h"
 #include "lex.h"
+#include "../catalog/group.h"
+#include "../catalog/device.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 typedef struct {
     qlex_t       lex;
@@ -358,3 +361,309 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
     }
     return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
 }
+
+/* ---- DDL helpers -------------------------------------------------------- */
+
+/* Case-insensitive strncmp helper. */
+static int ident_ci(const qtok_t *t, const char *s) {
+    size_t n = strlen(s);
+    if (t->len != n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)t->start[i]) != tolower((unsigned char)s[i])) return 0;
+    }
+    return 1;
+}
+
+/* Safe copy of token text into fixed buffer. */
+static void tok_copy(const qtok_t *t, char *dst, size_t cap) {
+    size_t n = t->len < cap - 1 ? t->len : cap - 1;
+    memcpy(dst, t->start, n);
+    dst[n] = '\0';
+}
+
+/* Parse (key=value, ...) property list for CREATE GROUP / CREATE DEVICE.
+ * Recognised keys are set on the spec structs; unknown keys are silently
+ * accumulated in the 'tags' field as "key=value," pairs. */
+
+static int parse_props_group(parser_t *p, tsdb_group_t *g) {
+    /* optional paren-delimited list */
+    int has_paren = accept(p, QTOK_LPAREN);
+    if (!has_paren && p->tok.kind != QTOK_IDENT &&
+        p->tok.kind != QTOK_REGION && p->tok.kind != QTOK_RETENTION &&
+        p->tok.kind != QTOK_PROFILE && p->tok.kind != QTOK_REPLICA) {
+        return TSDB_OK; /* no props */
+    }
+    char tags_buf[512];
+    tags_buf[0] = '\0';
+
+    while (!p->errored) {
+        /* key can be a keyword or ident */
+        qtok_kind_t kk = p->tok.kind;
+        if (kk != QTOK_IDENT && kk != QTOK_REGION && kk != QTOK_RETENTION &&
+            kk != QTOK_PROFILE && kk != QTOK_REPLICA && kk != QTOK_FACTOR) {
+            break;
+        }
+        qtok_t key = p->tok;
+        advance(p);
+
+        if (expect(p, QTOK_EQ) != TSDB_OK) return TSDB_ERR_PARSE;
+
+        /* value: string or number */
+        char valstr[256];
+        if (p->tok.kind == QTOK_STRING) {
+            size_t n = p->tok.len < sizeof(valstr) - 1 ? p->tok.len : sizeof(valstr) - 1;
+            memcpy(valstr, p->tok.start, n);
+            valstr[n] = '\0';
+            advance(p);
+        } else if (p->tok.kind == QTOK_NUMBER) {
+            snprintf(valstr, sizeof(valstr), "%lld", (long long)p->tok.i);
+            advance(p);
+        } else if (p->tok.kind == QTOK_INTERVAL) {
+            snprintf(valstr, sizeof(valstr), "%lld", (long long)p->tok.i);
+            advance(p);
+        } else {
+            perr(p, "expected string or number value in properties"); return TSDB_ERR_PARSE;
+        }
+
+        /* Dispatch known keys. */
+        if (key.kind == QTOK_REGION || ident_ci(&key, "region")) {
+            snprintf(g->region, sizeof(g->region), "%s", valstr);
+        } else if (key.kind == QTOK_RETENTION || ident_ci(&key, "retention")) {
+            /* value can be "30d" (interval string) or integer ns. */
+            int64_t ns = qlex_parse_interval(valstr, strlen(valstr));
+            if (ns > 0) g->retention_ns = ns;
+            else g->retention_ns = strtoll(valstr, NULL, 10);
+        } else if (key.kind == QTOK_PROFILE || ident_ci(&key, "profile")) {
+            snprintf(g->codec_profile, sizeof(g->codec_profile), "%s", valstr);
+        } else if (key.kind == QTOK_REPLICA || ident_ci(&key, "replica")) {
+            g->replica_factor = atoi(valstr);
+        } else {
+            /* Unknown key → accumulate in tags. */
+            char keystr[128];
+            tok_copy(&key, keystr, sizeof(keystr));
+            size_t tl = strlen(tags_buf);
+            snprintf(tags_buf + tl, sizeof(tags_buf) - tl, "%s=%s,", keystr, valstr);
+        }
+
+        if (!accept(p, QTOK_COMMA)) break;
+        /* allow trailing comma before ) */
+        if (has_paren && p->tok.kind == QTOK_RPAREN) break;
+    }
+
+    if (has_paren && expect(p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+    /* Strip trailing comma. */
+    size_t tl = strlen(tags_buf);
+    if (tl > 0 && tags_buf[tl-1] == ',') tags_buf[tl-1] = '\0';
+    snprintf(g->tags, sizeof(g->tags), "%s", tags_buf);
+    return TSDB_OK;
+}
+
+static int parse_props_device(parser_t *p, tsdb_device_t *d) {
+    int has_paren = accept(p, QTOK_LPAREN);
+    if (!has_paren && p->tok.kind != QTOK_IDENT) return TSDB_OK;
+
+    char tags_buf[512];
+    tags_buf[0] = '\0';
+
+    while (!p->errored) {
+        if (p->tok.kind != QTOK_IDENT) break;
+        qtok_t key = p->tok;
+        advance(p);
+        if (expect(p, QTOK_EQ) != TSDB_OK) return TSDB_ERR_PARSE;
+
+        char valstr[256];
+        if (p->tok.kind == QTOK_STRING) {
+            size_t n = p->tok.len < sizeof(valstr) - 1 ? p->tok.len : sizeof(valstr) - 1;
+            memcpy(valstr, p->tok.start, n);
+            valstr[n] = '\0';
+            advance(p);
+        } else if (p->tok.kind == QTOK_NUMBER) {
+            snprintf(valstr, sizeof(valstr), "%lld", (long long)p->tok.i);
+            advance(p);
+        } else {
+            perr(p, "expected value"); return TSDB_ERR_PARSE;
+        }
+
+        if (ident_ci(&key, "type")) {
+            snprintf(d->type, sizeof(d->type), "%s", valstr);
+        } else if (ident_ci(&key, "location")) {
+            snprintf(d->location, sizeof(d->location), "%s", valstr);
+        } else if (ident_ci(&key, "status")) {
+            d->status = atoi(valstr);
+        } else {
+            char keystr[128];
+            tok_copy(&key, keystr, sizeof(keystr));
+            size_t tl = strlen(tags_buf);
+            snprintf(tags_buf + tl, sizeof(tags_buf) - tl, "%s=%s,", keystr, valstr);
+        }
+
+        if (!accept(p, QTOK_COMMA)) break;
+        if (has_paren && p->tok.kind == QTOK_RPAREN) break;
+    }
+
+    if (has_paren && expect(p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+    size_t tl = strlen(tags_buf);
+    if (tl > 0 && tags_buf[tl-1] == ',') tags_buf[tl-1] = '\0';
+    snprintf(d->tags, sizeof(d->tags), "%s", tags_buf);
+    return TSDB_OK;
+}
+
+/* ---- qparse_stmt -------------------------------------------------------- */
+
+int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
+                char *err, size_t errcap) {
+    if (!src || !out) return TSDB_ERR_INVAL;
+
+    parser_t p;
+    qlex_init(&p.lex, src);
+    p.arena = a;
+    p.err = err;
+    p.errcap = errcap;
+    p.errored = 0;
+    if (err && errcap) err[0] = 0;
+    memset(out, 0, sizeof(*out));
+
+    if (advance(&p) != TSDB_OK) return TSDB_ERR_PARSE;
+
+    /* ---- SELECT (existing query) ---------------------------------------- */
+    if (p.tok.kind == QTOK_SELECT) {
+        out->kind = QAST_STMT_SELECT;
+        /* Delegate to qparse. The existing qparse re-initialises its own
+         * parser struct so we can call it directly on the original src. */
+        return qparse(src, a, &out->u.query, err, errcap);
+    }
+
+    /* ---- CREATE --------------------------------------------------------- */
+    if (accept(&p, QTOK_CREATE)) {
+        /* CREATE GROUP <name> [(props)] */
+        if (accept(&p, QTOK_GROUP)) {
+            out->kind = QAST_STMT_CREATE_GROUP;
+            tsdb_group_t *g = &out->u.create_group.spec;
+            memset(g, 0, sizeof(*g));
+            g->replica_factor = 3;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, g->name, sizeof(g->name));
+            advance(&p);
+            if (parse_props_group(&p, g) != TSDB_OK) return TSDB_ERR_PARSE;
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* CREATE DEVICE <id> IN GROUP <group> [(props)] */
+        if (accept(&p, QTOK_DEVICE)) {
+            out->kind = QAST_STMT_CREATE_DEVICE;
+            tsdb_device_t *d = &out->u.create_device.spec;
+            memset(d, 0, sizeof(*d));
+
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected device id"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, d->id, sizeof(d->id));
+            advance(&p);
+
+            if (!accept(&p, QTOK_IN)) {
+                perr(&p, "expected IN after device id"); return TSDB_ERR_PARSE;
+            }
+            if (!accept(&p, QTOK_GROUP)) {
+                perr(&p, "expected GROUP after IN"); return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, d->group, sizeof(d->group));
+            advance(&p);
+
+            if (parse_props_device(&p, d) != TSDB_OK) return TSDB_ERR_PARSE;
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP or DEVICE after CREATE");
+        return TSDB_ERR_PARSE;
+    }
+
+    /* ---- DROP ----------------------------------------------------------- */
+    if (accept(&p, QTOK_DROP)) {
+        /* DROP GROUP <name> */
+        if (accept(&p, QTOK_GROUP)) {
+            out->kind = QAST_STMT_DROP_GROUP;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_group.name, sizeof(out->u.drop_group.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* DROP DEVICE <id> IN GROUP <group> */
+        if (accept(&p, QTOK_DEVICE)) {
+            out->kind = QAST_STMT_DROP_DEVICE;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected device id"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_device.id, sizeof(out->u.drop_device.id));
+            advance(&p);
+            if (!accept(&p, QTOK_IN)) {
+                perr(&p, "expected IN"); return TSDB_ERR_PARSE;
+            }
+            if (!accept(&p, QTOK_GROUP)) {
+                perr(&p, "expected GROUP"); return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_device.group, sizeof(out->u.drop_device.group));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP or DEVICE after DROP");
+        return TSDB_ERR_PARSE;
+    }
+
+    /* ---- LIST ----------------------------------------------------------- */
+    if (accept(&p, QTOK_LIST)) {
+        /* LIST GROUPS  — "groups" lexes as QTOK_IDENT (plural not a keyword) */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "groups")) {
+            out->kind = QAST_STMT_LIST_GROUPS;
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return TSDB_OK;
+        }
+
+        /* LIST DEVICES [IN GROUP <group>] */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "devices")) {
+            out->kind = QAST_STMT_LIST_DEVICES;
+            out->u.list_devices.group[0] = '\0';
+            advance(&p);
+            if (accept(&p, QTOK_IN)) {
+                if (!accept(&p, QTOK_GROUP)) {
+                    perr(&p, "expected GROUP after IN"); return TSDB_ERR_PARSE;
+                }
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, out->u.list_devices.group,
+                         sizeof(out->u.list_devices.group));
+                advance(&p);
+            }
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUPS or DEVICES after LIST");
+        return TSDB_ERR_PARSE;
+    }
+
+    perr(&p, "expected SELECT, CREATE, DROP, or LIST");
+    return TSDB_ERR_PARSE;
+}
+
+/* qparse: legacy SELECT-only wrapper.  Calls qparse_stmt and errors for
+ * any non-SELECT statement so callers that only expect SELECT still work. */
+/* NOTE: qparse is already defined above this block.  We instead just update
+ * tsdb_query in exec.c to call qparse_stmt directly. */

@@ -11,6 +11,8 @@
 #include "../../include/tsdb.h"
 #include "schema.h"
 #include "memtable.h"
+#include "part.h"
+#include "../catalog/group.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +24,10 @@ typedef struct tsdb_table_internal tsdb_table_internal_t;
 
 const char            *tsdb_db_data_dir(tsdb_db_t *db);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
+
+/* Access the catalog embedded in the db. May return NULL if catalog
+ * failed to open (non-fatal for pure SELECT workloads). */
+tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
 
 tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
@@ -60,11 +66,43 @@ typedef int (*tsdb_on_create_fn)(void *ud, tsdb_db_t *db,
                                   const char *table_name,
                                   tsdb_schema_t *schema);
 
+/*
+ * on_raw_block: called by tsdb_part_flush_ex after each column block is encoded.
+ * Opt-in raw-block replication path.  When registered, it fires on every
+ * encoded block; set TSDB_REPLICATION_MODE=raw in db_cluster.c to activate
+ * this path instead of on_replicate.
+ *
+ * Signature: (userdata, db, table_name, day_yyyymmdd, col_idx, meta,
+ *              block_bytes, block_bytes_len)
+ *   block_bytes: compressed data only (NO 32-byte BlockHeader prefix).
+ *   meta: populated by part.c (codec, flags, count, ts_min, ts_max).
+ *   Returns TSDB_OK or error (logged but not propagated).
+ */
+typedef int (*tsdb_on_raw_block_fn)(void *ud, tsdb_db_t *db,
+                                     const char *table_name,
+                                     uint32_t part_day,
+                                     uint16_t col_idx,
+                                     const tsdb_block_meta_t *meta,
+                                     const uint8_t *block_bytes,
+                                     size_t block_bytes_len);
+
 /* Register hooks for a specific db instance. */
 void tsdb_db_set_hooks(tsdb_db_t *db,
                         tsdb_on_replicate_fn on_replicate,
                         tsdb_on_create_fn on_create,
                         void *userdata);
+
+/* Register the raw-block hook (opt-in; independent from set_hooks).
+ * raw_ud is passed as the first argument to on_raw_block. */
+void tsdb_db_set_raw_block_hook(tsdb_db_t *db,
+                                 tsdb_on_raw_block_fn on_raw_block,
+                                 void *raw_ud);
+
+/* Retrieve the registered raw-block hook + userdata.  Called from part.c.
+ * Uses void** to avoid a circular typedef between db.h and part.h. */
+void tsdb_db_get_raw_block_hook(tsdb_db_t *db,
+                                 void **out_fn,
+                                 void **out_ud);
 
 /*
  * Mark a batch as local-only (no cluster replication on commit).

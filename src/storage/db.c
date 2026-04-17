@@ -6,6 +6,8 @@
 #include "part.h"
 #include "wal.h"
 #include "../../include/tsdb.h"
+#include "../catalog/group.h"
+#include "../catalog/device.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +50,13 @@ struct tsdb_db {
     tsdb_on_replicate_fn on_replicate;
     tsdb_on_create_fn    on_create;
     void                *hook_ud;
+
+    /* Raw-block replication hook (opt-in, NULL by default). */
+    tsdb_on_raw_block_fn on_raw_block;
+    void                *raw_block_ud;
+
+    /* Catalog (Group/Device metadata). Opened in tsdb_open. */
+    tsdb_catalog_t      *catalog;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -81,6 +90,12 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
 
     snprintf(db->data_dir, sizeof(db->data_dir), "%s", data_dir);
     pthread_mutex_init(&db->lock, NULL);
+
+    /* Open catalog — non-fatal on failure so plain SELECT workloads
+     * still work even if catalog dir creation fails. */
+    if (tsdb_catalog_open(data_dir, &db->catalog) != TSDB_OK) {
+        db->catalog = NULL;
+    }
 
     *out = db;
     return TSDB_OK;
@@ -117,6 +132,8 @@ void tsdb_close(tsdb_db_t *db) {
         }
         free(t);
     }
+
+    if (db->catalog) tsdb_catalog_close(db->catalog);
 
     pthread_mutex_unlock(&db->lock);
     pthread_mutex_destroy(&db->lock);
@@ -382,14 +399,22 @@ int tsdb_batch_begin(tsdb_table_t *tbl, tsdb_batch_t **out) {
 static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_rows(t->memtable) == 0) return TSDB_OK;
 
-    /* Cluster replication: fan out BEFORE local flush so data is in memtable. */
-    if (!skip_replicate && t->db && t->db->on_replicate) {
+    /* Row-level cluster replication: fires BEFORE flush so data still in
+     * memtable.  Skipped when raw-block mode is active (on_raw_block != NULL)
+     * to avoid double-replication. */
+    if (!skip_replicate && t->db && t->db->on_replicate &&
+        !t->db->on_raw_block) {
         t->db->on_replicate(t->db->hook_ud, t->db, t->name,
                             t->schema, t->memtable);
         /* Errors are logged by the hook but do not abort the local write. */
     }
 
-    int rc = tsdb_part_flush(t->schema, t->memtable);
+    /* Raw-block replication is triggered from inside tsdb_part_flush_ex
+     * after each block encode — pass db + table_name so the hook has context.
+     * For replica-received writes (skip_replicate=1) pass NULL to suppress. */
+    int rc = tsdb_part_flush_ex(t->schema, t->memtable,
+                                 skip_replicate ? NULL : t->db,
+                                 t->name);
     if (rc == TSDB_OK) {
         tsdb_memtable_clear(t->memtable);
         /* Truncate WAL after successful flush. */
@@ -498,6 +523,32 @@ void tsdb_db_set_hooks(tsdb_db_t *db,
     pthread_mutex_unlock(&db->lock);
 }
 
+void tsdb_db_set_raw_block_hook(tsdb_db_t *db,
+                                 tsdb_on_raw_block_fn on_raw_block,
+                                 void *raw_ud)
+{
+    if (!db) return;
+    pthread_mutex_lock(&db->lock);
+    db->on_raw_block = on_raw_block;
+    db->raw_block_ud = raw_ud;
+    pthread_mutex_unlock(&db->lock);
+}
+
+/* Called from part.c to retrieve the raw-block hook.
+ * We pass the function pointer via void** to avoid a typedef conflict
+ * between db.h's tsdb_on_raw_block_fn and part.c's local part_raw_block_fn_t.
+ * The cast is valid since the underlying function signatures are identical. */
+void tsdb_db_get_raw_block_hook(tsdb_db_t *db,
+                                 void **out_fn,
+                                 void **out_ud)
+{
+    if (!db || !out_fn || !out_ud) return;
+    /* Store function pointer as void* via memcpy to satisfy strict-aliasing. */
+    tsdb_on_raw_block_fn fn = db->on_raw_block;
+    __builtin_memcpy(out_fn, &fn, sizeof(void *));
+    *out_ud = db->raw_block_ud;
+}
+
 /* ---- Internal accessors for query module ------------------------------- */
 
 const char *tsdb_db_data_dir(tsdb_db_t *db) { return db ? db->data_dir : NULL; }
@@ -514,3 +565,4 @@ tsdb_schema_t   *tsdb_tbl_schema(tsdb_table_internal_t *t)   { return t ? t->sch
 tsdb_memtable_t *tsdb_tbl_memtable(tsdb_table_internal_t *t) { return t ? t->memtable : NULL; }
 const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->schema) ? t->schema->dir : NULL; }
 const char      *tsdb_tbl_name(tsdb_table_internal_t *t)     { return t ? t->name : NULL; }
+tsdb_catalog_t  *tsdb_db_catalog(tsdb_db_t *db)              { return db ? db->catalog : NULL; }

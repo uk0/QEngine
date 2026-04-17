@@ -31,6 +31,8 @@
 #include <stdint.h>
 #include "../core/arena.h"
 #include "../../include/tsdb.h"
+#include "../catalog/group.h"
+#include "../catalog/device.h"
 
 typedef enum {
     /* Literals */
@@ -126,5 +128,30 @@ qast_expr_t *qast_mk_null(tsdb_arena_t *a);
 qast_expr_t *qast_mk_unary(tsdb_arena_t *a, qast_kind_t k, qast_expr_t *x);
 qast_expr_t *qast_mk_binop(tsdb_arena_t *a, qast_kind_t k, qast_expr_t *l, qast_expr_t *r);
 qast_expr_t *qast_mk_call(tsdb_arena_t *a, const char *name, qast_expr_t **args, int nargs);
+
+/* ---- Statement-level AST (DDL + SELECT) --------------------------------- */
+
+typedef enum {
+    QAST_STMT_SELECT,          /* existing query */
+    QAST_STMT_CREATE_GROUP,
+    QAST_STMT_DROP_GROUP,
+    QAST_STMT_LIST_GROUPS,
+    QAST_STMT_CREATE_DEVICE,
+    QAST_STMT_DROP_DEVICE,
+    QAST_STMT_LIST_DEVICES,
+} qast_stmt_kind_t;
+
+typedef struct {
+    qast_stmt_kind_t kind;
+    union {
+        qast_query_t query;                              /* QAST_STMT_SELECT */
+        struct { tsdb_group_t spec; }  create_group;     /* QAST_STMT_CREATE_GROUP */
+        struct { char name[64]; }      drop_group;       /* QAST_STMT_DROP_GROUP */
+        /* LIST_GROUPS has no extra data */
+        struct { tsdb_device_t spec; } create_device;    /* QAST_STMT_CREATE_DEVICE */
+        struct { char group[64]; char id[128]; } drop_device;  /* QAST_STMT_DROP_DEVICE */
+        struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
+    } u;
+} qast_stmt_t;
 
 #endif

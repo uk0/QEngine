@@ -34,6 +34,12 @@ typedef enum {
     QTOK_IN, QTOK_BETWEEN,
     QTOK_TRUE, QTOK_FALSE,
 
+    /* DDL keywords (IoT Group/Device) */
+    QTOK_CREATE, QTOK_DROP, QTOK_LIST,
+    QTOK_DEVICE,
+    QTOK_RETENTION, QTOK_PROFILE, QTOK_REGION,
+    QTOK_REPLICA, QTOK_FACTOR,
+
     QTOK_ERR
 } qtok_kind_t;
 

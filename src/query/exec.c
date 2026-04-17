@@ -14,6 +14,8 @@
 #include "../exec/filter.h"
 #include "../exec/bucket.h"
 #include "../exec/pool.h"
+#include "../catalog/group.h"
+#include "../catalog/device.h"
 #include "../../include/tsdb.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -1512,15 +1514,185 @@ done:
     return rc;
 }
 
+/* ---- DDL execution helpers --------------------------------------------- */
+
+/*
+ * Build a result row for LIST GROUPS: one SYMBOL col per field.
+ * Columns: name, region, retention_ns(i64), codec_profile, replica_factor(i64),
+ *          tags, created_at(ts)
+ */
+static const char *LIST_GROUPS_COLS[]  = {"name","region","retention_ns","codec_profile","replica_factor","tags","created_at"};
+static const tsdb_type_t LIST_GROUPS_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,  TSDB_TYPE_SYMBOL,
+    TSDB_TYPE_TIMESTAMP
+};
+#define LIST_GROUPS_NCOLS 7
+
+static const char *LIST_DEVICES_COLS[] = {"group","id","type","location","tags","last_seen","status"};
+static const tsdb_type_t LIST_DEVICES_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL,
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_TIMESTAMP,
+    TSDB_TYPE_INT64
+};
+#define LIST_DEVICES_NCOLS 7
+
+/* Allocate an owned symtab. Registers it in the result's owned list. */
+static tsdb_symtab_t *result_new_owned_symtab(tsdb_result_t *r) {
+    tsdb_symtab_t *st = NULL;
+    if (tsdb_symtab_new(&st) != TSDB_OK) return NULL;
+    int n = r->n_owned_symtabs;
+    tsdb_symtab_t **arr = realloc(r->owned_symtabs,
+                                   (size_t)(n + 1) * sizeof(*arr));
+    if (!arr) { tsdb_symtab_free(st); return NULL; }
+    arr[n] = st;
+    r->owned_symtabs = arr;
+    r->n_owned_symtabs = n + 1;
+    return st;
+}
+
+/* Intern a string into symtab and append to result col. */
+static int result_append_sym(tsdb_result_t *r, int col, const char *s) {
+    tsdb_symtab_t *st = r->col_symtab[col];
+    if (!st) return TSDB_ERR_INTERNAL;
+    uint32_t code = tsdb_symtab_intern(st, s ? s : "");
+    if (code == TSDB_SYMBOL_INVALID) return TSDB_ERR_NOMEM;
+    ((uint64_t *)r->col_data[col])[r->nrows] = code;
+    return TSDB_OK;
+}
+
+static int result_append_i64_val(tsdb_result_t *r, int col, int64_t v) {
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    ((uint64_t *)r->col_data[col])[r->nrows] = bits;
+    return TSDB_OK;
+}
+
+static int result_append_ts_val(tsdb_result_t *r, int col, tsdb_ts_t v) {
+    return result_append_i64_val(r, col, (int64_t)v);
+}
+
+/* Initialise result with ncols columns; allocate symtabs for SYMBOL cols.
+ * Also preallocates 64 rows worth of data. */
+static int result_init_ddl(tsdb_result_t *r, int ncols,
+                            const char **names,
+                            const tsdb_type_t *types) {
+    r->ncols     = ncols;
+    r->col_names  = calloc((size_t)ncols, sizeof(char *));
+    r->col_types  = calloc((size_t)ncols, sizeof(tsdb_type_t));
+    r->col_symtab = calloc((size_t)ncols, sizeof(tsdb_symtab_t *));
+    r->col_data   = calloc((size_t)ncols, sizeof(void *));
+    if (!r->col_names || !r->col_types || !r->col_data || !r->col_symtab)
+        return TSDB_ERR_NOMEM;
+
+    size_t init_rows = 64;
+    for (int i = 0; i < ncols; i++) {
+        r->col_names[i] = strdup(names[i]);
+        r->col_types[i] = types[i];
+        r->col_data[i]  = malloc(init_rows * 8);
+        if (!r->col_names[i] || !r->col_data[i]) return TSDB_ERR_NOMEM;
+        if (types[i] == TSDB_TYPE_SYMBOL) {
+            r->col_symtab[i] = result_new_owned_symtab(r);
+            if (!r->col_symtab[i]) return TSDB_ERR_NOMEM;
+        }
+    }
+    r->cap_rows = init_rows;
+    return TSDB_OK;
+}
+
+/* Grow result data arrays if needed before appending. */
+static int result_ddl_ensure_cap(tsdb_result_t *r) {
+    if (r->nrows < r->cap_rows) return TSDB_OK;
+    size_t newcap = r->cap_rows * 2;
+    for (int i = 0; i < r->ncols; i++) {
+        void *np = realloc(r->col_data[i], newcap * 8);
+        if (!np) return TSDB_ERR_NOMEM;
+        r->col_data[i] = np;
+    }
+    r->cap_rows = newcap;
+    return TSDB_OK;
+}
+
+/* Commit a row (increment nrows). */
+static void result_ddl_end_row(tsdb_result_t *r) { r->nrows++; }
+
+static int exec_list_groups(tsdb_catalog_t *cat, tsdb_result_t *r) {
+    int rc = result_init_ddl(r, LIST_GROUPS_NCOLS,
+                              LIST_GROUPS_COLS, LIST_GROUPS_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_group_t *arr = NULL;
+    size_t n = 0;
+    rc = tsdb_group_list(cat, &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_group_t *g = &arr[i];
+        char ret_str[32];
+        snprintf(ret_str, sizeof(ret_str), "%lld", (long long)g->retention_ns);
+
+        result_append_sym(r, 0, g->name);
+        result_append_sym(r, 1, g->region);
+        result_append_i64_val(r, 2, g->retention_ns);
+        result_append_sym(r, 3, g->codec_profile);
+        result_append_i64_val(r, 4, (int64_t)g->replica_factor);
+        result_append_sym(r, 5, g->tags);
+        result_append_ts_val(r, 6, g->created_at);
+        result_ddl_end_row(r);
+    }
+    tsdb_group_list_free(arr);
+    return rc;
+}
+
+static int exec_list_devices(tsdb_catalog_t *cat, const char *group,
+                              tsdb_result_t *r) {
+    int rc = result_init_ddl(r, LIST_DEVICES_NCOLS,
+                              LIST_DEVICES_COLS, LIST_DEVICES_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_device_t *arr = NULL;
+    size_t n = 0;
+    /* group="" means list all */
+    rc = tsdb_device_list(cat, (group && group[0]) ? group : NULL, &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_device_t *d = &arr[i];
+        result_append_sym(r, 0, d->group);
+        result_append_sym(r, 1, d->id);
+        result_append_sym(r, 2, d->type);
+        result_append_sym(r, 3, d->location);
+        result_append_sym(r, 4, d->tags);
+        result_append_ts_val(r, 5, d->last_seen);
+        result_append_i64_val(r, 6, (int64_t)d->status);
+        result_ddl_end_row(r);
+    }
+    tsdb_device_list_free(arr);
+    return rc;
+}
+
+/* Build a single-row, single-col STATUS result with a message string. */
+static int result_status(tsdb_result_t *r, const char *msg) {
+    static const char *col_names[] = {"status"};
+    static const tsdb_type_t col_types[] = {TSDB_TYPE_SYMBOL};
+    int rc = result_init_ddl(r, 1, col_names, col_types);
+    if (rc != TSDB_OK) return rc;
+    result_append_sym(r, 0, msg);
+    result_ddl_end_row(r);
+    return TSDB_OK;
+}
+
 /* ---- Public API implementations --------------------------------------- */
 
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     if (!db || !qtl || !out) return TSDB_ERR_INVAL;
 
     tsdb_arena_t a; tsdb_arena_init(&a, 16 * 1024);
-    qast_query_t q;
+    qast_stmt_t stmt;
     char err[256];
-    int rc = qparse(qtl, &a, &q, err, sizeof(err));
+    int rc = qparse_stmt(qtl, &a, &stmt, err, sizeof(err));
     if (rc != TSDB_OK) {
         tsdb_arena_free(&a);
         return rc;
@@ -1530,8 +1702,66 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     if (!r) { tsdb_arena_free(&a); return TSDB_ERR_NOMEM; }
     r->cur = -1;
 
-    rc = exec_select(db, &q, r, err, sizeof(err));
+    if (stmt.kind == QAST_STMT_SELECT) {
+        rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
+        tsdb_arena_free(&a);
+        if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
+        *out = r;
+        return TSDB_OK;
+    }
+
     tsdb_arena_free(&a);
+
+    /* DDL statements require the catalog. */
+    tsdb_catalog_t *cat = tsdb_db_catalog(db);
+    if (!cat) {
+        tsdb_result_free(r);
+        eset(err, sizeof(err), "catalog not available");
+        return TSDB_ERR_INTERNAL;
+    }
+
+    switch (stmt.kind) {
+    case QAST_STMT_CREATE_GROUP: {
+        rc = tsdb_group_create(cat, &stmt.u.create_group.spec);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: group created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: group exists"); rc = TSDB_ERR_EXISTS; }
+        else result_status(r, "ERR: create group failed");
+        break;
+    }
+    case QAST_STMT_DROP_GROUP: {
+        rc = tsdb_group_drop(cat, stmt.u.drop_group.name);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: group dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group not found"); rc = TSDB_ERR_NOTFOUND; }
+        else result_status(r, "ERR: drop group failed");
+        break;
+    }
+    case QAST_STMT_LIST_GROUPS:
+        rc = exec_list_groups(cat, r);
+        break;
+    case QAST_STMT_CREATE_DEVICE: {
+        rc = tsdb_device_create(cat, &stmt.u.create_device.spec);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: device created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: device exists"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group not found"); rc = TSDB_ERR_NOTFOUND; }
+        else result_status(r, "ERR: create device failed");
+        break;
+    }
+    case QAST_STMT_DROP_DEVICE: {
+        rc = tsdb_device_drop(cat, stmt.u.drop_device.group, stmt.u.drop_device.id);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: device dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: device not found"); rc = TSDB_ERR_NOTFOUND; }
+        else result_status(r, "ERR: drop device failed");
+        break;
+    }
+    case QAST_STMT_LIST_DEVICES:
+        rc = exec_list_devices(cat, stmt.u.list_devices.group, r);
+        break;
+    default:
+        result_status(r, "ERR: unknown statement");
+        rc = TSDB_ERR_UNSUPPORTED;
+        break;
+    }
+
     if (rc != TSDB_OK) {
         tsdb_result_free(r);
         return rc;
@@ -1550,6 +1780,13 @@ void tsdb_result_free(tsdb_result_t *r) {
     free(r->col_types);
     free(r->col_symtab);
     free(r->col_data);
+    /* Free owned symtabs (created by DDL LIST results). */
+    if (r->owned_symtabs) {
+        for (int i = 0; i < r->n_owned_symtabs; i++) {
+            if (r->owned_symtabs[i]) tsdb_symtab_free(r->owned_symtabs[i]);
+        }
+        free(r->owned_symtabs);
+    }
     free(r);
 }
 

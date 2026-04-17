@@ -22,6 +22,11 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"group",     QTOK_GROUP},    {"order",     QTOK_ORDER},     {"asc",       QTOK_ASC},
     {"desc",      QTOK_DESC},     {"limit",     QTOK_LIMIT},     {"in",        QTOK_IN},
     {"between",   QTOK_BETWEEN},  {"true",      QTOK_TRUE},      {"false",     QTOK_FALSE},
+    /* DDL keywords */
+    {"create",    QTOK_CREATE},   {"drop",      QTOK_DROP},      {"list",      QTOK_LIST},
+    {"device",    QTOK_DEVICE},
+    {"retention", QTOK_RETENTION},{"profile",   QTOK_PROFILE},   {"region",    QTOK_REGION},
+    {"replica",   QTOK_REPLICA},  {"factor",    QTOK_FACTOR},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -55,6 +60,11 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_ASC: return "ASC"; case QTOK_DESC: return "DESC"; case QTOK_LIMIT: return "LIMIT";
     case QTOK_IN: return "IN"; case QTOK_BETWEEN: return "BETWEEN";
     case QTOK_TRUE: return "true"; case QTOK_FALSE: return "false";
+    case QTOK_CREATE: return "CREATE"; case QTOK_DROP: return "DROP";
+    case QTOK_LIST: return "LIST"; case QTOK_DEVICE: return "DEVICE";
+    case QTOK_RETENTION: return "RETENTION"; case QTOK_PROFILE: return "PROFILE";
+    case QTOK_REGION: return "REGION"; case QTOK_REPLICA: return "REPLICA";
+    case QTOK_FACTOR: return "FACTOR";
     case QTOK_ERR: return "<error>";
     }
     return "?";
