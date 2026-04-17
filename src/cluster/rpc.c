@@ -8,6 +8,7 @@
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
+#include "../federation/fedrpc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -373,6 +374,56 @@ static void *connection_handler(void *arg) {
                     }
                 }
                 send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
+        case TSDB_RPC_FED_QUERY:
+            /* Federation query: run QTL on local DB, encode result, send back. */
+            if (db && msg.payload_len >= 2) {
+                uint16_t qlen;
+                memcpy(&qlen, msg.payload, 2);
+                if ((uint32_t)qlen + 2 <= msg.payload_len && qlen < 4096) {
+                    char qtl[4096];
+                    memcpy(qtl, msg.payload + 2, qlen);
+                    qtl[qlen] = '\0';
+
+                    tsdb_result_t *qr = NULL;
+                    int qrc = tsdb_query(db, qtl, &qr);
+
+                    if (qrc == TSDB_OK && qr) {
+                        /* Encode result into a response buffer. */
+                        uint32_t rbufcap = 64 * 1024 * 1024; /* 64 MB */
+                        uint8_t *rbuf = malloc(rbufcap);
+                        if (rbuf) {
+                            int encoded = fedrpc_encode_result(rbuf, rbufcap, qr);
+                            if (encoded > 0) {
+                                /* Send ACK with payload = encoded result. */
+                                uint8_t *frame = malloc((size_t)encoded + TSDB_RPC_HDR_SIZE);
+                                if (frame) {
+                                    int fn = tsdb_rpc_encode(frame,
+                                                             (size_t)encoded + TSDB_RPC_HDR_SIZE,
+                                                             TSDB_RPC_ACK,
+                                                             msg.req_id,
+                                                             rbuf, (uint32_t)encoded);
+                                    if (fn > 0) write_full(fd, frame, (size_t)fn);
+                                    free(frame);
+                                }
+                            } else {
+                                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                            }
+                            free(rbuf);
+                        } else {
+                            send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                        }
+                        tsdb_result_free(qr);
+                    } else {
+                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    }
+                } else {
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
             } else {
                 send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }

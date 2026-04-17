@@ -46,7 +46,8 @@ typedef enum {
     TSDB_RPC_HEARTBEAT    = 4,
     TSDB_RPC_SCHEMA_SYNC  = 5,
     TSDB_RPC_ACK          = 6,
-    TSDB_RPC_ERR          = 7
+    TSDB_RPC_ERR          = 7,
+    TSDB_RPC_FED_QUERY    = 8   /* federation query: QTL → encoded result */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
