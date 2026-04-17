@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <time.h>
 
 /* Forward declaration of mkdir_p from schema.c. */
 extern int tsdb_mkdir_p(const char *path);
@@ -208,4 +210,234 @@ int tsdb_wal_replay(const char *db_dir, const char *table_name,
     free(buf);
     fclose(f);
     return rc;
+}
+
+/* ---- Group-commit implementation ---------------------------------------- */
+
+/*
+ * State machine:
+ *
+ *   Writer thread                       BG thread
+ *   ─────────────────────────           ───────────────────────────────────
+ *   lock(gc->mu)
+ *   tsdb_wal_append(...)                cond_timedwait(gc->append_cv, window)
+ *   my_seq = ++gc->write_seq            OR nwaiters >= TSDB_GC_EAGER_WAITERS
+ *   gc->nwaiters++
+ *   if nwaiters >= EAGER: signal(bg_cv) wakes early
+ *   while fsynced_seq < my_seq:         lock, capture target = write_seq
+ *     cond_wait(gc->done_cv, gc->mu)    unlock, fsync(fd)
+ *   gc->nwaiters--                      lock, fsynced_seq = target
+ *   unlock(gc->mu)                      broadcast(done_cv)
+ *   return TSDB_OK                      unlock
+ *
+ * Key invariants:
+ * - gc->mu serializes all appends so no records interleave on the fd.
+ * - A writer captures my_seq AFTER its append; the bg thread only
+ *   marks fsynced_seq = write_seq captured BEFORE the fsync call,
+ *   so it never over-reports durability.
+ * - On stop: bg does a final fsync then sets fsynced_seq = write_seq
+ *   and broadcasts, unblocking any remaining waiters.
+ */
+
+struct tsdb_group_commit {
+    tsdb_wal_t     *wal;
+    int64_t         batch_window_ns;
+
+    pthread_mutex_t mu;
+    pthread_cond_t  append_cv;  /* bg thread waits here for new appenders */
+    pthread_cond_t  done_cv;    /* writers wait here for fsync completion  */
+
+    uint64_t        write_seq;     /* incremented by each append_sync caller */
+    uint64_t        fsynced_seq;   /* latest seq known durable after fsync   */
+    int             nwaiters;      /* writers currently blocked in done_cv   */
+    int             stop;          /* 1 = stopping, 2 = fully stopped        */
+    int             last_fsync_rc; /* last fsync errno (0 = success)         */
+
+    pthread_t       bg_thread;
+};
+
+/* Background thread: batches fsyncs.
+ *
+ * State machine:
+ *
+ *  IDLE:  write_seq == fsynced_seq — nothing to fsync.
+ *         Sleeps on append_cv until a writer increments write_seq.
+ *
+ *  BATCH: write_seq > fsynced_seq — collecting writers.
+ *         Waits up to batch_window_ns for more writers, or until
+ *         nwaiters reaches TSDB_GC_EAGER_WAITERS (whichever comes first).
+ *
+ *  FSYNC: captures target_seq = write_seq, releases mutex, calls fsync(),
+ *         reacquires mutex, advances fsynced_seq, broadcasts done_cv.
+ *         Then explicitly yields the mutex (unlock+relock) so that all
+ *         woken waiters have a chance to reacquire the mutex and finish
+ *         their wait before the bg thread loops back to IDLE/BATCH.
+ *
+ * Without the yield after broadcast, the bg thread may spin in BATCH with
+ * nwaiters >= EAGER and write_seq == fsynced_seq (all sequences already
+ * covered), starving workers of the mutex they need to decrement nwaiters
+ * and proceed to their next append.
+ */
+static void *gc_bg_thread(void *arg) {
+    tsdb_group_commit_t *gc = (tsdb_group_commit_t *)arg;
+
+    pthread_mutex_lock(&gc->mu);
+
+    while (!gc->stop) {
+        /* IDLE: wait until there is at least one unfsynced write. */
+        while (!gc->stop && gc->write_seq == gc->fsynced_seq) {
+            pthread_cond_wait(&gc->append_cv, &gc->mu);
+        }
+        if (gc->stop) break;
+
+        /* BATCH: wait up to batch_window for more writers or eager threshold. */
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += gc->batch_window_ns / 1000000000LL;
+        deadline.tv_nsec += gc->batch_window_ns % 1000000000LL;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        while (!gc->stop && gc->nwaiters < TSDB_GC_EAGER_WAITERS) {
+            int r = pthread_cond_timedwait(&gc->append_cv, &gc->mu, &deadline);
+            if (r == ETIMEDOUT) break;
+            (void)r;
+        }
+
+        if (gc->stop) break;
+
+        /* FSYNC: capture target, release lock, fsync, reacquire, advance seq. */
+        uint64_t target_seq = gc->write_seq;
+
+        pthread_mutex_unlock(&gc->mu);
+        int frc = fsync(gc->wal->fd);
+        pthread_mutex_lock(&gc->mu);
+
+        gc->last_fsync_rc = (frc == 0) ? 0 : errno;
+        if (target_seq > gc->fsynced_seq) {
+            gc->fsynced_seq = target_seq;
+        }
+
+        /* Wake all blocked writers — each will check its own seq. */
+        pthread_cond_broadcast(&gc->done_cv);
+
+        /*
+         * YIELD: release the mutex so that newly-woken waiters can
+         * reacquire it, verify fsynced_seq >= my_seq, decrement nwaiters,
+         * and proceed.  Without this unlock/relock, the bg thread may
+         * spin in the BATCH section while holding the mutex, starving all
+         * workers when nwaiters >= TSDB_GC_EAGER_WAITERS and no new
+         * sequences have been added yet.
+         */
+        pthread_mutex_unlock(&gc->mu);
+        pthread_mutex_lock(&gc->mu);
+    }
+
+    /* Final fsync on shutdown to drain any last unfsynced records. */
+    uint64_t final_seq = gc->write_seq;
+    pthread_mutex_unlock(&gc->mu);
+    if (final_seq > 0) {
+        fsync(gc->wal->fd);
+    }
+    pthread_mutex_lock(&gc->mu);
+    gc->fsynced_seq = gc->write_seq; /* mark all remaining writes durable */
+    gc->stop = 2;
+    pthread_cond_broadcast(&gc->done_cv);
+    pthread_mutex_unlock(&gc->mu);
+
+    return NULL;
+}
+
+int tsdb_group_commit_start(tsdb_wal_t *w, int64_t batch_window_ns,
+                             tsdb_group_commit_t **out)
+{
+    if (!w || batch_window_ns <= 0 || !out) return TSDB_ERR_INVAL;
+
+    tsdb_group_commit_t *gc = calloc(1, sizeof(*gc));
+    if (!gc) return TSDB_ERR_NOMEM;
+
+    gc->wal             = w;
+    gc->batch_window_ns = batch_window_ns;
+    gc->write_seq       = 0;
+    gc->fsynced_seq     = 0;
+    gc->nwaiters        = 0;
+    gc->stop            = 0;
+    gc->last_fsync_rc   = 0;
+
+    pthread_mutex_init(&gc->mu, NULL);
+    pthread_cond_init(&gc->append_cv, NULL);
+    pthread_cond_init(&gc->done_cv, NULL);
+
+    int rc = pthread_create(&gc->bg_thread, NULL, gc_bg_thread, gc);
+    if (rc != 0) {
+        pthread_mutex_destroy(&gc->mu);
+        pthread_cond_destroy(&gc->append_cv);
+        pthread_cond_destroy(&gc->done_cv);
+        free(gc);
+        return TSDB_ERR_IO;
+    }
+
+    *out = gc;
+    return TSDB_OK;
+}
+
+void tsdb_group_commit_stop(tsdb_group_commit_t *g) {
+    if (!g) return;
+
+    pthread_mutex_lock(&g->mu);
+    g->stop = 1;
+    pthread_cond_broadcast(&g->append_cv); /* wake bg thread */
+    pthread_mutex_unlock(&g->mu);
+
+    pthread_join(g->bg_thread, NULL);
+
+    pthread_cond_destroy(&g->done_cv);
+    pthread_cond_destroy(&g->append_cv);
+    pthread_mutex_destroy(&g->mu);
+    free(g);
+}
+
+int tsdb_wal_append_sync(tsdb_wal_t *w, tsdb_group_commit_t *g,
+                          const void *rec, size_t n)
+{
+    if (!w || !g) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&g->mu);
+
+    if (g->stop) {
+        pthread_mutex_unlock(&g->mu);
+        return TSDB_ERR_IO;
+    }
+
+    /* Append under the group-commit lock so records don't interleave. */
+    int arc = tsdb_wal_append(w, rec, n);
+    if (arc != TSDB_OK) {
+        pthread_mutex_unlock(&g->mu);
+        return arc;
+    }
+
+    /* Claim a sequence number AFTER the successful append. */
+    uint64_t my_seq = ++g->write_seq;
+    g->nwaiters++;
+
+    /* Signal bg thread so it knows there is work. */
+    pthread_cond_signal(&g->append_cv);
+
+    /* Trigger eager batch if threshold reached. */
+    if (g->nwaiters >= TSDB_GC_EAGER_WAITERS) {
+        pthread_cond_broadcast(&g->append_cv);
+    }
+
+    /* Wait until our seq is durable or the thread has fully stopped. */
+    while (g->fsynced_seq < my_seq && g->stop < 2) {
+        pthread_cond_wait(&g->done_cv, &g->mu);
+    }
+
+    g->nwaiters--;
+    int last_rc = g->last_fsync_rc;
+    pthread_mutex_unlock(&g->mu);
+
+    return (last_rc == 0) ? TSDB_OK : TSDB_ERR_IO;
 }
