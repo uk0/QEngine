@@ -124,6 +124,12 @@ typedef struct {
     int64_t  shutdown_grace_ns;
     bool     allow_core;
 
+    /* -- InfluxDB Line Protocol HTTP endpoint -- */
+    char     influx_bind[128];  /* "host:port" e.g. "0.0.0.0:28091"; empty = disabled */
+
+    /* -- Prometheus metrics HTTP endpoint -- */
+    char     metrics_bind[128]; /* "host:port" e.g. "0.0.0.0:28094"; empty = disabled */
+
     /* -- TLS -- */
     char     tls_cert[TSDB_CFG_MAX_PATH];   /* server certificate PEM */
     char     tls_key[TSDB_CFG_MAX_PATH];    /* server private key PEM */

@@ -21,6 +21,7 @@
 #include "../src/server/server.h"
 #include "../src/server/config.h"
 #include "../src/server/log.h"
+#include "../src/server/influx_line.h"
 #include "../include/tsdb.h"
 
 #include <stdio.h>
@@ -199,6 +200,16 @@ int main(int argc, char **argv) {
     TSDB_LOG_INFO("main", "listening on %s (port=%d)",
                   cfg.bind, tsdb_server_port(g_srv));
 
+    /* Start InfluxDB Line Protocol HTTP endpoint if configured. */
+    if (cfg.influx_bind[0]) {
+        rc = tsdb_influx_http_start(cfg.influx_bind, db);
+        if (rc != 0) {
+            TSDB_LOG_ERROR("main", "influx http start(%s) failed", cfg.influx_bind);
+        } else {
+            TSDB_LOG_INFO("main", "influx LP endpoint on %s", cfg.influx_bind);
+        }
+    }
+
     /* Install signals. */
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
@@ -227,6 +238,7 @@ int main(int argc, char **argv) {
 
     /* 8. Graceful shutdown. */
     TSDB_LOG_INFO("main", "shutting down");
+    tsdb_influx_http_stop();
     tsdb_server_stop(g_srv);
     tsdb_close(db);
     tsdb_log_shutdown();

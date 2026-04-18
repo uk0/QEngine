@@ -14,6 +14,7 @@
 #include "tls.h"    /* must come before proto.h to expose tsdb_io_t */
 #include "server.h"
 #include "proto.h"
+#include "metrics.h"
 #include "../../include/tsdb.h"
 #include "../storage/db.h"
 #include "../storage/schema.h"
@@ -577,6 +578,9 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         return send_error(io, req_id, write_err, "batch_commit failed");
 
     atomic_fetch_add(&srv->stat_rows_written, nrows);
+    tsdb_metric_add("qengine_rows_written_total", nrows);
+    tsdb_metric_add("qengine_bytes_written_total", plen);
+    tsdb_metric_observe("qengine_ingest_batch_size", (double)nrows);
 
     /* Fan-out subscriptions with structured SUB_EVENT payload.
      *
@@ -708,10 +712,24 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     int qlen = (plen < sizeof(qtl) - 1) ? (int)plen : (int)sizeof(qtl) - 1;
     memcpy(qtl, payload, qlen);
 
+    /* Time the query for histogram metric. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     tsdb_result_t *res = NULL;
     int rc = tsdb_query(srv->db, qtl, &res);
-    if (rc != TSDB_OK || !res)
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed_ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                        (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6;
+
+    tsdb_metric_inc("qengine_queries_total");
+    tsdb_metric_observe("qengine_query_duration_ms", elapsed_ms);
+
+    if (rc != TSDB_OK || !res) {
+        tsdb_metric_inc("qengine_query_errors_total");
         return send_error(io, req_id, rc ? rc : TSDB_ERR_INTERNAL, "query failed");
+    }
 
     atomic_fetch_add(&srv->stat_queries, 1);
 
@@ -938,6 +956,8 @@ static void *connection_handler(void *arg) {
     tsdb_io_t *io = &io_obj;
 
     atomic_fetch_add(&srv->stat_conns, 1);
+    tsdb_metric_inc("qengine_connections_total");
+    tsdb_metric_gauge_inc("qengine_connections_active");
 
     tsdb_frame_hdr_t hdr;
     uint8_t *payload = NULL;
@@ -1025,6 +1045,7 @@ done:
     else
         close(fd);
     atomic_fetch_sub(&srv->stat_conns, 1);
+    tsdb_metric_gauge_dec("qengine_connections_active");
     return NULL;
 }
 

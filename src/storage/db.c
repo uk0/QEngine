@@ -8,6 +8,7 @@
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "../server/metrics.h"
 #include "retention.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -486,6 +487,7 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
                                  t->name);
     pthread_mutex_unlock(&t->compact_mtx);
     if (rc == TSDB_OK) {
+        tsdb_metric_inc("qengine_flushes_total");
         tsdb_memtable_clear(t->memtable);
         /* Truncate WAL after successful flush. */
         if (t->wal) tsdb_wal_truncate(t->wal);

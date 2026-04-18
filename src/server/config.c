@@ -225,6 +225,8 @@ static int kv_apply(tsdb_config_t *cfg, const char *key, const char *val,
 
     /* -- server -- */
     if (!strcmp(key, "bind"))                { snprintf(cfg->bind, sizeof(cfg->bind), "%s", val); return 0; }
+    if (!strcmp(key, "influx_bind"))         { snprintf(cfg->influx_bind, sizeof(cfg->influx_bind), "%s", val); return 0; }
+    if (!strcmp(key, "metrics_bind"))        { snprintf(cfg->metrics_bind, sizeof(cfg->metrics_bind), "%s", val); return 0; }
     if (!strcmp(key, "max_conns"))           { int64_t x; if (parse_int64(val, &x)<0) BAD("max_conns: bad int"); cfg->max_conns=(int)x; return 0; }
     if (!strcmp(key, "write_workers"))       { int64_t x; if (parse_int64(val, &x)<0) BAD("write_workers: bad int"); cfg->write_workers=(int)x; return 0; }
     if (!strcmp(key, "auth_token"))          { snprintf(cfg->auth_token, sizeof(cfg->auth_token), "%s", val); return 0; }
@@ -432,7 +434,7 @@ static const char *env_for(const char *key, char *buf, size_t cap) {
 
 void tsdb_config_apply_env(tsdb_config_t *cfg) {
     static const char *keys[] = {
-        "bind","max_conns","write_workers","auth_token","request_timeout",
+        "bind","influx_bind","metrics_bind","max_conns","write_workers","auth_token","request_timeout",
         "data_dir","data_dirs","data_dirs_strategy","wal_policy","wal_sync_interval",
         "block_points","default_partition","default_codec","max_partition_bytes",
         "default_retention","retention_sweep_every","shards","flush_rows_threshold",
@@ -520,6 +522,8 @@ void tsdb_config_dump(const tsdb_config_t *cfg) {
     fprintf(stderr, "# tsd.conf effective config (loaded_from=%s)\n",
             cfg->loaded_from[0] ? cfg->loaded_from : "<defaults>");
     fprintf(stderr, "bind                   = %s\n", cfg->bind);
+    fprintf(stderr, "influx_bind            = %s\n", cfg->influx_bind[0] ? cfg->influx_bind : "(disabled)");
+    fprintf(stderr, "metrics_bind           = %s\n", cfg->metrics_bind[0] ? cfg->metrics_bind : "(disabled)");
     fprintf(stderr, "max_conns              = %d\n", cfg->max_conns);
     fprintf(stderr, "write_workers          = %d\n", cfg->write_workers);
     fprintf(stderr, "data_dir               = %s\n", cfg->data_dir);

@@ -28,6 +28,7 @@
 #include "../compress/codec.h"
 #include "../core/types.h"
 #include "../../include/tsdb.h"
+#include "../server/metrics.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -553,6 +554,7 @@ static int compact_partition(tsdb_schema_t   *schema,
                                      &bw, &bs);
         if (rc == TSDB_OK && bw > 0) {
             any_compacted = 1;
+            tsdb_metric_inc("qengine_compactions_total");
             if (stats) {
                 stats->bytes_written += bw;
                 stats->bytes_saved   += bs;
