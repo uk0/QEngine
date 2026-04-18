@@ -755,6 +755,8 @@ typedef struct {
     int     mavg_head;       /* oldest element index                          */
     int     mavg_window;     /* configured window size                        */
     double  mavg_sum;        /* running sum                                   */
+    /* INTERP: grid interval in nanoseconds */
+    int64_t interp_bucket_ns;
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
@@ -793,6 +795,7 @@ static void proj_tdigest_free(proj_t *p) {
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                              proj_t **out, int *out_n, int *out_has_agg,
                              int *out_has_window, int *out_has_ts_agg,
+                             int *out_has_interp,
                              char *err, size_t errcap) {
     proj_t *arr = NULL;
     int cap = 0, n = 0;
@@ -800,6 +803,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
     int has_agg = 0;
     int has_window = 0;
     int has_ts_agg = 0;
+    int has_interp = 0;
 
     for (int i = 0; i < q->nsel; i++) {
         qast_sel_item_t *si = &q->sel[i];
@@ -954,8 +958,41 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             else                                            wk = PROJ_WIN_INTERP;
 
             if (wk == PROJ_WIN_INTERP) {
-                eset(err, errcap, "interp() is not yet implemented");
-                free(arr); return TSDB_ERR_UNSUPPORTED;
+                /* interp(col, interval_ns) — grid-aligned linear interpolation.
+                 * Requires exactly 2 args: column name + interval literal. */
+                if (e->nargs < 2) {
+                    eset(err, errcap, "interp() requires 2 args: interp(col, interval)");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                if (e->args[0]->kind != QAST_IDENT) {
+                    eset(err, errcap, "interp(): first argument must be a column name");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                int64_t ibucket = 0;
+                if (e->args[1]->kind == QAST_LIT_INT) {
+                    ibucket = e->args[1]->v.i;
+                } else {
+                    eset(err, errcap, "interp(): second argument must be an interval literal");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                if (ibucket <= 0) {
+                    eset(err, errcap, "interp(): interval must be positive");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                int c = resolve_col(s, e->args[0]->v.s);
+                if (c < 0) {
+                    eset(err, errcap, "interp(): unknown column '%s'", e->args[0]->v.s);
+                    free(arr); return TSDB_ERR_SCHEMA;
+                }
+                arr[n].kind             = PROJ_WIN_INTERP;
+                arr[n].col              = c;
+                arr[n].interp_bucket_ns = ibucket;
+                arr[n].out_type         = TSDB_TYPE_FLOAT64;
+                if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
+                else snprintf(arr[n].name, sizeof(arr[n].name), "interp(%s)", s->cols[c].name);
+                has_interp = 1;
+                n++;
+                continue;
             }
             if (e->nargs < 1 || e->args[0]->kind != QAST_IDENT) {
                 eset(err, errcap, "%s() requires a column name as first argument", wname);
@@ -1001,6 +1038,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
     *out = arr; *out_n = n; *out_has_agg = has_agg;
     if (out_has_window)  *out_has_window  = has_window;
     if (out_has_ts_agg) *out_has_ts_agg = has_ts_agg;
+    if (out_has_interp)  *out_has_interp  = has_interp;
     return TSDB_OK;
 }
 
@@ -2692,8 +2730,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* Build projections. */
     proj_t *projs = NULL; int nprojs = 0, has_agg = 0, has_window = 0, has_ts_agg = 0;
+    int has_interp = 0;
     int rc = build_projections(q, s, &projs, &nprojs, &has_agg, &has_window,
-                               &has_ts_agg, err, errcap);
+                               &has_ts_agg, &has_interp, err, errcap);
     if (rc != TSDB_OK) return rc;
 
     /* Window functions only valid in plain non-agg SELECT (no GROUP BY,

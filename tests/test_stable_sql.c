@@ -143,6 +143,20 @@ int main(void) {
     }
     printf("  PASS: 3 rows → d1, 2 rows → d2\n");
 
+    /* ─ Phase 3.5: Non-aggregate row scan (exercises stable_result_concat) ─ */
+    printf("\n[3.5] SELECT voltage FROM meters  (expect 5 rows via row-concat)\n");
+    {
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT voltage FROM meters;", &r));
+        ASSERT(r != NULL);
+        int nrows = 0;
+        while (tsdb_result_next(r)) nrows++;
+        printf("  row-concat rows = %d\n", nrows);
+        ASSERT(nrows == 5);
+        tsdb_result_free(r);
+        printf("  PASS: non-aggregate union row count = 5\n");
+    }
+
     /* ─ Phase 4: SELECT count(*) FROM meters (union all) ───────────────── */
     printf("\n[4] SELECT count(*) FROM meters  (expect 5 = 3+2)\n");
     {
