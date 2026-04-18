@@ -61,3 +61,4 @@ bench/results/
 bench/*.csv
 jdbc/target/
 sdk/go/bench5m
+sdk/java/target/
