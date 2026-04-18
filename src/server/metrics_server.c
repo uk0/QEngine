@@ -417,7 +417,6 @@ static void *handle_connection(void *arg) {
 "   mb.textContent='CLUSTER · '+aliveCount+'/'+totalCount+' nodes';"
 "   mb.className='badge mode';"
 " }"
-" // cluster-wide writes/sec from gossip: sum of autobalance.nodes[].writes_sec"
 " let clusterWrites=0;"
 " (ab.nodes||[]).forEach(n=>{clusterWrites+=(n.writes_sec||0);});"
 " document.getElementById('cmode').innerHTML="
