@@ -13,6 +13,7 @@
 #include "../cluster/rawblock.h"
 #include "../../include/tsdb_cluster.h"
 #include "../core/types.h"
+#include "../server/metrics.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,8 @@ static int cluster_on_raw_block(void *ud, tsdb_db_t *db,
     (void)db;
     tsdb_cluster_t *c = (tsdb_cluster_t *)ud;
     if (!c || !table_name || !meta) return TSDB_OK;
+
+    tsdb_metric_inc("qengine_rawblock_pushes_total");
 
     /* quorum_w=2: local write counts as 1, need 1 remote ACK. */
     return tsdb_rawblock_replicate(c, table_name, part_day, col_idx,

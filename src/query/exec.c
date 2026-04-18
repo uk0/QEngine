@@ -21,6 +21,7 @@
 #include "../catalog/device.h"
 #include "../catalog/stable.h"
 #include "../../include/tsdb.h"
+#include "../server/metrics.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -3009,8 +3010,10 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
          * Only applies to disk blocks (memtable has no bloom). */
         if (bloom_nbc > 0 && src->part) {
             g_bloom_blocks_total++;
+            tsdb_metric_inc("qengine_bloom_lookups_total");
             if (bloom_can_skip_block(src->part, s, src, bloom_bc, bloom_nbc)) {
                 g_bloom_blocks_skipped++;
+                tsdb_metric_inc("qengine_bloom_skips_total");
                 continue;
             }
         }
