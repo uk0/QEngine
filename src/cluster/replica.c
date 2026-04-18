@@ -9,6 +9,7 @@
 #include "replica.h"
 #include "node.h"
 #include "rpc.h"
+#include "../server/metrics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,7 +128,11 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
     pthread_mutex_unlock(&rmgr->lock);
 
     tsdb_rpc_conn_t *newc = tsdb_rpc_connect(info.addr, 2000);
-    if (!newc) return NULL;
+    if (!newc) {
+        tsdb_metric_inc("qengine_replica_dial_fail_total");
+        return NULL;
+    }
+    tsdb_metric_inc("qengine_replica_dial_total");
 
     pthread_mutex_lock(&rmgr->lock);
     /* Slot or peer may have been recycled while we dialed; re-find. */
@@ -250,6 +255,11 @@ static void *fanout_worker(void *arg) {
         rc = tsdb_rpc_call(conn, ctx->rpc_kind, ctx->payload, ctx->payload_len);
         if (rc != TSDB_OK) evict_one_conn(ctx->rmgr, nid, conn);
     }
+    if (rc == TSDB_OK) {
+        tsdb_metric_inc("qengine_replicate_ack_total");
+    } else {
+        tsdb_metric_inc("qengine_replicate_fail_total");
+    }
 
     pthread_mutex_lock(&ctx->mu);
     if (rc == TSDB_OK) ctx->ack_count++;
@@ -286,6 +296,8 @@ static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
     /* Bump refcount once per worker *before* creating any thread, so a
      * worker that exits before the loop ends can't drop refcount to 0. */
     atomic_fetch_add_explicit(&ctx->refcount, nreplicas, memory_order_acq_rel);
+
+    tsdb_metric_add("qengine_replicate_sent_total", (uint64_t)nreplicas);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);

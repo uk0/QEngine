@@ -485,13 +485,16 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     uint32_t nrows;
     memcpy(&nrows, p, 4); p += 4;
 
-    if (ncols == 0 || ncols > 64 || nrows == 0 || nrows > 16*1024*1024)
+    if (ncols == 0 || ncols > TSDB_MAX_COLS || nrows == 0 || nrows > 16*1024*1024)
         return send_error(io, req_id, TSDB_ERR_INVAL, "bad ncols/nrows");
 
-    char     col_names[64][256];
-    uint8_t  col_types[64];
-    const uint8_t *col_data[64];
-    uint32_t col_sizes[64];
+    /* Stack usage at TSDB_MAX_COLS=256: col_names 64KiB + col_types 256B +
+     * col_data 2KiB + col_sizes 1KiB ≈ 67KiB, well inside the 8MiB pthread
+     * default.  Bump to heap if TSDB_MAX_COLS ever crosses 1024. */
+    char            col_names[TSDB_MAX_COLS][256];
+    uint8_t         col_types[TSDB_MAX_COLS];
+    const uint8_t  *col_data [TSDB_MAX_COLS];
+    uint32_t        col_sizes[TSDB_MAX_COLS];
 
     for (int c = 0; c < ncols; c++) {
         NEED(1);
@@ -542,7 +545,7 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     }
 
     /* Compute byte-stride for each column (RAW: 8 bytes per value, SYMBOL: 4). */
-    uint32_t stride[64];
+    uint32_t stride[TSDB_MAX_COLS];
     for (int c = 0; c < ncols; c++) {
         stride[c] = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
         /* Sanity check size. */
@@ -695,12 +698,16 @@ static int handle_create_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_i
     char ts_col[256]; int tsc=(tslen<255)?tslen:255;
     memcpy(ts_col, p, tsc); ts_col[tsc]='\0'; p+=tslen;
 
-    NEED2(1); uint8_t ncols = *p++;
-    if (ncols == 0 || ncols > 64)
+    NEED2(1); uint16_t ncols = *p++;
+    /* Wire still carries 1 byte, so the hard upper bound is 255 until the
+     * protocol adds a 2-byte ncols field; TSDB_MAX_COLS (256) is the
+     * storage engine's ceiling.  Clamp to min of the two. */
+    uint16_t ncols_limit = (TSDB_MAX_COLS < 255) ? (uint16_t)TSDB_MAX_COLS : 255;
+    if (ncols == 0 || ncols > ncols_limit)
         return send_error(io, req_id, TSDB_ERR_INVAL, "bad ncols");
 
-    tsdb_col_t cols[64];
-    char col_name_storage[64][256];
+    tsdb_col_t cols[TSDB_MAX_COLS];
+    char col_name_storage[TSDB_MAX_COLS][256];
 
     for (int c = 0; c < ncols; c++) {
         NEED2(1); uint8_t cnlen = *p++;
