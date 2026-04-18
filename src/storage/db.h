@@ -41,6 +41,11 @@ struct tsdb_tmq       *tsdb_db_tmq(tsdb_db_t *db);
 struct tsdb_auth;
 struct tsdb_auth      *tsdb_db_auth(tsdb_db_t *db);
 
+/* Access the UDF (user-defined function) catalog. May be NULL if opening
+ * failed. */
+struct tsdb_udf_catalog;
+struct tsdb_udf_catalog *tsdb_db_udf(tsdb_db_t *db);
+
 tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_dir(tsdb_table_internal_t *t);

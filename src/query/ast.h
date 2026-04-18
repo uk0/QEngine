@@ -194,6 +194,10 @@ typedef enum {
     QAST_STMT_GRANT,                  /* GRANT <priv> ON <table>|* TO <user>                  */
     QAST_STMT_REVOKE,                 /* REVOKE <priv> ON <table>|* FROM <user>               */
     QAST_STMT_ALTER_USER_PASSWORD,    /* ALTER USER n SET PASSWORD '<pw>'                      */
+    /* UDF DDL */
+    QAST_STMT_CREATE_FUNCTION,        /* CREATE FUNCTION f(T,T) RETURNS T FROM '...' SYMBOL '...' */
+    QAST_STMT_DROP_FUNCTION,          /* DROP FUNCTION f                                       */
+    QAST_STMT_LIST_FUNCTIONS,         /* LIST FUNCTIONS                                        */
 } qast_stmt_kind_t;
 
 typedef struct {
@@ -239,6 +243,17 @@ typedef struct {
             char name[64];
             char password[128];
         } alter_user_password;
+        /* UDF DDL.  arg_types[] uses tsdb_type_t from include/tsdb.h
+         * (which matches tsdb_udf_type_t 1-for-1 in v1). */
+        struct {
+            char         name[64];
+            char         so_path[1024];
+            char         symbol[128];
+            int          nargs;
+            tsdb_type_t  arg_types[8];   /* TSDB_UDF_MAX_ARGS in tsdb_udf.h */
+            tsdb_type_t  ret_type;
+        } create_function;
+        struct { char name[64]; } drop_function;
     } u;
 } qast_stmt_t;
 

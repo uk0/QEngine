@@ -6,7 +6,12 @@ STD       ?= -std=c11
 OPT       ?= -O3
 WARN      := -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter
 INC       := -Iinclude
-LIBS      := -lpthread -lm
+# -ldl only needed on Linux; macOS libc provides dlopen unconditionally.
+ifeq ($(shell uname -s), Linux)
+  LIBS    := -lpthread -lm -ldl
+else
+  LIBS    := -lpthread -lm
+endif
 
 # Per-architecture SIMD flags.
 # -march=native covers AVX2/NEON at the global level.
@@ -54,7 +59,7 @@ SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster sr
 SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c tests/test_retention.c tests/test_v06_e2e.c tests/test_sample_by_stream.c tests/test_bloom_filter.c tests/test_tls.c tests/test_group_by.c tests/test_v07_e2e.c tests/test_window_fns.c tests/test_ts_aggregates.c tests/test_advanced_windows.c tests/test_stable.c tests/test_v08_e2e.c tests/test_promql.c tests/test_influx_line.c tests/test_metrics.c tests/test_stable_sql.c tests/test_parallel_groupby.c tests/test_v09_e2e.c tests/test_alter_table.c tests/test_tmq.c tests/test_parquet.c tests/test_rbac.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c tests/test_retention.c tests/test_v06_e2e.c tests/test_sample_by_stream.c tests/test_bloom_filter.c tests/test_tls.c tests/test_group_by.c tests/test_v07_e2e.c tests/test_window_fns.c tests/test_ts_aggregates.c tests/test_advanced_windows.c tests/test_stable.c tests/test_v08_e2e.c tests/test_promql.c tests/test_influx_line.c tests/test_metrics.c tests/test_stable_sql.c tests/test_parallel_groupby.c tests/test_v09_e2e.c tests/test_alter_table.c tests/test_tmq.c tests/test_udf.c tests/test_parquet.c tests/test_rbac.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
@@ -132,6 +137,15 @@ test-federation: $(FED_TEST_BINS)
 
 # test_tls has a special rule (links wire obj + TLS libs) — defined elsewhere
 build/test/test_tls: tests/test_tls.c $(OBJS) $(WIRE_OBJ)
+
+# UDF sample shared library — built alongside tests, not linked into libtsdb.
+build/test/udf_sample.so: tests/udf_sample.c include/tsdb_udf.h
+	@mkdir -p build/test
+	@$(CC) -fPIC -shared -Iinclude -o $@ tests/udf_sample.c
+	@echo "SO  $@"
+
+# test_udf depends on the sample .so being built first.
+build/test/test_udf: tests/test_udf.c $(OBJS) build/test/udf_sample.so
 
 build/test/%: tests/%.c $(OBJS)
 	@mkdir -p build/test

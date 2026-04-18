@@ -949,7 +949,112 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP, DEVICE, STABLE, TABLE, or USER after CREATE");
+        /* CREATE FUNCTION f([T[, T...]]) RETURNS T FROM '<.so>' SYMBOL '<sym>' */
+        if (accept(&p, QTOK_FUNCTION)) {
+            out->kind = QAST_STMT_CREATE_FUNCTION;
+            memset(&out->u.create_function, 0, sizeof(out->u.create_function));
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected function name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.create_function.name,
+                     sizeof(out->u.create_function.name));
+            advance(&p);
+
+            if (!accept(&p, QTOK_LPAREN)) {
+                perr(&p, "expected '(' after function name"); return TSDB_ERR_PARSE;
+            }
+            int n = 0;
+            if (p.tok.kind != QTOK_RPAREN) {
+                for (;;) {
+                    if (n >= 8) {
+                        perr(&p, "too many UDF arguments (max 8)"); return TSDB_ERR_PARSE;
+                    }
+                    if (!tok_is_name_like(&p.tok)) {
+                        perr(&p, "expected type name"); return TSDB_ERR_PARSE;
+                    }
+                    tsdb_type_t t;
+                    if      (ident_ci(&p.tok, "timestamp")) t = TSDB_TYPE_TIMESTAMP;
+                    else if (ident_ci(&p.tok, "int64"))     t = TSDB_TYPE_INT64;
+                    else if (ident_ci(&p.tok, "float64"))   t = TSDB_TYPE_FLOAT64;
+                    else {
+                        perr(&p, "unknown UDF arg type '%.*s' (v1: TIMESTAMP | INT64 | FLOAT64)",
+                             (int)p.tok.len, p.tok.start);
+                        return TSDB_ERR_PARSE;
+                    }
+                    out->u.create_function.arg_types[n++] = t;
+                    advance(&p);
+                    if (!accept(&p, QTOK_COMMA)) break;
+                }
+            }
+            if (!accept(&p, QTOK_RPAREN)) {
+                perr(&p, "expected ')' after argument types"); return TSDB_ERR_PARSE;
+            }
+            out->u.create_function.nargs = n;
+
+            if (!accept(&p, QTOK_RETURNS)) {
+                perr(&p, "expected RETURNS after argument list"); return TSDB_ERR_PARSE;
+            }
+            {
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected return type"); return TSDB_ERR_PARSE;
+                }
+                tsdb_type_t rt;
+                if      (ident_ci(&p.tok, "timestamp")) rt = TSDB_TYPE_TIMESTAMP;
+                else if (ident_ci(&p.tok, "int64"))     rt = TSDB_TYPE_INT64;
+                else if (ident_ci(&p.tok, "float64"))   rt = TSDB_TYPE_FLOAT64;
+                else {
+                    perr(&p, "unknown UDF return type '%.*s'",
+                         (int)p.tok.len, p.tok.start);
+                    return TSDB_ERR_PARSE;
+                }
+                out->u.create_function.ret_type = rt;
+                advance(&p);
+            }
+
+            if (!accept(&p, QTOK_FROM)) {
+                perr(&p, "expected FROM '<.so path>'"); return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_STRING) {
+                perr(&p, "expected quoted .so path"); return TSDB_ERR_PARSE;
+            }
+            {
+                char *s = str_literal(&p, &p.tok);
+                if (!s) return TSDB_ERR_NOMEM;
+                size_t n2 = strlen(s);
+                if (n2 >= sizeof(out->u.create_function.so_path))
+                    n2 = sizeof(out->u.create_function.so_path) - 1;
+                memcpy(out->u.create_function.so_path, s, n2);
+                out->u.create_function.so_path[n2] = '\0';
+            }
+            advance(&p);
+
+            /* SYMBOL '<exported_symbol>' — optional; defaults to function name.
+             * SYMBOL lexes as IDENT (there is no QTOK_SYMBOL keyword). */
+            if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "symbol")) {
+                advance(&p);
+                if (p.tok.kind != QTOK_STRING) {
+                    perr(&p, "expected quoted symbol name"); return TSDB_ERR_PARSE;
+                }
+                char *s = str_literal(&p, &p.tok);
+                if (!s) return TSDB_ERR_NOMEM;
+                size_t n2 = strlen(s);
+                if (n2 >= sizeof(out->u.create_function.symbol))
+                    n2 = sizeof(out->u.create_function.symbol) - 1;
+                memcpy(out->u.create_function.symbol, s, n2);
+                out->u.create_function.symbol[n2] = '\0';
+                advance(&p);
+            } else {
+                /* Default: symbol == function name */
+                snprintf(out->u.create_function.symbol,
+                         sizeof(out->u.create_function.symbol),
+                         "%s", out->u.create_function.name);
+            }
+
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, STABLE, TABLE, USER, or FUNCTION after CREATE");
         return TSDB_ERR_PARSE;
     }
 
@@ -1090,7 +1195,20 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP, DEVICE, STABLE, or USER after DROP");
+        /* DROP FUNCTION <name> */
+        if (accept(&p, QTOK_FUNCTION)) {
+            out->kind = QAST_STMT_DROP_FUNCTION;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected function name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_function.name,
+                     sizeof(out->u.drop_function.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, STABLE, USER, or FUNCTION after DROP");
         return TSDB_ERR_PARSE;
     }
 
@@ -1120,6 +1238,14 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                          sizeof(out->u.list_devices.group));
                 advance(&p);
             }
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* LIST FUNCTIONS — "functions" is an IDENT (plural of FUNCTION keyword). */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "functions")) {
+            out->kind = QAST_STMT_LIST_FUNCTIONS;
+            advance(&p);
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }

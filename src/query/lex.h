@@ -68,6 +68,10 @@ typedef enum {
     QTOK_TO,
     QTOK_PARQUET,
 
+    /* UDF DDL: CREATE FUNCTION f(types) RETURNS T FROM '<so>' SYMBOL '<s>' */
+    QTOK_FUNCTION,
+    QTOK_RETURNS,
+
     /* RBAC keywords — see CREATE USER / GRANT / REVOKE / ALTER USER. */
     QTOK_USER,            /* CREATE USER / DROP USER / ALTER USER     */
     QTOK_IDENTIFIED,      /* IDENTIFIED BY '<password>'               */

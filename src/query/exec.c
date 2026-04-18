@@ -22,6 +22,7 @@
 #include "../catalog/device.h"
 #include "../catalog/stable.h"
 #include "../catalog/tmq.h"
+#include "../catalog/udf.h"
 #include "../catalog/user.h"
 #include "../../include/tsdb.h"
 #include "../server/metrics.h"
@@ -704,6 +705,7 @@ typedef enum {
     PROJ_WIN_CSUM,        /* csum(col)         cumulative sum */
     PROJ_WIN_MAVG,        /* mavg(col, N)      moving average, window N ≤ 64 */
     PROJ_WIN_INTERP,      /* interp(col,'Xs')  (stub – not yet implemented) */
+    PROJ_UDF_SCALAR,      /* user-defined scalar function, per-row call    */
 } proj_kind_t;
 
 /* Range sentinels: all PROJ_AGG_* kinds.
@@ -763,6 +765,12 @@ typedef struct {
     double  mavg_sum;        /* running sum                                   */
     /* INTERP: grid interval in nanoseconds */
     int64_t interp_bucket_ns;
+    /* ---- UDF scalar call state ------------------------------------------ */
+    tsdb_udf_fn_t     udf_fn;
+    int               udf_nargs;
+    int               udf_arg_cols[8];  /* source column index per UDF arg    */
+    tsdb_udf_type_t   udf_arg_types[8];
+    tsdb_udf_type_t   udf_ret_type;
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
@@ -799,6 +807,7 @@ static void proj_tdigest_free(proj_t *p) {
 }
 
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
+                             tsdb_db_t *db,
                              proj_t **out, int *out_n, int *out_has_agg,
                              int *out_has_window, int *out_has_ts_agg,
                              int *out_has_interp,
@@ -1035,6 +1044,65 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else snprintf(arr[n].name, sizeof(arr[n].name), "%s(%s)", wname, s->cols[c].name);
             has_window = 1;
+        } else if (e->kind == QAST_CALL && db) {
+            /* ---- UDF scalar call --------------------------------------------
+             * Not a builtin — look up in the UDF catalog, resolve dlopen/dlsym
+             * lazily, and wire an entry that the emit path invokes per row. */
+            tsdb_udf_catalog_t *udfcat = tsdb_db_udf(db);
+            const tsdb_udf_entry_t *ue = NULL;
+            char ebuf[256] = {0};
+            int lrc = udfcat ? tsdb_udf_catalog_lookup(udfcat, e->v.s, &ue, ebuf, sizeof(ebuf))
+                             : TSDB_ERR_NOTFOUND;
+            if (lrc != TSDB_OK) {
+                if (lrc == TSDB_ERR_UNSUPPORTED) {
+                    eset(err, errcap, "UDF '%s': %s", e->v.s,
+                         ebuf[0] ? ebuf : "ABI version mismatch");
+                } else if (ebuf[0]) {
+                    eset(err, errcap, "UDF '%s' not callable: %s", e->v.s, ebuf);
+                } else {
+                    eset(err, errcap, "unknown function '%s' (not a builtin or registered UDF)",
+                         e->v.s);
+                }
+                free(arr); return lrc;
+            }
+            if (e->nargs != ue->nargs) {
+                eset(err, errcap, "UDF '%s' expects %d args, got %d",
+                     e->v.s, ue->nargs, e->nargs);
+                free(arr); return TSDB_ERR_PARSE;
+            }
+            /* Each argument must be a bare column reference in v1. */
+            for (int ai = 0; ai < e->nargs; ai++) {
+                if (e->args[ai]->kind != QAST_IDENT) {
+                    eset(err, errcap,
+                         "UDF '%s': arg %d must be a column reference (v1 restriction)",
+                         e->v.s, ai);
+                    free(arr); return TSDB_ERR_UNSUPPORTED;
+                }
+                int ci = resolve_col(s, e->args[ai]->v.s);
+                if (ci < 0) {
+                    eset(err, errcap, "UDF '%s': unknown column '%s'",
+                         e->v.s, e->args[ai]->v.s);
+                    free(arr); return TSDB_ERR_SCHEMA;
+                }
+                /* Per-arg type match. */
+                tsdb_udf_type_t wire = (tsdb_udf_type_t)s->cols[ci].type;
+                if (wire != ue->arg_types[ai]) {
+                    eset(err, errcap,
+                         "UDF '%s': arg %d column '%s' type mismatch",
+                         e->v.s, ai, e->args[ai]->v.s);
+                    free(arr); return TSDB_ERR_SCHEMA;
+                }
+                arr[n].udf_arg_cols[ai]  = ci;
+                arr[n].udf_arg_types[ai] = wire;
+            }
+            arr[n].kind         = PROJ_UDF_SCALAR;
+            arr[n].udf_fn       = ue->fn;
+            arr[n].udf_nargs    = ue->nargs;
+            arr[n].udf_ret_type = ue->ret_type;
+            arr[n].out_type     = (tsdb_type_t)ue->ret_type;
+            arr[n].col          = arr[n].udf_arg_cols[0]; /* used by scan gather */
+            if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
+            else           snprintf(arr[n].name, sizeof(arr[n].name), "%s()", e->v.s);
         } else {
             eset(err, errcap, "unsupported SELECT expression kind %d", e->kind);
             free(arr); return TSDB_ERR_UNSUPPORTED;
@@ -3477,7 +3545,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     /* Build projections. */
     proj_t *projs = NULL; int nprojs = 0, has_agg = 0, has_window = 0, has_ts_agg = 0;
     int has_interp = 0;
-    int rc = build_projections(q, s, &projs, &nprojs, &has_agg, &has_window,
+    int rc = build_projections(q, s, db, &projs, &nprojs, &has_agg, &has_window,
                                &has_ts_agg, &has_interp, err, errcap);
     if (rc != TSDB_OK) return rc;
 
@@ -3836,7 +3904,16 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
         int need_col[TSDB_MAX_COLS] = {0};
         /* Columns needed: from projections + from WHERE */
-        for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        for (int i = 0; i < nprojs; i++) {
+            if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+            /* Multi-arg UDFs reference columns beyond proj.col. */
+            if (projs[i].kind == PROJ_UDF_SCALAR) {
+                for (int ai = 0; ai < projs[i].udf_nargs; ai++) {
+                    int ci = projs[i].udf_arg_cols[ai];
+                    if (ci >= 0) need_col[ci] = 1;
+                }
+            }
+        }
         /* Scan WHERE expression for idents */
         /* Simple: just load all referenced columns; recursion */
         /* For WHERE, we call a helper that marks column bits. */
@@ -4336,6 +4413,23 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         uint64_t bits;
                         memcpy(&bits, &out_v, 8);
                         result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_UDF_SCALAR) {
+                        /* Per-row scalar UDF call.
+                         * v1 path invokes the vectorised ABI with n=1 for
+                         * simplicity; batching across the block is a follow-up
+                         * optimisation. */
+                        uint64_t in_vals[TSDB_UDF_MAX_ARGS] = {0};
+                        const void *argp[TSDB_UDF_MAX_ARGS] = {0};
+                        for (int ai = 0; ai < p->udf_nargs; ai++) {
+                            int ci = p->udf_arg_cols[ai];
+                            in_vals[ai] = ((const uint64_t *)bufs[ci])[i];
+                            argp[ai] = &in_vals[ai];
+                        }
+                        uint64_t out_bits = 0;
+                        tsdb_udf_ctx_t ctx = { .abi_version = TSDB_UDF_ABI_V1 };
+                        int urc = p->udf_fn(&ctx, argp, 1, &out_bits);
+                        if (urc != TSDB_UDF_OK) out_bits = 0;
+                        result_append_cell(r, pi, out_bits);
                     }
                 }
                 r->nrows++;
@@ -4989,6 +5083,69 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         if (rc == TSDB_OK)                  rc = result_status(r, "OK: password updated");
         else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: user not found"); rc = TSDB_ERR_NOTFOUND; }
         else                                result_status(r, "ERR: alter user failed");
+        break;
+    }
+    case QAST_STMT_CREATE_FUNCTION: {
+        tsdb_udf_catalog_t *udfcat = tsdb_db_udf(db);
+        if (!udfcat) { result_status(r, "ERR: udf catalog not available"); rc = TSDB_ERR_INTERNAL; break; }
+        tsdb_udf_entry_t e;
+        memset(&e, 0, sizeof(e));
+        snprintf(e.name,    sizeof(e.name),    "%s", stmt.u.create_function.name);
+        snprintf(e.so_path, sizeof(e.so_path), "%s", stmt.u.create_function.so_path);
+        snprintf(e.symbol,  sizeof(e.symbol),  "%s", stmt.u.create_function.symbol);
+        e.nargs      = stmt.u.create_function.nargs;
+        for (int i = 0; i < e.nargs; i++) {
+            e.arg_types[i] = (tsdb_udf_type_t)stmt.u.create_function.arg_types[i];
+        }
+        e.ret_type   = (tsdb_udf_type_t)stmt.u.create_function.ret_type;
+        e.created_at = tsdb_now_ns();
+        rc = tsdb_udf_catalog_create(udfcat, &e);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: function created");
+        else if (rc == TSDB_ERR_EXISTS)   { result_status(r, "ERR: function exists or shadows builtin"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_FULL)     { result_status(r, "ERR: too many functions"); rc = TSDB_ERR_FULL; }
+        else                                result_status(r, "ERR: create function failed");
+        break;
+    }
+    case QAST_STMT_DROP_FUNCTION: {
+        tsdb_udf_catalog_t *udfcat = tsdb_db_udf(db);
+        if (!udfcat) { result_status(r, "ERR: udf catalog not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_udf_catalog_drop(udfcat, stmt.u.drop_function.name);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: function dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: function not found"); rc = TSDB_ERR_NOTFOUND; }
+        else                                result_status(r, "ERR: drop function failed");
+        break;
+    }
+    case QAST_STMT_LIST_FUNCTIONS: {
+        tsdb_udf_catalog_t *udfcat = tsdb_db_udf(db);
+        if (!udfcat) { result_status(r, "ERR: udf catalog not available"); rc = TSDB_ERR_INTERNAL; break; }
+        tsdb_udf_entry_t *arr = NULL;
+        size_t n = 0;
+        rc = tsdb_udf_catalog_list(udfcat, &arr, &n);
+        if (rc != TSDB_OK) { result_status(r, "ERR: list functions failed"); break; }
+        const char *names[] = {"name", "nargs", "ret_type", "so_path", "symbol"};
+        tsdb_type_t types[] = {TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64, TSDB_TYPE_SYMBOL,
+                                TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL};
+        rc = result_init_ddl(r, 5, names, types);
+        if (rc == TSDB_OK) {
+            for (size_t i = 0; i < n; i++) {
+                const char *rtn =
+                    arr[i].ret_type == TSDB_UDF_TYPE_INT64     ? "INT64"     :
+                    arr[i].ret_type == TSDB_UDF_TYPE_FLOAT64   ? "FLOAT64"   :
+                    arr[i].ret_type == TSDB_UDF_TYPE_TIMESTAMP ? "TIMESTAMP" : "?";
+                result_reserve_rows(r, r->nrows + 1);
+                uint32_t c_name    = tsdb_symtab_intern(r->col_symtab[0], arr[i].name);
+                uint32_t c_rtn     = tsdb_symtab_intern(r->col_symtab[2], rtn);
+                uint32_t c_path    = tsdb_symtab_intern(r->col_symtab[3], arr[i].so_path);
+                uint32_t c_symbol  = tsdb_symtab_intern(r->col_symtab[4], arr[i].symbol);
+                result_append_cell(r, 0, (uint64_t)c_name);
+                ((int64_t *)r->col_data[1])[r->nrows] = arr[i].nargs;
+                result_append_cell(r, 2, (uint64_t)c_rtn);
+                result_append_cell(r, 3, (uint64_t)c_path);
+                result_append_cell(r, 4, (uint64_t)c_symbol);
+                r->nrows++;
+            }
+        }
+        free(arr);
         break;
     }
 

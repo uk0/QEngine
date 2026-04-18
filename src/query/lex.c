@@ -50,6 +50,9 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"export",       QTOK_EXPORT},
     {"to",           QTOK_TO},
     {"parquet",      QTOK_PARQUET},
+    /* UDF DDL */
+    {"function",     QTOK_FUNCTION},
+    {"returns",      QTOK_RETURNS},
     /* RBAC keywords */
     {"user",         QTOK_USER},
     {"identified",   QTOK_IDENTIFIED},
@@ -118,6 +121,8 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_EXPORT:       return "EXPORT";
     case QTOK_TO:           return "TO";
     case QTOK_PARQUET:      return "PARQUET";
+    case QTOK_FUNCTION:     return "FUNCTION";
+    case QTOK_RETURNS:      return "RETURNS";
     case QTOK_USER:         return "USER";
     case QTOK_IDENTIFIED:   return "IDENTIFIED";
     case QTOK_ROLE:         return "ROLE";
