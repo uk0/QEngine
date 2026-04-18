@@ -1,6 +1,9 @@
-# syntax=docker/dockerfile:1.6
 # -----------------------------------------------------------------------------
 # tsdb Dockerfile — two-stage build
+#
+# Note: no `# syntax=` directive — we stay on classic build syntax so this
+# image can be built on hosts that can't reach docker.io/docker/dockerfile.
+# All features used here (ARG, multi-stage, COPY --from) are pre-BuildKit.
 #
 #   stage 1: compile tsdb-server, tsdb-cli, tsdb_node using clang under Alpine
 #   stage 2: minimal runtime image (Alpine + libgcc + libstdc++) containing
@@ -12,21 +15,22 @@
 #   docker tag tsdb:dev ghcr.io/your-org/tsdb:0.5.0
 # -----------------------------------------------------------------------------
 
-ARG ALPINE_VERSION=3.20
+ARG DEBIAN_VERSION=22.04
 
 # -----------------------------------------------------------------------------
-# Stage 1 — builder
+# Stage 1 — builder (glibc-based Ubuntu; earlier Alpine+musl image hit a
+# runtime crash in the float64 write path that reproduced only under musl.
+# Native gcc + glibc build worked fine on the same host.)
 # -----------------------------------------------------------------------------
-FROM alpine:${ALPINE_VERSION} AS builder
+FROM ubuntu:${DEBIAN_VERSION} AS builder
 
-RUN apk add --no-cache \
-        clang \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
         make \
-        musl-dev \
-        linux-headers \
-        pkgconfig \
-        readline-dev \
-        openssl-dev
+        pkg-config \
+        libssl-dev \
+        libreadline-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
@@ -37,25 +41,21 @@ RUN find . -name '*.o' -delete && rm -rf build
 # Release build. -march=native is intentionally NOT used here — containers
 # run on heterogeneous hardware. Set ARCH via build-arg to enable avx2 on
 # a known Intel fleet, e.g. --build-arg ARCH="-march=x86-64-v3".
-ARG ARCH="-O3"
+ARG ARCH="-O2 -g -fno-omit-frame-pointer"
 
-# musl on Alpine hides POSIX-2008 extensions (strdup, clock_gettime,
-# strnlen, timegm, pthread_setname_np) unless a feature-test macro is
-# set. Pipe -D_POSIX_C_SOURCE=200809L + -D_DEFAULT_SOURCE via CFLAGS
-# so every translation unit sees them.
-RUN make CC=clang \
-         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Iinclude -D_GNU_SOURCE" \
-         all cluster_node \
-      && strip build/tsdb-server build/tsdb-cli build/cluster/tsdb_node
+RUN make CC=gcc \
+         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" \
+         tcp_cli server_cli cluster_node
 
 # -----------------------------------------------------------------------------
-# Stage 2 — runtime
+# Stage 2 — runtime (slim Ubuntu with only OpenSSL + readline runtime libs)
 # -----------------------------------------------------------------------------
-FROM alpine:${ALPINE_VERSION}
+FROM ubuntu:${DEBIAN_VERSION}
 
-# libgcc / readline for the binaries; su-exec for dropping root in entrypoint.
-RUN apk add --no-cache libgcc readline su-exec tini libcrypto3 libssl3 \
-    && addgroup -S tsdb && adduser -S -G tsdb -h /var/lib/tsdb tsdb
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 libreadline8 tini netcat-openbsd wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r tsdb && useradd -r -g tsdb -d /var/lib/tsdb -s /bin/sh tsdb
 
 COPY --from=builder /src/build/tsdb-server          /usr/local/bin/tsdb-server
 COPY --from=builder /src/build/tsdb-cli             /usr/local/bin/tsdb-cli
@@ -76,5 +76,5 @@ ENV TSDB_DATA_DIR=/var/lib/tsdb \
     TSDB_BIND=0.0.0.0:28090 \
     TSDB_ROLE=server
 
-ENTRYPOINT ["/sbin/tini","-g","--","/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini","-g","--","/usr/local/bin/entrypoint.sh"]
 CMD []

@@ -28,7 +28,7 @@ chown -R tsdb:tsdb "$TSDB_DATA_DIR"
 case "$TSDB_ROLE" in
   server)
     echo "[entrypoint] mode=server  data=$TSDB_DATA_DIR  bind=$TSDB_BIND"
-    exec su-exec tsdb tsdb-server \
+    exec runuser -u tsdb -- tsdb-server \
          --data-dir "$TSDB_DATA_DIR" \
          --bind     "$TSDB_BIND"
     ;;
@@ -39,7 +39,7 @@ case "$TSDB_ROLE" in
     if [ -n "$TSDB_SEEDS" ]; then
       ARGS="$ARGS --seeds $TSDB_SEEDS"
     fi
-    exec su-exec tsdb tsdb-node $ARGS
+    exec runuser -u tsdb -- tsdb-node $ARGS
     ;;
 
   cli)

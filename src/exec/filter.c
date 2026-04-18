@@ -251,8 +251,13 @@ static int filter_u32_eq_neon(const uint32_t *v, size_t n, uint32_t rhs,
 
 /* -----------------------------------------------------------------------
  * === AVX2 KERNELS ===  (x86-64 only)
+ *
+ * Compile-out escape hatch: -DTSDB_NO_AVX2_FILTER skips these kernels
+ * entirely so the scalar path remains.  Needed on toolchains (alpine
+ * clang-17, alpine gcc-13) where constant-propagation through the
+ * avx2_pred helper fails and _mm256_cmp_pd rejects the runtime `pred`.
  * --------------------------------------------------------------------- */
-#if defined(__x86_64__) || defined(__i386__)
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(TSDB_NO_AVX2_FILTER)
 #include <immintrin.h>
 
 static inline __attribute__((target("avx2"))) int avx2_pred(tsdb_cmp_t op) {

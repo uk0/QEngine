@@ -1,0 +1,69 @@
+# docker-compose.twin.yml — two independent tsdb "clusters" on one host.
+#
+# For the production trial on lvm1: two tsdb-server instances, each with
+# its own data volume + metrics dashboard, deployed side-by-side.  Clients
+# pick which one to talk to by port; they do not replicate to each other.
+#
+# Host ports:
+#   Cluster A  client 29090 · metrics 29094
+#   Cluster B  client 29190 · metrics 29194
+#
+# Usage (on lvm1):
+#   cd /home/nas/tsdb/src/deployment
+#   docker compose -f docker-compose.twin.yml build
+#   docker compose -f docker-compose.twin.yml up -d
+#   docker compose -f docker-compose.twin.yml logs -f
+#   docker compose -f docker-compose.twin.yml down          # keep data
+#   docker compose -f docker-compose.twin.yml down -v       # nuke data
+
+services:
+
+  cluster-a:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: qengine/tsdb:dev
+    container_name: qengine-cluster-a
+    hostname: cluster-a
+    environment:
+      TSDB_ROLE:          server
+      TSDB_DATA_DIR:      /var/lib/tsdb
+      TSDB_BIND:          0.0.0.0:28090
+      TSDB_METRICS_BIND:  0.0.0.0:28094
+    ports:
+      - "29090:28090"     # client — Go SDK / JDBC / CLI
+      - "29094:28094"     # dashboard + /health + /metrics
+    volumes:
+      - /home/nas/tsdb/cluster-a/data:/var/lib/tsdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
+
+  cluster-b:
+    image: qengine/tsdb:dev
+    container_name: qengine-cluster-b
+    hostname: cluster-b
+    depends_on:
+      cluster-a:
+        condition: service_started
+    environment:
+      TSDB_ROLE:          server
+      TSDB_DATA_DIR:      /var/lib/tsdb
+      TSDB_BIND:          0.0.0.0:28090
+      TSDB_METRICS_BIND:  0.0.0.0:28094
+    ports:
+      - "29190:28090"     # client
+      - "29194:28094"     # dashboard
+    volumes:
+      - /home/nas/tsdb/cluster-b/data:/var/lib/tsdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
