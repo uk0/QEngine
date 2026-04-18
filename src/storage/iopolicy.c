@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <strings.h>
+#include <fcntl.h>
 
 /* ---- Linux-only sysfs probe --------------------------------------------- */
 
@@ -146,6 +147,30 @@ void tsdb_iopolicy_advise_read(tsdb_iopolicy_t p, void *addr, size_t len) {
     (void)madvise(addr, len, advice);
 #else
     (void)p;
+#endif
+}
+
+void tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_t p, int fd) {
+    if (fd < 0) return;
+    /* SSD: kernel default readahead is already tuned well.  Avoid hints
+     * that could displace hot pages in the page cache. */
+    if (p != TSDB_IOPOLICY_HDD) return;
+#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
+    /* Tell the kernel to read ahead aggressively + evict pages behind us
+     * once read, and to prefetch the whole range into the page cache
+     * asynchronously. .idx files are small (≪ MB per column-partition), so
+     * the WILLNEED pass rarely blows the cache. */
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#  if defined(POSIX_FADV_WILLNEED)
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+#  endif
+#elif defined(F_RDADVISE) && defined(F_RDAHEAD)
+    /* macOS: F_RDAHEAD is a boolean; F_RDADVISE needs a range. Enable the
+     * former only — macOS laptops default to SSD so this branch seldom
+     * fires in practice. */
+    (void)fcntl(fd, F_RDAHEAD, 1);
+#else
+    (void)fd;
 #endif
 }
 

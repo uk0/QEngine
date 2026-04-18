@@ -70,6 +70,26 @@ int main(void) {
     CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_HDD) >= 64u * 1024u,
           "HDD write buffer recommendation is >= 64 KiB");
 
+    /* 7. advise_seq_fd — no crash on any combination of (policy, fd). */
+    {
+        /* Create a temp file with some bytes. */
+        char path[] = "/tmp/tsdb_iopolicy_seqfdXXXXXX";
+        int fd = mkstemp(path);
+        CHECK(fd >= 0, "mkstemp");
+        if (fd >= 0) {
+            char data[4096] = {0};
+            (void)write(fd, data, sizeof(data));
+            lseek(fd, 0, SEEK_SET);
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_SSD, fd);
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_HDD, fd);
+            /* Invalid fd → silent no-op. */
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_HDD, -1);
+            close(fd);
+            unlink(path);
+            CHECK(1, "advise_seq_fd handled both policies + bad fd");
+        }
+    }
+
     /* 6. advise_read on an anonymous mmap region — no crash. */
     size_t pg = (size_t)sysconf(_SC_PAGESIZE);
     void *region = mmap(NULL, pg * 4, PROT_READ | PROT_WRITE,

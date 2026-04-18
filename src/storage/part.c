@@ -304,6 +304,9 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     {
         FILE *idx_r = fopen(w->idx_path, "rb");
         if (idx_r) {
+            /* HDD: prefetch whole idx file async via fadvise. */
+            tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(part_dir),
+                                         fileno(idx_r));
             uint8_t hdr[TSDB_IDX_HEADER_SIZE];
             size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r);
             uint32_t cnt = 0;
@@ -448,6 +451,9 @@ static int col_writer_close(col_writer_t *w) {
         {
             FILE *idx_r = fopen(w->idx_path, "rb");
             if (idx_r) {
+                /* HDD: prefetch the idx file into page cache async. */
+                tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(w->idx_path),
+                                             fileno(idx_r));
                 uint8_t hdr[TSDB_IDX_HEADER_SIZE];
                 size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_r);
                 uint32_t cnt = 0;
@@ -729,6 +735,11 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
 
         FILE *idx_f = fopen(idx_path, "rb");
         if (!idx_f) continue;
+
+        /* HDD: async prefetch the idx file — the scan loop below reads the
+         * whole file sequentially to populate the block-metadata array. */
+        tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(partition_dir),
+                                     fileno(idx_f));
 
         uint8_t hdr[TSDB_IDX_HEADER_SIZE];
         size_t hdr_n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_f);

@@ -42,6 +42,12 @@ tsdb_iopolicy_t tsdb_iopolicy_detect(const char *path);
  * region. No-op on failure (madvise is advisory). */
 void tsdb_iopolicy_advise_read(tsdb_iopolicy_t p, void *addr, size_t len);
 
+/* Apply posix_fadvise() SEQUENTIAL + WILLNEED on an open fd opened for
+ * reading.  Used on .idx files — sequentially scanned, typically small
+ * enough that a full prefetch fits in page cache.  No-op on platforms
+ * without posix_fadvise (macOS) and on SSD policy. */
+void tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_t p, int fd);
+
 /* Recommended stdio write-buffer size (bytes) for append-heavy writes on
  * this medium.  HDD favours larger buffers to coalesce syscall load; SSD
  * is fine with the stdio default (0 = caller should not call setvbuf). */
