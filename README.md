@@ -8,7 +8,7 @@ A production-grade time-series database written in C11. Column-oriented
 storage, SIMD-vectorized execution, clustered with raw-block replication,
 and a purpose-built query language (QTL) with IoT group/device semantics.
 
-> License: MIT · Status: public preview · Contributions welcome.
+> License: AGPLv3 · Status: public preview · Contributions welcome.
 
 ```
 tsdb-cli  ──TCP v1──▶  tsdb-server ⇄ cluster (gossip + hashring + autobalance)
@@ -559,4 +559,6 @@ docs/                   # design notes, research, test plan (gitignored)
 
 ## License
 
-MIT (LICENSE file to be added).
+GNU Affero General Public License v3.0 — see [LICENSE](./LICENSE) for
+the full text. Network-service use (e.g. hosting tsdb as a SaaS) triggers
+AGPLv3 §13 — modifications must be offered as source to remote users.
