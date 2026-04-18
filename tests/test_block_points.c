@@ -121,7 +121,47 @@ int main(void) {
         tsdb_schema_free(s);
     }
 
-    /* ---- 4. v2 schema on disk reads back with default block_points ---- */
+    /* ---- 4. Public setter plumbs through to schema_create ------------- */
+    {
+        char ddir[256]; snprintf(ddir, sizeof(ddir), "%s/db_public", dir);
+        tsdb_db_t *db = NULL;
+        CHECK(tsdb_open(ddir, &db) == TSDB_OK, "tsdb_open for public test");
+        tsdb_db_set_default_block_points(db, 2048);
+
+        tsdb_col_t pc[] = {
+            {"ts", TSDB_TYPE_TIMESTAMP},
+            {"v",  TSDB_TYPE_INT64},
+        };
+        CHECK(tsdb_create_table(db, "tuned", pc, 2, "ts") == TSDB_OK,
+              "create tuned table under default=2048");
+        tsdb_close(db);
+
+        /* Re-open, walk to the schema.bin, verify block_points persisted. */
+        char tdir[512];
+        snprintf(tdir, sizeof(tdir), "%s/tuned", ddir);
+        tsdb_schema_t *s = NULL;
+        CHECK(tsdb_schema_open(tdir, &s) == TSDB_OK, "schema_open after close");
+        CHECK(s && s->block_points == 2048,
+              "public setter: new table inherited 2048");
+        tsdb_schema_free(s);
+
+        /* Zero resets to default. */
+        CHECK(tsdb_open(ddir, &db) == TSDB_OK, "reopen db_public");
+        tsdb_db_set_default_block_points(db, 0);
+        CHECK(tsdb_create_table(db, "tuned2", pc, 2, "ts") == TSDB_OK,
+              "create tuned2 with setter=0");
+        tsdb_close(db);
+
+        char t2dir[512];
+        snprintf(t2dir, sizeof(t2dir), "%s/tuned2", ddir);
+        s = NULL;
+        CHECK(tsdb_schema_open(t2dir, &s) == TSDB_OK, "open tuned2 schema");
+        CHECK(s && s->block_points == TSDB_BLOCK_POINTS,
+              "setter=0 gives default TSDB_BLOCK_POINTS");
+        tsdb_schema_free(s);
+    }
+
+    /* ---- 5. v2 schema on disk reads back with default block_points ---- */
     {
         char d[256]; snprintf(d, sizeof(d), "%s/t_v2", dir); mkdir(d, 0755);
         tsdb_schema_t *s = NULL;

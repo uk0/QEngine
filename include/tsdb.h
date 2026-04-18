@@ -68,6 +68,12 @@ typedef struct {
 int tsdb_open(const char *data_dir, tsdb_db_t **out);
 void tsdb_close(tsdb_db_t *db);
 
+/* Set the default block_points that subsequently-created tables will use
+ * when the caller does not specify one.  Out-of-range values are silently
+ * clamped into [1024, 8192]; 0 resets to the library default (8192).
+ * Has no effect on tables already created. */
+void tsdb_db_set_default_block_points(tsdb_db_t *db, int block_points);
+
 /* Partition granularity chosen at CREATE TABLE time.
  * Fixed for the lifetime of the table. DAY is the default.
  * HOUR improves block-skip selectivity 24x for queries that hit a

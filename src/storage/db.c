@@ -83,6 +83,10 @@ struct tsdb_db {
 
     /* Group-commit window (0 = disabled). Applied to all table WALs. */
     int64_t              group_commit_window_ns;
+
+    /* Default block_points for subsequently-created tables.  0 = library
+     * default (TSDB_BLOCK_POINTS).  Tunable via tsdb_db_set_default_block_points. */
+    int                  default_block_points;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -252,7 +256,7 @@ static int create_table_impl(tsdb_db_t *db,
 
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_create_ex(dir, name, cols, (int)ncols, ts_col,
-                                    part_unit, /*block_points*/ 0, &schema);
+                                    part_unit, db->default_block_points, &schema);
     if (rc != TSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return rc;
@@ -749,6 +753,17 @@ int tsdb_auth_check(tsdb_db_t *db, const char *token,
     tsdb_auth_t *a = db->auth;
     if (!a) return TSDB_ERR_PERMISSION;
     return tsdb_auth_verify(a, token, privilege, resource);
+}
+
+void tsdb_db_set_default_block_points(tsdb_db_t *db, int block_points) {
+    if (!db) return;
+    int clamped = block_points;
+    if (clamped < 0)                   clamped = 0;
+    if (clamped > 0 && clamped < 1024) clamped = 1024;
+    if (clamped > TSDB_BLOCK_POINTS)   clamped = TSDB_BLOCK_POINTS;
+    pthread_mutex_lock(&db->lock);
+    db->default_block_points = clamped;
+    pthread_mutex_unlock(&db->lock);
 }
 
 void tsdb_auth_set_enforce(tsdb_db_t *db, bool enforce) {

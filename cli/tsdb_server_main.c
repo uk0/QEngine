@@ -175,6 +175,11 @@ int main(int argc, char **argv) {
     tsdb_metrics_init();
     tsdb_db_t *db = NULL;
     rc = tsdb_open(cfg.data_dir, &db);
+    if (rc == TSDB_OK && db && cfg.block_points > 0) {
+        /* Deployment-level knob: subsequently-created tables inherit this
+         * block size.  Clamped internally into [1024, 8192]. */
+        tsdb_db_set_default_block_points(db, cfg.block_points);
+    }
     if (rc != TSDB_OK) {
         TSDB_LOG_ERROR("main", "tsdb_open(%s) failed: %s",
                        cfg.data_dir, tsdb_errstr(rc));
