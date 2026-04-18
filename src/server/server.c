@@ -708,9 +708,23 @@ static int handle_drop_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
 static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                         const uint8_t *payload, uint32_t plen) {
     int fd = io->fd; (void)fd;
+
+    /* cli/tsdb_client.c prefixes QTL with a u16 little-endian length.
+     * Legacy callers (test_server.c, some SDKs) send the raw bytes. Detect
+     * and strip the u16 prefix when it matches (plen - 2). */
+    const uint8_t *q_bytes = payload;
+    uint32_t       q_plen  = plen;
+    if (plen >= 2) {
+        uint16_t declared = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+        if ((uint32_t)declared + 2 == plen) {
+            q_bytes = payload + 2;
+            q_plen  = declared;
+        }
+    }
+
     char qtl[4096] = {0};
-    int qlen = (plen < sizeof(qtl) - 1) ? (int)plen : (int)sizeof(qtl) - 1;
-    memcpy(qtl, payload, qlen);
+    int qlen = (q_plen < sizeof(qtl) - 1) ? (int)q_plen : (int)sizeof(qtl) - 1;
+    memcpy(qtl, q_bytes, qlen);
 
     /* Time the query for histogram metric. */
     struct timespec t0, t1;

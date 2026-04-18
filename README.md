@@ -138,6 +138,41 @@ For a **federated** deployment spanning two regions, use
 two 3-node clusters plus a federation coordinator. See
 [docs/deployment.md](docs/deployment.md) for full details.
 
+### 2 × 3-node performance harness (standalone)
+
+`deployment/docker-compose.perf.yml` brings up two isolated 3-node
+stacks (6 servers total) ready for load testing:
+
+```bash
+# from repository root
+docker build -f deployment/Dockerfile -t tsdb:0.5.0 .
+cd deployment
+docker compose -f docker-compose.perf.yml up -d
+cd ..
+
+# compile the wire-level harness
+clang -Iinclude -Icli \
+      -o build/bench/bench_docker_cluster \
+      bench/bench_docker_cluster.c cli/tsdb_wire.c -lpthread
+
+# concurrent write + read + disaster-recovery + isolation probe
+./build/bench/bench_docker_cluster 8 20 1024 8 100
+
+# clean teardown
+cd deployment && docker compose -f docker-compose.perf.yml down -v
+```
+
+Reference run on an Apple M2 Max, `v1.0.0-rc1` image:
+
+| Metric | Result |
+|--------|:---:|
+| Aggregate write throughput (6 nodes, 48 workers) | **2.24 M rows/s** |
+| Read p50 / p99 (6 nodes, 48 workers × 100 queries) | **11.5 ms / 28 ms** |
+| Disaster recovery on `docker kill` + restart | **PASS** |
+| Per-node idle memory | **~1.7 MiB** |
+
+Full write-up in [`docs/benchmark-docker-cluster.md`](docs/benchmark-docker-cluster.md).
+
 ---
 
 ## Query language (QTL)

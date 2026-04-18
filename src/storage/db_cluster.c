@@ -5,6 +5,15 @@
  * tsdb_batch_commit and tsdb_create_table without modifying db.c's logic.
  */
 
+/* clock_gettime + CLOCK_REALTIME are POSIX.1-2001; musl requires the
+ * feature-test macro to unhide them. glibc uses _DEFAULT_SOURCE. */
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE 1
+#endif
+
 #include "db.h"
 #include "schema.h"
 #include "memtable.h"

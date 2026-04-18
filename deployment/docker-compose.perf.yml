@@ -1,0 +1,90 @@
+# docker-compose.perf.yml — 2 clusters × 3 server nodes for performance
+# benchmarking + disaster-recovery + data-migration scenarios.
+#
+# Topology:
+#   cluster-east: east-1..3  (host 28181..28183)
+#   cluster-west: west-1..3  (host 28281..28283)
+# Each node runs a standalone tsdb-server with wire protocol on :28090
+# (mapped to a distinct host port). They are isolated by bridge network
+# but live on the same compose network for the harness to hit all of
+# them. No peer-replication is active in `server` role — recovery tests
+# rely on per-node durability (WAL + partition files on the named
+# volume).
+
+x-server-common: &server-common
+  image: tsdb:0.5.0
+  environment:
+    TSDB_ROLE:     server
+    TSDB_DATA_DIR: /var/lib/tsdb
+    TSDB_BIND:     0.0.0.0:28090
+  healthcheck:
+    # BusyBox nc returns 0 when it connects, non-zero on refused.
+    # We pipe nothing and set a 1s deadline so the probe stays cheap.
+    test: ["CMD-SHELL", "nc -w 1 127.0.0.1 28090 </dev/null >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 3s
+    retries: 8
+    start_period: 3s
+  restart: unless-stopped
+
+services:
+  east-1:
+    <<: *server-common
+    hostname: east-1
+    container_name: tsdb-perf-east-1
+    ports: ["28181:28090"]
+    volumes: [east-1-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+  east-2:
+    <<: *server-common
+    hostname: east-2
+    container_name: tsdb-perf-east-2
+    ports: ["28182:28090"]
+    volumes: [east-2-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+  east-3:
+    <<: *server-common
+    hostname: east-3
+    container_name: tsdb-perf-east-3
+    ports: ["28183:28090"]
+    volumes: [east-3-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+  west-1:
+    <<: *server-common
+    hostname: west-1
+    container_name: tsdb-perf-west-1
+    ports: ["28281:28090"]
+    volumes: [west-1-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+  west-2:
+    <<: *server-common
+    hostname: west-2
+    container_name: tsdb-perf-west-2
+    ports: ["28282:28090"]
+    volumes: [west-2-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+  west-3:
+    <<: *server-common
+    hostname: west-3
+    container_name: tsdb-perf-west-3
+    ports: ["28283:28090"]
+    volumes: [west-3-data:/var/lib/tsdb]
+    networks: [perf-net]
+
+networks:
+  perf-net:
+    driver: bridge
+    name: tsdb-perf-net
+
+volumes:
+  east-1-data:
+  east-2-data:
+  east-3-data:
+  west-1-data:
+  west-2-data:
+  west-3-data:

@@ -25,7 +25,8 @@ RUN apk add --no-cache \
         musl-dev \
         linux-headers \
         pkgconfig \
-        readline-dev
+        readline-dev \
+        openssl-dev
 
 WORKDIR /src
 COPY . .
@@ -38,7 +39,13 @@ RUN find . -name '*.o' -delete && rm -rf build
 # a known Intel fleet, e.g. --build-arg ARCH="-march=x86-64-v3".
 ARG ARCH="-O3"
 
-RUN make CC=clang OPT="${ARCH}" all cluster_node \
+# musl on Alpine hides POSIX-2008 extensions (strdup, clock_gettime,
+# strnlen, timegm, pthread_setname_np) unless a feature-test macro is
+# set. Pipe -D_POSIX_C_SOURCE=200809L + -D_DEFAULT_SOURCE via CFLAGS
+# so every translation unit sees them.
+RUN make CC=clang \
+         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Iinclude -D_GNU_SOURCE" \
+         all cluster_node \
       && strip build/tsdb-server build/tsdb-cli build/cluster/tsdb_node
 
 # -----------------------------------------------------------------------------
@@ -47,7 +54,7 @@ RUN make CC=clang OPT="${ARCH}" all cluster_node \
 FROM alpine:${ALPINE_VERSION}
 
 # libgcc / readline for the binaries; su-exec for dropping root in entrypoint.
-RUN apk add --no-cache libgcc readline su-exec tini \
+RUN apk add --no-cache libgcc readline su-exec tini libcrypto3 libssl3 \
     && addgroup -S tsdb && adduser -S -G tsdb -h /var/lib/tsdb tsdb
 
 COPY --from=builder /src/build/tsdb-server          /usr/local/bin/tsdb-server

@@ -1,3 +1,13 @@
+/* Expose timegm / strptime on musl (Alpine) and GNU libc alike.
+ * musl gates timegm behind _BSD_SOURCE; glibc behind _DEFAULT_SOURCE.
+ * This block must precede every system header. */
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE 1
+#endif
+#ifndef _BSD_SOURCE
+#  define _BSD_SOURCE 1
+#endif
+
 #include "../../include/tsdb.h"
 #include <string.h>
 #include <time.h>
