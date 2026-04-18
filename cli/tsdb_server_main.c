@@ -22,6 +22,8 @@
 #include "../src/server/config.h"
 #include "../src/server/log.h"
 #include "../src/server/influx_line.h"
+#include "../src/server/metrics.h"
+#include "../src/server/metrics_server.h"
 #include "../include/tsdb.h"
 
 #include <stdio.h>
@@ -170,6 +172,7 @@ int main(int argc, char **argv) {
         TSDB_LOG_INFO("main", "extra data dir [%d] = %s", i, cfg.data_dirs[i]);
 
     /* 6. Open DB and start server. */
+    tsdb_metrics_init();
     tsdb_db_t *db = NULL;
     rc = tsdb_open(cfg.data_dir, &db);
     if (rc != TSDB_OK) {
@@ -199,6 +202,18 @@ int main(int argc, char **argv) {
     }
     TSDB_LOG_INFO("main", "listening on %s (port=%d)",
                   cfg.bind, tsdb_server_port(g_srv));
+
+    /* Start Prometheus metrics HTTP endpoint if configured. */
+    tsdb_metrics_server_t *ms = NULL;
+    if (cfg.metrics_bind[0]) {
+        rc = tsdb_metrics_server_start(cfg.metrics_bind, &ms);
+        if (rc != 0) {
+            TSDB_LOG_ERROR("main", "metrics server start(%s) failed", cfg.metrics_bind);
+        } else {
+            TSDB_LOG_INFO("main", "metrics endpoint on %s (port=%d)",
+                          cfg.metrics_bind, tsdb_metrics_server_port(ms));
+        }
+    }
 
     /* Start InfluxDB Line Protocol HTTP endpoint if configured. */
     if (cfg.influx_bind[0]) {
@@ -238,6 +253,7 @@ int main(int argc, char **argv) {
 
     /* 8. Graceful shutdown. */
     TSDB_LOG_INFO("main", "shutting down");
+    if (ms) tsdb_metrics_server_stop(ms);
     tsdb_influx_http_stop();
     tsdb_server_stop(g_srv);
     tsdb_close(db);

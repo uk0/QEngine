@@ -218,31 +218,29 @@ void tsdb_metric_gauge_set(const char *name, double val) {
 void tsdb_metric_gauge_inc(const char *name) {
     metric_t *m = find_metric(name);
     if (!m || m->kind != MT_GAUGE) return;
-    /* Non-atomic RMW on double — acceptable for gauge semantics; small race
-     * window where two increments could collide, losing one.  For counters
-     * that need strict accuracy, use MT_COUNTER instead. */
-    pthread_mutex_t tmp = PTHREAD_MUTEX_INITIALIZER;
-    (void)tmp; /* no mutex needed for gauge_inc in relaxed model */
-    /* Simple atomic CAS loop to do gauge_inc safely */
-    uint64_t old_bits = atomic_load_explicit(&m->data.g.bits, memory_order_relaxed);
-    double old_val; memcpy(&old_val, &old_bits, 8);
-    double new_val = old_val + 1.0;
-    uint64_t new_bits; memcpy(&new_bits, &new_val, 8);
-    atomic_compare_exchange_strong_explicit(
+    uint64_t old_bits, new_bits;
+    do {
+        old_bits = atomic_load_explicit(&m->data.g.bits, memory_order_relaxed);
+        double old_val; memcpy(&old_val, &old_bits, 8);
+        double new_val = old_val + 1.0;
+        memcpy(&new_bits, &new_val, 8);
+    } while (!atomic_compare_exchange_weak_explicit(
         &m->data.g.bits, &old_bits, new_bits,
-        memory_order_relaxed, memory_order_relaxed);
+        memory_order_relaxed, memory_order_relaxed));
 }
 
 void tsdb_metric_gauge_dec(const char *name) {
     metric_t *m = find_metric(name);
     if (!m || m->kind != MT_GAUGE) return;
-    uint64_t old_bits = atomic_load_explicit(&m->data.g.bits, memory_order_relaxed);
-    double old_val; memcpy(&old_val, &old_bits, 8);
-    double new_val = old_val - 1.0;
-    uint64_t new_bits; memcpy(&new_bits, &new_val, 8);
-    atomic_compare_exchange_strong_explicit(
+    uint64_t old_bits, new_bits;
+    do {
+        old_bits = atomic_load_explicit(&m->data.g.bits, memory_order_relaxed);
+        double old_val; memcpy(&old_val, &old_bits, 8);
+        double new_val = old_val - 1.0;
+        memcpy(&new_bits, &new_val, 8);
+    } while (!atomic_compare_exchange_weak_explicit(
         &m->data.g.bits, &old_bits, new_bits,
-        memory_order_relaxed, memory_order_relaxed);
+        memory_order_relaxed, memory_order_relaxed));
 }
 
 /* ---- Histogram ----------------------------------------------------------- */
