@@ -638,3 +638,20 @@ int tsdb_auth_verify(tsdb_auth_t *a,
     pthread_mutex_unlock(&a->lock);
     return TSDB_ERR_PERMISSION;
 }
+
+int tsdb_auth_token_role(tsdb_auth_t      *a,
+                          const char       *token,
+                          tsdb_user_role_t *out_role)
+{
+    if (!a || !token || !out_role) return TSDB_ERR_PERMISSION;
+    pthread_mutex_lock(&a->lock);
+    for (int i = 0; i < a->ntokens; i++) {
+        if (strcmp(a->tokens[i].token, token) == 0) {
+            *out_role = a->tokens[i].role;
+            pthread_mutex_unlock(&a->lock);
+            return TSDB_OK;
+        }
+    }
+    pthread_mutex_unlock(&a->lock);
+    return TSDB_ERR_PERMISSION;
+}

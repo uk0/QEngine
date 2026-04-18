@@ -117,6 +117,14 @@ int tsdb_auth_verify(tsdb_auth_t *a,
                       int         priv,
                       const char *resource);
 
+/* Resolve the role associated with <token>.  Used by tsdb_query_auth to gate
+ * ADMIN-only statements (CREATE FUNCTION, user management) where the standard
+ * privilege bitmask is too coarse.
+ *   Returns TSDB_OK + *out_role on known token, TSDB_ERR_PERMISSION otherwise. */
+int tsdb_auth_token_role(tsdb_auth_t      *a,
+                          const char       *token,
+                          tsdb_user_role_t *out_role);
+
 #ifdef __cplusplus
 }
 #endif

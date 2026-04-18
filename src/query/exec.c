@@ -5163,6 +5163,132 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     return TSDB_OK;
 }
 
+/* ---- Authenticated query entrypoint ------------------------------------- */
+
+/* Derive required authorization from a parsed statement.
+ *
+ *   *out_priv       : bitmask of TSDB_PRIV_* needed (0 when admin_only is set)
+ *   *out_resource   : table name or "*" — points at stable storage owned by
+ *                     the caller (either a literal or stmt's arena-allocated
+ *                     string; caller must copy before freeing arena)
+ *   *out_admin_only : non-zero when the statement requires ADMIN role
+ */
+static void stmt_required_authz(const qast_stmt_t *stmt,
+                                 int          *out_priv,
+                                 const char  **out_resource,
+                                 int          *out_admin_only)
+{
+    *out_priv        = 0;
+    *out_resource    = "*";
+    *out_admin_only  = 0;
+
+    switch (stmt->kind) {
+    case QAST_STMT_SELECT:
+        *out_priv     = TSDB_PRIV_SELECT;
+        *out_resource = stmt->u.query.from ? stmt->u.query.from : "*";
+        break;
+
+    /* Catalog reads — SELECT privilege on "*" */
+    case QAST_STMT_LIST_GROUPS:
+    case QAST_STMT_LIST_DEVICES:
+    case QAST_STMT_LIST_FUNCTIONS:
+        *out_priv = TSDB_PRIV_SELECT;
+        break;
+
+    /* Schema DDL */
+    case QAST_STMT_CREATE_GROUP:
+    case QAST_STMT_DROP_GROUP:
+    case QAST_STMT_CREATE_DEVICE:
+    case QAST_STMT_DROP_DEVICE:
+    case QAST_STMT_CREATE_STABLE:
+    case QAST_STMT_DROP_STABLE:
+        *out_priv = TSDB_PRIV_DDL;
+        break;
+    case QAST_STMT_CREATE_CHILD_TABLE:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.create_child_table.spec.name;
+        break;
+    case QAST_STMT_ALTER_ADD_COLUMN:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.alter_add_column.table;
+        break;
+
+    /* TMQ consumer-group statements — DDL */
+    case QAST_STMT_CREATE_CONSUMER_GROUP:
+    case QAST_STMT_JOIN_GROUP:
+    case QAST_STMT_LEAVE_GROUP:
+    case QAST_STMT_COMMIT_OFFSET:
+        *out_priv = TSDB_PRIV_DDL;
+        break;
+
+    case QAST_STMT_EXPORT_PARQUET:
+        *out_priv     = TSDB_PRIV_SELECT;
+        *out_resource = stmt->u.export_parquet.table;
+        break;
+
+    /* ADMIN-only: user management + UDF registration.
+     * Rationale: CREATE FUNCTION is effectively shell access to the server
+     * (dlopen of an arbitrary .so).  A DDL-granted NORMAL user must NOT
+     * be able to do this even with GRANT DDL ON *. */
+    case QAST_STMT_CREATE_USER:
+    case QAST_STMT_DROP_USER:
+    case QAST_STMT_LIST_USERS:
+    case QAST_STMT_GRANT:
+    case QAST_STMT_REVOKE:
+    case QAST_STMT_ALTER_USER_PASSWORD:
+    case QAST_STMT_CREATE_FUNCTION:
+    case QAST_STMT_DROP_FUNCTION:
+        *out_admin_only = 1;
+        break;
+    }
+}
+
+int tsdb_query_auth(tsdb_db_t *db, const char *token,
+                     const char *qtl, tsdb_result_t **out)
+{
+    if (!db || !token || !qtl || !out) return TSDB_ERR_INVAL;
+
+    tsdb_auth_t *auth = tsdb_db_auth(db);
+    if (!auth) return TSDB_ERR_INTERNAL;
+
+    /* Parse once to decide authz; then free the arena and delegate to
+     * tsdb_query (which re-parses).  Double-parse is negligible for DDL
+     * and cheap for SELECT — the simplicity is worth it. */
+    tsdb_arena_t a;
+    tsdb_arena_init(&a, 16 * 1024);
+    qast_stmt_t stmt;
+    char err[256];
+    int rc = qparse_stmt(qtl, &a, &stmt, err, sizeof(err));
+    if (rc != TSDB_OK) { tsdb_arena_free(&a); return rc; }
+
+    int priv = 0, admin_only = 0;
+    const char *resource = "*";
+    stmt_required_authz(&stmt, &priv, &resource, &admin_only);
+
+    /* Snapshot resource before releasing the arena. */
+    char resbuf[TSDB_USER_RESOURCE_MAX];
+    snprintf(resbuf, sizeof(resbuf), "%s", resource ? resource : "*");
+    tsdb_arena_free(&a);
+
+    if (admin_only) {
+        tsdb_user_role_t role;
+        rc = tsdb_auth_token_role(auth, token, &role);
+        if (rc != TSDB_OK) return TSDB_ERR_PERMISSION;
+        if (role != TSDB_USER_ROLE_ADMIN) return TSDB_ERR_PERMISSION;
+    } else if (priv != 0) {
+        rc = tsdb_auth_verify(auth, token, priv, resbuf);
+        if (rc != TSDB_OK) return rc;
+    } else {
+        /* Unknown statement kind with no authz mapping — require a valid
+         * token as a minimum bar rather than silently allowing. */
+        tsdb_user_role_t role;
+        rc = tsdb_auth_token_role(auth, token, &role);
+        if (rc != TSDB_OK) return TSDB_ERR_PERMISSION;
+    }
+
+    return tsdb_query(db, qtl, out);
+}
+
 void tsdb_result_free(tsdb_result_t *r) {
     if (!r) return;
     for (int i = 0; i < r->ncols; i++) {

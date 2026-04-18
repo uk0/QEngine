@@ -132,6 +132,28 @@ void tsdb_batch_discard(tsdb_batch_t *b);
 
 /* Query: QTL text → result iterator. */
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out);
+
+/* Authenticated query: parses <qtl>, authorizes it against <token>'s
+ * grants/role, then executes.  Differs from tsdb_query in that it ALWAYS
+ * enforces RBAC regardless of db->auth_enforce — callers that want bypass
+ * behavior should use tsdb_query directly.
+ *
+ * Privilege mapping:
+ *   SELECT                     → TSDB_PRIV_SELECT on FROM table
+ *   LIST_GROUPS/DEVICES/FNS    → TSDB_PRIV_SELECT on "*"
+ *   CREATE/DROP/ALTER stable   → TSDB_PRIV_DDL    on target (or "*")
+ *   CREATE/DROP/LIST USER,
+ *   GRANT / REVOKE,
+ *   ALTER USER PASSWORD,
+ *   CREATE / DROP FUNCTION     → ADMIN role only (grant bitmask insufficient)
+ *
+ * Returns TSDB_ERR_PERMISSION if the token is unknown or lacks the required
+ * privilege; otherwise matches tsdb_query semantics. */
+int tsdb_query_auth(tsdb_db_t  *db,
+                     const char *token,
+                     const char *qtl,
+                     tsdb_result_t **out);
+
 void tsdb_result_free(tsdb_result_t *r);
 
 /* Result row iteration. Returns 1 if a row was read, 0 at end, < 0 on error. */
