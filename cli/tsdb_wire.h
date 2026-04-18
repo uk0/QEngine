@@ -110,6 +110,18 @@ typedef enum {
  * LIST_DEVICES payload:
  *   [group_len u8] [group utf8]
  *
+ * AUTH_LOGIN payload (type 5):
+ *   [user_len u8] [user utf8] [pass_len u8] [pass utf8]
+ *   Client sends this right after HELLO when the server is configured with
+ *   require_auth=true.  On success the server replies AUTH_OK; on failure
+ *   it replies ERROR with err_code = TSDB_ERR_PERMISSION (-13).
+ *
+ * AUTH_OK payload (type 6):
+ *   32 bytes of lowercase hex (no NUL) — the session token.  The server
+ *   associates this token with the underlying connection; subsequent
+ *   QUERY frames on the same connection are executed as the authenticated
+ *   user.  On connection close the token is discarded.
+ *
  * QUERY payload:
  *   [qtl_len u16 LE] [qtl utf8]
  *
