@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -71,6 +72,9 @@ static void usage(const char *prog) {
 /* ─── main ─────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    /* Ignore SIGPIPE so a client disconnect mid-write cannot kill us. */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *cfg_arg           = NULL;
     const char *override_data_dir = NULL;
     const char *override_bind     = NULL;

@@ -135,6 +135,13 @@ int main(int argc, char **argv) {
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+    /* TCP writes to a peer that closed their end must not kill us.
+     * Without this, client-side disconnect during a write_batch causes
+     * the handler thread to trap SIGPIPE → default action is terminate
+     * the whole process → cluster node flaps.  Ignoring makes send()
+     * return EPIPE/-1 which the RPC / wire-protocol layers surface as
+     * an ordinary I/O error. */
+    signal(SIGPIPE, SIG_IGN);
 
     tsdb_db_t *db = NULL;
     int rc = tsdb_open_cluster(data_dir, rpc_addr, seeds, &db);
