@@ -39,11 +39,43 @@ int tsdb_codec_encode(tsdb_type_t type,
 
     switch (type) {
     case TSDB_TYPE_TIMESTAMP: {
-        /* Timestamps: always use DoD — ideal for monotone nanosecond series. */
+        /* Timestamps: try DoD first (ideal for monotone nanosecond series).
+         * DoD can fail with TSDB_ERR_OVERFLOW when delta-of-deltas exceed ±2^31
+         * (e.g. timestamps with gaps > ~2s when consecutive deltas differ by > 2^31 ns).
+         * On overflow, fall back to PFOR-i64, then to raw (CODEC_NONE). */
         rc = tsdb_dod_encode((const int64_t *)in, in_count, out, out_cap, &out_bytes);
-        if (rc) return rc;
-        *out_codec = TSDB_CODEC_DOD;
-        return (int)out_bytes;
+        if (rc == TSDB_OK) {
+            *out_codec = TSDB_CODEC_DOD;
+            return (int)out_bytes;
+        }
+        /* DoD failed — try PFOR-i64. */
+        {
+            size_t tmp_cap = out_cap + 64;
+            uint8_t *tmp = malloc(tmp_cap);
+            if (tmp) {
+                size_t pfor_bytes = 0;
+                int pfor_rc = tsdb_pfor_encode_i64((const int64_t *)in, in_count,
+                                                    tmp, tmp_cap, &pfor_bytes);
+                if (pfor_rc == TSDB_OK && pfor_bytes <= out_cap) {
+                    memcpy(out, tmp, pfor_bytes);
+                    free(tmp);
+                    *out_codec = TSDB_CODEC_PFOR;
+                    return (int)pfor_bytes;
+                }
+                free(tmp);
+            }
+        }
+        /* Final fallback: raw copy (CODEC_NONE). */
+        {
+            size_t raw_bytes = in_count * sizeof(int64_t);
+            if (raw_bytes <= out_cap) {
+                memcpy(out, in, raw_bytes);
+                *out_codec = TSDB_CODEC_NONE;
+                return (int)raw_bytes;
+            }
+        }
+        /* Buffer too small even for raw. */
+        return TSDB_ERR_OVERFLOW;
     }
     case TSDB_TYPE_INT64: {
         /*

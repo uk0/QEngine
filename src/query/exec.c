@@ -2778,7 +2778,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         }
 
         /* Execute projections */
-        if (has_agg && !has_sample) {
+        if (has_agg && !has_sample && !q->has_adv_window) {
             /* Single-row aggregate over all rows matching. */
             for (int pi = 0; pi < nprojs; pi++) {
                 if (projs[pi].kind >= PROJ_AGG_RANGE_BEGIN && projs[pi].kind <= PROJ_AGG_RANGE_END)
@@ -2963,11 +2963,13 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
 #define ADW_ACC(ri)                                                                \
     do {                                                                           \
+        /* Increment row count once per row (not per projection). */              \
+        cur_state.count++;                                                         \
         for (int _pa = 0; _pa < nprojs; _pa++) {                                  \
             if (projs[_pa].kind < PROJ_AGG_RANGE_BEGIN ||                         \
                 projs[_pa].kind > PROJ_AGG_COUNT) continue;                       \
+            if (projs[_pa].kind == PROJ_AGG_COUNT) continue; /* row count above */ \
             int _caa = projs[_pa].col;                                            \
-            if (projs[_pa].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; } \
             if (_caa < 0) continue;                                               \
             if (s->cols[_caa].type == TSDB_TYPE_FLOAT64) {                        \
                 double _xa = ((const double *)bufs[_caa])[(ri)];                  \
@@ -2980,7 +2982,6 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 if (_xa < cur_state.min_i) cur_state.min_i = _xa;                 \
                 if (_xa > cur_state.max_i) cur_state.max_i = _xa;                 \
             }                                                                      \
-            cur_state.count++;                                                     \
         }                                                                          \
     } while (0)
 
@@ -3190,7 +3191,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
 post_scan:
     /* Write aggregates or final bucket flush. */
-    if (has_agg && !has_sample) {
+    if (has_agg && !has_sample && !q->has_adv_window) {
         rc = result_reserve_rows(r, 1);
         if (rc != TSDB_OK) goto done;
         for (int pi = 0; pi < nprojs; pi++) agg_write(&projs[pi], s, r, pi);
