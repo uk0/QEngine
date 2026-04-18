@@ -28,7 +28,12 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"retention", QTOK_RETENTION},{"profile",   QTOK_PROFILE},   {"region",    QTOK_REGION},
     {"replica",   QTOK_REPLICA},  {"factor",    QTOK_FACTOR},
     /* ASOF JOIN */
-    {"asof",      QTOK_ASOF},    {"join",      QTOK_JOIN},
+    {"asof",         QTOK_ASOF},         {"join",         QTOK_JOIN},
+    /* Advanced windows — state_window / event_window lex as single IDENT
+     * because '_' is an ident character; map them here directly. */
+    {"session",      QTOK_SESSION},
+    {"state_window", QTOK_STATE_WINDOW},
+    {"event_window", QTOK_EVENT_WINDOW},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -69,6 +74,9 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_FACTOR: return "FACTOR";
     case QTOK_ASOF: return "ASOF";
     case QTOK_JOIN: return "JOIN";
+    case QTOK_SESSION:      return "SESSION";
+    case QTOK_STATE_WINDOW: return "STATE_WINDOW";
+    case QTOK_EVENT_WINDOW: return "EVENT_WINDOW";
     case QTOK_ERR: return "<error>";
     }
     return "?";

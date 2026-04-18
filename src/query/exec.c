@@ -656,6 +656,8 @@ static int apply_filter_expr(eval_ctx_t *ctx, qast_expr_t *e, uint64_t *bm) {
 
 /* ---- Projection -------------------------------------------------------- */
 
+#define MAVG_MAX_WINDOW 64
+
 /* A "projection" tells how to get values for an output column from a block. */
 typedef enum {
     PROJ_COL,
@@ -671,13 +673,36 @@ typedef enum {
     PROJ_AGG_P99,
     PROJ_AGG_PERCENTILE,  /* percentile(col, q) — user-specified q */
     PROJ_AGG_STDDEV,
+    /* Time-series specialised aggregates (TDengine-style) */
+    PROJ_AGG_TS_FIRST,    /* first(col)    -- value at earliest ts */
+    PROJ_AGG_TS_LAST,     /* last(col)     -- value at latest ts */
+    PROJ_AGG_TS_LAST_ROW, /* last_row(col) -- MVP: same as last(col) */
+    PROJ_AGG_TS_TWA,      /* twa(col)      -- time-weighted average */
+    /* Window (per-row transform) functions */
+    PROJ_WIN_DIFF,        /* diff(col)         v[i] - v[i-1], NaN on first row */
+    PROJ_WIN_DERIVATIVE,  /* derivative(col)   (v[i]-v[i-1])/(ts[i]-ts[i-1])*1e9 */
+    PROJ_WIN_CSUM,        /* csum(col)         cumulative sum */
+    PROJ_WIN_MAVG,        /* mavg(col, N)      moving average, window N ≤ 64 */
+    PROJ_WIN_INTERP,      /* interp(col,'Xs')  (stub – not yet implemented) */
 } proj_kind_t;
 
-/* Sentinel: all PROJ_AGG_* kinds from SUM through STDDEV */
-#define PROJ_AGG_FIRST PROJ_AGG_SUM
-#define PROJ_AGG_LAST  PROJ_AGG_STDDEV
+/* Range sentinels: all PROJ_AGG_* kinds.
+ * PROJ_AGG_RANGE_BEGIN / PROJ_AGG_RANGE_END replace old PROJ_AGG_FIRST/LAST
+ * to avoid collision with user-facing first()/last() => PROJ_AGG_TS_FIRST/LAST. */
+#define PROJ_AGG_RANGE_BEGIN PROJ_AGG_SUM
+#define PROJ_AGG_RANGE_END   PROJ_AGG_TS_TWA
 /* T-digest kinds start at P50 */
 #define PROJ_AGG_TDIGEST_FIRST PROJ_AGG_P50
+/* TS-specialised agg kinds start here */
+#define PROJ_AGG_TS_KIND_FIRST PROJ_AGG_TS_FIRST
+
+/* Legacy sentinels kept for compatibility with older code in the file. */
+#define PROJ_AGG_FIRST PROJ_AGG_SUM
+#define PROJ_AGG_LAST  PROJ_AGG_TS_TWA
+
+/* Sentinel: all PROJ_WIN_* kinds */
+#define PROJ_WIN_FIRST PROJ_WIN_DIFF
+#define PROJ_WIN_LAST  PROJ_WIN_INTERP
 
 typedef struct {
     proj_kind_t kind;
@@ -695,19 +720,52 @@ typedef struct {
     /* T-digest state for PROJ_AGG_P50/P90/P99/PERCENTILE/STDDEV */
     tsdb_tdigest_t *tdigest;        /* NULL unless this is a tdigest kind */
     double          percentile_q;   /* q for PROJ_AGG_PERCENTILE [0,1] */
+    /* ---- FIRST / LAST / LAST_ROW / TWA state (serial path only) ---------- */
+    int64_t  ts_first;              /* ts of first row seen (INT64_MAX=none)  */
+    int64_t  ts_last;               /* ts of last  row seen (INT64_MIN=none)  */
+    double   ts_first_f, ts_last_f; /* float64 payload for FIRST/LAST         */
+    int64_t  ts_first_i, ts_last_i; /* int64   payload for FIRST/LAST         */
+    uint32_t ts_first_u32, ts_last_u32; /* uint32 payload for FIRST/LAST      */
+    /* TWA state (step-wise-backward): twa = sum(prev_v*dt) / total_dt         */
+    double   twa_wsum;              /* weighted sum accumulated so far         */
+    int64_t  twa_last_ts;           /* ts of most-recent point (-1=none)       */
+    double   twa_last_v;            /* val of most-recent point                */
+    /* ---- Window (per-row transform) function state ----------------------- */
+    int     win_has_prev;    /* 1 once at least one row has been processed    */
+    double  win_prev_f;      /* previous value as double (DIFF/DERIVATIVE)    */
+    int64_t win_prev_ts;     /* previous timestamp (DERIVATIVE)               */
+    double  win_csum;        /* cumulative sum accumulator (CSUM)             */
+    /* MAVG ring buffer */
+    double  mavg_buf[MAVG_MAX_WINDOW];
+    int     mavg_n;          /* current fill count                            */
+    int     mavg_head;       /* oldest element index                          */
+    int     mavg_window;     /* configured window size                        */
+    double  mavg_sum;        /* running sum                                   */
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
     if (!e || e->kind != QAST_CALL) return 0;
     const char *n = e->v.s;
-    return strcasecmp(n, "sum") == 0       || strcasecmp(n, "avg") == 0   ||
-           strcasecmp(n, "min") == 0       || strcasecmp(n, "max") == 0   ||
+    return strcasecmp(n, "sum") == 0       || strcasecmp(n, "avg") == 0        ||
+           strcasecmp(n, "min") == 0       || strcasecmp(n, "max") == 0        ||
            strcasecmp(n, "count") == 0     ||
-           strcasecmp(n, "p50") == 0       || strcasecmp(n, "p90") == 0   ||
+           strcasecmp(n, "p50") == 0       || strcasecmp(n, "p90") == 0        ||
            strcasecmp(n, "p99") == 0       || strcasecmp(n, "percentile") == 0 ||
-           strcasecmp(n, "stddev") == 0;
+           strcasecmp(n, "stddev") == 0    ||
+           /* TDengine-style TS aggregates */
+           strcasecmp(n, "first") == 0     || strcasecmp(n, "last") == 0       ||
+           strcasecmp(n, "last_row") == 0  || strcasecmp(n, "twa") == 0;
 }
 
+static int is_window_call(qast_expr_t *e) {
+    if (!e || e->kind != QAST_CALL) return 0;
+    const char *n = e->v.s;
+    return strcasecmp(n, "diff") == 0       ||
+           strcasecmp(n, "derivative") == 0 ||
+           strcasecmp(n, "csum") == 0       ||
+           strcasecmp(n, "mavg") == 0       ||
+           strcasecmp(n, "interp") == 0;
+}
 /* Helper: allocate a fresh tdigest and store into proj; NULLs on failure. */
 static int proj_tdigest_init(proj_t *p) {
     return tsdb_tdigest_new(100.0, &p->tdigest);
@@ -720,11 +778,14 @@ static void proj_tdigest_free(proj_t *p) {
 
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                              proj_t **out, int *out_n, int *out_has_agg,
+                             int *out_has_window, int *out_has_ts_agg,
                              char *err, size_t errcap) {
     proj_t *arr = NULL;
     int cap = 0, n = 0;
 
     int has_agg = 0;
+    int has_window = 0;
+    int has_ts_agg = 0;
 
     for (int i = 0; i < q->nsel; i++) {
         qast_sel_item_t *si = &q->sel[i];
@@ -766,6 +827,11 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             else if (strcasecmp(name, "p99") == 0)        k = PROJ_AGG_P99;
             else if (strcasecmp(name, "percentile") == 0) k = PROJ_AGG_PERCENTILE;
             else if (strcasecmp(name, "stddev") == 0)     k = PROJ_AGG_STDDEV;
+            /* TDengine-style TS aggregates */
+            else if (strcasecmp(name, "first") == 0)    { k = PROJ_AGG_TS_FIRST;    has_ts_agg = 1; }
+            else if (strcasecmp(name, "last") == 0)     { k = PROJ_AGG_TS_LAST;     has_ts_agg = 1; }
+            else if (strcasecmp(name, "last_row") == 0) { k = PROJ_AGG_TS_LAST_ROW; has_ts_agg = 1; }
+            else if (strcasecmp(name, "twa") == 0)      { k = PROJ_AGG_TS_TWA;      has_ts_agg = 1; }
             arr[n].kind = k;
 
             /* Resolve column argument. */
@@ -778,6 +844,13 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                 arr[n].col = c;
             } else if (k == PROJ_AGG_COUNT && (e->nargs == 0 || (e->nargs == 1 && e->args[0]->kind == QAST_STAR))) {
                 arr[n].col = s->ts_col_idx; /* count uses row count */
+            } else if (k >= PROJ_AGG_TS_KIND_FIRST) {
+                /* TS agg requires a column argument */
+                if (e->nargs < 1 || e->args[0]->kind != QAST_IDENT) {
+                    eset(err, errcap, "%s() requires a column argument", name);
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                /* col already resolved above */
             } else if (k < PROJ_AGG_TDIGEST_FIRST) {
                 eset(err, errcap, "unsupported aggregate argument");
                 free(arr); return TSDB_ERR_UNSUPPORTED;
@@ -808,10 +881,14 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             }
 
             /* Output type */
-            if (k == PROJ_AGG_COUNT)                  arr[n].out_type = TSDB_TYPE_INT64;
-            else if (k >= PROJ_AGG_TDIGEST_FIRST)     arr[n].out_type = TSDB_TYPE_FLOAT64;
-            else if (k == PROJ_AGG_AVG)               arr[n].out_type = TSDB_TYPE_FLOAT64;
-            else arr[n].out_type = (arr[n].col >= 0) ? s->cols[arr[n].col].type : TSDB_TYPE_FLOAT64;
+            if (k == PROJ_AGG_COUNT)
+                arr[n].out_type = TSDB_TYPE_INT64;
+            else if (k >= PROJ_AGG_TDIGEST_FIRST && k < PROJ_AGG_TS_KIND_FIRST)
+                arr[n].out_type = TSDB_TYPE_FLOAT64;
+            else if (k == PROJ_AGG_AVG || k == PROJ_AGG_TS_TWA)
+                arr[n].out_type = TSDB_TYPE_FLOAT64;
+            else
+                arr[n].out_type = (arr[n].col >= 0) ? s->cols[arr[n].col].type : TSDB_TYPE_FLOAT64;
 
             /* Build output column name. */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
@@ -826,11 +903,17 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             arr[n].agg_min_i = INT64_MAX;
             arr[n].agg_max_i = INT64_MIN;
 
-            /* Allocate tdigest for tdigest-kind projections. */
-            if (k >= PROJ_AGG_TDIGEST_FIRST) {
+            /* Allocate tdigest for tdigest-kind projections (not TS agg). */
+            if (k >= PROJ_AGG_TDIGEST_FIRST && k < PROJ_AGG_TS_KIND_FIRST) {
                 if (proj_tdigest_init(&arr[n]) != 0) {
                     free(arr); return TSDB_ERR_NOMEM;
                 }
+            }
+            /* Initialise TS agg state. */
+            if (k >= PROJ_AGG_TS_KIND_FIRST) {
+                arr[n].ts_first   = INT64_MAX;
+                arr[n].ts_last    = INT64_MIN;
+                arr[n].twa_last_ts = -1;
             }
         } else if (e->kind == QAST_CALL && strcasecmp(e->v.s, "time_bucket") == 0) {
             /* time_bucket(ts, interval) */
@@ -846,6 +929,55 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             arr[n].out_type = TSDB_TYPE_TIMESTAMP;
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else snprintf(arr[n].name, sizeof(arr[n].name), "time_bucket(%s)", s->cols[c].name);
+        } else if (is_window_call(e)) {
+            /* ---- Window (per-row transform) functions -------------------- */
+            const char *wname = e->v.s;
+            proj_kind_t wk;
+            if      (strcasecmp(wname, "diff")       == 0) wk = PROJ_WIN_DIFF;
+            else if (strcasecmp(wname, "derivative") == 0) wk = PROJ_WIN_DERIVATIVE;
+            else if (strcasecmp(wname, "csum")       == 0) wk = PROJ_WIN_CSUM;
+            else if (strcasecmp(wname, "mavg")       == 0) wk = PROJ_WIN_MAVG;
+            else                                            wk = PROJ_WIN_INTERP;
+
+            if (wk == PROJ_WIN_INTERP) {
+                eset(err, errcap, "interp() is not yet implemented");
+                free(arr); return TSDB_ERR_UNSUPPORTED;
+            }
+            if (e->nargs < 1 || e->args[0]->kind != QAST_IDENT) {
+                eset(err, errcap, "%s() requires a column name as first argument", wname);
+                free(arr); return TSDB_ERR_PARSE;
+            }
+            int c = resolve_col(s, e->args[0]->v.s);
+            if (c < 0) {
+                eset(err, errcap, "%s(): unknown column '%s'", wname, e->args[0]->v.s);
+                free(arr); return TSDB_ERR_SCHEMA;
+            }
+            arr[n].kind     = wk;
+            arr[n].col      = c;
+            arr[n].out_type = TSDB_TYPE_FLOAT64;
+            /* MAVG: parse window size from second argument. */
+            if (wk == PROJ_WIN_MAVG) {
+                if (e->nargs != 2) {
+                    eset(err, errcap, "mavg() requires 2 arguments: mavg(col, N)");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                qast_expr_t *warg = e->args[1];
+                int64_t wsize = 0;
+                if (warg->kind == QAST_LIT_INT)        wsize = warg->v.i;
+                else if (warg->kind == QAST_LIT_FLOAT)  wsize = (int64_t)warg->v.f;
+                else {
+                    eset(err, errcap, "mavg() window size must be an integer literal");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                if (wsize < 1 || wsize > MAVG_MAX_WINDOW) {
+                    eset(err, errcap, "mavg() window size must be 1..%d", MAVG_MAX_WINDOW);
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                arr[n].mavg_window = (int)wsize;
+            }
+            if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
+            else snprintf(arr[n].name, sizeof(arr[n].name), "%s(%s)", wname, s->cols[c].name);
+            has_window = 1;
         } else {
             eset(err, errcap, "unsupported SELECT expression kind %d", e->kind);
             free(arr); return TSDB_ERR_UNSUPPORTED;
@@ -853,6 +985,8 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
         n++;
     }
     *out = arr; *out_n = n; *out_has_agg = has_agg;
+    if (out_has_window)  *out_has_window  = has_window;
+    if (out_has_ts_agg) *out_has_ts_agg = has_ts_agg;
     return TSDB_OK;
 }
 
@@ -876,7 +1010,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     if (popcnt == 0) return;
 
     /* ---- T-digest path (always f64 gathered) ---- */
-    if (p->kind >= PROJ_AGG_TDIGEST_FIRST) {
+    if (p->kind >= PROJ_AGG_TDIGEST_FIRST && p->kind < PROJ_AGG_TS_KIND_FIRST) {
         if (!p->tdigest) return;
         const double *src;
         size_t cn;
@@ -981,6 +1115,57 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
         default: break;
         }
     }
+
+    /* ---- TS-specialised aggregates: FIRST / LAST / LAST_ROW / TWA --------
+     * These iterate rows one-by-one using the ts column (bufs[ts_col_idx]).  */
+    if (p->kind == PROJ_AGG_TS_FIRST || p->kind == PROJ_AGG_TS_LAST ||
+        p->kind == PROJ_AGG_TS_LAST_ROW || p->kind == PROJ_AGG_TS_TWA) {
+        const int64_t *ts_col = (bufs && s->ts_col_idx >= 0)
+                                ? (const int64_t *)bufs[s->ts_col_idx] : NULL;
+        if (!ts_col || p->col < 0) return;
+        tsdb_type_t vt = s->cols[p->col].type;
+        for (size_t i = 0; i < n; i++) {
+            if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
+            int64_t ts = ts_col[i];
+            double   vf  = 0.0;
+            int64_t  vi  = 0;
+            uint32_t vu  = 0;
+            int is_f64 = (vt == TSDB_TYPE_FLOAT64);
+            int is_sym = (vt == TSDB_TYPE_SYMBOL );
+            if (is_f64)      vf = ((const double *)  bufs[p->col])[i];
+            else if (is_sym) vu = ((const uint32_t *) bufs[p->col])[i];
+            else             vi = ((const int64_t *)  bufs[p->col])[i];
+
+            /* FIRST / LAST / LAST_ROW */
+            if (p->kind != PROJ_AGG_TS_TWA) {
+                if (ts < p->ts_first) {
+                    p->ts_first = ts;
+                    if (is_f64) p->ts_first_f = vf;
+                    else if (is_sym) p->ts_first_u32 = vu;
+                    else p->ts_first_i = vi;
+                }
+                if (ts > p->ts_last) {
+                    p->ts_last = ts;
+                    if (is_f64) p->ts_last_f = vf;
+                    else if (is_sym) p->ts_last_u32 = vu;
+                    else p->ts_last_i = vi;
+                }
+            }
+            /* TWA: step-wise-backward convention --
+             * when we see point i we credit prev_val * (ts[i]-prev_ts).     */
+            if (p->kind == PROJ_AGG_TS_TWA) {
+                if (p->twa_last_ts >= 0) {
+                    int64_t dt = ts - p->twa_last_ts;
+                    if (dt > 0)
+                        p->twa_wsum += p->twa_last_v * (double)dt;
+                }
+                if (ts < p->ts_first) p->ts_first = ts;
+                if (ts > p->ts_last)  p->ts_last  = ts;
+                p->twa_last_ts = ts;
+                p->twa_last_v  = is_f64 ? vf : (double)vi;
+            }
+        }
+    }
 }
 
 static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx) {
@@ -1018,6 +1203,32 @@ static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx
     case PROJ_AGG_STDDEV:
         out_f = p->tdigest ? tsdb_tdigest_stddev(p->tdigest) : 0.0 / 0.0;
         break;
+    /* TS-specialised aggregates */
+    case PROJ_AGG_TS_FIRST:
+        if (p->ts_first == INT64_MAX) { out_f = 0.0/0.0; break; }
+        if (src_t == TSDB_TYPE_FLOAT64) { out_f = p->ts_first_f; }
+        else if (src_t == TSDB_TYPE_SYMBOL ) {
+            ((uint64_t *)r->col_data[col_idx])[r->nrows] = (uint64_t)p->ts_first_u32;
+            return;
+        } else { out_i = p->ts_first_i; }
+        break;
+    case PROJ_AGG_TS_LAST:
+    case PROJ_AGG_TS_LAST_ROW:
+        if (p->ts_last == INT64_MIN) { out_f = 0.0/0.0; break; }
+        if (src_t == TSDB_TYPE_FLOAT64) { out_f = p->ts_last_f; }
+        else if (src_t == TSDB_TYPE_SYMBOL ) {
+            ((uint64_t *)r->col_data[col_idx])[r->nrows] = (uint64_t)p->ts_last_u32;
+            return;
+        } else { out_i = p->ts_last_i; }
+        break;
+    case PROJ_AGG_TS_TWA: {
+        int64_t total_dt = p->ts_last - p->ts_first;
+        if (total_dt <= 0)
+            out_f = (p->twa_last_ts >= 0) ? p->twa_last_v : 0.0/0.0;
+        else
+            out_f = p->twa_wsum / (double)total_dt;
+        break;
+    }
     default: return;
     }
 
@@ -1146,7 +1357,7 @@ void tsdb_par_scan_task(void *arg) {
 
         /* Update private aggregate state. */
         for (int pi = 0; pi < t->nprojs; pi++) {
-            if (t->projs[pi].kind >= PROJ_AGG_FIRST && t->projs[pi].kind <= PROJ_AGG_LAST)
+            if (t->projs[pi].kind >= PROJ_AGG_RANGE_BEGIN && t->projs[pi].kind <= PROJ_AGG_RANGE_END)
                 agg_update(&t->projs[pi], t->schema, bufs, n, bm, agg_scratch);
         }
 
@@ -1928,6 +2139,14 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         for (int i = 0; i < q->ngroup_by; i++) need_col[gkey_cols[i]] = 1;
         for (int i = 0; i < nprojs; i++)
             if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        /* TS agg functions also need the ts column loaded. */
+        for (int i = 0; i < nprojs; i++) {
+            if (projs[i].kind >= PROJ_AGG_TS_KIND_FIRST &&
+                projs[i].kind <= PROJ_AGG_RANGE_END) {
+                need_col[s->ts_col_idx] = 1;
+                break;
+            }
+        }
         /* WHERE idents. */
         qast_expr_t *stk[128]; int tp = 0;
         if (q->where) stk[tp++] = q->where;
@@ -2042,6 +2261,12 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                     if (w == 8) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 8;
                     else if (w == 4) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 4;
                 }
+                /* TS agg functions also need the ts column pointer. */
+                if (gp->kind >= PROJ_AGG_TS_KIND_FIRST) {
+                    int tsc = s->ts_col_idx;
+                    if (bufs[tsc])
+                        one_bufs[tsc] = (uint8_t *)bufs[tsc] + row * 8;
+                }
                 agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
             }
         }
@@ -2109,9 +2334,21 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     }
 
     /* Build projections. */
-    proj_t *projs = NULL; int nprojs = 0, has_agg = 0;
-    int rc = build_projections(q, s, &projs, &nprojs, &has_agg, err, errcap);
+    proj_t *projs = NULL; int nprojs = 0, has_agg = 0, has_window = 0, has_ts_agg = 0;
+    int rc = build_projections(q, s, &projs, &nprojs, &has_agg, &has_window,
+                               &has_ts_agg, err, errcap);
     if (rc != TSDB_OK) return rc;
+
+    /* Window functions only valid in plain non-agg SELECT (no GROUP BY,
+     * no SAMPLE BY, no LATEST ON, no ASOF JOIN). */
+    if (has_window && (has_agg || q->has_sample_by || q->ngroup_by > 0 ||
+                       q->has_latest_on || q->has_asof_join)) {
+        if (projs) { for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]); free(projs); }
+        eset(err, errcap,
+             "window functions (diff/derivative/csum/mavg) cannot be combined with "
+             "aggregates, GROUP BY, SAMPLE BY, LATEST ON, or ASOF JOIN");
+        return TSDB_ERR_UNSUPPORTED;
+    }
 
     /* Allocate result columns. */
     rc = result_reserve_cols(r, nprojs);
@@ -2178,6 +2415,16 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     cur_state.min_i = INT64_MAX; cur_state.max_i = INT64_MIN;
     int64_t cur_bucket = INT64_MIN;  /* sentinel: no active bucket */
 
+    /* ---- Advanced window extra state ------------------------------------ */
+    int64_t adv_prev_ts = INT64_MIN;
+    uint64_t adv_prev_state = 0;
+    int      adv_prev_state_valid = 0;
+    int     adv_inside_window = 0;
+    int64_t adv_win_start_ts  = 0;
+    int adv_state_col_idx = -1;
+    if (q->has_adv_window && q->adv_window_kind == QAST_WIN_STATE && q->state_col)
+        adv_state_col_idx = resolve_col(s, q->state_col);
+
     size_t rows_emitted = 0;
     size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
 
@@ -2190,7 +2437,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
      * then main thread merges all partial states. */
     pthread_once(&g_pool_once, init_pool);
 
-    int use_parallel = has_agg && !has_sample && plan.nsrcs > 1
+    /* has_ts_agg requires row-by-row ts access — disable parallel for now */
+    int use_parallel = has_agg && !has_sample && !q->has_adv_window
+                       && !has_ts_agg && plan.nsrcs > 1
                        && g_parallel_on && g_query_pool != NULL
                        && tsdb_pool_size(g_query_pool) > 1;
 
@@ -2258,7 +2507,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             memcpy(t->projs, projs, (size_t)nprojs * sizeof(proj_t));
             /* Deep-copy tdigest pointers — each worker needs its own empty digest. */
             for (int pi = 0; pi < nprojs; pi++) {
-                if (t->projs[pi].kind >= PROJ_AGG_TDIGEST_FIRST) {
+                if (t->projs[pi].kind >= PROJ_AGG_TDIGEST_FIRST &&
+                    t->projs[pi].kind < PROJ_AGG_TS_KIND_FIRST) {
                     t->projs[pi].tdigest = NULL; /* clear shallow-copied pointer */
                     if (proj_tdigest_init(&t->projs[pi]) != 0) {
                         /* cleanup all already allocated */
@@ -2437,8 +2687,27 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             }
         }
 
-        /* Always load ts col if SAMPLE BY */
-        if (has_sample) need_col[s->ts_col_idx] = 1;
+        /* Always load ts col if SAMPLE BY, advanced window, or any window fn */
+        if (has_sample || q->has_adv_window || has_window || has_ts_agg) need_col[s->ts_col_idx] = 1;
+        /* STATE_WINDOW: also pre-load the state column. */
+        if (q->has_adv_window && q->adv_window_kind == QAST_WIN_STATE && q->state_col) {
+            int sc = resolve_col(s, q->state_col);
+            if (sc >= 0) need_col[sc] = 1;
+        }
+        /* EVENT_WINDOW: mark columns referenced in start/end expressions. */
+        if (q->has_adv_window && q->adv_window_kind == QAST_WIN_EVENT) {
+            qast_expr_t *estk[64]; int etp = 0;
+            if (q->event_start_expr) estk[etp++] = q->event_start_expr;
+            if (q->event_end_expr)   estk[etp++] = q->event_end_expr;
+            while (etp > 0) {
+                qast_expr_t *ee = estk[--etp];
+                if (!ee) continue;
+                if (ee->kind == QAST_IDENT) { int ec = resolve_col(s, ee->v.s); if (ec >= 0) need_col[ec] = 1; }
+                if (ee->lhs && etp < 64) estk[etp++] = ee->lhs;
+                if (ee->rhs && etp < 64) estk[etp++] = ee->rhs;
+                for (int ei = 0; ei < ee->nargs && etp < 64; ei++) estk[etp++] = ee->args[ei];
+            }
+        }
 
         for (int c = 0; c < s->ncols; c++) {
             if (!need_col[c]) continue;
@@ -2503,7 +2772,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (has_agg && !has_sample) {
             /* Single-row aggregate over all rows matching. */
             for (int pi = 0; pi < nprojs; pi++) {
-                if (projs[pi].kind >= PROJ_AGG_FIRST && projs[pi].kind <= PROJ_AGG_LAST)
+                if (projs[pi].kind >= PROJ_AGG_RANGE_BEGIN && projs[pi].kind <= PROJ_AGG_RANGE_END)
                     agg_update(&projs[pi], s, bufs, n, bm, serial_agg_scratch);
             }
         } else if (has_agg && has_sample) {
@@ -2584,7 +2853,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
                 /* Accumulate row into current bucket. */
                 for (int pi = 0; pi < nprojs; pi++) {
-                    if (projs[pi].kind < PROJ_AGG_FIRST || projs[pi].kind > PROJ_AGG_COUNT) continue;
+                    if (projs[pi].kind < PROJ_AGG_RANGE_BEGIN || projs[pi].kind > PROJ_AGG_COUNT) continue;
                     int col = projs[pi].col;
                     if (projs[pi].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; }
                     if (col < 0) continue;
@@ -2611,13 +2880,221 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 free(bufs); free(syms);
                 goto post_scan;
             }
+        } else if (q->has_adv_window && has_agg) {
+            /* ---- Advanced window aggregation (SESSION/STATE_WINDOW/EVENT_WINDOW) ----
+             * Shares bkt_state_t cur_state / cur_bucket declared above.
+             */
+            const int64_t *adv_ts = (const int64_t *)bufs[s->ts_col_idx];
+
+/* Local macros for advanced window (undef'd at end of block) */
+#define ADW_FLUSH(start_ts_val)                                                    \
+    do {                                                                           \
+        if (cur_state.count > 0) {                                                 \
+            rc = result_reserve_rows(r, r->nrows + 1);                             \
+            if (rc != TSDB_OK) {                                                   \
+                free(bm);                                                          \
+                for (int _ca = 0; _ca < s->ncols; _ca++)                           \
+                    if (!src->mem && bufs[_ca]) free(bufs[_ca]);                   \
+                free(bufs); free(syms); goto done;                                 \
+            }                                                                      \
+            for (int _p2 = 0; _p2 < nprojs; _p2++) {                             \
+                proj_t *_pp = &projs[_p2];                                        \
+                if (_pp->kind == PROJ_TS_BUCKET) {                                \
+                    int64_t _sv = (start_ts_val);                                 \
+                    uint64_t _bb; memcpy(&_bb, &_sv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else if (_pp->kind == PROJ_AGG_SUM) {                           \
+                    double _vv = (_pp->col >= 0 &&                                \
+                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
+                        ? cur_state.sum_f : (double)cur_state.sum_i;              \
+                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else if (_pp->kind == PROJ_AGG_AVG) {                           \
+                    double _vv = 0;                                                \
+                    if (cur_state.count > 0) {                                    \
+                        _vv = (_pp->col >= 0 &&                                   \
+                            s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)          \
+                            ? (cur_state.sum_f / (double)cur_state.count)         \
+                            : ((double)cur_state.sum_i / (double)cur_state.count); \
+                    }                                                              \
+                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else if (_pp->kind == PROJ_AGG_MIN) {                           \
+                    double _vv = (_pp->col >= 0 &&                                \
+                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
+                        ? cur_state.min_f : (double)cur_state.min_i;              \
+                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else if (_pp->kind == PROJ_AGG_MAX) {                           \
+                    double _vv = (_pp->col >= 0 &&                                \
+                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
+                        ? cur_state.max_f : (double)cur_state.max_i;              \
+                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else if (_pp->kind == PROJ_AGG_COUNT) {                         \
+                    int64_t _vv = (int64_t)cur_state.count;                       \
+                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
+                    result_append_cell(r, _p2, _bb);                              \
+                } else {                                                           \
+                    result_append_cell(r, _p2, 0);                                \
+                }                                                                  \
+            }                                                                      \
+            r->nrows++;                                                            \
+            rows_emitted++;                                                        \
+        }                                                                          \
+    } while (0)
+
+#define ADW_OPEN(ts_val)                                                           \
+    do {                                                                           \
+        memset(&cur_state, 0, sizeof(cur_state));                                  \
+        cur_state.min_f =  INFINITY; cur_state.max_f = -INFINITY;                 \
+        cur_state.min_i = INT64_MAX; cur_state.max_i = INT64_MIN;                 \
+        cur_bucket = (ts_val);                                                     \
+    } while (0)
+
+#define ADW_ACC(ri)                                                                \
+    do {                                                                           \
+        for (int _pa = 0; _pa < nprojs; _pa++) {                                  \
+            if (projs[_pa].kind < PROJ_AGG_RANGE_BEGIN ||                         \
+                projs[_pa].kind > PROJ_AGG_COUNT) continue;                       \
+            int _caa = projs[_pa].col;                                            \
+            if (projs[_pa].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; } \
+            if (_caa < 0) continue;                                               \
+            if (s->cols[_caa].type == TSDB_TYPE_FLOAT64) {                        \
+                double _xa = ((const double *)bufs[_caa])[(ri)];                  \
+                cur_state.sum_f += _xa;                                           \
+                if (_xa < cur_state.min_f) cur_state.min_f = _xa;                 \
+                if (_xa > cur_state.max_f) cur_state.max_f = _xa;                 \
+            } else {                                                               \
+                int64_t _xa = ((const int64_t *)bufs[_caa])[(ri)];                \
+                cur_state.sum_i += _xa;                                           \
+                if (_xa < cur_state.min_i) cur_state.min_i = _xa;                 \
+                if (_xa > cur_state.max_i) cur_state.max_i = _xa;                 \
+            }                                                                      \
+            cur_state.count++;                                                     \
+        }                                                                          \
+    } while (0)
+
+            if (q->adv_window_kind == QAST_WIN_SESSION) {
+                int64_t gap_ns = q->session_gap_ns;
+                if (gap_ns <= 0) gap_ns = 1;
+                for (size_t i = 0; i < n && rows_emitted < limit; i++) {
+                    if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
+                    int64_t ts = adv_ts[i];
+                    if (cur_bucket != INT64_MIN && (ts - adv_prev_ts) > gap_ns) {
+                        ADW_FLUSH(cur_bucket);
+                        ADW_OPEN(ts);
+                    }
+                    if (cur_bucket == INT64_MIN) ADW_OPEN(ts);
+                    adv_prev_ts = ts;
+                    ADW_ACC(i);
+                }
+            } else if (q->adv_window_kind == QAST_WIN_STATE) {
+                if (adv_state_col_idx < 0) {
+                    eset(err, errcap, "STATE_WINDOW: column '%s' not found",
+                         q->state_col ? q->state_col : "?");
+                    rc = TSDB_ERR_SCHEMA;
+                    free(bm);
+                    for (int c2 = 0; c2 < s->ncols; c2++)
+                        if (!src->mem && bufs[c2]) free(bufs[c2]);
+                    free(bufs); free(syms); goto done;
+                }
+                size_t sw = tsdb_type_width(s->cols[adv_state_col_idx].type);
+                for (size_t i = 0; i < n && rows_emitted < limit; i++) {
+                    if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
+                    int64_t ts = adv_ts[i];
+                    uint64_t sv = 0;
+                    if (sw == 8)      sv = ((const uint64_t *)bufs[adv_state_col_idx])[i];
+                    else if (sw == 4) sv = ((const uint32_t *)bufs[adv_state_col_idx])[i];
+                    else if (sw == 2) sv = ((const uint16_t *)bufs[adv_state_col_idx])[i];
+                    else if (sw == 1) sv = ((const uint8_t  *)bufs[adv_state_col_idx])[i];
+                    if (adv_prev_state_valid && sv != adv_prev_state) {
+                        ADW_FLUSH(cur_bucket);
+                        ADW_OPEN(ts);
+                    }
+                    if (cur_bucket == INT64_MIN) ADW_OPEN(ts);
+                    adv_prev_ts = ts;
+                    adv_prev_state = sv;
+                    adv_prev_state_valid = 1;
+                    ADW_ACC(i);
+                }
+            } else if (q->adv_window_kind == QAST_WIN_EVENT) {
+                size_t nbm2 = (n + 63) / 64;
+                uint64_t *sbm = calloc(nbm2, sizeof(uint64_t));
+                uint64_t *ebm = calloc(nbm2, sizeof(uint64_t));
+                if (!sbm || !ebm) {
+                    free(sbm); free(ebm); free(bm);
+                    for (int c2 = 0; c2 < s->ncols; c2++) if (!src->mem && bufs[c2]) free(bufs[c2]);
+                    free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto done;
+                }
+                for (size_t wb = 0; wb < nbm2; wb++) { sbm[wb] = ~(uint64_t)0; ebm[wb] = ~(uint64_t)0; }
+                if (n % 64 != 0) {
+                    uint64_t mask2 = (~(uint64_t)0) >> (64 - n % 64);
+                    sbm[nbm2-1] &= mask2; ebm[nbm2-1] &= mask2;
+                }
+                eval_ctx_t ectx2;
+                memset(&ectx2, 0, sizeof(ectx2));
+                ectx2.schema = s; ectx2.col_bufs = bufs; ectx2.col_syms = syms; ectx2.nrows = n;
+                int evrc = apply_filter_expr(&ectx2, q->event_start_expr, sbm);
+                if (evrc != TSDB_OK) {
+                    if (ectx2.err[0]) eset(err, errcap, "%s", ectx2.err);
+                    free(sbm); free(ebm); free(bm);
+                    for (int c2 = 0; c2 < s->ncols; c2++) if (!src->mem && bufs[c2]) free(bufs[c2]);
+                    free(bufs); free(syms); rc = evrc; goto done;
+                }
+                memset(&ectx2, 0, sizeof(ectx2));
+                ectx2.schema = s; ectx2.col_bufs = bufs; ectx2.col_syms = syms; ectx2.nrows = n;
+                evrc = apply_filter_expr(&ectx2, q->event_end_expr, ebm);
+                if (evrc != TSDB_OK) {
+                    if (ectx2.err[0]) eset(err, errcap, "%s", ectx2.err);
+                    free(sbm); free(ebm); free(bm);
+                    for (int c2 = 0; c2 < s->ncols; c2++) if (!src->mem && bufs[c2]) free(bufs[c2]);
+                    free(bufs); free(syms); rc = evrc; goto done;
+                }
+                for (size_t i = 0; i < n && rows_emitted < limit; i++) {
+                    int64_t ts = adv_ts[i];
+                    int is_s = (int)((sbm[i/64] >> (i%64)) & 1);
+                    int is_e = (int)((ebm[i/64] >> (i%64)) & 1);
+                    if (!adv_inside_window && is_s) {
+                        adv_inside_window = 1;
+                        adv_win_start_ts  = ts;
+                        ADW_OPEN(ts);
+                    }
+                    if (adv_inside_window) {
+                        ADW_ACC(i);
+                        adv_prev_ts = ts;
+                        if (is_e) {
+                            ADW_FLUSH(adv_win_start_ts);
+                            cur_bucket = INT64_MIN;
+                            adv_inside_window = 0;
+                        }
+                    }
+                }
+                free(sbm); free(ebm);
+            }
+
+#undef ADW_FLUSH
+#undef ADW_OPEN
+#undef ADW_ACC
+
+            /* Early-exit the source loop if LIMIT already satisfied */
+            if (q->has_limit && rows_emitted >= limit) {
+                free(bm);
+                for (int c2 = 0; c2 < s->ncols; c2++)
+                    if (!src->mem && bufs[c2]) free(bufs[c2]);
+                free(bufs); free(syms);
+                goto post_scan;
+            }
         } else {
-            /* Simple row projection. */
+            /* Simple row projection (and window functions). */
+            const int64_t *ts_col_buf =
+                (const int64_t *)bufs[s->ts_col_idx];
             for (size_t i = 0; i < n; i++) {
                 if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
                 if (rows_emitted >= limit) break;
 
                 result_reserve_rows(r, r->nrows + 1);
+                int64_t cur_ts = ts_col_buf ? ts_col_buf[i] : 0;
 
                 for (int pi = 0; pi < nprojs; pi++) {
                     proj_t *p = &projs[pi];
@@ -2629,9 +3106,65 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         result_append_cell(r, pi, bits);
                     } else if (p->kind == PROJ_TS_BUCKET) {
                         int64_t ts = ((int64_t *)bufs[p->col])[i];
-                        int64_t b = ts - (ts % p->bucket_ns);
+                        int64_t b  = ts - (ts % p->bucket_ns);
                         uint64_t bits;
                         memcpy(&bits, &b, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind >= PROJ_WIN_FIRST &&
+                               p->kind <= PROJ_WIN_LAST) {
+                        /* Window function per-row compute. */
+                        tsdb_type_t ct = s->cols[p->col].type;
+                        double cur_v = (ct == TSDB_TYPE_FLOAT64)
+                            ? ((const double   *)bufs[p->col])[i]
+                            : (double)((const int64_t *)bufs[p->col])[i];
+                        double out_v = NAN;
+                        switch (p->kind) {
+                        case PROJ_WIN_DIFF:
+                            out_v = p->win_has_prev
+                                    ? cur_v - p->win_prev_f : NAN;
+                            p->win_prev_f   = cur_v;
+                            p->win_has_prev = 1;
+                            break;
+                        case PROJ_WIN_DERIVATIVE:
+                            if (p->win_has_prev) {
+                                int64_t dt = cur_ts - p->win_prev_ts;
+                                out_v = (dt == 0) ? 0.0
+                                      : (cur_v - p->win_prev_f)
+                                        / (double)dt * 1.0e9;
+                            }
+                            p->win_prev_f   = cur_v;
+                            p->win_prev_ts  = cur_ts;
+                            p->win_has_prev = 1;
+                            break;
+                        case PROJ_WIN_CSUM:
+                            p->win_csum += cur_v;
+                            out_v = p->win_csum;
+                            p->win_has_prev = 1;
+                            break;
+                        case PROJ_WIN_MAVG: {
+                            int ww = p->mavg_window;
+                            if (p->mavg_n < ww) {
+                                int slot = (p->mavg_head + p->mavg_n) % ww;
+                                p->mavg_buf[slot] = cur_v;
+                                p->mavg_sum += cur_v;
+                                p->mavg_n++;
+                                out_v = p->mavg_sum / (double)p->mavg_n;
+                            } else {
+                                double evict = p->mavg_buf[p->mavg_head];
+                                p->mavg_sum = p->mavg_sum - evict + cur_v;
+                                p->mavg_buf[p->mavg_head] = cur_v;
+                                p->mavg_head = (p->mavg_head + 1) % ww;
+                                out_v = p->mavg_sum / (double)ww;
+                            }
+                            p->win_has_prev = 1;
+                            break;
+                        }
+                        default:
+                            out_v = NAN;
+                            break;
+                        }
+                        uint64_t bits;
+                        memcpy(&bits, &out_v, 8);
                         result_append_cell(r, pi, bits);
                     }
                 }
@@ -2700,6 +3233,53 @@ post_scan:
                 }
             }
             r->nrows++;
+        }
+    } else if (q->has_adv_window && has_agg) {
+        /* Flush the last open advanced window bucket if one is still open. */
+        if (cur_bucket != INT64_MIN && cur_state.count > 0 &&
+            !(q->has_limit && rows_emitted >= limit)) {
+            rc = result_reserve_rows(r, r->nrows + 1);
+            if (rc == TSDB_OK) {
+                int64_t win_start = cur_bucket;
+                for (int pi = 0; pi < nprojs; pi++) {
+                    proj_t *p = &projs[pi];
+                    if (p->kind == PROJ_TS_BUCKET) {
+                        uint64_t bits; memcpy(&bits, &win_start, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_AGG_SUM) {
+                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                   ? cur_state.sum_f : (double)cur_state.sum_i;
+                        uint64_t bits; memcpy(&bits, &v, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_AGG_AVG) {
+                        double v = 0;
+                        if (cur_state.count > 0) {
+                            v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                ? (cur_state.sum_f / (double)cur_state.count)
+                                : ((double)cur_state.sum_i / (double)cur_state.count);
+                        }
+                        uint64_t bits; memcpy(&bits, &v, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_AGG_MIN) {
+                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                   ? cur_state.min_f : (double)cur_state.min_i;
+                        uint64_t bits; memcpy(&bits, &v, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_AGG_MAX) {
+                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                   ? cur_state.max_f : (double)cur_state.max_i;
+                        uint64_t bits; memcpy(&bits, &v, 8);
+                        result_append_cell(r, pi, bits);
+                    } else if (p->kind == PROJ_AGG_COUNT) {
+                        int64_t v = (int64_t)cur_state.count;
+                        uint64_t bits; memcpy(&bits, &v, 8);
+                        result_append_cell(r, pi, bits);
+                    } else {
+                        result_append_cell(r, pi, 0);
+                    }
+                }
+                r->nrows++;
+            }
         }
     }
 

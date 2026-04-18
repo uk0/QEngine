@@ -356,6 +356,61 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
         }
     }
 
+    /* ---- Advanced window: SESSION / STATE_WINDOW / EVENT_WINDOW ----------- */
+    if (accept(&p, QTOK_SESSION)) {
+        if (q->has_sample_by) {
+            perr(&p, "SESSION cannot be combined with SAMPLE BY");
+            return TSDB_ERR_PARSE;
+        }
+        if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        /* first arg: ts column name (consumed but ignored — we use schema ts col) */
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "SESSION: expected column name as first argument");
+            return TSDB_ERR_PARSE;
+        }
+        advance(&p);
+        if (expect(&p, QTOK_COMMA) != TSDB_OK) return TSDB_ERR_PARSE;
+        /* second arg: gap interval */
+        if (p.tok.kind != QTOK_INTERVAL && p.tok.kind != QTOK_NUMBER) {
+            perr(&p, "SESSION: expected interval as second argument (e.g. 5m, 3s)");
+            return TSDB_ERR_PARSE;
+        }
+        q->session_gap_ns = p.tok.i;
+        advance(&p);
+        if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        q->has_adv_window = 1;
+        q->adv_window_kind = QAST_WIN_SESSION;
+    } else if (accept(&p, QTOK_STATE_WINDOW)) {
+        if (q->has_sample_by) {
+            perr(&p, "STATE_WINDOW cannot be combined with SAMPLE BY");
+            return TSDB_ERR_PARSE;
+        }
+        if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "STATE_WINDOW: expected state column name");
+            return TSDB_ERR_PARSE;
+        }
+        q->state_col = tok_strdup(&p, &p.tok);
+        advance(&p);
+        if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        q->has_adv_window = 1;
+        q->adv_window_kind = QAST_WIN_STATE;
+    } else if (accept(&p, QTOK_EVENT_WINDOW)) {
+        if (q->has_sample_by) {
+            perr(&p, "EVENT_WINDOW cannot be combined with SAMPLE BY");
+            return TSDB_ERR_PARSE;
+        }
+        if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        q->event_start_expr = parse_expr(&p);
+        if (!q->event_start_expr) return TSDB_ERR_PARSE;
+        if (expect(&p, QTOK_COMMA) != TSDB_OK) return TSDB_ERR_PARSE;
+        q->event_end_expr = parse_expr(&p);
+        if (!q->event_end_expr) return TSDB_ERR_PARSE;
+        if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        q->has_adv_window = 1;
+        q->adv_window_kind = QAST_WIN_EVENT;
+    }
+
     if (accept(&p, QTOK_LATEST)) {
         if (expect(&p, QTOK_ON) != TSDB_OK) return TSDB_ERR_PARSE;
         if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected ts column after LATEST ON"); return TSDB_ERR_PARSE; }

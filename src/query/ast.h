@@ -6,6 +6,7 @@
  *                [ ASOF JOIN ident ON key=key [, key=key]* ]
  *                [ WHERE expr ]
  *                [ SAMPLE BY interval [ FILL (fill) ] ]
+ *                [ SESSION(ts_col, gap) | STATE_WINDOW(col) | EVENT_WINDOW(start,end) ]
  *                [ LATEST ON ident [ PARTITION BY ident_list ] ]
  *                [ GROUP BY ident_list ]
  *                [ ORDER BY ident [ ASC | DESC ] ]
@@ -90,6 +91,14 @@ typedef struct {
 
 typedef enum { QAST_ORDER_ASC, QAST_ORDER_DESC } qast_order_dir_t;
 
+/* Advanced window kind (mutually exclusive with has_sample_by). */
+typedef enum {
+    QAST_WIN_SAMPLE_BY = 0,  /* existing fixed-interval bucket     */
+    QAST_WIN_SESSION   = 1,  /* gap-based: new window when ts gap > threshold */
+    QAST_WIN_STATE     = 2,  /* value-change: new window when state col changes */
+    QAST_WIN_EVENT     = 3,  /* expression boundary: open/close on bool exprs */
+} qast_window_kind_t;
+
 typedef struct {
     qast_sel_item_t *sel;
     int              nsel;
@@ -111,6 +120,15 @@ typedef struct {
     int              has_sample_by;
     qast_interval_t  sample_by;
     qast_fill_t      fill;
+
+    /* Advanced window (SESSION / STATE_WINDOW / EVENT_WINDOW).
+     * Mutually exclusive with has_sample_by. */
+    int                has_adv_window;
+    qast_window_kind_t adv_window_kind;
+    int64_t            session_gap_ns;    /* SESSION: gap threshold in ns          */
+    char              *state_col;         /* STATE_WINDOW: column to watch         */
+    qast_expr_t       *event_start_expr;  /* EVENT_WINDOW: open-window condition   */
+    qast_expr_t       *event_end_expr;    /* EVENT_WINDOW: close-window condition  */
 
     int              has_latest_on;
     char            *latest_on_col;

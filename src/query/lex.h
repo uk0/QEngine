@@ -43,6 +43,11 @@ typedef enum {
     /* ASOF JOIN keywords */
     QTOK_ASOF, QTOK_JOIN,
 
+    /* Advanced window keywords */
+    QTOK_SESSION,         /* SESSION(ts_col, gap_interval)          */
+    QTOK_STATE_WINDOW,    /* STATE_WINDOW(state_col)                 */
+    QTOK_EVENT_WINDOW,    /* EVENT_WINDOW(start_expr, end_expr)      */
+
     QTOK_ERR
 } qtok_kind_t;
 
