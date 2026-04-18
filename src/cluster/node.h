@@ -69,6 +69,13 @@ const char *tsdb_node_manager_local_addr(tsdb_node_manager_t *mgr);
 void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
                               const tsdb_node_info_t *info);
 
+/* SWIM refute — called when a peer's state_sync claims the local node
+ * is SUSPECT or DEAD.  Bumps the local version strictly past peer_ver
+ * and marks self ALIVE.  Next STATE_SYNC fanout carries the new
+ * (ver, ALIVE) tuple which the higher-version-wins merge accepts
+ * everywhere, restoring our membership. */
+void tsdb_node_manager_refute(tsdb_node_manager_t *mgr, uint64_t peer_ver);
+
 /* Mark a node as SUSPECT (failed probe). */
 void tsdb_node_manager_suspect(tsdb_node_manager_t *mgr, tsdb_node_id_t id);
 

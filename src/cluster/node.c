@@ -195,6 +195,31 @@ void tsdb_node_manager_heartbeat(tsdb_node_manager_t *mgr) {
     pthread_mutex_unlock(&mgr->lock);
 }
 
+/* SWIM "refute" — when a peer's STATE_SYNC claims the local node is
+ * SUSPECT or DEAD, bump local version strictly past the peer's claim
+ * and re-assert ALIVE.  The next outbound STATE_SYNC will carry the
+ * new (ver, ALIVE) tuple which wins the higher-version-wins merge
+ * everywhere, restoring our membership.
+ *
+ * Needed because a node restart resets the in-memory node_mgr to
+ * version=0 while peers still hold ver=N DEAD from the prior
+ * incarnation — without refutation the DEAD entry is stable forever.
+ */
+void tsdb_node_manager_refute(tsdb_node_manager_t *mgr, uint64_t peer_ver) {
+    if (!mgr) return;
+    pthread_mutex_lock(&mgr->lock);
+    int idx = find_node(mgr, mgr->local_id);
+    if (idx >= 0) {
+        if (peer_ver >= mgr->nodes[idx].version) {
+            mgr->nodes[idx].version = peer_ver + 1;
+        }
+        mgr->nodes[idx].state         = TSDB_NODE_ALIVE;
+        mgr->nodes[idx].suspect_count = 0;
+        mgr->nodes[idx].last_heartbeat_ns = now_ns();
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
 int tsdb_node_manager_snapshot(tsdb_node_manager_t *mgr,
                                 tsdb_node_info_t *out_buf, int buf_cap)
 {
@@ -344,9 +369,8 @@ void tsdb_node_manager_decode(tsdb_node_manager_t *mgr,
 
         memcpy(&info.id, p, 8); p += 8;
 
-        /* Skip local node updates from gossip. */
-        if (info.id == mgr->local_id) continue;
-
+        /* Parse the full record first (even when it's about us) so we
+         * can inspect the peer's opinion of our state for refutation. */
         memcpy(info.addr,        p, 24); info.addr[23]        = '\0'; p += 24;
         memcpy(info.gossip_addr, p, 24); info.gossip_addr[23] = '\0'; p += 24;
 
@@ -356,6 +380,17 @@ void tsdb_node_manager_decode(tsdb_node_manager_t *mgr,
         memcpy(&info.version, p, 8); p += 8;
         memcpy(&info.last_heartbeat_ns, p, 8); p += 8;
         memcpy(&info.suspect_count, p, 4); p += 4;
+
+        if (info.id == mgr->local_id) {
+            /* Peer has an opinion about us.  Refute if they think we
+             * are SUSPECT or DEAD (we obviously know we're ALIVE — we
+             * just received this message). */
+            if (info.state == TSDB_NODE_SUSPECT ||
+                info.state == TSDB_NODE_DEAD) {
+                tsdb_node_manager_refute(mgr, info.version);
+            }
+            continue;
+        }
 
         tsdb_node_manager_upsert(mgr, &info);
     }
