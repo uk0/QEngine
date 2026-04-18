@@ -17,6 +17,7 @@
 
 #include "group.h"
 #include "device.h"
+#include "stable.h"
 #include "../../include/tsdb.h"
 #include "../core/types.h"
 
@@ -239,8 +240,16 @@ struct tsdb_catalog {
     /* device_index: group_name -> group_entry_t* (owned) */
     hmap_t         device_index;
 
+    /* stables: name -> tsdb_stable_t* (owned) */
+    hmap_t         stables;
+
+    /* child_tables: child_name -> tsdb_child_table_t* (owned) */
+    hmap_t         child_tables;
+
     FILE          *groups_log;
     FILE          *devices_log;
+    FILE          *stables_log;
+    FILE          *children_log;
 };
 
 /* ---- Log helpers --------------------------------------------------------- */
@@ -503,26 +512,40 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
 
     pthread_mutex_init(&c->lock, NULL);
 
-    if (hmap_init(&c->groups) != 0 || hmap_init(&c->device_index) != 0) {
+    if (hmap_init(&c->groups) != 0 || hmap_init(&c->device_index) != 0
+        || hmap_init(&c->stables) != 0 || hmap_init(&c->child_tables) != 0) {
         free(c);
         return TSDB_ERR_NOMEM;
     }
 
     /* Replay existing logs. */
-    char groups_path[4096], devices_path[4096];
-    snprintf(groups_path, sizeof(groups_path), "%s/groups.log", c->cat_dir);
-    snprintf(devices_path, sizeof(devices_path), "%s/devices.log", c->cat_dir);
+    char groups_path[4096], devices_path[4096], stables_path[4096], children_path[4096];
+    snprintf(groups_path,   sizeof(groups_path),   "%s/groups.log",       c->cat_dir);
+    snprintf(devices_path,  sizeof(devices_path),  "%s/devices.log",      c->cat_dir);
+    snprintf(stables_path,  sizeof(stables_path),  "%s/stables.log",      c->cat_dir);
+    snprintf(children_path, sizeof(children_path), "%s/child_tables.log", c->cat_dir);
 
     int rc = replay_groups(c, groups_path);
     if (rc != TSDB_OK) { free(c); return rc; }
     rc = replay_devices(c, devices_path);
     if (rc != TSDB_OK) { free(c); return rc; }
+    /* Stable/child replays declared below. */
+    extern int tsdb_catalog_replay_stables(tsdb_catalog_t *c, const char *path);
+    extern int tsdb_catalog_replay_children(tsdb_catalog_t *c, const char *path);
+    rc = tsdb_catalog_replay_stables(c, stables_path);
+    if (rc != TSDB_OK) { free(c); return rc; }
+    rc = tsdb_catalog_replay_children(c, children_path);
+    if (rc != TSDB_OK) { free(c); return rc; }
 
     /* Open logs for appending. */
-    c->groups_log = fopen(groups_path, "a");
+    c->groups_log   = fopen(groups_path,   "a");
     if (!c->groups_log) { free(c); return TSDB_ERR_IO; }
-    c->devices_log = fopen(devices_path, "a");
+    c->devices_log  = fopen(devices_path,  "a");
     if (!c->devices_log) { fclose(c->groups_log); free(c); return TSDB_ERR_IO; }
+    c->stables_log  = fopen(stables_path,  "a");
+    if (!c->stables_log) { fclose(c->groups_log); fclose(c->devices_log); free(c); return TSDB_ERR_IO; }
+    c->children_log = fopen(children_path, "a");
+    if (!c->children_log) { fclose(c->groups_log); fclose(c->devices_log); fclose(c->stables_log); free(c); return TSDB_ERR_IO; }
 
     *out = c;
     return TSDB_OK;
@@ -533,8 +556,14 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
 
     pthread_mutex_lock(&c->lock);
 
-    if (c->groups_log) fclose(c->groups_log);
-    if (c->devices_log) fclose(c->devices_log);
+    if (c->groups_log)   fclose(c->groups_log);
+    if (c->devices_log)  fclose(c->devices_log);
+    if (c->stables_log)  fclose(c->stables_log);
+    if (c->children_log) fclose(c->children_log);
+
+    /* Free stables + child_tables hmaps (values are malloc'd). */
+    hmap_free_values(&c->stables);      free(c->stables.buckets);
+    hmap_free_values(&c->child_tables); free(c->child_tables.buckets);
 
     /* Free device_index: group_entry_t entries. */
     for (size_t i = 0; i < c->device_index.cap; i++) {
