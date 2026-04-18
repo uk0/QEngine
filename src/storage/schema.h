@@ -78,6 +78,24 @@ void tsdb_schema_free(tsdb_schema_t *s);
 /* Return column index by name, or -1 if not found. */
 int tsdb_schema_col_idx(tsdb_schema_t *s, const char *name);
 
+/*
+ * Append a column to an existing schema in place, and re-persist schema.bin.
+ *
+ * The new column is added at index s->ncols (the previous end) and becomes
+ * addressable as the new last index on return.  If type is SYMBOL a fresh
+ * symtab is created and its .sym file flushed.
+ *
+ * Failure modes:
+ *   TSDB_ERR_EXISTS   — a column with the same name already exists
+ *   TSDB_ERR_INVAL    — name too long or null args
+ *   TSDB_ERR_IO       — disk write failed
+ *
+ * The caller is responsible for making sure no concurrent reader/writer is
+ * looking at the schema while this runs.
+ */
+int tsdb_schema_add_column(tsdb_schema_t *s, const char *col_name,
+                            tsdb_type_t col_type);
+
 #ifdef __cplusplus
 }
 #endif

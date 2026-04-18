@@ -8,6 +8,7 @@
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "../catalog/tmq.h"
 #include "../server/metrics.h"
 #include "retention.h"
 #include <stdio.h>
@@ -62,6 +63,9 @@ struct tsdb_db {
     /* Catalog (Group/Device metadata). Opened in tsdb_open. */
     tsdb_catalog_t      *catalog;
 
+    /* TMQ consumer-group store. Opened in tsdb_open. */
+    tsdb_tmq_t          *tmq;
+
     /* Retention GC (NULL when not configured). Stopped in tsdb_close(). */
     struct tsdb_retention *retention;
 
@@ -107,6 +111,11 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         db->catalog = NULL;
     }
 
+    /* Open TMQ store alongside the catalog. Also non-fatal. */
+    if (tsdb_tmq_open(data_dir, &db->tmq) != TSDB_OK) {
+        db->tmq = NULL;
+    }
+
     *out = db;
     return TSDB_OK;
 }
@@ -146,6 +155,7 @@ void tsdb_close(tsdb_db_t *db) {
         free(t);
     }
 
+    if (db->tmq)     tsdb_tmq_close(db->tmq);
     if (db->catalog) tsdb_catalog_close(db->catalog);
 
     /* Stop retention GC before destroying the mutex. */
@@ -374,6 +384,9 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
 
 /* ---- tsdb_drop_table ---------------------------------------------------- */
 
+/* Forward decl: definition below. Needed by tsdb_alter_table_add_column. */
+static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate);
+
 /*
  * Recursively remove a directory and its contents.
  * Only goes one level deep for partition dirs (no recursive descent needed
@@ -439,6 +452,45 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
 
     pthread_mutex_unlock(&db->lock);
     return TSDB_OK;
+}
+
+/* ---- ALTER TABLE ADD COLUMN -------------------------------------------- */
+
+int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
+                                 const char *col_name, tsdb_type_t col_type)
+{
+    if (!db || !table_name || !col_name) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = NULL;
+    for (int i = 0; i < db->ntables; i++) {
+        if (db->tables[i] && strcmp(db->tables[i]->name, table_name) == 0) {
+            t = db->tables[i]; break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    if (!t) return TSDB_ERR_NOTFOUND;
+
+    /* Serialise with compactor and concurrent flushes. */
+    pthread_mutex_lock(&t->compact_mtx);
+
+    /* Force memtable to disk so we can safely re-size its column buffers. */
+    int rc = flush_and_clear_ex(t, /*skip_replicate=*/1);
+    if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
+
+    /* Persist the schema change first. */
+    rc = tsdb_schema_add_column(t->schema, col_name, col_type);
+    if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
+
+    /* Grow the memtable's column buffer to match. */
+    rc = tsdb_memtable_extend_for_new_column(t->memtable);
+    /* If this fails the schema is already updated on disk; we leave the
+     * in-memory schema consistent but the memtable cannot ingest new rows
+     * for this column until reopen. Surface the error unchanged. */
+
+    pthread_mutex_unlock(&t->compact_mtx);
+    return rc;
 }
 
 /* ---- Batch API ---------------------------------------------------------- */
@@ -649,6 +701,7 @@ tsdb_memtable_t *tsdb_tbl_memtable(tsdb_table_internal_t *t) { return t ? t->mem
 const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->schema) ? t->schema->dir : NULL; }
 const char      *tsdb_tbl_name(tsdb_table_internal_t *t)     { return t ? t->name : NULL; }
 tsdb_catalog_t  *tsdb_db_catalog(tsdb_db_t *db)              { return db ? db->catalog : NULL; }
+tsdb_tmq_t      *tsdb_db_tmq(tsdb_db_t *db)                  { return db ? db->tmq : NULL; }
 pthread_mutex_t *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t) { return t ? &t->compact_mtx : NULL; }
 /* ---- Group-commit DB-level API ------------------------------------------ */
 

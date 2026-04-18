@@ -74,6 +74,15 @@ void tsdb_memtable_row_abort(tsdb_memtable_t *m);
  */
 const void *tsdb_memtable_col(tsdb_memtable_t *m, int col);
 
+/*
+ * Notify the memtable that a new trailing column has been appended to the
+ * schema.  Allocates its column buffer and extends col_set.
+ *
+ * The caller must ensure the memtable is empty (nrows==0) and no row is in
+ * progress — otherwise TSDB_ERR_INVAL is returned.
+ */
+int tsdb_memtable_extend_for_new_column(tsdb_memtable_t *m);
+
 #ifdef __cplusplus
 }
 #endif

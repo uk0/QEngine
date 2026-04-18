@@ -30,6 +30,8 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     /* STable DDL */
     {"stable",    QTOK_STABLE},   {"using",     QTOK_USING},     {"tags",      QTOK_TAGS},
     {"table",     QTOK_TABLE},
+    /* ALTER TABLE ADD COLUMN */
+    {"alter",     QTOK_ALTER},    {"add",       QTOK_ADD},       {"column",    QTOK_COLUMN},
     /* ASOF JOIN */
     {"asof",         QTOK_ASOF},         {"join",         QTOK_JOIN},
     /* Advanced windows — state_window / event_window lex as single IDENT
@@ -37,6 +39,17 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"session",      QTOK_SESSION},
     {"state_window", QTOK_STATE_WINDOW},
     {"event_window", QTOK_EVENT_WINDOW},
+    /* TMQ consumer-group keywords */
+    {"consumer",     QTOK_CONSUMER},
+    {"commit",       QTOK_COMMIT},
+    {"offset",       QTOK_OFFSET},
+    {"at",           QTOK_AT},
+    {"leave",        QTOK_LEAVE},
+    {"topic",        QTOK_TOPIC},
+    /* Parquet export */
+    {"export",       QTOK_EXPORT},
+    {"to",           QTOK_TO},
+    {"parquet",      QTOK_PARQUET},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -79,11 +92,23 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_USING: return "USING";
     case QTOK_TAGS: return "TAGS";
     case QTOK_TABLE: return "TABLE";
+    case QTOK_ALTER: return "ALTER";
+    case QTOK_ADD:   return "ADD";
+    case QTOK_COLUMN: return "COLUMN";
     case QTOK_ASOF: return "ASOF";
     case QTOK_JOIN: return "JOIN";
     case QTOK_SESSION:      return "SESSION";
     case QTOK_STATE_WINDOW: return "STATE_WINDOW";
     case QTOK_EVENT_WINDOW: return "EVENT_WINDOW";
+    case QTOK_CONSUMER:     return "CONSUMER";
+    case QTOK_COMMIT:       return "COMMIT";
+    case QTOK_OFFSET:       return "OFFSET";
+    case QTOK_AT:           return "AT";
+    case QTOK_LEAVE:        return "LEAVE";
+    case QTOK_TOPIC:        return "TOPIC";
+    case QTOK_EXPORT:       return "EXPORT";
+    case QTOK_TO:           return "TO";
+    case QTOK_PARQUET:      return "PARQUET";
     case QTOK_ERR: return "<error>";
     }
     return "?";

@@ -766,6 +766,45 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         }
     }
 
+    /* ─── ALTER TABLE ADD COLUMN support ───────────────────────────────────
+     * Columns added after earlier flushes have fewer (or zero) blocks than
+     * the TS column for this partition. Pad the front with synthetic
+     * block-meta records so readers that walk TS-aligned blocks always
+     * find a matching entry. Sentinel: offset=0, codec=TSDB_CODEC_NONE,
+     * no col file mapped for the synthesised block range.
+     * tsdb_part_read_block zero-fills when it sees the sentinel. */
+    int ts_ci = s->ts_col_idx;
+    if (ts_ci >= 0 && ts_ci < s->ncols && p->col_meta_n[ts_ci] > 0) {
+        size_t nb_ts = p->col_meta_n[ts_ci];
+        for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci)                  continue;
+            size_t nb_col = p->col_meta_n[ci];
+            if (nb_col >= nb_ts)              continue;   /* already aligned */
+
+            size_t nmiss = nb_ts - nb_col;
+            tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
+            if (!merged) { tsdb_part_close(p); return TSDB_ERR_NOMEM; }
+
+            /* Synthesise the leading blocks that pre-date the column. */
+            for (size_t b = 0; b < nmiss; b++) {
+                memset(&merged[b], 0, sizeof(merged[b]));
+                merged[b].offset = UINT64_MAX;                /* sentinel */
+                merged[b].count  = p->col_metas[ts_ci][b].count;
+                merged[b].ts_min = p->col_metas[ts_ci][b].ts_min;
+                merged[b].ts_max = p->col_metas[ts_ci][b].ts_max;
+                merged[b].codec  = TSDB_CODEC_NONE;
+            }
+            /* Append existing real blocks after the synthetic prefix. */
+            if (nb_col > 0 && p->col_metas[ci]) {
+                memcpy(&merged[nmiss], p->col_metas[ci],
+                       nb_col * sizeof(*merged));
+                free(p->col_metas[ci]);
+            }
+            p->col_metas[ci]  = merged;
+            p->col_meta_n[ci] = nb_ts;
+        }
+    }
+
     *out = p;
     return TSDB_OK;
 }
@@ -801,6 +840,16 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
 {
     if (!p || col_idx < 0 || col_idx >= p->schema->ncols || !meta || !out_buf)
         return TSDB_ERR_INVAL;
+
+    /* ALTER TABLE ADD COLUMN sentinel: offset == UINT64_MAX marks a block
+     * that pre-dates the column's creation — zero-fill with the type's
+     * default value. Works whether the column file is mapped or not. */
+    if (meta->offset == UINT64_MAX) {
+        tsdb_type_t type = p->schema->cols[col_idx].type;
+        size_t w = tsdb_type_width(type);
+        memset(out_buf, 0, (size_t)meta->count * w);
+        return TSDB_OK;
+    }
 
     if (!p->col_maps[col_idx].map) return TSDB_ERR_NOTFOUND;
 
@@ -838,6 +887,11 @@ void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,
     if (col_idx < 0 || col_idx >= p->schema->ncols) return;
     *out_map = p->col_maps[col_idx].map;
     *out_len = p->col_maps[col_idx].map_size;
+}
+
+/* Schema accessor for the Parquet exporter (see src/storage/parquet.c). */
+tsdb_schema_t *tsdb_part_schema(const tsdb_part_t *p) {
+    return p ? p->schema : NULL;
 }
 
 int tsdb_part_zone_map(tsdb_part_t *p, int64_t *out_ts_min, int64_t *out_ts_max) {

@@ -178,6 +178,15 @@ typedef enum {
     QAST_STMT_CREATE_STABLE,
     QAST_STMT_DROP_STABLE,
     QAST_STMT_CREATE_CHILD_TABLE,  /* CREATE TABLE name USING stable TAGS(...) */
+    /* ALTER TABLE t ADD COLUMN c TYPE */
+    QAST_STMT_ALTER_ADD_COLUMN,
+    /* TMQ consumer-group statements */
+    QAST_STMT_CREATE_CONSUMER_GROUP,  /* CREATE CONSUMER GROUP n ON topic   */
+    QAST_STMT_JOIN_GROUP,             /* JOIN GROUP n AS consumer_id        */
+    QAST_STMT_LEAVE_GROUP,            /* LEAVE GROUP n AS consumer_id       */
+    QAST_STMT_COMMIT_OFFSET,          /* COMMIT OFFSET n AT seq (needs AS)  */
+    /* Parquet export */
+    QAST_STMT_EXPORT_PARQUET,         /* EXPORT TABLE <name> TO PARQUET '<dir>' */
 } qast_stmt_kind_t;
 
 typedef struct {
@@ -194,6 +203,19 @@ typedef struct {
         struct { tsdb_stable_t spec; }       create_stable;       /* QAST_STMT_CREATE_STABLE */
         struct { char name[64]; }            drop_stable;          /* QAST_STMT_DROP_STABLE */
         struct { tsdb_child_table_t spec; }  create_child_table;   /* QAST_STMT_CREATE_CHILD_TABLE */
+        /* ALTER TABLE t ADD COLUMN c TYPE */
+        struct {
+            char         table[64];
+            char         col_name[64];
+            tsdb_type_t  col_type;
+        } alter_add_column;
+        /* TMQ statements (all use short fixed-size names) */
+        struct { char name[64]; char topic[64]; } create_consumer_group;
+        struct { char name[64]; char consumer_id[64]; } join_group;
+        struct { char name[64]; char consumer_id[64]; } leave_group;
+        struct { char name[64]; char consumer_id[64]; int64_t seq; } commit_offset;
+        /* Parquet export: EXPORT TABLE <table> TO PARQUET '<dir>' */
+        struct { char table[64]; char out_dir[1024]; } export_parquet;
     } u;
 } qast_stmt_t;
 

@@ -8,6 +8,7 @@
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
 #include "../storage/part.h"
+#include "../storage/parquet.h"
 #include "../core/arena.h"
 #include "../core/symbol.h"
 #include "../core/bits.h"
@@ -20,6 +21,7 @@
 #include "../catalog/group.h"
 #include "../catalog/device.h"
 #include "../catalog/stable.h"
+#include "../catalog/tmq.h"
 #include "../../include/tsdb.h"
 #include "../server/metrics.h"
 #include <stdio.h>
@@ -32,6 +34,9 @@
 #include <ctype.h>
 #include <math.h>
 #include <pthread.h>
+
+/* Forward declaration for the mkdir -p helper exposed by schema.c. */
+extern int tsdb_mkdir_p(const char *path);
 
 /* ---- Global parallel query pool --------------------------------------- */
 
@@ -4760,6 +4765,136 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         if (rc == TSDB_OK) rc = result_status(r, "OK: child table created");
         else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: child table exists"); rc = TSDB_ERR_EXISTS; }
         else { result_status(r, "ERR: child table catalog failed"); }
+        break;
+    }
+    case QAST_STMT_ALTER_ADD_COLUMN: {
+        rc = tsdb_alter_table_add_column(db,
+            stmt.u.alter_add_column.table,
+            stmt.u.alter_add_column.col_name,
+            stmt.u.alter_add_column.col_type);
+        if (rc == TSDB_OK)                   rc = result_status(r, "OK: column added");
+        else if (rc == TSDB_ERR_NOTFOUND)  { result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND; }
+        else if (rc == TSDB_ERR_EXISTS)    { result_status(r, "ERR: column already exists"); rc = TSDB_ERR_EXISTS; }
+        else                                 result_status(r, "ERR: alter add column failed");
+        break;
+    }
+
+    /* ---- TMQ consumer-group statements --------------------------------- */
+    case QAST_STMT_CREATE_CONSUMER_GROUP: {
+        tsdb_tmq_t *tmq = tsdb_db_tmq(db);
+        if (!tmq) { result_status(r, "ERR: tmq not available"); rc = TSDB_ERR_INTERNAL; break; }
+        /* Validate that the topic refers to an existing table. */
+        tsdb_table_t *tbl = NULL;
+        int trc = tsdb_open_table(db, stmt.u.create_consumer_group.topic, &tbl);
+        if (trc != TSDB_OK || !tbl) {
+            result_status(r, "ERR: topic (table) not found");
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
+        rc = tsdb_tmq_group_create(tmq,
+                                    stmt.u.create_consumer_group.name,
+                                    stmt.u.create_consumer_group.topic);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: consumer group created");
+        else if (rc == TSDB_ERR_EXISTS)   { result_status(r, "ERR: consumer group exists"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_FULL)     { result_status(r, "ERR: too many consumer groups"); rc = TSDB_ERR_FULL; }
+        else                                result_status(r, "ERR: create consumer group failed");
+        break;
+    }
+    case QAST_STMT_JOIN_GROUP: {
+        tsdb_tmq_t *tmq = tsdb_db_tmq(db);
+        if (!tmq) { result_status(r, "ERR: tmq not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_tmq_join(tmq,
+                           stmt.u.join_group.name,
+                           stmt.u.join_group.consumer_id);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: joined group");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group not found"); rc = TSDB_ERR_NOTFOUND; }
+        else if (rc == TSDB_ERR_EXISTS)   { result_status(r, "ERR: consumer already in group"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_FULL)     { result_status(r, "ERR: group full"); rc = TSDB_ERR_FULL; }
+        else                                result_status(r, "ERR: join failed");
+        break;
+    }
+    case QAST_STMT_LEAVE_GROUP: {
+        tsdb_tmq_t *tmq = tsdb_db_tmq(db);
+        if (!tmq) { result_status(r, "ERR: tmq not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_tmq_leave(tmq,
+                            stmt.u.leave_group.name,
+                            stmt.u.leave_group.consumer_id);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: left group");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group or consumer not found"); rc = TSDB_ERR_NOTFOUND; }
+        else                                result_status(r, "ERR: leave failed");
+        break;
+    }
+    case QAST_STMT_COMMIT_OFFSET: {
+        tsdb_tmq_t *tmq = tsdb_db_tmq(db);
+        if (!tmq) { result_status(r, "ERR: tmq not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_tmq_commit(tmq,
+                             stmt.u.commit_offset.name,
+                             stmt.u.commit_offset.consumer_id,
+                             stmt.u.commit_offset.seq);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: offset committed");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group or consumer not found"); rc = TSDB_ERR_NOTFOUND; }
+        else if (rc == TSDB_ERR_INVAL)    { result_status(r, "ERR: seq must be monotonic"); rc = TSDB_ERR_INVAL; }
+        else                                result_status(r, "ERR: commit failed");
+        break;
+    }
+
+    case QAST_STMT_EXPORT_PARQUET: {
+        const char *tname   = stmt.u.export_parquet.table;
+        const char *out_dir = stmt.u.export_parquet.out_dir;
+        /* Locate the table + schema. */
+        tsdb_table_internal_t *ti = tsdb_db_find_table(db, tname);
+        if (!ti) {
+            result_status(r, "ERR: table not found");
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
+        tsdb_schema_t *s     = tsdb_tbl_schema(ti);
+        const char    *tdir  = tsdb_tbl_dir(ti);
+        /* Ensure output directory exists. */
+        if (tsdb_mkdir_p(out_dir) != TSDB_OK) {
+            result_status(r, "ERR: cannot create output dir");
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        /* Enumerate partition subdirs (YYYYMMDD / YYYYMMDDHH). */
+        DIR *d = opendir(tdir);
+        if (!d) {
+            result_status(r, "ERR: table dir unreadable");
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        int nfiles = 0;
+        int export_rc = TSDB_OK;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t nl = strlen(ent->d_name);
+            if (nl != 8 && nl != 10) continue;
+            int all_digit = 1;
+            for (size_t i = 0; i < nl; i++) {
+                if (ent->d_name[i] < '0' || ent->d_name[i] > '9') { all_digit = 0; break; }
+            }
+            if (!all_digit) continue;
+            char pdir[4096];
+            snprintf(pdir, sizeof(pdir), "%s/%s", tdir, ent->d_name);
+            tsdb_part_t *p = NULL;
+            if (tsdb_part_open(s, pdir, &p) != TSDB_OK) continue;
+            char outfile[4096];
+            snprintf(outfile, sizeof(outfile), "%s/%s_%s.parquet",
+                     out_dir, tname, ent->d_name);
+            int prc = tsdb_part_export_parquet(p, outfile);
+            tsdb_part_close(p);
+            if (prc != TSDB_OK) { export_rc = prc; break; }
+            nfiles++;
+        }
+        closedir(d);
+        if (export_rc != TSDB_OK) {
+            result_status(r, "ERR: parquet export failed");
+            rc = export_rc;
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "OK: exported %d partition(s)", nfiles);
+            rc = result_status(r, msg);
+        }
         break;
     }
 

@@ -137,6 +137,9 @@ void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,
  */
 int tsdb_part_zone_map(tsdb_part_t *p, int64_t *out_ts_min, int64_t *out_ts_max);
 
+/* Accessor: the schema this partition was opened against. */
+tsdb_schema_t *tsdb_part_schema(const tsdb_part_t *p);
+
 #ifdef __cplusplus
 }
 #endif

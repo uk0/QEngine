@@ -44,6 +44,9 @@ typedef enum {
     QTOK_STABLE, QTOK_USING, QTOK_TAGS,
     QTOK_TABLE,
 
+    /* ALTER TABLE ADD COLUMN */
+    QTOK_ALTER, QTOK_ADD, QTOK_COLUMN,
+
     /* ASOF JOIN keywords */
     QTOK_ASOF, QTOK_JOIN,
 
@@ -51,6 +54,19 @@ typedef enum {
     QTOK_SESSION,         /* SESSION(ts_col, gap_interval)          */
     QTOK_STATE_WINDOW,    /* STATE_WINDOW(state_col)                 */
     QTOK_EVENT_WINDOW,    /* EVENT_WINDOW(start_expr, end_expr)      */
+
+    /* TMQ consumer-group keywords */
+    QTOK_CONSUMER,        /* CONSUMER GROUP <name> ON <topic>       */
+    QTOK_COMMIT,          /* COMMIT OFFSET                           */
+    QTOK_OFFSET,
+    QTOK_AT,
+    QTOK_LEAVE,           /* LEAVE GROUP                             */
+    QTOK_TOPIC,           /* reserved (not required by current grammar) */
+
+    /* Parquet export */
+    QTOK_EXPORT,          /* EXPORT TABLE <name> TO PARQUET '<dir>'   */
+    QTOK_TO,
+    QTOK_PARQUET,
 
     QTOK_ERR
 } qtok_kind_t;

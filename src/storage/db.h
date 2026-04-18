@@ -31,6 +31,11 @@ tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
  * failed to open (non-fatal for pure SELECT workloads). */
 tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
 
+/* Access the TMQ consumer-group store embedded in the db. Returns NULL if
+ * it failed to open (non-fatal for plain workloads). */
+struct tsdb_tmq;
+struct tsdb_tmq       *tsdb_db_tmq(tsdb_db_t *db);
+
 tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_dir(tsdb_table_internal_t *t);

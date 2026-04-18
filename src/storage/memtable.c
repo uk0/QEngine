@@ -63,6 +63,33 @@ int tsdb_memtable_new(tsdb_schema_t *s, tsdb_memtable_t **out) {
     return TSDB_OK;
 }
 
+int tsdb_memtable_extend_for_new_column(tsdb_memtable_t *m) {
+    if (!m) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&m->lock);
+    if (m->in_row || m->nrows != 0) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_ERR_INVAL;
+    }
+    int new_n = m->schema->ncols;           /* schema was already extended */
+    int old_n = new_n - 1;
+
+    void **nb = realloc(m->col_bufs, (size_t)new_n * sizeof(void *));
+    if (!nb) { pthread_mutex_unlock(&m->lock); return TSDB_ERR_NOMEM; }
+    m->col_bufs = nb;
+
+    size_t w = tsdb_type_width(m->schema->cols[old_n].type);
+    m->col_bufs[old_n] = malloc(w * TSDB_BLOCK_POINTS);
+    if (!m->col_bufs[old_n]) { pthread_mutex_unlock(&m->lock); return TSDB_ERR_NOMEM; }
+
+    uint8_t *ns = realloc(m->col_set, (size_t)new_n * sizeof(uint8_t));
+    if (!ns) { free(m->col_bufs[old_n]); pthread_mutex_unlock(&m->lock); return TSDB_ERR_NOMEM; }
+    m->col_set = ns;
+    m->col_set[old_n] = 0;
+
+    pthread_mutex_unlock(&m->lock);
+    return TSDB_OK;
+}
+
 void tsdb_memtable_free(tsdb_memtable_t *m) {
     if (!m) return;
     pthread_mutex_lock(&m->lock);

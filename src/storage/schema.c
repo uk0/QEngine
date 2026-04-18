@@ -188,6 +188,47 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
     return TSDB_OK;
 }
 
+/* ---- tsdb_schema_add_column -------------------------------------------- */
+
+int tsdb_schema_add_column(tsdb_schema_t *s, const char *col_name,
+                            tsdb_type_t col_type)
+{
+    if (!s || !col_name) return TSDB_ERR_INVAL;
+    if (strlen(col_name) > TSDB_MAX_NAME) return TSDB_ERR_INVAL;
+    if (s->ncols >= TSDB_MAX_COLS) return TSDB_ERR_INVAL;
+
+    /* Duplicate-name guard. */
+    for (int i = 0; i < s->ncols; i++) {
+        if (strcmp(s->cols[i].name, col_name) == 0) return TSDB_ERR_EXISTS;
+    }
+
+    tsdb_col_info_t *nc = realloc(s->cols, (size_t)(s->ncols + 1) * sizeof(*s->cols));
+    if (!nc) return TSDB_ERR_NOMEM;
+    s->cols = nc;
+
+    tsdb_col_info_t *slot = &s->cols[s->ncols];
+    memset(slot, 0, sizeof(*slot));
+    strncpy(slot->name, col_name, TSDB_MAX_NAME);
+    slot->type   = col_type;
+    slot->symtab = NULL;
+
+    if (col_type == TSDB_TYPE_SYMBOL) {
+        int rc = tsdb_symtab_new(&slot->symtab);
+        if (rc != TSDB_OK) return rc;
+    }
+
+    s->ncols++;
+
+    int rc = schema_save(s);
+    if (rc != TSDB_OK) {
+        /* Best-effort rollback. */
+        if (slot->symtab) { tsdb_symtab_free(slot->symtab); slot->symtab = NULL; }
+        s->ncols--;
+        return rc;
+    }
+    return TSDB_OK;
+}
+
 /* ---- tsdb_schema_open -------------------------------------------------- */
 
 int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {

@@ -666,6 +666,33 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
 
     /* ---- CREATE --------------------------------------------------------- */
     if (accept(&p, QTOK_CREATE)) {
+        /* CREATE CONSUMER GROUP <name> ON <topic>  (TMQ) — matched first
+         * because GROUP alone is already a valid legacy DDL keyword.       */
+        if (accept(&p, QTOK_CONSUMER)) {
+            if (!accept(&p, QTOK_GROUP)) {
+                perr(&p, "expected GROUP after CONSUMER");
+                return TSDB_ERR_PARSE;
+            }
+            out->kind = QAST_STMT_CREATE_CONSUMER_GROUP;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected consumer-group name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.create_consumer_group.name,
+                     sizeof(out->u.create_consumer_group.name));
+            advance(&p);
+            if (!accept(&p, QTOK_ON)) {
+                perr(&p, "expected ON <topic>"); return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected topic name after ON"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.create_consumer_group.topic,
+                     sizeof(out->u.create_consumer_group.topic));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
         /* CREATE GROUP <name> [(props)] */
         if (accept(&p, QTOK_GROUP)) {
             out->kind = QAST_STMT_CREATE_GROUP;
@@ -880,6 +907,47 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return TSDB_ERR_PARSE;
     }
 
+    /* ---- ALTER TABLE t ADD COLUMN c TYPE -------------------------------- */
+    if (accept(&p, QTOK_ALTER)) {
+        if (!accept(&p, QTOK_TABLE)) {
+            perr(&p, "expected TABLE after ALTER"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_ALTER_ADD_COLUMN;
+        tok_copy(&p.tok, out->u.alter_add_column.table,
+                 sizeof(out->u.alter_add_column.table));
+        advance(&p);
+
+        if (!accept(&p, QTOK_ADD)) {
+            perr(&p, "expected ADD after table name"); return TSDB_ERR_PARSE;
+        }
+        /* COLUMN is optional syntactic sugar — TDengine tolerates both. */
+        accept(&p, QTOK_COLUMN);
+
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected column name"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.alter_add_column.col_name,
+                 sizeof(out->u.alter_add_column.col_name));
+        advance(&p);
+
+        if (!tok_is_name_like(&p.tok)) {
+            perr(&p, "expected column type"); return TSDB_ERR_PARSE;
+        }
+        if      (ident_ci(&p.tok, "timestamp")) out->u.alter_add_column.col_type = TSDB_TYPE_TIMESTAMP;
+        else if (ident_ci(&p.tok, "int64"))     out->u.alter_add_column.col_type = TSDB_TYPE_INT64;
+        else if (ident_ci(&p.tok, "float64"))   out->u.alter_add_column.col_type = TSDB_TYPE_FLOAT64;
+        else if (ident_ci(&p.tok, "symbol"))    out->u.alter_add_column.col_type = TSDB_TYPE_SYMBOL;
+        else { perr(&p, "unknown column type '%.*s'", (int)p.tok.len, p.tok.start);
+               return TSDB_ERR_PARSE; }
+        advance(&p);
+
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
     /* ---- DROP ----------------------------------------------------------- */
     if (accept(&p, QTOK_DROP)) {
         /* DROP GROUP <name> */
@@ -967,7 +1035,129 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return TSDB_ERR_PARSE;
     }
 
-    perr(&p, "expected SELECT, CREATE, DROP, or LIST");
+    /* ---- JOIN GROUP <name> AS <consumer_id> (TMQ) ---------------------- */
+    if (accept(&p, QTOK_JOIN)) {
+        if (!accept(&p, QTOK_GROUP)) {
+            perr(&p, "expected GROUP after JOIN"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_JOIN_GROUP;
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer-group name"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.join_group.name,
+                 sizeof(out->u.join_group.name));
+        advance(&p);
+        if (!accept(&p, QTOK_AS)) {
+            perr(&p, "expected AS <consumer_id>"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer id after AS"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.join_group.consumer_id,
+                 sizeof(out->u.join_group.consumer_id));
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    /* ---- LEAVE GROUP <name> AS <consumer_id> (TMQ) --------------------- */
+    if (accept(&p, QTOK_LEAVE)) {
+        if (!accept(&p, QTOK_GROUP)) {
+            perr(&p, "expected GROUP after LEAVE"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_LEAVE_GROUP;
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer-group name"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.leave_group.name,
+                 sizeof(out->u.leave_group.name));
+        advance(&p);
+        if (!accept(&p, QTOK_AS)) {
+            perr(&p, "expected AS <consumer_id>"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer id after AS"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.leave_group.consumer_id,
+                 sizeof(out->u.leave_group.consumer_id));
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    /* ---- COMMIT OFFSET <name> AS <consumer_id> AT <seq> (TMQ) ---------
+     * Note: task spec says "COMMIT OFFSET <name> AT <seq>" but a consumer
+     * group has multiple members. We require AS <consumer_id> to identify
+     * which member is committing (its owned partitions get <seq>).     */
+    if (accept(&p, QTOK_COMMIT)) {
+        if (!accept(&p, QTOK_OFFSET)) {
+            perr(&p, "expected OFFSET after COMMIT"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_COMMIT_OFFSET;
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer-group name"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.commit_offset.name,
+                 sizeof(out->u.commit_offset.name));
+        advance(&p);
+        if (!accept(&p, QTOK_AS)) {
+            perr(&p, "expected AS <consumer_id>"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected consumer id after AS"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.commit_offset.consumer_id,
+                 sizeof(out->u.commit_offset.consumer_id));
+        advance(&p);
+        if (!accept(&p, QTOK_AT)) {
+            perr(&p, "expected AT <seq>"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_NUMBER) {
+            perr(&p, "expected integer seq after AT"); return TSDB_ERR_PARSE;
+        }
+        out->u.commit_offset.seq = p.tok.i;
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    /* ---- EXPORT TABLE <name> TO PARQUET '<dir>' ------------------------- */
+    if (accept(&p, QTOK_EXPORT)) {
+        if (!accept(&p, QTOK_TABLE)) {
+            perr(&p, "expected TABLE after EXPORT"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_EXPORT_PARQUET;
+        tok_copy(&p.tok, out->u.export_parquet.table,
+                 sizeof(out->u.export_parquet.table));
+        advance(&p);
+        if (!accept(&p, QTOK_TO)) {
+            perr(&p, "expected TO after table name"); return TSDB_ERR_PARSE;
+        }
+        if (!accept(&p, QTOK_PARQUET)) {
+            perr(&p, "expected PARQUET after TO"); return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_STRING) {
+            perr(&p, "expected '<dir>' path after PARQUET"); return TSDB_ERR_PARSE;
+        }
+        {
+            char *path = str_literal(&p, &p.tok);
+            if (!path) return TSDB_ERR_NOMEM;
+            size_t n = strlen(path);
+            if (n >= sizeof(out->u.export_parquet.out_dir)) {
+                n = sizeof(out->u.export_parquet.out_dir) - 1;
+            }
+            memcpy(out->u.export_parquet.out_dir, path, n);
+            out->u.export_parquet.out_dir[n] = '\0';
+        }
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    perr(&p, "expected SELECT, CREATE, DROP, LIST, JOIN, LEAVE, COMMIT, or EXPORT");
     return TSDB_ERR_PARSE;
 }
 

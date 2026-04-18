@@ -92,6 +92,23 @@ int tsdb_create_table_ex(tsdb_db_t *db,
 int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out);
 int tsdb_drop_table(tsdb_db_t *db, const char *name);
 
+/*
+ * Add a column to an existing table.
+ *
+ * Semantics:
+ *   - In-memory rows are flushed to disk first.
+ *   - The new column is appended at the end (highest col index).
+ *   - Rows in previously-flushed partitions (no data file for the new
+ *     column) read back as zero/0.0/empty-symbol during subsequent queries.
+ *   - New inserts after this call MUST provide a value for the new column
+ *     via tsdb_batch_row_{i64,f64,sym}.
+ *
+ * Returns TSDB_OK, TSDB_ERR_NOTFOUND, TSDB_ERR_EXISTS (same-name column),
+ * or negative error.
+ */
+int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
+                                 const char *col_name, tsdb_type_t col_type);
+
 /* Batch insert
  * Typical pattern:
  *   tsdb_batch_begin(tbl, &b);
