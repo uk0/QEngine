@@ -1745,6 +1745,349 @@ done:
     return rc;
 }
 
+/* ---- GROUP BY hash-aggregate executor ---------------------------------
+ *
+ * Triggered by `SELECT ... GROUP BY col1 [, col2, ...]` without SAMPLE BY.
+ * Maintains one aggregate-state slot per unique group-key tuple, using a
+ * flat open-addressing hashmap keyed by FNV-1a over the packed group-key
+ * bytes. One row per group emitted at end, respecting LIMIT.
+ *
+ * Design decisions:
+ *   - Group state is a `proj_t[nprojs]` heap array, deep-copied from the
+ *     master projs[] (so t-digest aggregates clone correctly).
+ *   - Hash table: power-of-two, 50% load-factor rehash threshold.
+ *   - Key tuple: for each GROUP BY col, pack 8 bytes (i64/ts/f64/sym-code
+ *     as uint32 cast to uint64). Hash those bytes via FNV-1a.
+ *   - Collision handling: store full key tuple in group to verify on
+ *     lookup (hash collision + dup key are distinct).
+ *   - Output schema: (group keys in declared order) + (agg expressions
+ *     as they appear in SELECT list). Other SELECT items are rejected.
+ *
+ * Only the serial path is implemented; parallel hash-agg is planned for
+ * v0.8. For the workloads we target (TSBS double-groupby-* with ≤ dozens
+ * of groups, ingest-side rate matters more than query parallelism), this
+ * is sufficient.
+ */
+
+typedef struct gb_slot {
+    int       occupied;
+    uint64_t  key_hash;
+    uint64_t  key_tuple[TSDB_MAX_COLS];  /* packed group-key values */
+    int       n_key;
+    proj_t   *state;                     /* nprojs-sized clone */
+} gb_slot_t;
+
+static uint64_t gb_fnv1a(const uint8_t *buf, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Allocate a hash-table of capacity `cap` (power of two). */
+static gb_slot_t *gb_alloc(size_t cap) {
+    gb_slot_t *t = calloc(cap, sizeof(gb_slot_t));
+    return t;
+}
+
+static void gb_slot_free_state(gb_slot_t *s, int nprojs) {
+    if (!s->state) return;
+    for (int i = 0; i < nprojs; i++) {
+        if (s->state[i].tdigest) tsdb_tdigest_free(s->state[i].tdigest);
+    }
+    free(s->state);
+    s->state = NULL;
+}
+
+/* Look up (or insert) a slot for key_tuple. Returns the slot. */
+static gb_slot_t *gb_upsert(gb_slot_t *tbl, size_t cap,
+                            const uint64_t *key, int nk,
+                            uint64_t hash, int nprojs,
+                            const proj_t *master_projs, size_t *nused)
+{
+    size_t mask = cap - 1;
+    size_t i = (size_t)hash & mask;
+    for (;;) {
+        gb_slot_t *s = &tbl[i];
+        if (!s->occupied) {
+            /* Insert. */
+            s->occupied = 1;
+            s->key_hash = hash;
+            s->n_key    = nk;
+            memcpy(s->key_tuple, key, (size_t)nk * sizeof(uint64_t));
+            s->state = malloc((size_t)nprojs * sizeof(proj_t));
+            if (!s->state) return NULL;
+            memcpy(s->state, master_projs, (size_t)nprojs * sizeof(proj_t));
+            /* Clone t-digests; base proj_t copy shares pointer otherwise. */
+            for (int p = 0; p < nprojs; p++) {
+                if (master_projs[p].tdigest) {
+                    s->state[p].tdigest = NULL;
+                    tsdb_tdigest_clone(master_projs[p].tdigest, &s->state[p].tdigest);
+                }
+            }
+            (*nused)++;
+            return s;
+        }
+        if (s->key_hash == hash && s->n_key == nk
+            && memcmp(s->key_tuple, key, (size_t)nk * sizeof(uint64_t)) == 0) {
+            return s;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/* Grow the hash table 2× when load factor exceeds 0.5. */
+static int gb_grow(gb_slot_t **tbl, size_t *cap, size_t nused, int nprojs) {
+    (void)nused; (void)nprojs;
+    size_t ncap = (*cap) * 2;
+    gb_slot_t *nt = gb_alloc(ncap);
+    if (!nt) return TSDB_ERR_NOMEM;
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < *cap; i++) {
+        gb_slot_t *s = &(*tbl)[i];
+        if (!s->occupied) continue;
+        size_t j = (size_t)s->key_hash & mask;
+        while (nt[j].occupied) j = (j + 1) & mask;
+        nt[j] = *s;   /* move — do not free state */
+    }
+    free(*tbl);
+    *tbl = nt;
+    *cap = ncap;
+    return TSDB_OK;
+}
+
+static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
+                         qast_query_t *q, tsdb_result_t *r,
+                         proj_t *projs, int nprojs,
+                         char *err, size_t errcap)
+{
+    (void)db;
+    tsdb_schema_t *s = tsdb_tbl_schema(tbl);
+
+    /* Resolve GROUP BY columns. */
+    int gkey_cols[TSDB_MAX_COLS];
+    for (int i = 0; i < q->ngroup_by; i++) {
+        int c = resolve_col(s, q->group_by[i]);
+        if (c < 0) {
+            eset(err, errcap, "unknown GROUP BY column '%s'", q->group_by[i]);
+            return TSDB_ERR_SCHEMA;
+        }
+        gkey_cols[i] = c;
+    }
+
+    /* Validate SELECT items: every non-aggregate must be a GROUP BY column. */
+    for (int i = 0; i < nprojs; i++) {
+        if (projs[i].kind == PROJ_COL) {
+            int ok = 0;
+            for (int g = 0; g < q->ngroup_by; g++)
+                if (projs[i].col == gkey_cols[g]) { ok = 1; break; }
+            if (!ok) {
+                eset(err, errcap,
+                     "column '%s' in SELECT must appear in GROUP BY or be aggregated",
+                     s->cols[projs[i].col].name);
+                return TSDB_ERR_SCHEMA;
+            }
+        }
+    }
+
+    /* Build scan plan (with zone-map prune). */
+    ts_range_t zr;
+    ts_range_init(&zr);
+    if (q->where) extract_ts_bounds(q->where, s, &zr);
+
+    scan_plan_t plan = {0};
+    int rc = scan_plan_build_ex(&plan, tbl,
+                                 (zr.has_lo || zr.has_hi) ? &zr : NULL);
+    if (rc != TSDB_OK) return rc;
+
+    /* Hash table. Start at 64 slots, grow as needed. */
+    size_t cap = 64;
+    gb_slot_t *ht = gb_alloc(cap);
+    if (!ht) { scan_plan_free(&plan); return TSDB_ERR_NOMEM; }
+    size_t nused = 0;
+
+    /* SIMD gather scratch for agg updates. */
+    void *agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
+    if (!agg_scratch) {
+        free(ht); scan_plan_free(&plan); return TSDB_ERR_NOMEM;
+    }
+
+    size_t limit_rows = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    /* Scan all sources. */
+    for (size_t si = 0; si < plan.nsrcs; si++) {
+        scan_src_t *src = &plan.srcs[si];
+        size_t n = src->row_count;
+
+        if ((zr.has_lo || zr.has_hi) &&
+            ts_range_excludes(&zr, src->ts_min, src->ts_max))
+            continue;
+
+        /* Decode needed columns: group keys + agg source columns + WHERE cols. */
+        int need_col[TSDB_MAX_COLS];
+        memset(need_col, 0, sizeof(need_col));
+        for (int i = 0; i < q->ngroup_by; i++) need_col[gkey_cols[i]] = 1;
+        for (int i = 0; i < nprojs; i++)
+            if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        /* WHERE idents. */
+        qast_expr_t *stk[128]; int tp = 0;
+        if (q->where) stk[tp++] = q->where;
+        while (tp > 0) {
+            qast_expr_t *e = stk[--tp];
+            if (!e) continue;
+            if (e->kind == QAST_IDENT) {
+                int c = resolve_col(s, e->v.s);
+                if (c >= 0) need_col[c] = 1;
+            }
+            if (e->lhs && tp < 128) stk[tp++] = e->lhs;
+            if (e->rhs && tp < 128) stk[tp++] = e->rhs;
+            for (int a = 0; a < e->nargs && tp < 128; a++) stk[tp++] = e->args[a];
+        }
+
+        void **bufs = calloc((size_t)s->ncols, sizeof(void *));
+        tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
+        if (!bufs || !syms) { free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto out; }
+
+        for (int c = 0; c < s->ncols; c++) {
+            if (!need_col[c]) continue;
+            syms[c] = s->cols[c].symtab;
+            size_t w = tsdb_type_width(s->cols[c].type);
+            if (src->mem) {
+                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                bufs[c] = malloc(w * n);
+                if (!bufs[c]) { rc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (rc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++)
+                    if (metas[b].ts_min == src->meta.ts_min
+                        && metas[b].count == src->meta.count) {
+                        hit = &metas[b]; break;
+                    }
+                if (!hit) { free(metas); rc = TSDB_ERR_CORRUPT; break; }
+                rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
+                free(metas);
+                if (rc != TSDB_OK) break;
+            }
+        }
+        if (rc != TSDB_OK) {
+            for (int c = 0; c < s->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms); goto out;
+        }
+
+        /* Apply WHERE → bitmap. */
+        size_t nw = (n + 63) / 64;
+        uint64_t *bm = malloc(nw * sizeof(uint64_t));
+        if (!bm) {
+            for (int c = 0; c < s->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto out;
+        }
+        for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
+        size_t tail = nw * 64 - n;
+        if (tail) bm[nw - 1] &= (~(uint64_t)0) >> tail;
+
+        if (q->where) {
+            eval_ctx_t ctx = {0};
+            ctx.schema = s; ctx.col_bufs = bufs; ctx.col_syms = syms; ctx.nrows = n;
+            int frc = apply_filter_expr(&ctx, q->where, bm);
+            if (frc != TSDB_OK) {
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (!src->mem && bufs[c]) free(bufs[c]);
+                free(bufs); free(syms); rc = frc; goto out;
+            }
+        }
+
+        /* Per-row: compute key tuple, upsert, update aggregates. */
+        for (size_t row = 0; row < n; row++) {
+            if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
+
+            uint64_t key_tuple[TSDB_MAX_COLS];
+            for (int g = 0; g < q->ngroup_by; g++) {
+                int c = gkey_cols[g];
+                size_t w = tsdb_type_width(s->cols[c].type);
+                uint64_t val = 0;
+                if (w == 8) val = ((const uint64_t *)bufs[c])[row];
+                else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
+                key_tuple[g] = val;
+            }
+
+            uint64_t hash = gb_fnv1a((const uint8_t *)key_tuple,
+                                      (size_t)q->ngroup_by * sizeof(uint64_t));
+
+            if (nused * 2 >= cap) {
+                if (gb_grow(&ht, &cap, nused, nprojs) != TSDB_OK) {
+                    rc = TSDB_ERR_NOMEM; break;
+                }
+            }
+
+            gb_slot_t *slot = gb_upsert(ht, cap, key_tuple, q->ngroup_by,
+                                         hash, nprojs, projs, &nused);
+            if (!slot) { rc = TSDB_ERR_NOMEM; break; }
+
+            /* For each agg projection in this slot, update with this one row. */
+            for (int p = 0; p < nprojs; p++) {
+                proj_t *gp = &slot->state[p];
+                if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
+                /* Single-row bitmap. */
+                uint64_t one_bm = 1;
+                size_t   one_n  = 1;
+                void    *one_bufs[TSDB_MAX_COLS];
+                memset(one_bufs, 0, sizeof(one_bufs));
+                if (gp->col >= 0) {
+                    size_t w = tsdb_type_width(s->cols[gp->col].type);
+                    if (w == 8) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 8;
+                    else if (w == 4) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 4;
+                }
+                agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
+            }
+        }
+        free(bm);
+        for (int c = 0; c < s->ncols; c++)
+            if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+        if (rc != TSDB_OK) goto out;
+    }
+
+    /* Emit one row per occupied slot. */
+    for (size_t i = 0; i < cap; i++) {
+        gb_slot_t *slot = &ht[i];
+        if (!slot->occupied) continue;
+        if (r->nrows >= limit_rows) break;
+
+        rc = result_reserve_rows(r, r->nrows + 1);
+        if (rc != TSDB_OK) break;
+
+        for (int p = 0; p < nprojs; p++) {
+            proj_t *mp = &projs[p];
+            if (mp->kind == PROJ_COL) {
+                /* Find which GROUP BY col this is → pull from tuple. */
+                uint64_t bits = 0;
+                for (int g = 0; g < q->ngroup_by; g++)
+                    if (mp->col == gkey_cols[g]) { bits = slot->key_tuple[g]; break; }
+                ((uint64_t *)r->col_data[p])[r->nrows] = bits;
+            } else {
+                /* Aggregate — write from slot->state[p]. */
+                agg_write(&slot->state[p], s, r, p);
+            }
+        }
+        r->nrows++;
+    }
+
+out:
+    /* Free per-slot state. */
+    for (size_t i = 0; i < cap; i++) {
+        if (ht[i].occupied) gb_slot_free_state(&ht[i], nprojs);
+    }
+    free(ht);
+    free(agg_scratch);
+    scan_plan_free(&plan);
+    return rc;
+}
+
 /* ---- Main select execution ------------------------------------------- */
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -1786,6 +2129,17 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         int lrc = exec_latest_on(tbl, q, r, projs, nprojs, err, errcap);
         free(projs);
         return lrc;
+    }
+
+    /* GROUP BY dispatch — hash-aggregate with tuple keys.
+     * Triggered only when SELECT includes one or more aggregate expressions
+     * AND the query has a GROUP BY clause. Pure projection with GROUP BY
+     * (no aggregates) is treated as DISTINCT, which we implement via the
+     * same path by emitting one row per unique key with no agg updates. */
+    if (q->ngroup_by > 0 && !q->has_sample_by) {
+        int grc = exec_group_by(db, tbl, q, r, projs, nprojs, err, errcap);
+        free(projs);
+        return grc;
     }
 
     /* Extract ts bounds from WHERE once, so both file-level zone-map prune
