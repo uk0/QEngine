@@ -402,8 +402,6 @@ static void *handle_connection(void *arg) {
 " const rows=(c.nodes||[]).map(n=>{"
 "  const s=(n.state||'ALIVE').toLowerCase();"
 "  const isLocal=(String(n.id)===String(c.local_id));"
-"  // local node: merge disk from c.local; peer: show dash.  Autobalance"
-"  // gives us vn weight for ALL nodes once they're in the ring."
 "  const localDisk=(isLocal&&c.local&&c.local.disk)?c.local.disk:(n.disk||{});"
 "  const cap=localDisk.total_bytes?(fmtBytes(localDisk.free_bytes||0)+' / '+fmtBytes(localDisk.total_bytes)):(isStandalone?'-':'peer');"
 "  const abNode=abByID[n.id]||{};"
