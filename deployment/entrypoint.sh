@@ -34,8 +34,9 @@ case "$TSDB_ROLE" in
     ;;
 
   cluster-node)
-    echo "[entrypoint] mode=cluster-node  data=$TSDB_DATA_DIR  rpc=$TSDB_RPC_BIND  seeds=${TSDB_SEEDS:-<none>}"
-    ARGS="--data-dir $TSDB_DATA_DIR --rpc $TSDB_RPC_BIND"
+    : "${TSDB_METRICS_BIND:=0.0.0.0:28094}"
+    echo "[entrypoint] mode=cluster-node  data=$TSDB_DATA_DIR  rpc=$TSDB_RPC_BIND  bind=$TSDB_BIND  metrics=$TSDB_METRICS_BIND  seeds=${TSDB_SEEDS:-<none>}"
+    ARGS="--data-dir $TSDB_DATA_DIR --rpc $TSDB_RPC_BIND --bind $TSDB_BIND --metrics-bind $TSDB_METRICS_BIND"
     if [ -n "$TSDB_SEEDS" ]; then
       ARGS="$ARGS --seeds $TSDB_SEEDS"
     fi

@@ -1,0 +1,126 @@
+# docker-compose.cluster.yml — a single 3-node QEngine cluster.
+#
+# Each node runs tsdb-node (gossip + rawblock replication) AND exposes
+# the wire-protocol client API + the dashboard.  Clients can hit any
+# node; writes propagate to peers via the raw-block hook; reads can
+# fan across replicas.
+#
+# Host port map (chosen to not collide with docker-compose.twin.yml
+# which uses 29090/29094/29190/29194):
+#
+#   node1  client 29301  dashboard 29311
+#   node2  client 29302  dashboard 29312
+#   node3  client 29303  dashboard 29313
+#
+# Internal (on the bridge network tsdb-cnet, not exposed):
+#   28090 tcp — client
+#   28081 tcp — cluster RPC
+#   28080 udp — gossip
+#
+# Usage:
+#   docker compose -f docker-compose.cluster.yml build
+#   docker compose -f docker-compose.cluster.yml up -d
+#   curl http://host:29194/cluster     # node1 dashboard JSON
+#   curl http://host:29194/            # node1 HTML dashboard
+
+services:
+
+  node1:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: qengine/tsdb:dev
+    container_name: qengine-cnode-1
+    hostname: qengine-cnode-1
+    environment:
+      TSDB_ROLE:          cluster-node
+      TSDB_DATA_DIR:      /var/lib/tsdb
+      TSDB_BIND:          0.0.0.0:28090
+      # RPC + gossip advertise using the container's docker-network
+      # alias so peers can actually reach this node.  (Bind call accepts
+      # a hostname; resolves to the container's internal network IP.)
+      TSDB_RPC_BIND:      qengine-cnode-1:28081
+      TSDB_METRICS_BIND:  0.0.0.0:28094
+      # node1 is the seed — no TSDB_SEEDS.
+    ports:
+      - "29301:28090"
+      - "29311:28094"
+    volumes:
+      - /home/nas/tsdb/cnode1/data:/var/lib/tsdb
+    networks:
+      tsdb-cnet:
+        aliases: [qengine-cnode-1]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
+
+  node2:
+    image: qengine/tsdb:dev
+    container_name: qengine-cnode-2
+    hostname: qengine-cnode-2
+    depends_on:
+      node1:
+        condition: service_healthy
+    environment:
+      TSDB_ROLE:          cluster-node
+      TSDB_DATA_DIR:      /var/lib/tsdb
+      TSDB_BIND:          0.0.0.0:28090
+      TSDB_RPC_BIND:      qengine-cnode-2:28081
+      TSDB_METRICS_BIND:  0.0.0.0:28094
+      # Seeds are gossip addresses (= RPC port − 1).
+      TSDB_SEEDS:         qengine-cnode-1:28080
+    ports:
+      - "29302:28090"
+      - "29312:28094"
+    volumes:
+      - /home/nas/tsdb/cnode2/data:/var/lib/tsdb
+    networks:
+      tsdb-cnet:
+        aliases: [qengine-cnode-2]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
+
+  node3:
+    image: qengine/tsdb:dev
+    container_name: qengine-cnode-3
+    hostname: qengine-cnode-3
+    depends_on:
+      node1:
+        condition: service_healthy
+    environment:
+      TSDB_ROLE:          cluster-node
+      TSDB_DATA_DIR:      /var/lib/tsdb
+      TSDB_BIND:          0.0.0.0:28090
+      TSDB_RPC_BIND:      qengine-cnode-3:28081
+      TSDB_METRICS_BIND:  0.0.0.0:28094
+      # Seeds are gossip addresses (= RPC port − 1).
+      TSDB_SEEDS:         qengine-cnode-1:28080,qengine-cnode-2:28080
+    ports:
+      - "29303:28090"
+      - "29313:28094"
+    volumes:
+      - /home/nas/tsdb/cnode3/data:/var/lib/tsdb
+    networks:
+      tsdb-cnet:
+        aliases: [qengine-cnode-3]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+      start_period: 5s
+
+networks:
+  tsdb-cnet:
+    driver: bridge
+    name: tsdb-cnet
