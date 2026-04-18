@@ -1,6 +1,7 @@
 /* part.c — disk partition flush and read. */
 
 #include "part.h"
+#include "iopolicy.h"
 #include "../compress/codec.h"
 #include "../core/bits.h"
 #include <stdio.h>
@@ -278,6 +279,20 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     /* Open .col for appending. */
     w->col_fp = fopen(col_path, "ab");
     if (!w->col_fp) return TSDB_ERR_IO;
+
+    /* On HDD, coalesce write syscalls with a larger stdio buffer.  Each
+     * block-header+payload is typically 10–100 KiB; a 256 KiB buffer
+     * flushes 2–25 blocks per write(), amortising seek + metadata cost.
+     * On SSD, the default 4–8 KiB buffer is fine. */
+    size_t wbuf = tsdb_iopolicy_write_buf_bytes(
+        tsdb_iopolicy_detect(part_dir));
+    if (wbuf > 0) {
+        /* setvbuf may fail silently if called after I/O; we've only just
+         * opened, so this is the legal moment.  Failure is non-fatal —
+         * the stream stays on its default buffering. */
+        (void)setvbuf(w->col_fp, NULL, _IOFBF, wbuf);
+    }
+
     fseek(w->col_fp, 0, SEEK_END);
     w->col_offset = (uint64_t)ftell(w->col_fp);
 
@@ -691,6 +706,13 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
 
         void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (map == MAP_FAILED) { close(fd); continue; }
+
+        /* Hint the kernel about expected access pattern.  Forward scan +
+         * block-skip benefits from SEQUENTIAL on HDD (aggressive readahead
+         * + early page eviction) and WILLNEED on SSD (warm page cache
+         * without forward prefetch). */
+        tsdb_iopolicy_advise_read(tsdb_iopolicy_detect(partition_dir),
+                                  map, (size_t)st.st_size);
 
         p->col_maps[ci].fd       = fd;
         p->col_maps[ci].map      = (uint8_t *)map;
