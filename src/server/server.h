@@ -22,6 +22,10 @@ typedef struct {
     int         max_conns;     /* soft cap (default 1024) */
     int         write_workers; /* reserved for future pooled writes; ignored now */
     tsdb_db_t  *db;            /* underlying DB — must remain valid for server lifetime */
+    /* TLS (optional — all three NULL/0 = plaintext mode) */
+    const char *tls_cert;      /* PEM server certificate file path */
+    const char *tls_key;       /* PEM server private key file path */
+    const char *tls_ca;        /* PEM CA bundle for mTLS client auth (may be NULL) */
 } tsdb_server_opts_t;
 
 /*

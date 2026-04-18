@@ -54,6 +54,9 @@ static void usage(const char *prog) {
         "  --bind ADDR            client listen address (e.g. 0.0.0.0:28090)\n"
         "  --log-level LVL        error | warn | info | debug | trace\n"
         "  --debug FLAGS          comma-separated debug feature flags\n"
+        "  --tls-cert PATH        PEM server certificate (enables TLS)\n"
+        "  --tls-key  PATH        PEM server private key  (required with --tls-cert)\n"
+        "  --tls-ca   PATH        PEM CA bundle for mutual TLS client auth (optional)\n"
         "  --show-config          dump effective config and exit\n"
         "  --help                 show this help\n"
         "\n"
@@ -70,6 +73,9 @@ int main(int argc, char **argv) {
     const char *override_bind     = NULL;
     const char *override_level    = NULL;
     const char *override_debug    = NULL;
+    const char *override_tls_cert = NULL;
+    const char *override_tls_key  = NULL;
+    const char *override_tls_ca   = NULL;
     int show_config = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -82,6 +88,9 @@ int main(int argc, char **argv) {
         /* Accept legacy flags and silently ignore (tsd.conf handles cluster). */
         else if (!strcmp(argv[i], "--cluster-bind") && i + 1 < argc) i++;
         else if (!strcmp(argv[i], "--seeds")        && i + 1 < argc) i++;
+        else if (!strcmp(argv[i], "--tls-cert") && i + 1 < argc) override_tls_cert = argv[++i];
+        else if (!strcmp(argv[i], "--tls-key")  && i + 1 < argc) override_tls_key  = argv[++i];
+        else if (!strcmp(argv[i], "--tls-ca")   && i + 1 < argc) override_tls_ca   = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -110,8 +119,13 @@ int main(int argc, char **argv) {
     tsdb_config_apply_env(&cfg);
 
     /* 4. Command-line overrides (highest priority). */
-    if (override_data_dir) snprintf(cfg.data_dir, sizeof(cfg.data_dir), "%s", override_data_dir);
-    if (override_bind)     snprintf(cfg.bind,     sizeof(cfg.bind),     "%s", override_bind);
+    if (override_data_dir) snprintf(cfg.data_dir,  sizeof(cfg.data_dir),  "%s", override_data_dir);
+    if (override_bind)     snprintf(cfg.bind,       sizeof(cfg.bind),       "%s", override_bind);
+    if (override_tls_cert) snprintf(cfg.tls_cert,   sizeof(cfg.tls_cert),   "%s", override_tls_cert);
+    if (override_tls_key)  snprintf(cfg.tls_key,    sizeof(cfg.tls_key),    "%s", override_tls_key);
+    if (override_tls_ca)   snprintf(cfg.tls_ca,     sizeof(cfg.tls_ca),     "%s", override_tls_ca);
+    /* Recompute derived flag. */
+    cfg.tls_enabled = (cfg.tls_cert[0] != '\0' && cfg.tls_key[0] != '\0');
     if (override_level) {
         if      (!strcmp(override_level, "error")) cfg.log_level = TSDB_LOG_ERROR;
         else if (!strcmp(override_level, "warn"))  cfg.log_level = TSDB_LOG_WARN;
@@ -170,6 +184,9 @@ int main(int argc, char **argv) {
         .max_conns     = cfg.max_conns,
         .write_workers = cfg.write_workers ? cfg.write_workers : 4,
         .db            = db,
+        .tls_cert      = cfg.tls_cert[0] ? cfg.tls_cert : NULL,
+        .tls_key       = cfg.tls_key[0]  ? cfg.tls_key  : NULL,
+        .tls_ca        = cfg.tls_ca[0]   ? cfg.tls_ca   : NULL,
     };
     rc = tsdb_server_start(&opts, &g_srv);
     if (rc != TSDB_OK) {

@@ -15,6 +15,119 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
+/* ─── TLS integration ────────────────────────────────────────────────────── */
+/*
+ * The client-side TLS state is managed via the same OpenSSL / mbedtls macros
+ * as the server, but the cli/ directory doesn't link against libtsdb.
+ * We include the tls backend directly using the same feature-test macros set
+ * by the Makefile (TSDB_TLS_OPENSSL / TSDB_TLS_MBEDTLS).
+ */
+
+#if defined(TSDB_TLS_OPENSSL)
+#  include <openssl/ssl.h>
+#  include <openssl/err.h>
+
+/* Thin wrapper matching the tsdb_cli_tls_conn forward decl in tsdb_wire.h */
+struct tsdb_cli_tls_conn {
+    SSL_CTX *ctx;
+    SSL     *ssl;
+};
+
+static int cli_tls_available(void) { return 1; }
+
+static struct tsdb_cli_tls_conn *
+cli_tls_connect(const char *host, int fd, const char *ca_path, int skip_verify)
+{
+    SSL_CTX *cx = SSL_CTX_new(TLS_client_method());
+    if (!cx) return NULL;
+    SSL_CTX_set_min_proto_version(cx, TLS1_2_VERSION);
+    SSL_CTX_set_options(cx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+                            SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    if (skip_verify) {
+        SSL_CTX_set_verify(cx, SSL_VERIFY_NONE, NULL);
+    } else {
+        if (ca_path && *ca_path) {
+            if (SSL_CTX_load_verify_locations(cx, ca_path, NULL) != 1) {
+                SSL_CTX_free(cx); return NULL;
+            }
+        } else {
+            SSL_CTX_set_default_verify_paths(cx);
+        }
+        SSL_CTX_set_verify(cx, SSL_VERIFY_PEER, NULL);
+    }
+    SSL *ssl = SSL_new(cx);
+    if (!ssl) { SSL_CTX_free(cx); return NULL; }
+    SSL_set_fd(ssl, fd);
+    SSL_set_connect_state(ssl);
+    if (host && *host) {
+        SSL_set_tlsext_host_name(ssl, host);
+        SSL_set1_host(ssl, host);
+    }
+    /* Handshake loop. */
+    int ret;
+    while ((ret = SSL_do_handshake(ssl)) != 1) {
+        int err = SSL_get_error(ssl, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+        fprintf(stderr, "[tls-cli] handshake failed (err=%d)\n", err);
+        SSL_free(ssl); SSL_CTX_free(cx); return NULL;
+    }
+    struct tsdb_cli_tls_conn *c = calloc(1, sizeof(*c));
+    if (!c) { SSL_free(ssl); SSL_CTX_free(cx); return NULL; }
+    c->ctx = cx; c->ssl = ssl;
+    return c;
+}
+
+static ssize_t cli_tls_read(struct tsdb_cli_tls_conn *c, void *buf, size_t n)
+{
+    int sz = (n > (size_t)INT_MAX) ? INT_MAX : (int)n;
+    for (;;) {
+        int r = SSL_read(c->ssl, buf, sz);
+        if (r > 0) return r;
+        int err = SSL_get_error(c->ssl, r);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+        if (err == SSL_ERROR_ZERO_RETURN) { errno = ECONNRESET; return 0; }
+        errno = EIO; return -1;
+    }
+}
+
+static ssize_t cli_tls_write(struct tsdb_cli_tls_conn *c, const void *buf, size_t n)
+{
+    int sz = (n > (size_t)INT_MAX) ? INT_MAX : (int)n;
+    for (;;) {
+        int r = SSL_write(c->ssl, buf, sz);
+        if (r > 0) return r;
+        int err = SSL_get_error(c->ssl, r);
+        if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) continue;
+        errno = EIO; return -1;
+    }
+}
+
+static void cli_tls_free(struct tsdb_cli_tls_conn *c)
+{
+    if (!c) return;
+    SSL_shutdown(c->ssl);
+    SSL_free(c->ssl);
+    SSL_CTX_free(c->ctx);
+    free(c);
+}
+
+#else /* No TLS */
+
+struct tsdb_cli_tls_conn { int _dummy; };
+static int cli_tls_available(void)               { return 0; }
+static struct tsdb_cli_tls_conn *
+cli_tls_connect(const char *h, int fd, const char *ca, int sv)
+{ (void)h;(void)fd;(void)ca;(void)sv; errno = ENOTSUP; return NULL; }
+static ssize_t cli_tls_read(struct tsdb_cli_tls_conn *c, void *b, size_t n)
+{ (void)c;(void)b;(void)n; errno=ENOTSUP; return -1; }
+static ssize_t cli_tls_write(struct tsdb_cli_tls_conn *c, const void *b, size_t n)
+{ (void)c;(void)b;(void)n; errno=ENOTSUP; return -1; }
+static void cli_tls_free(struct tsdb_cli_tls_conn *c) { (void)c; }
+
+#endif /* TSDB_TLS_OPENSSL */
 
 /* ─── CRC32C (Castagnoli) table-driven implementation ────────────────────── */
 /*
@@ -47,10 +160,14 @@ uint32_t crc32c(uint32_t crc, const uint8_t *buf, size_t len) {
 
 /* ─── Reliable I/O helpers ───────────────────────────────────────────────── */
 
-/* Write exactly n bytes to fd, retrying on EINTR. */
-static int write_all(int fd, const uint8_t *buf, size_t n) {
+/* Write exactly n bytes, dispatching through TLS or plain fd. */
+static int write_all(tsdb_conn_t *c, const uint8_t *buf, size_t n) {
     while (n > 0) {
-        ssize_t r = write(fd, buf, n);
+        ssize_t r;
+        if (c->tls)
+            r = cli_tls_write(c->tls, buf, n);
+        else
+            r = write(c->fd, buf, n);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -61,26 +178,34 @@ static int write_all(int fd, const uint8_t *buf, size_t n) {
     return 0;
 }
 
-/* Read exactly n bytes from fd with poll-based timeout (ms). */
-static int read_all(int fd, uint8_t *buf, size_t n, int timeout_ms) {
+/*
+ * Read exactly n bytes from conn.
+ * For TLS: SSL_read already buffers internally, poll is skipped to avoid
+ * the TLS-record vs fd-read mismatch.  SO_RCVTIMEO on the socket handles
+ * the timeout at the OS level (set by tsdb_conn_connect_tls).
+ * For plaintext: poll-based timeout as before.
+ */
+static int read_all(tsdb_conn_t *c, uint8_t *buf, size_t n, int timeout_ms) {
     while (n > 0) {
-        struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, timeout_ms);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        ssize_t r;
+        if (c->tls) {
+            r = cli_tls_read(c->tls, buf, n);
+        } else {
+            struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
+            int pr = poll(&pfd, 1, timeout_ms);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (pr == 0) { errno = ETIMEDOUT; return -1; }
+            if ((pfd.revents & (POLLERR | POLLNVAL)) && !(pfd.revents & POLLIN)) {
+                errno = ECONNRESET; return -1;
+            }
+            if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
+                errno = ECONNRESET; return -1;
+            }
+            r = read(c->fd, buf, n);
         }
-        if (pr == 0) { errno = ETIMEDOUT; return -1; }
-        /* POLLERR or POLLNVAL without POLLIN means no data coming */
-        if ((pfd.revents & (POLLERR | POLLNVAL)) &&
-            !(pfd.revents & POLLIN)) {
-            errno = ECONNRESET; return -1;
-        }
-        /* POLLHUP with no POLLIN: peer closed, no data left */
-        if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
-            errno = ECONNRESET; return -1;
-        }
-        ssize_t r = read(fd, buf, n);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -124,9 +249,9 @@ int frame_send(tsdb_conn_t *c, uint8_t type, uint16_t flags,
     uint8_t trail[4];
     put_u32(trail, crc);
 
-    if (write_all(c->fd, hdr, TSDB_WIRE_HDR_SIZE) < 0) return -1;
-    if (plen > 0 && payload && write_all(c->fd, payload, plen) < 0) return -1;
-    if (write_all(c->fd, trail, 4) < 0) return -1;
+    if (write_all(c, hdr, TSDB_WIRE_HDR_SIZE) < 0) return -1;
+    if (plen > 0 && payload && write_all(c, payload, plen) < 0) return -1;
+    if (write_all(c, trail, 4) < 0) return -1;
     return 0;
 }
 
@@ -134,7 +259,7 @@ int frame_recv(tsdb_conn_t *c, tsdb_msg_t *msg) {
     memset(msg, 0, sizeof(*msg));
 
     uint8_t hdr[TSDB_WIRE_HDR_SIZE];
-    if (read_all(c->fd, hdr, TSDB_WIRE_HDR_SIZE, c->timeout_ms) < 0)
+    if (read_all(c, hdr, TSDB_WIRE_HDR_SIZE, c->timeout_ms) < 0)
         return -1;
 
     uint32_t magic = get_u32(hdr + 0);
@@ -158,14 +283,14 @@ int frame_recv(tsdb_conn_t *c, tsdb_msg_t *msg) {
     if (plen > 0) {
         payload = malloc(plen);
         if (!payload) return -1;
-        if (read_all(c->fd, payload, plen, c->timeout_ms) < 0) {
+        if (read_all(c, payload, plen, c->timeout_ms) < 0) {
             free(payload); return -1;
         }
     }
 
     /* Read 4-byte CRC trailer */
     uint8_t trail[4];
-    if (read_all(c->fd, trail, 4, c->timeout_ms) < 0) {
+    if (read_all(c, trail, 4, c->timeout_ms) < 0) {
         free(payload); return -1;
     }
     uint32_t crc_recv = get_u32(trail);
@@ -226,4 +351,69 @@ int send_recv(tsdb_conn_t *c,
     }
 
     return 0;
+}
+
+/* ─── TLS connect ────────────────────────────────────────────────────────── */
+
+int tsdb_conn_connect_tls(const char *host, int port,
+                          const char *ca_path, int skip_verify,
+                          tsdb_conn_t *conn)
+{
+    if (!host || !conn) { errno = EINVAL; return -1; }
+
+    if (!cli_tls_available()) {
+        fprintf(stderr, "[tls-cli] TLS support not compiled in\n");
+        errno = ENOTSUP; return -1;
+    }
+
+    /* Resolve and connect. */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    struct addrinfo hints = {0};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        errno = ENOENT; return -1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        int e = errno;
+        freeaddrinfo(res);
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    /* TLS wrap. */
+    struct tsdb_cli_tls_conn *tls = cli_tls_connect(host, fd, ca_path, skip_verify);
+    if (!tls) {
+        close(fd);
+        return -1;
+    }
+
+    conn->fd          = fd;
+    conn->tls         = tls;
+    conn->next_req_id = 1;
+    conn->timeout_ms  = 10000;
+    snprintf(conn->host, sizeof(conn->host), "%s", host);
+    conn->port        = port;
+    return 0;
+}
+
+void tsdb_conn_close(tsdb_conn_t *conn)
+{
+    if (!conn) return;
+    if (conn->tls) {
+        cli_tls_free(conn->tls);
+        conn->tls = NULL;
+        /* cli_tls_free calls SSL_shutdown which does the underlying close */
+    } else if (conn->fd >= 0) {
+        close(conn->fd);
+    }
+    conn->fd = -1;
 }

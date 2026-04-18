@@ -4,6 +4,7 @@
  * Known test vector: crc32c("123456789") == 0xE3069283.
  */
 
+#include "tls.h"   /* must come before proto.h to expose tsdb_io_t */
 #include "proto.h"
 #include "../../include/tsdb.h"
 
@@ -260,6 +261,134 @@ int tsdb_proto_recv(int fd, tsdb_frame_hdr_t *hdr, uint8_t **out_payload) {
                         | ((uint32_t)crc_bytes[3] << 24);
 
     /* Compute expected CRC over header[4..24) + payload. */
+    pthread_once(&crc32c_once, crc32c_init_table);
+    uint32_t running = 0xFFFFFFFFu;
+    const uint8_t *hp = raw_hdr + 4;
+    for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
+        running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
+    if (payload && hdr->payload_len > 0) {
+        for (size_t i = 0; i < hdr->payload_len; i++)
+            running = crc32c_table[0][(running ^ payload[i]) & 0xFF] ^ (running >> 8);
+    }
+    uint32_t computed_crc = running ^ 0xFFFFFFFFu;
+
+    if (computed_crc != stored_crc) {
+        free(payload);
+        return TSDB_ERR_CORRUPT;
+    }
+
+    *out_payload = payload;
+    return TSDB_OK;
+}
+
+/* ---- TLS-aware I/O helpers ----------------------------------------------- */
+
+static int write_all_io(tsdb_io_t *io, const uint8_t *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = tsdb_io_write(io, buf + done, n - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return TSDB_ERR_IO;
+        }
+        if (w == 0) return TSDB_ERR_IO;
+        done += (size_t)w;
+    }
+    return TSDB_OK;
+}
+
+static int read_all_io(tsdb_io_t *io, uint8_t *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = tsdb_io_read(io, buf + done, n - done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return TSDB_ERR_IO;
+        }
+        if (r == 0) return TSDB_ERR_IO;  /* EOF / clean shutdown */
+        done += (size_t)r;
+    }
+    return TSDB_OK;
+}
+
+/* Send a frame over an io abstraction (plain fd or TLS). */
+int tsdb_proto_send_io(tsdb_io_t *io, uint8_t type, uint16_t flags,
+                       uint64_t req_id, const void *payload, size_t n)
+{
+    if (!io) return TSDB_ERR_INVAL;
+    if (n > TSDB_PROTO_MAX_PAYLOAD) return TSDB_ERR_INVAL;
+
+    tsdb_frame_hdr_t hdr = {
+        .magic       = TSDB_PROTO_MAGIC,
+        .ver         = TSDB_PROTO_VER,
+        .type        = type,
+        .flags       = flags,
+        .req_id      = req_id,
+        .payload_len = (uint32_t)n,
+    };
+
+    uint8_t raw_hdr[TSDB_PROTO_HDR_SIZE];
+    tsdb_frame_write_hdr(&hdr, raw_hdr);
+
+    pthread_once(&crc32c_once, crc32c_init_table);
+    uint32_t running = 0xFFFFFFFFu;
+    const uint8_t *hp = raw_hdr + 4;
+    for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
+        running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
+    if (payload && n > 0) {
+        const uint8_t *pp = (const uint8_t *)payload;
+        for (size_t i = 0; i < n; i++)
+            running = crc32c_table[0][(running ^ pp[i]) & 0xFF] ^ (running >> 8);
+    }
+    uint32_t crc = running ^ 0xFFFFFFFFu;
+    uint8_t crc_bytes[4];
+    crc_bytes[0]=(uint8_t)(crc);      crc_bytes[1]=(uint8_t)(crc>>8);
+    crc_bytes[2]=(uint8_t)(crc>>16);  crc_bytes[3]=(uint8_t)(crc>>24);
+
+    int rc;
+    if ((rc = write_all_io(io, raw_hdr, TSDB_PROTO_HDR_SIZE)) != TSDB_OK) return rc;
+    if (n > 0 && payload)
+        if ((rc = write_all_io(io, (const uint8_t *)payload, n)) != TSDB_OK) return rc;
+    return write_all_io(io, crc_bytes, 4);
+}
+
+/* Receive a frame over an io abstraction (plain fd or TLS). */
+int tsdb_proto_recv_io(tsdb_io_t *io, tsdb_frame_hdr_t *hdr,
+                       uint8_t **out_payload)
+{
+    if (!io) return TSDB_ERR_INVAL;
+
+    uint8_t raw_hdr[TSDB_PROTO_HDR_SIZE];
+    int rc;
+
+    if ((rc = read_all_io(io, raw_hdr, TSDB_PROTO_HDR_SIZE)) != TSDB_OK)
+        return rc;
+
+    if ((rc = tsdb_frame_read_hdr(raw_hdr, hdr)) != TSDB_OK)
+        return rc;
+
+    if (hdr->payload_len > TSDB_PROTO_MAX_PAYLOAD)
+        return TSDB_ERR_CORRUPT;
+
+    uint8_t *payload = NULL;
+    if (hdr->payload_len > 0) {
+        payload = (uint8_t *)malloc(hdr->payload_len);
+        if (!payload) return TSDB_ERR_NOMEM;
+        if ((rc = read_all_io(io, payload, hdr->payload_len)) != TSDB_OK) {
+            free(payload); return rc;
+        }
+    }
+
+    uint8_t crc_bytes[4];
+    if ((rc = read_all_io(io, crc_bytes, 4)) != TSDB_OK) {
+        free(payload); return rc;
+    }
+
+    uint32_t stored_crc = (uint32_t)crc_bytes[0]
+                        | ((uint32_t)crc_bytes[1] << 8)
+                        | ((uint32_t)crc_bytes[2] << 16)
+                        | ((uint32_t)crc_bytes[3] << 24);
+
     pthread_once(&crc32c_once, crc32c_init_table);
     uint32_t running = 0xFFFFFFFFu;
     const uint8_t *hp = raw_hdr + 4;

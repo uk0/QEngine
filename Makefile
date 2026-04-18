@@ -22,15 +22,39 @@ else
   ARCH    := -march=native
 endif
 
-COMMON    := $(STD) $(OPT) $(WARN) $(ARCH) $(INC)
+# ── TLS backend detection ─────────────────────────────────────────────────
+# Preference: OpenSSL (stable, well-tested) → mbedtls → no TLS.
+# Note: mbedtls 4.0 renamed libmbedcrypto to libtfpsacrypto; pkg-config
+#       for 'mbedtls' alone pulls in the crypto and x509 transitively.
+OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null)
+ifneq ($(OPENSSL_LIBS),)
+  TLS_DEF    := -DTSDB_TLS_OPENSSL
+  TLS_FLAGS  := $(OPENSSL_CFLAGS)
+  TLS_LIBS   := $(OPENSSL_LIBS)
+else
+  MBEDTLS_CFLAGS := $(shell pkg-config --cflags mbedtls 2>/dev/null)
+  MBEDTLS_LIBS   := $(shell pkg-config --libs   mbedtls 2>/dev/null)
+  ifneq ($(MBEDTLS_LIBS),)
+    TLS_DEF    := -DTSDB_TLS_MBEDTLS
+    TLS_FLAGS  := $(MBEDTLS_CFLAGS)
+    TLS_LIBS   := $(MBEDTLS_LIBS)
+  else
+    TLS_DEF    :=
+    TLS_FLAGS  :=
+    TLS_LIBS   :=
+  endif
+endif
+
+COMMON    := $(STD) $(OPT) $(WARN) $(ARCH) $(INC) $(TLS_DEF) $(TLS_FLAGS)
 CFLAGS    ?= $(COMMON)
-LDFLAGS   ?= $(LIBS)
+LDFLAGS   ?= $(LIBS) $(TLS_LIBS)
 
 SRC_DIRS  := src/core src/compress src/storage src/exec src/query src/cluster src/federation src/server src/catalog
 SRCS      := $(filter-out src/cluster/tsdb_node_main.c,$(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)))
 OBJS      := $(SRCS:.c=.o)
 
-TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c tests/test_retention.c tests/test_v06_e2e.c tests/test_sample_by_stream.c tests/test_bloom_filter.c
+TEST_SRCS := tests/test_compress.c tests/test_storage.c tests/test_exec.c tests/test_query.c tests/test_lzlite.c tests/test_pfor.c tests/test_simd_dispatch.c tests/test_adaptive.c tests/test_parallel.c tests/test_server.c tests/test_catalog.c tests/test_rawblock.c tests/test_pubsub.c tests/test_autobalance.c tests/test_tdigest.c tests/test_compaction.c tests/test_group_commit.c tests/test_asof_join.c tests/test_retention.c tests/test_v06_e2e.c tests/test_sample_by_stream.c tests/test_bloom_filter.c tests/test_tls.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
@@ -106,6 +130,9 @@ test-federation: $(FED_TEST_BINS)
 	  echo "--- $$t ---"; $$t || exit 1; \
 	done
 
+# test_tls has a special rule (links wire obj + TLS libs) — defined elsewhere
+build/test/test_tls: tests/test_tls.c $(OBJS) $(WIRE_OBJ)
+
 build/test/%: tests/%.c $(OBJS)
 	@mkdir -p build/test
 	@$(CC) $(CFLAGS) -o $@ $< $(OBJS) $(LDFLAGS)
@@ -137,18 +164,30 @@ $(WIRE_OBJ): cli/tsdb_wire.c cli/tsdb_wire.h
 
 $(TCP_CLI_BIN): $(TCP_CLI_SRCS) cli/tsdb_wire.h
 	@mkdir -p build
-	@$(CC) $(CFLAGS) $(TCP_CLI_CFLAGS) -Icli -o $@ $(TCP_CLI_SRCS) -lpthread -lm $(TCP_CLI_LDFLAGS)
+	@$(CC) $(CFLAGS) $(TCP_CLI_CFLAGS) -Icli -o $@ $(TCP_CLI_SRCS) \
+	    -lpthread -lm $(TCP_CLI_LDFLAGS) $(TLS_LIBS)
 	@echo "LD  $@"
 
 # test_client: links against tsdb_wire.o only (no full libtsdb)
 build/test/test_client: tests/test_client.c $(WIRE_OBJ)
 	@mkdir -p build/test
-	@$(CC) $(CFLAGS) -Icli -o $@ tests/test_client.c $(WIRE_OBJ) -lpthread
+	@$(CC) $(CFLAGS) -Icli -o $@ tests/test_client.c $(WIRE_OBJ) -lpthread $(TLS_LIBS)
 	@echo "LD  build/test/test_client"
 
 test-client: build/test/test_client
 	@echo "--- build/test/test_client ---"
 	@build/test/test_client
+
+# TLS test: links libtsdb + tsdb_wire.o (needs both server-side and client-side)
+build/test/test_tls: tests/test_tls.c $(OBJS) $(WIRE_OBJ)
+	@mkdir -p build/test
+	@$(CC) $(CFLAGS) -Icli -o $@ tests/test_tls.c $(OBJS) $(WIRE_OBJ) \
+	    $(LDFLAGS) $(TLS_LIBS)
+	@echo "LD  build/test/test_tls"
+
+test-tls: build/test/test_tls
+	@echo "--- build/test/test_tls ---"
+	@build/test/test_tls
 
 server_cli: $(SERVER_CLI_BIN)
 

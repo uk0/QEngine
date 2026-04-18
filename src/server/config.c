@@ -338,6 +338,11 @@ static int kv_apply(tsdb_config_t *cfg, const char *key, const char *val,
     if (!strcmp(key, "shutdown_grace"))      { if (parse_duration_ns(val,&cfg->shutdown_grace_ns)<0) BAD("shutdown_grace"); return 0; }
     if (!strcmp(key, "allow_core"))          { if (parse_bool(val,&cfg->allow_core)<0) BAD("allow_core"); return 0; }
 
+    /* -- TLS -- */
+    if (!strcmp(key, "tls_cert")) { snprintf(cfg->tls_cert,sizeof(cfg->tls_cert),"%s",val); return 0; }
+    if (!strcmp(key, "tls_key"))  { snprintf(cfg->tls_key, sizeof(cfg->tls_key), "%s",val); return 0; }
+    if (!strcmp(key, "tls_ca"))   { snprintf(cfg->tls_ca,  sizeof(cfg->tls_ca),  "%s",val); return 0; }
+
     /* -- dev -- */
     if (!strcmp(key, "cpu_level"))           { snprintf(cfg->cpu_level,sizeof(cfg->cpu_level),"%s",val); return 0; }
     if (!strcmp(key, "force_codec"))         { snprintf(cfg->force_codec,sizeof(cfg->force_codec),"%s",val); return 0; }
@@ -400,6 +405,9 @@ int tsdb_config_load(tsdb_config_t *cfg, const char *path,
     fclose(f);
     cfg->parse_errors = errors;
 
+    /* Compute derived field: TLS enabled when both cert and key are set. */
+    cfg->tls_enabled = (cfg->tls_cert[0] != '\0' && cfg->tls_key[0] != '\0');
+
     if (errors > 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "%s", first_err);
         return -2;
@@ -439,6 +447,7 @@ void tsdb_config_apply_env(tsdb_config_t *cfg) {
         "slow_query_threshold","cpu_profile_path","user","group","pidfile",
         "shutdown_grace","allow_core","cpu_level","force_codec",
         "fault_flush_delay","fault_rpc_delay",
+        "tls_cert","tls_key","tls_ca",
         NULL
     };
     char envname[128];
@@ -446,6 +455,8 @@ void tsdb_config_apply_env(tsdb_config_t *cfg) {
         const char *v = env_for(keys[i], envname, sizeof(envname));
         if (v) (void)kv_apply(cfg, keys[i], v, NULL, 0);
     }
+    /* Recompute derived TLS flag after env overrides. */
+    cfg->tls_enabled = (cfg->tls_cert[0] != '\0' && cfg->tls_key[0] != '\0');
 }
 
 /* ─── locate ────────────────────────────────────────────────────────────── */

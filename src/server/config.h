@@ -124,6 +124,12 @@ typedef struct {
     int64_t  shutdown_grace_ns;
     bool     allow_core;
 
+    /* -- TLS -- */
+    char     tls_cert[TSDB_CFG_MAX_PATH];   /* server certificate PEM */
+    char     tls_key[TSDB_CFG_MAX_PATH];    /* server private key PEM */
+    char     tls_ca[TSDB_CFG_MAX_PATH];     /* optional CA bundle for mTLS */
+    bool     tls_enabled;                   /* computed: tls_cert + tls_key non-empty */
+
     /* -- dev toggles -- */
     char     cpu_level[16];
     char     force_codec[16];

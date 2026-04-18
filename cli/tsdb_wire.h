@@ -157,6 +157,14 @@ typedef struct {
     uint32_t payload_len;
 } tsdb_frame_hdr_t;
 
+/* ─── TLS opaque pointer (only valid when tsdb_tls_available() == 1) ────── */
+/*
+ * Forward-declared so that tsdb_conn_t can hold a pointer without pulling in
+ * the full TLS headers.  Cast to tsdb_tls_conn_t* when using.
+ * When TLS is not compiled in, this field is always NULL.
+ */
+struct tsdb_cli_tls_conn;
+
 /* ─── Connection context ─────────────────────────────────────────────────── */
 typedef struct {
     int      fd;
@@ -164,6 +172,8 @@ typedef struct {
     char     host[256];
     int      port;
     int      timeout_ms;   /* recv/send timeout, default 10000 */
+    /* TLS state — NULL for plaintext connections */
+    struct tsdb_cli_tls_conn *tls;
 } tsdb_conn_t;
 
 /* ─── Received message ───────────────────────────────────────────────────── */
@@ -206,6 +216,28 @@ int frame_recv(tsdb_conn_t *c, tsdb_msg_t *msg);
 static inline void msg_free(tsdb_msg_t *m) {
     if (m && m->payload) { free(m->payload); m->payload = NULL; }
 }
+
+/* ─── TLS-aware connect ──────────────────────────────────────────────────── */
+
+/*
+ * Connect with TLS.
+ *   ca_path      — PEM CA bundle to verify server cert; NULL = system store
+ *   skip_verify  — non-zero disables certificate verification (insecure)
+ * The fd is taken from an already-connected socket (use tsdb_conn_connect or
+ * fill conn->fd yourself), then wrapped.  Alternatively, pass a ready fd < 0
+ * to have this function create and connect the socket.
+ *
+ * Returns 0 on success, -1 on error (errno set).
+ */
+int tsdb_conn_connect_tls(const char *host, int port,
+                          const char *ca_path, int skip_verify,
+                          tsdb_conn_t *conn);
+
+/*
+ * Close a connection, freeing TLS resources if applicable.
+ * Safe to call even if conn->tls == NULL (plain close).
+ */
+void tsdb_conn_close(tsdb_conn_t *conn);
 
 /* ─── High-level request/response ────────────────────────────────────────── */
 

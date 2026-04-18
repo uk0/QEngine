@@ -134,6 +134,19 @@ int tsdb_proto_send(int fd, uint8_t type, uint16_t flags, uint64_t req_id,
  */
 int tsdb_proto_recv(int fd, tsdb_frame_hdr_t *hdr, uint8_t **out_payload);
 
+/* ---- TLS-aware I/O variants --------------------------------------------- */
+/*
+ * Same as tsdb_proto_send / tsdb_proto_recv but use a tsdb_io_t for the
+ * underlying read/write operations.  When io->tls == NULL these degrade to
+ * the plain-fd versions above.  Include tls.h before proto.h to use these.
+ */
+#ifdef TSDB_SERVER_TLS_H
+int tsdb_proto_send_io(tsdb_io_t *io, uint8_t type, uint16_t flags,
+                       uint64_t req_id, const void *payload, size_t n);
+int tsdb_proto_recv_io(tsdb_io_t *io, tsdb_frame_hdr_t *hdr,
+                       uint8_t **out_payload);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,6 +11,7 @@
  * POSIX-only; no platform-specific event loop needed for correctness.
  */
 
+#include "tls.h"    /* must come before proto.h to expose tsdb_io_t */
 #include "server.h"
 #include "proto.h"
 #include "../../include/tsdb.h"
@@ -354,6 +355,9 @@ struct tsdb_server {
     tsdb_sub_list_t     subs;
     write_lock_pool_t   write_locks;
 
+    /* TLS context (NULL when running in plaintext mode). */
+    tsdb_tls_ctx_t     *tls_ctx;
+
     /* Atomic stats */
     atomic_uint_fast64_t stat_conns;
     atomic_uint_fast64_t stat_rows_written;
@@ -366,29 +370,30 @@ struct tsdb_server {
 /* ---- Per-connection context ---------------------------------------------- */
 
 typedef struct {
-    tsdb_server_t *srv;
-    int            fd;
+    tsdb_server_t   *srv;
+    int              fd;
+    tsdb_tls_conn_t *tls;  /* NULL = plaintext */
 } conn_ctx_t;
 
 /* ---- Payload helpers ------------------------------------------------------ */
 
 /* Encode a simple status response (OK or ERROR). */
-static int send_ok(int fd, uint64_t req_id) {
-    return tsdb_proto_send(fd, TSDB_MT_HELLO_OK,
-                           TSDB_FLAG_FIN, req_id, NULL, 0);
+static int send_ok(tsdb_io_t *io, uint64_t req_id) {
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK,
+                              TSDB_FLAG_FIN, req_id, NULL, 0);
 }
 
-static int send_write_ack(int fd, uint64_t req_id, uint32_t nrows) {
+static int send_write_ack(tsdb_io_t *io, uint64_t req_id, uint32_t nrows) {
     uint8_t buf[4];
     buf[0] = (uint8_t)(nrows);
     buf[1] = (uint8_t)(nrows >> 8);
     buf[2] = (uint8_t)(nrows >> 16);
     buf[3] = (uint8_t)(nrows >> 24);
-    return tsdb_proto_send(fd, TSDB_MT_WRITE_ACK,
-                           TSDB_FLAG_FIN, req_id, buf, 4);
+    return tsdb_proto_send_io(io, TSDB_MT_WRITE_ACK,
+                              TSDB_FLAG_FIN, req_id, buf, 4);
 }
 
-static int send_error(int fd, uint64_t req_id, int err_code, const char *msg) {
+static int send_error(tsdb_io_t *io, uint64_t req_id, int err_code, const char *msg) {
     size_t mlen = msg ? strlen(msg) : 0;
     size_t total = 4 + mlen;
     uint8_t *buf = (uint8_t *)malloc(total);
@@ -398,7 +403,7 @@ static int send_error(int fd, uint64_t req_id, int err_code, const char *msg) {
     buf[2] = (uint8_t)((err_code) >> 16);
     buf[3] = (uint8_t)((err_code) >> 24);
     if (mlen > 0) memcpy(buf + 4, msg, mlen);
-    int rc = tsdb_proto_send(fd, TSDB_MT_ERROR, TSDB_FLAG_FIN, req_id, buf, total);
+    int rc = tsdb_proto_send_io(io, TSDB_MT_ERROR, TSDB_FLAG_FIN, req_id, buf, total);
     free(buf);
     return rc;
 }
@@ -417,12 +422,13 @@ static int send_error(int fd, uint64_t req_id, int err_code, const char *msg) {
  */
 #define TSDB_CODEC_RAW  0
 
-static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd;
     const uint8_t *p = payload;
     const uint8_t *end = payload + plen;
 
-#define NEED(n) if (p + (n) > end) return send_error(fd, req_id, TSDB_ERR_INVAL, "short payload")
+#define NEED(n) if (p + (n) > end) return send_error(io, req_id, TSDB_ERR_INVAL, "short payload")
 
     NEED(1);
     uint8_t tnlen = *p++;
@@ -440,7 +446,7 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
     memcpy(&nrows, p, 4); p += 4;
 
     if (ncols == 0 || ncols > 64 || nrows == 0 || nrows > 16*1024*1024)
-        return send_error(fd, req_id, TSDB_ERR_INVAL, "bad ncols/nrows");
+        return send_error(io, req_id, TSDB_ERR_INVAL, "bad ncols/nrows");
 
     char     col_names[64][256];
     uint8_t  col_types[64];
@@ -480,13 +486,13 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
     tsdb_table_t *tbl = NULL;
     if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
         write_lock_release(&srv->write_locks, table_name);
-        return send_error(fd, req_id, TSDB_ERR_NOTFOUND, "table not found");
+        return send_error(io, req_id, TSDB_ERR_NOTFOUND, "table not found");
     }
 
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
         write_lock_release(&srv->write_locks, table_name);
-        return send_error(fd, req_id, TSDB_ERR_INTERNAL, "batch_begin failed");
+        return send_error(io, req_id, TSDB_ERR_INTERNAL, "batch_begin failed");
     }
 
     /* Find timestamp column index. */
@@ -503,7 +509,7 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
         if (col_sizes[c] < stride[c] * nrows) {
             tsdb_batch_discard(batch);
             write_lock_release(&srv->write_locks, table_name);
-            return send_error(fd, req_id, TSDB_ERR_INVAL, "col data too short");
+            return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
         }
     }
 
@@ -561,14 +567,14 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
     if (write_err != TSDB_OK) {
         tsdb_batch_discard(batch);
         write_lock_release(&srv->write_locks, table_name);
-        return send_error(fd, req_id, write_err, "row_end failed");
+        return send_error(io, req_id, write_err, "row_end failed");
     }
 
     write_err = tsdb_batch_commit(batch);
     write_lock_release(&srv->write_locks, table_name);
 
     if (write_err != TSDB_OK)
-        return send_error(fd, req_id, write_err, "batch_commit failed");
+        return send_error(io, req_id, write_err, "batch_commit failed");
 
     atomic_fetch_add(&srv->stat_rows_written, nrows);
 
@@ -612,7 +618,7 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
         }
     }
 
-    return send_write_ack(fd, req_id, nrows);
+    return send_write_ack(io, req_id, nrows);
 }
 
 /* ---- CREATE_TABLE decoder ------------------------------------------------ */
@@ -624,12 +630,13 @@ static int handle_write_batch(tsdb_server_t *srv, int fd, uint64_t req_id,
  *   for each column:
  *     [name_len u8] [name] [type u8]
  */
-static int handle_create_table(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_create_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                 const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd; (void)fd;
     const uint8_t *p = payload;
     const uint8_t *end = payload + plen;
 
-#define NEED2(n) if (p + (n) > end) return send_error(fd, req_id, TSDB_ERR_INVAL, "short payload")
+#define NEED2(n) if (p + (n) > end) return send_error(io, req_id, TSDB_ERR_INVAL, "short payload")
 
     NEED2(1); uint8_t tnlen = *p++;
     NEED2(tnlen);
@@ -643,7 +650,7 @@ static int handle_create_table(tsdb_server_t *srv, int fd, uint64_t req_id,
 
     NEED2(1); uint8_t ncols = *p++;
     if (ncols == 0 || ncols > 64)
-        return send_error(fd, req_id, TSDB_ERR_INVAL, "bad ncols");
+        return send_error(io, req_id, TSDB_ERR_INVAL, "bad ncols");
 
     tsdb_col_t cols[64];
     char col_name_storage[64][256];
@@ -663,24 +670,25 @@ static int handle_create_table(tsdb_server_t *srv, int fd, uint64_t req_id,
     int rc = tsdb_create_table(srv->db, tname, cols, ncols, ts_col);
     if (rc == TSDB_ERR_EXISTS) rc = TSDB_OK; /* idempotent */
     if (rc != TSDB_OK)
-        return send_error(fd, req_id, rc, "create_table failed");
+        return send_error(io, req_id, rc, "create_table failed");
 
     /* Send HELLO_OK (reuse as generic OK) with FIN. */
-    return tsdb_proto_send(fd, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
 }
 
 /* ---- DROP_TABLE ---------------------------------------------------------- */
-static int handle_drop_table(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_drop_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                               const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd; (void)fd;
     if (!payload || plen == 0)
-        return send_error(fd, req_id, TSDB_ERR_INVAL, "missing table name");
+        return send_error(io, req_id, TSDB_ERR_INVAL, "missing table name");
     char tname[256];
     int n = (plen<255)?(int)plen:255;
     memcpy(tname, payload, n); tname[n]='\0';
     int rc = tsdb_drop_table(srv->db, tname);
     if (rc != TSDB_OK)
-        return send_error(fd, req_id, rc, "drop_table failed");
-    return tsdb_proto_send(fd, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
+        return send_error(io, req_id, rc, "drop_table failed");
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
 }
 
 /* ---- QUERY --------------------------------------------------------------- */
@@ -693,8 +701,9 @@ static int handle_drop_table(tsdb_server_t *srv, int fd, uint64_t req_id,
  */
 #define QUERY_CHUNK_ROWS 4096
 
-static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                         const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd; (void)fd;
     char qtl[4096] = {0};
     int qlen = (plen < sizeof(qtl) - 1) ? (int)plen : (int)sizeof(qtl) - 1;
     memcpy(qtl, payload, qlen);
@@ -702,7 +711,7 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
     tsdb_result_t *res = NULL;
     int rc = tsdb_query(srv->db, qtl, &res);
     if (rc != TSDB_OK || !res)
-        return send_error(fd, req_id, rc ? rc : TSDB_ERR_INTERNAL, "query failed");
+        return send_error(io, req_id, rc ? rc : TSDB_ERR_INTERNAL, "query failed");
 
     atomic_fetch_add(&srv->stat_queries, 1);
 
@@ -729,7 +738,7 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
         }
         /* If result has 0 rows, set FIN on HDR. */
         /* We don't know yet — send HDR without FIN, then check. */
-        rc = tsdb_proto_send(fd, TSDB_MT_QUERY_RESULT_HDR, 0, req_id,
+        rc = tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_HDR, 0, req_id,
                              hbuf, hdr_sz);
         free(hbuf);
         if (rc != TSDB_OK) { tsdb_result_free(res); return rc; }
@@ -794,7 +803,7 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
                 memcpy(cp, cbuf[c], (size_t)chunk_rows * 8);
                 cp += (size_t)chunk_rows * 8;
             }
-            rc = tsdb_proto_send(fd, TSDB_MT_QUERY_RESULT_ROWS, 0, req_id,
+            rc = tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, 0, req_id,
                                  cbody, csz);
             free(cbody);
             if (rc != TSDB_OK) break;
@@ -818,13 +827,13 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
                 }
                 cp += (size_t)chunk_rows * 8;
             }
-            tsdb_proto_send(fd, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
+            tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
                             req_id, cbody, csz);
             free(cbody);
         } else if (!any_rows) {
             /* Zero rows: send FIN on empty ROWS frame. */
             uint8_t zbuf[6] = {0,0,0,0,0,0};
-            tsdb_proto_send(fd, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
+            tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
                             req_id, zbuf, 6);
         }
     }
@@ -846,8 +855,9 @@ static int handle_query(tsdb_server_t *srv, int fd, uint64_t req_id,
  * Backward compat: if payload is just a plain table name string (no filter_len),
  * detect by checking whether plen == 1 + table_len (old format).
  */
-static int handle_subscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_subscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                              const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd;
     char table[256]      = {0};
     char filter_col[64]  = {0};
     char filter_val[256] = {0};
@@ -889,7 +899,7 @@ static int handle_subscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
     uint64_t sub_id = sub_list_add(&srv->subs, table, fd, req_id,
                                     filter_col, filter_val);
     if (sub_id == 0)
-        return send_error(fd, req_id, TSDB_ERR_FULL, "too many subscriptions");
+        return send_error(io, req_id, TSDB_ERR_FULL, "too many subscriptions");
     atomic_fetch_add(&srv->stat_subs_active, 1);
 
     /* Acknowledge with sub_id (8 bytes LE). */
@@ -898,11 +908,12 @@ static int handle_subscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
     ack[2]=(uint8_t)(sub_id>>16); ack[3]=(uint8_t)(sub_id>>24);
     ack[4]=(uint8_t)(sub_id>>32); ack[5]=(uint8_t)(sub_id>>40);
     ack[6]=(uint8_t)(sub_id>>48); ack[7]=(uint8_t)(sub_id>>56);
-    return tsdb_proto_send(fd, TSDB_MT_HELLO_OK, 0, req_id, ack, 8);
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, 0, req_id, ack, 8);
 }
 
-static int handle_unsubscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
+static int handle_unsubscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                const uint8_t *payload, uint32_t plen) {
+    int fd = io->fd;
     if (plen >= 8) {
         uint64_t sub_id;
         memcpy(&sub_id, payload, 8);
@@ -910,16 +921,21 @@ static int handle_unsubscribe(tsdb_server_t *srv, int fd, uint64_t req_id,
         uint64_t cur = atomic_load(&srv->stat_subs_active);
         if (cur > 0) atomic_fetch_sub(&srv->stat_subs_active, 1);
     }
-    return tsdb_proto_send(fd, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
 }
 
 /* ---- Main connection handler --------------------------------------------- */
 
 static void *connection_handler(void *arg) {
     conn_ctx_t *ctx = (conn_ctx_t *)arg;
-    tsdb_server_t *srv = ctx->srv;
-    int fd = ctx->fd;
+    tsdb_server_t   *srv = ctx->srv;
+    int              fd  = ctx->fd;
+    tsdb_tls_conn_t *tls = ctx->tls;
     free(ctx);
+
+    /* Build IO abstraction — dispatches through TLS when tls != NULL. */
+    tsdb_io_t io_obj = { .fd = fd, .tls = tls };
+    tsdb_io_t *io = &io_obj;
 
     atomic_fetch_add(&srv->stat_conns, 1);
 
@@ -927,7 +943,7 @@ static void *connection_handler(void *arg) {
     uint8_t *payload = NULL;
 
     for (;;) {
-        int rc = tsdb_proto_recv(fd, &hdr, &payload);
+        int rc = tsdb_proto_recv_io(io, &hdr, &payload);
         if (rc != TSDB_OK) {
             /* Bad magic or closed connection: just disconnect. */
             break;
@@ -941,40 +957,40 @@ static void *connection_handler(void *arg) {
         case TSDB_MT_HELLO:
             /* Version negotiation: accept any ver ≤ TSDB_PROTO_VER. */
             if (hdr.ver > TSDB_PROTO_VER) {
-                send_error(fd, hdr.req_id, TSDB_ERR_UNSUPPORTED, "version too high");
+                send_error(io, hdr.req_id, TSDB_ERR_UNSUPPORTED, "version too high");
                 free(payload);
                 goto done;
             }
-            send_ok(fd, hdr.req_id);
+            send_ok(io, hdr.req_id);
             break;
 
         case TSDB_MT_PING:
-            tsdb_proto_send(fd, TSDB_MT_PING, TSDB_FLAG_PONG | TSDB_FLAG_FIN,
-                            hdr.req_id, payload, hdr.payload_len);
+            tsdb_proto_send_io(io, TSDB_MT_PING, TSDB_FLAG_PONG | TSDB_FLAG_FIN,
+                               hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_CREATE_TABLE:
-            handle_create_table(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_create_table(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_DROP_TABLE:
-            handle_drop_table(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_drop_table(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_WRITE_BATCH:
-            handle_write_batch(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_write_batch(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_QUERY:
-            handle_query(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_query(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_SUBSCRIBE:
-            handle_subscribe(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_subscribe(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_UNSUBSCRIBE:
-            handle_unsubscribe(srv, fd, hdr.req_id, payload, hdr.payload_len);
+            handle_unsubscribe(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_CLUSTER_STATS:
@@ -986,12 +1002,12 @@ static void *connection_handler(void *arg) {
         case TSDB_MT_DROP_DEVICE:
         case TSDB_MT_SCHEMA:
             /* Stub: ACK */
-            tsdb_proto_send(fd, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN,
-                            hdr.req_id, NULL, 0);
+            tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN,
+                               hdr.req_id, NULL, 0);
             break;
 
         default:
-            send_error(fd, hdr.req_id, TSDB_ERR_UNSUPPORTED, "unknown message type");
+            send_error(io, hdr.req_id, TSDB_ERR_UNSUPPORTED, "unknown message type");
             break;
         }
 
@@ -1002,7 +1018,12 @@ static void *connection_handler(void *arg) {
 done:
     free(payload);
     sub_list_remove_by_fd(&srv->subs, fd);
-    close(fd);
+    /* Close TLS connection (sends close_notify + closes fd).
+     * For plain connections close the fd directly. */
+    if (tls)
+        tsdb_tls_close(tls);
+    else
+        close(fd);
     atomic_fetch_sub(&srv->stat_conns, 1);
     return NULL;
 }
@@ -1034,14 +1055,26 @@ static void *accept_loop(void *arg) {
         if (!ctx) { close(cfd); continue; }
         ctx->srv = srv;
         ctx->fd  = cfd;
+        ctx->tls = NULL;
+
+        /* TLS handshake (synchronous, blocks here before the handler thread). */
+        if (srv->tls_ctx) {
+            if (tsdb_tls_server_wrap(srv->tls_ctx, cfd, &ctx->tls) != 0) {
+                /* Handshake failed (plaintext probe, bad cert, etc.) */
+                free(ctx);
+                close(cfd);
+                continue;
+            }
+        }
 
         pthread_t tid;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&tid, &attr, connection_handler, ctx) != 0) {
+            if (ctx->tls) tsdb_tls_close(ctx->tls);
+            else          close(cfd);
             free(ctx);
-            close(cfd);
         }
         pthread_attr_destroy(&attr);
     }
@@ -1116,8 +1149,28 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
 
     sub_list_init(&srv->subs);
     write_lock_pool_init(&srv->write_locks);
+    srv->tls_ctx = NULL;
+
+    /* Initialise TLS context if cert + key are provided. */
+    if (opts->tls_cert && opts->tls_cert[0] &&
+        opts->tls_key  && opts->tls_key[0]) {
+        if (tsdb_tls_available()) {
+            if (tsdb_tls_server_ctx(opts->tls_cert, opts->tls_key,
+                                    opts->tls_ca, &srv->tls_ctx) != 0) {
+                sub_list_destroy(&srv->subs);
+                write_lock_pool_destroy(&srv->write_locks);
+                close(lfd);
+                free(srv);
+                return TSDB_ERR_INTERNAL;
+            }
+            fprintf(stderr, "[tls] server TLS enabled (cert=%s)\n", opts->tls_cert);
+        } else {
+            fprintf(stderr, "[tls] WARNING: TLS requested but no TLS backend compiled in\n");
+        }
+    }
 
     if (pthread_create(&srv->accept_thread, NULL, accept_loop, srv) != 0) {
+        tsdb_tls_free(srv->tls_ctx);
         sub_list_destroy(&srv->subs);
         write_lock_pool_destroy(&srv->write_locks);
         close(lfd);
@@ -1137,6 +1190,7 @@ void tsdb_server_stop(tsdb_server_t *s) {
     shutdown(s->listen_fd, SHUT_RDWR);
     pthread_join(s->accept_thread, NULL);
     close(s->listen_fd);
+    tsdb_tls_free(s->tls_ctx);
     sub_list_destroy(&s->subs);
     write_lock_pool_destroy(&s->write_locks);
     free(s);

@@ -1067,9 +1067,12 @@ static void repl(tsdb_conn_t *c) {
 /* ─── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    const char *host  = "127.0.0.1";
-    int         port  = 28090;
-    const char *token = NULL;
+    const char *host         = "127.0.0.1";
+    int         port         = 28090;
+    const char *token        = NULL;
+    int         use_tls      = 0;
+    const char *tls_ca       = NULL;
+    int         tls_insecure = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
@@ -1078,9 +1081,24 @@ int main(int argc, char **argv) {
             port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc)
             token = argv[++i];
+        else if (strcmp(argv[i], "--tls") == 0)
+            use_tls = 1;
+        else if (strcmp(argv[i], "--tls-ca") == 0 && i + 1 < argc) {
+            tls_ca = argv[++i];
+            use_tls = 1;  /* --tls-ca implies --tls */
+        }
+        else if (strcmp(argv[i], "--tls-insecure") == 0) {
+            use_tls = 1;
+            tls_insecure = 1;
+        }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("usage: tsdb-cli [--host HOST] [--port PORT] [--token TOKEN]\n"
-                   "  default host=127.0.0.1 port=28090\n");
+            printf("usage: tsdb-cli [options]\n"
+                   "  --host HOST          server hostname (default 127.0.0.1)\n"
+                   "  --port PORT          server port    (default 28090)\n"
+                   "  --token TOKEN        auth token\n"
+                   "  --tls                enable TLS\n"
+                   "  --tls-ca FILE        PEM CA bundle for server cert verification\n"
+                   "  --tls-insecure       disable certificate verification (insecure)\n");
             return 0;
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
@@ -1088,24 +1106,35 @@ int main(int argc, char **argv) {
         }
     }
 
-    int fd = tcp_connect(host, port, 5000);
-    if (fd < 0) {
-        fprintf(stderr, "cannot connect to %s:%d\n", host, port);
+    tsdb_conn_t conn = {0};
+
+    if (use_tls) {
+        if (tsdb_conn_connect_tls(host, port, tls_ca, tls_insecure, &conn) < 0) {
+            fprintf(stderr, "TLS connect to %s:%d failed\n", host, port);
+            return 1;
+        }
+        printf("[tls] connected to %s:%d (TLS)\n", host, port);
+    } else {
+        int fd = tcp_connect(host, port, 5000);
+        if (fd < 0) {
+            fprintf(stderr, "cannot connect to %s:%d\n", host, port);
+            return 1;
+        }
+        conn.fd = fd;
+        conn.next_req_id = 1;
+        conn.port = port;
+        conn.timeout_ms = 10000;
+        strncpy(conn.host, host, sizeof(conn.host) - 1);
+    }
+
+    if (do_hello(&conn, token) < 0) {
+        if (conn.tls) { /* tsdb_tls_close equivalent for client */ }
+        else close(conn.fd);
         return 1;
     }
 
-    tsdb_conn_t conn = {0};
-    conn.fd = fd;
-    conn.next_req_id = 1;
-    conn.port = port;
-    conn.timeout_ms = 10000;
-    strncpy(conn.host, host, sizeof(conn.host) - 1);
-
-    if (do_hello(&conn, token) < 0) {
-        close(fd); return 1;
-    }
-
     repl(&conn);
-    close(fd);
+    if (!conn.tls) close(conn.fd);
+    /* TLS conn cleanup: SSL_shutdown happens when the fd is closed. */
     return 0;
 }
