@@ -17,99 +17,153 @@
 
 /* ---- Connection pool ----------------------------------------------------- */
 
-#define MAX_CONN_POOL 64
+/*
+ * Per-peer connection pool.  Each peer gets N connections (env
+ * TSDB_REPLICA_CONNS_PER_PEER, default 8).  Round-robin dispatch via an
+ * atomic counter: callers may still block on a per-conn mutex inside
+ * tsdb_rpc_call if two calls land on the same slot, but the peer-side
+ * RPC server spawns one handler thread per incoming connection, so N
+ * connections == N concurrent peer handlers.
+ */
+#define TSDB_REPLICA_CONNS_PER_PEER_MAX  32
+#define TSDB_REPLICA_CONNS_PER_PEER_DEF  8
+#define MAX_PEERS                        TSDB_CLUSTER_MAX_NODES
 
 typedef struct {
-    tsdb_node_id_t  node_id;
-    tsdb_rpc_conn_t *conn;
-} conn_entry_t;
+    tsdb_node_id_t   node_id;     /* 0 = empty slot */
+    tsdb_rpc_conn_t *conns[TSDB_REPLICA_CONNS_PER_PEER_MAX];
+    atomic_uint      rr;          /* round-robin dispatch counter */
+} peer_slot_t;
 
 struct tsdb_replica_mgr {
     tsdb_node_manager_t *node_mgr;
-    pthread_mutex_t      lock;
-    conn_entry_t         pool[MAX_CONN_POOL];
-    int                  nconns;
+    pthread_mutex_t      lock;     /* protects peers[].node_id / conns[] insertion */
+    peer_slot_t          peers[MAX_PEERS];
+    int                  conns_per_peer;  /* fixed at mgr_new time */
 };
+
+static int env_conns_per_peer(void) {
+    const char *v = getenv("TSDB_REPLICA_CONNS_PER_PEER");
+    if (!v || !*v) return TSDB_REPLICA_CONNS_PER_PEER_DEF;
+    int n = atoi(v);
+    if (n < 1) n = 1;
+    if (n > TSDB_REPLICA_CONNS_PER_PEER_MAX) n = TSDB_REPLICA_CONNS_PER_PEER_MAX;
+    return n;
+}
 
 tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr) {
     tsdb_replica_mgr_t *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->node_mgr = node_mgr;
+    r->conns_per_peer = env_conns_per_peer();
     pthread_mutex_init(&r->lock, NULL);
     return r;
 }
 
 void tsdb_replica_mgr_free(tsdb_replica_mgr_t *rmgr) {
     if (!rmgr) return;
-    for (int i = 0; i < rmgr->nconns; i++) {
-        if (rmgr->pool[i].conn) tsdb_rpc_conn_close(rmgr->pool[i].conn);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        peer_slot_t *p = &rmgr->peers[i];
+        if (p->node_id == 0) continue;
+        for (int k = 0; k < rmgr->conns_per_peer; k++) {
+            if (p->conns[k]) {
+                tsdb_rpc_conn_close(p->conns[k]);
+                p->conns[k] = NULL;
+            }
+        }
     }
     pthread_mutex_destroy(&rmgr->lock);
     free(rmgr);
+}
+
+/* Find the slot for node_id; return NULL if absent.  Caller must hold lock. */
+static peer_slot_t *find_slot_locked(tsdb_replica_mgr_t *rmgr,
+                                      tsdb_node_id_t node_id)
+{
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (rmgr->peers[i].node_id == node_id)
+            return &rmgr->peers[i];
+    }
+    return NULL;
+}
+
+/* Claim an empty slot for node_id; return it.  Caller must hold lock. */
+static peer_slot_t *claim_slot_locked(tsdb_replica_mgr_t *rmgr,
+                                       tsdb_node_id_t node_id)
+{
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (rmgr->peers[i].node_id == 0) {
+            rmgr->peers[i].node_id = node_id;
+            return &rmgr->peers[i];
+        }
+    }
+    return NULL;
 }
 
 tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
                                              tsdb_node_id_t node_id)
 {
     if (!rmgr) return NULL;
+
     pthread_mutex_lock(&rmgr->lock);
+    peer_slot_t *p = find_slot_locked(rmgr, node_id);
+    if (!p) p = claim_slot_locked(rmgr, node_id);
+    if (!p) { pthread_mutex_unlock(&rmgr->lock); return NULL; }
 
-    /* Look up existing connection. */
-    for (int i = 0; i < rmgr->nconns; i++) {
-        if (rmgr->pool[i].node_id == node_id && rmgr->pool[i].conn) {
-            tsdb_rpc_conn_t *c = rmgr->pool[i].conn;
-            pthread_mutex_unlock(&rmgr->lock);
-            return c;
-        }
-    }
+    /* Pick a round-robin slot.  Atomic counter is cheap and gives us
+     * uniform dispatch without tracking per-conn load. */
+    unsigned idx = atomic_fetch_add_explicit(&p->rr, 1, memory_order_relaxed)
+                   % (unsigned)rmgr->conns_per_peer;
+    tsdb_rpc_conn_t *c = p->conns[idx];
+    if (c) { pthread_mutex_unlock(&rmgr->lock); return c; }
 
-    /* Need to create new connection. */
+    /* Slot empty — need to dial.  Release lock while we connect so other
+     * threads can use already-established conns in the same peer. */
     tsdb_node_info_t info = {0};
     if (tsdb_node_manager_get(rmgr->node_mgr, node_id, &info) < 0) {
         pthread_mutex_unlock(&rmgr->lock);
         return NULL;
     }
+    pthread_mutex_unlock(&rmgr->lock);
 
-    if (rmgr->nconns >= MAX_CONN_POOL) {
+    tsdb_rpc_conn_t *newc = tsdb_rpc_connect(info.addr, 2000);
+    if (!newc) return NULL;
+
+    pthread_mutex_lock(&rmgr->lock);
+    /* Slot or peer may have been recycled while we dialed; re-find. */
+    peer_slot_t *p2 = find_slot_locked(rmgr, node_id);
+    if (!p2) {
+        /* Peer vanished while we dialed (unlikely); drop the new conn. */
         pthread_mutex_unlock(&rmgr->lock);
+        tsdb_rpc_conn_close(newc);
         return NULL;
     }
-
-    pthread_mutex_unlock(&rmgr->lock);
-
-    /* Connect outside lock to avoid blocking other threads. */
-    tsdb_rpc_conn_t *conn = tsdb_rpc_connect(info.addr, 2000);
-    if (!conn) return NULL;
-
-    pthread_mutex_lock(&rmgr->lock);
-    /* Check if another thread already inserted while we were connecting. */
-    for (int i = 0; i < rmgr->nconns; i++) {
-        if (rmgr->pool[i].node_id == node_id) {
-            /* Use the one already inserted; discard ours. */
-            tsdb_rpc_conn_close(conn);
-            conn = rmgr->pool[i].conn;
-            pthread_mutex_unlock(&rmgr->lock);
-            return conn;
-        }
+    if (p2->conns[idx]) {
+        /* Another thread filled the slot; keep the earlier one. */
+        tsdb_rpc_conn_t *existing = p2->conns[idx];
+        pthread_mutex_unlock(&rmgr->lock);
+        tsdb_rpc_conn_close(newc);
+        return existing;
     }
-
-    if (rmgr->nconns < MAX_CONN_POOL) {
-        rmgr->pool[rmgr->nconns].node_id = node_id;
-        rmgr->pool[rmgr->nconns].conn    = conn;
-        rmgr->nconns++;
-    }
+    p2->conns[idx] = newc;
     pthread_mutex_unlock(&rmgr->lock);
-    return conn;
+    return newc;
 }
 
-/* Remove a dead connection from the pool. */
+/*
+ * Evict all conns for a peer (e.g. on peer death).  Caller is the gossip
+ * layer or a failing RPC that wants to force reconnect across the pool.
+ * For single-conn failures, see evict_one_conn below.
+ */
 static void evict_conn(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t node_id) {
     pthread_mutex_lock(&rmgr->lock);
-    for (int i = 0; i < rmgr->nconns; i++) {
-        if (rmgr->pool[i].node_id == node_id) {
-            if (rmgr->pool[i].conn) tsdb_rpc_conn_close(rmgr->pool[i].conn);
-            rmgr->pool[i] = rmgr->pool[--rmgr->nconns];
-            break;
+    peer_slot_t *p = find_slot_locked(rmgr, node_id);
+    if (p) {
+        for (int k = 0; k < rmgr->conns_per_peer; k++) {
+            if (p->conns[k]) {
+                tsdb_rpc_conn_close(p->conns[k]);
+                p->conns[k] = NULL;
+            }
         }
     }
     pthread_mutex_unlock(&rmgr->lock);
