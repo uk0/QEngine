@@ -2127,6 +2127,266 @@ static int gb_grow(gb_slot_t **tbl, size_t *cap, size_t nused, int nprojs) {
     return TSDB_OK;
 }
 
+/*
+ * Merge `src` hash table into `dst` hash table.
+ * For each occupied slot in src, find the matching slot in dst (insert if
+ * absent) and combine the aggregate states.
+ * Both tables must have been built with the same key schema (nk) and the
+ * same projection list (nprojs, projs).
+ * Returns TSDB_OK on success, TSDB_ERR_NOMEM on allocation failure.
+ */
+static int gb_merge_into(gb_slot_t **dst_tbl, size_t *dst_cap, size_t *dst_nused,
+                          const gb_slot_t *src_tbl, size_t src_cap,
+                          int nprojs, const proj_t *master_projs)
+{
+    for (size_t si = 0; si < src_cap; si++) {
+        const gb_slot_t *ss = &src_tbl[si];
+        if (!ss->occupied) continue;
+
+        /* Grow dst if needed (50% load factor). */
+        if (*dst_nused * 2 >= *dst_cap) {
+            if (gb_grow(dst_tbl, dst_cap, *dst_nused, nprojs) != TSDB_OK)
+                return TSDB_ERR_NOMEM;
+        }
+
+        /* Find-or-insert into dst. */
+        gb_slot_t *ds = gb_upsert(*dst_tbl, *dst_cap,
+                                   ss->key_tuple, ss->n_key,
+                                   ss->key_hash, nprojs, master_projs, dst_nused);
+        if (!ds) return TSDB_ERR_NOMEM;
+
+        /* Merge aggregate states. */
+        for (int p = 0; p < nprojs; p++) {
+            proj_t *dp = &ds->state[p];
+            const proj_t *sp = &ss->state[p];
+            switch (dp->kind) {
+            case PROJ_AGG_COUNT:
+                dp->agg_count += sp->agg_count;
+                break;
+            case PROJ_AGG_SUM:
+                dp->agg_sum_f  += sp->agg_sum_f;
+                dp->agg_sum_i  += sp->agg_sum_i;
+                dp->agg_count  += sp->agg_count;
+                break;
+            case PROJ_AGG_AVG:
+                dp->agg_sum_f  += sp->agg_sum_f;
+                dp->agg_sum_i  += sp->agg_sum_i;
+                dp->agg_count  += sp->agg_count;
+                break;
+            case PROJ_AGG_MIN:
+                if (sp->agg_min_f < dp->agg_min_f) dp->agg_min_f = sp->agg_min_f;
+                if (sp->agg_min_i < dp->agg_min_i) dp->agg_min_i = sp->agg_min_i;
+                break;
+            case PROJ_AGG_MAX:
+                if (sp->agg_max_f > dp->agg_max_f) dp->agg_max_f = sp->agg_max_f;
+                if (sp->agg_max_i > dp->agg_max_i) dp->agg_max_i = sp->agg_max_i;
+                break;
+            case PROJ_AGG_P50:
+            case PROJ_AGG_P90:
+            case PROJ_AGG_P99:
+            case PROJ_AGG_PERCENTILE:
+            case PROJ_AGG_STDDEV:
+                if (dp->tdigest && sp->tdigest)
+                    tsdb_tdigest_merge(dp->tdigest, sp->tdigest);
+                break;
+            case PROJ_AGG_TS_FIRST:
+                if (sp->ts_first < dp->ts_first) {
+                    dp->ts_first   = sp->ts_first;
+                    dp->ts_first_f = sp->ts_first_f;
+                    dp->ts_first_i = sp->ts_first_i;
+                }
+                break;
+            case PROJ_AGG_TS_LAST:
+            case PROJ_AGG_TS_LAST_ROW:
+                if (sp->ts_last > dp->ts_last) {
+                    dp->ts_last   = sp->ts_last;
+                    dp->ts_last_f = sp->ts_last_f;
+                    dp->ts_last_i = sp->ts_last_i;
+                }
+                break;
+            case PROJ_AGG_TS_TWA:
+                dp->twa_wsum += sp->twa_wsum;
+                /* TWA merge is approximate (no overlap handling); acceptable for
+                 * partition-parallel where sources are disjoint time ranges. */
+                if (sp->ts_first < dp->ts_first) dp->ts_first = sp->ts_first;
+                if (sp->ts_last  > dp->ts_last)  dp->ts_last  = sp->ts_last;
+                break;
+            default:
+                break; /* PROJ_COL: key column, not merged */
+            }
+        }
+    }
+    return TSDB_OK;
+}
+
+/* ---- Parallel GROUP BY task ------------------------------------------- */
+/*
+ * Each worker receives a contiguous slice of scan sources, runs the full
+ * hash-agg loop over its slice into a private hash table, then the main
+ * thread merges all per-worker tables into one final table.
+ */
+typedef struct {
+    /* Input — read-only in worker. */
+    scan_src_t    *srcs;
+    size_t         nsrcs;
+    tsdb_schema_t *schema;
+    qast_expr_t   *where;
+    int            need_col[TSDB_MAX_COLS];
+    int            gkey_cols[TSDB_MAX_COLS]; /* GROUP BY column indices */
+    int            ngroup_by;
+    const proj_t  *master_projs;
+
+    /* Output — written by worker. */
+    int            nprojs;
+    gb_slot_t     *ht;
+    size_t         ht_cap;
+    size_t         ht_nused;
+
+    /* Error. */
+    int            rc;
+    char           err[256];
+} gbpar_task_t;
+
+static void tsdb_gbpar_scan_task(void *arg) {
+    gbpar_task_t *t = (gbpar_task_t *)arg;
+    t->rc = TSDB_OK;
+
+    tsdb_schema_t *s = t->schema;
+    int nprojs = t->nprojs;
+
+    void *agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
+    if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
+
+    for (size_t si = 0; si < t->nsrcs; si++) {
+        scan_src_t *src = &t->srcs[si];
+        size_t n = src->row_count;
+
+        /* Decode needed columns. */
+        void **bufs = calloc((size_t)s->ncols, sizeof(void *));
+        tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
+        if (!bufs || !syms) { free(bufs); free(syms); t->rc = TSDB_ERR_NOMEM; break; }
+
+        int local_rc = TSDB_OK;
+        for (int c = 0; c < s->ncols; c++) {
+            if (!t->need_col[c]) continue;
+            syms[c] = s->cols[c].symtab;
+            size_t w = tsdb_type_width(s->cols[c].type);
+            if (src->mem) {
+                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                bufs[c] = malloc(w * n);
+                if (!bufs[c]) { local_rc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                local_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (local_rc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++)
+                    if (metas[b].ts_min == src->meta.ts_min &&
+                        metas[b].count  == src->meta.count) {
+                        hit = &metas[b]; break;
+                    }
+                if (!hit) { free(metas); local_rc = TSDB_ERR_CORRUPT; break; }
+                local_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
+                free(metas);
+                if (local_rc != TSDB_OK) break;
+            }
+        }
+        if (local_rc != TSDB_OK) {
+            for (int c = 0; c < s->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms);
+            t->rc = local_rc;
+            break;
+        }
+
+        /* WHERE bitmap. */
+        size_t nw = (n + 63) / 64;
+        uint64_t *bm = malloc(nw * sizeof(uint64_t));
+        if (!bm) {
+            for (int c = 0; c < s->ncols; c++)
+                if (!src->mem && bufs[c]) free(bufs[c]);
+            free(bufs); free(syms);
+            t->rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
+        size_t tail = nw * 64 - n;
+        if (tail) bm[nw - 1] &= (~(uint64_t)0) >> tail;
+
+        if (t->where) {
+            eval_ctx_t ctx = {0};
+            ctx.schema = s; ctx.col_bufs = bufs; ctx.col_syms = syms; ctx.nrows = n;
+            local_rc = apply_filter_expr(&ctx, t->where, bm);
+            if (local_rc != TSDB_OK) {
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (!src->mem && bufs[c]) free(bufs[c]);
+                free(bufs); free(syms);
+                t->rc = local_rc;
+                break;
+            }
+        }
+
+        /* Per-row hash-aggregate into the worker's private hash table. */
+        for (size_t row = 0; row < n; row++) {
+            if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
+
+            uint64_t key_tuple[TSDB_MAX_COLS];
+            for (int g = 0; g < t->ngroup_by; g++) {
+                int c = t->gkey_cols[g];
+                size_t w = tsdb_type_width(s->cols[c].type);
+                uint64_t val = 0;
+                if (w == 8) val = ((const uint64_t *)bufs[c])[row];
+                else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
+                key_tuple[g] = val;
+            }
+
+            uint64_t hash = gb_fnv1a((const uint8_t *)key_tuple,
+                                      (size_t)t->ngroup_by * sizeof(uint64_t));
+
+            if (t->ht_nused * 2 >= t->ht_cap) {
+                if (gb_grow(&t->ht, &t->ht_cap, t->ht_nused, nprojs) != TSDB_OK) {
+                    t->rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+            }
+
+            gb_slot_t *slot = gb_upsert(t->ht, t->ht_cap, key_tuple,
+                                         t->ngroup_by, hash, nprojs,
+                                         t->master_projs, &t->ht_nused);
+            if (!slot) { t->rc = TSDB_ERR_NOMEM; break; }
+
+            for (int p = 0; p < nprojs; p++) {
+                proj_t *gp = &slot->state[p];
+                if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
+                uint64_t one_bm = 1;
+                size_t   one_n  = 1;
+                void    *one_bufs[TSDB_MAX_COLS];
+                memset(one_bufs, 0, sizeof(one_bufs));
+                if (gp->col >= 0) {
+                    size_t w = tsdb_type_width(s->cols[gp->col].type);
+                    if (w == 8)      one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 8;
+                    else if (w == 4) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 4;
+                }
+                if (gp->kind >= PROJ_AGG_TS_KIND_FIRST) {
+                    int tsc = s->ts_col_idx;
+                    if (bufs[tsc])
+                        one_bufs[tsc] = (uint8_t *)bufs[tsc] + row * 8;
+                }
+                agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
+            }
+            if (t->rc != TSDB_OK) break;
+        }
+
+        free(bm);
+        for (int c = 0; c < s->ncols; c++)
+            if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+        if (t->rc != TSDB_OK) break;
+    }
+    free(agg_scratch);
+}
+
 static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                          qast_query_t *q, tsdb_result_t *r,
                          proj_t *projs, int nprojs,
@@ -2170,6 +2430,141 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
     int rc = scan_plan_build_ex(&plan, tbl,
                                  (zr.has_lo || zr.has_hi) ? &zr : NULL);
     if (rc != TSDB_OK) return rc;
+
+    /* ---- Parallel GROUP BY path ----------------------------------------- */
+    /* Use the thread pool when: multiple sources, pool available, enabled.
+     * Each worker gets its own private hash table; main thread merges them. */
+    pthread_once(&g_pool_once, init_pool);
+
+    int use_gb_parallel = plan.nsrcs > 1
+                          && g_parallel_on
+                          && g_query_pool != NULL
+                          && tsdb_pool_size(g_query_pool) > 1;
+    {
+        const char *env = getenv("TSDB_QUERY_PARALLEL");
+        if (env && env[0] == '0') use_gb_parallel = 0;
+    }
+
+    if (use_gb_parallel) {
+        int nw = tsdb_pool_size(g_query_pool);
+        size_t nsrcs = plan.nsrcs;
+        size_t slice = (nsrcs + (size_t)nw - 1) / (size_t)nw;
+
+        /* Build the need_col mask (same logic as serial path below). */
+        int need_col[TSDB_MAX_COLS];
+        memset(need_col, 0, sizeof(need_col));
+        for (int i = 0; i < q->ngroup_by; i++) need_col[gkey_cols[i]] = 1;
+        for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        for (int i = 0; i < nprojs; i++)
+            if (projs[i].kind >= PROJ_AGG_TS_KIND_FIRST &&
+                projs[i].kind <= PROJ_AGG_RANGE_END)
+                need_col[s->ts_col_idx] = 1;
+        if (q->where) {
+            qast_expr_t *stk[128]; int tp = 0;
+            stk[tp++] = q->where;
+            while (tp > 0) {
+                qast_expr_t *e = stk[--tp];
+                if (!e) continue;
+                if (e->kind == QAST_IDENT) { int c = resolve_col(s, e->v.s); if (c >= 0) need_col[c] = 1; }
+                if (e->lhs && tp < 127) stk[tp++] = e->lhs;
+                if (e->rhs && tp < 127) stk[tp++] = e->rhs;
+                for (int a = 0; a < e->nargs && tp < 127; a++) stk[tp++] = e->args[a];
+            }
+        }
+
+        gbpar_task_t *tasks = calloc((size_t)nw, sizeof(gbpar_task_t));
+        if (!tasks) { scan_plan_free(&plan); return TSDB_ERR_NOMEM; }
+
+        int nactive = 0;
+        for (int w = 0; w < nw; w++) {
+            size_t start = (size_t)w * slice;
+            if (start >= nsrcs) break;
+            size_t end = start + slice;
+            if (end > nsrcs) end = nsrcs;
+
+            gbpar_task_t *t = &tasks[w];
+            t->srcs       = &plan.srcs[start];
+            t->nsrcs      = end - start;
+            t->schema     = s;
+            t->where      = q->where;
+            memcpy(t->need_col,  need_col,  sizeof(need_col));
+            memcpy(t->gkey_cols, gkey_cols, sizeof(int) * (size_t)q->ngroup_by);
+            t->ngroup_by  = q->ngroup_by;
+            t->master_projs = projs;
+            t->nprojs     = nprojs;
+            t->ht_cap     = 64;
+            t->ht         = gb_alloc(t->ht_cap);
+            if (!t->ht) {
+                /* Clean up already-allocated worker tables. */
+                for (int j = 0; j < w; j++) free(tasks[j].ht);
+                free(tasks); scan_plan_free(&plan);
+                return TSDB_ERR_NOMEM;
+            }
+            nactive++;
+        }
+
+        /* Submit workers. */
+        for (int w = 0; w < nactive; w++)
+            tsdb_pool_submit(g_query_pool, tsdb_gbpar_scan_task, &tasks[w]);
+        tsdb_pool_wait(g_query_pool);
+
+        /* Check worker errors. */
+        int grc = TSDB_OK;
+        for (int w = 0; w < nactive; w++) {
+            if (tasks[w].rc != TSDB_OK && grc == TSDB_OK) {
+                grc = tasks[w].rc;
+                if (tasks[w].err[0] && err && errcap)
+                    snprintf(err, errcap, "%s", tasks[w].err);
+            }
+        }
+
+        /* Merge all worker hash tables into tasks[0].ht (the master). */
+        if (grc == TSDB_OK) {
+            for (int w = 1; w < nactive; w++) {
+                grc = gb_merge_into(&tasks[0].ht, &tasks[0].ht_cap,
+                                     &tasks[0].ht_nused,
+                                     tasks[w].ht, tasks[w].ht_cap,
+                                     nprojs, projs);
+                if (grc != TSDB_OK) break;
+            }
+        }
+
+        /* Emit result from the merged table (tasks[0]). */
+        size_t limit_p = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+        if (grc == TSDB_OK) {
+            for (size_t i = 0; i < tasks[0].ht_cap && r->nrows < limit_p; i++) {
+                gb_slot_t *slot = &tasks[0].ht[i];
+                if (!slot->occupied) continue;
+
+                grc = result_reserve_rows(r, r->nrows + 1);
+                if (grc != TSDB_OK) break;
+
+                for (int p = 0; p < nprojs; p++) {
+                    proj_t *mp = &projs[p];
+                    if (mp->kind == PROJ_COL) {
+                        uint64_t bits = 0;
+                        for (int g = 0; g < q->ngroup_by; g++)
+                            if (mp->col == gkey_cols[g]) { bits = slot->key_tuple[g]; break; }
+                        ((uint64_t *)r->col_data[p])[r->nrows] = bits;
+                    } else {
+                        agg_write(&slot->state[p], s, r, p);
+                    }
+                }
+                r->nrows++;
+            }
+        }
+
+        /* Free all worker hash tables. */
+        for (int w = 0; w < nactive; w++) {
+            for (size_t i = 0; i < tasks[w].ht_cap; i++)
+                if (tasks[w].ht[i].occupied) gb_slot_free_state(&tasks[w].ht[i], nprojs);
+            free(tasks[w].ht);
+        }
+        free(tasks);
+        scan_plan_free(&plan);
+        return grc;
+    }
+    /* ---- End parallel GROUP BY path ------------------------------------- */
 
     /* Hash table. Start at 64 slots, grow as needed. */
     size_t cap = 64;
@@ -2370,6 +2765,253 @@ out:
     }
     free(ht);
     free(agg_scratch);
+    scan_plan_free(&plan);
+    return rc;
+}
+
+/* ---- INTERP linear interpolation ------------------------------------- */
+/*
+ * SELECT ts, interp(col, interval_ns) FROM t
+ *
+ * Semantic: produce one output row for each aligned bucket timestamp
+ * in [first_ts rounded down, last_ts rounded up] with step = interval_ns.
+ * For each bucket ts B:
+ *   - If a real data point exists at B exactly → emit it directly.
+ *   - Otherwise find the nearest point before B (lo) and after B (hi)
+ *     and emit lo_v + (B - lo_ts) / (hi_ts - lo_ts) * (hi_v - lo_v).
+ *   - If lo or hi is missing (B before first point / after last point)
+ *     → skip the bucket (no output row).
+ *
+ * The first projection must be the ts column (any PROJ_COL pointing to
+ * s->ts_col_idx) and the second must be PROJ_WIN_INTERP.
+ *
+ * Implementation:
+ *   1. Sequential scan: collect all (ts, val) pairs in a dynamic array,
+ *      applying WHERE filter.
+ *   2. Sort by ts (already sorted when reading from HDB; in-memory may
+ *      be out of order if concurrent writes occurred — sort anyway).
+ *   3. Walk the aligned grid, binary-search for surrounding points,
+ *      emit interpolated rows.
+ */
+typedef struct { int64_t ts; double val; } interp_pt_t;
+
+static int interp_pt_cmp(const void *a, const void *b) {
+    const interp_pt_t *pa = (const interp_pt_t *)a;
+    const interp_pt_t *pb = (const interp_pt_t *)b;
+    if (pa->ts < pb->ts) return -1;
+    if (pa->ts > pb->ts) return  1;
+    return 0;
+}
+
+static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
+                       qast_query_t *q, tsdb_result_t *r,
+                       proj_t *projs, int nprojs,
+                       char *err, size_t errcap)
+{
+    (void)db;
+    tsdb_schema_t *s = tsdb_tbl_schema(tbl);
+
+    /* Find the interp projection. */
+    int interp_proj = -1;
+    for (int p = 0; p < nprojs; p++) {
+        if (projs[p].kind == PROJ_WIN_INTERP) { interp_proj = p; break; }
+    }
+    if (interp_proj < 0) {
+        eset(err, errcap, "interp: no interp() projection found");
+        return TSDB_ERR_PARSE;
+    }
+
+    int val_col = projs[interp_proj].col;
+    int64_t interval_ns = projs[interp_proj].interp_bucket_ns;
+    int ts_col = s->ts_col_idx;
+
+    /* Phase 1: collect all (ts, val) pairs. */
+    size_t pts_cap = 4096;
+    size_t pts_n   = 0;
+    interp_pt_t *pts = malloc(pts_cap * sizeof(interp_pt_t));
+    if (!pts) return TSDB_ERR_NOMEM;
+
+    ts_range_t zr;
+    ts_range_init(&zr);
+    if (q->where) extract_ts_bounds(q->where, s, &zr);
+
+    scan_plan_t plan = {0};
+    int rc = scan_plan_build_ex(&plan, tbl,
+                                 (zr.has_lo || zr.has_hi) ? &zr : NULL);
+    if (rc != TSDB_OK) { free(pts); return rc; }
+
+    for (size_t si = 0; si < plan.nsrcs; si++) {
+        scan_src_t *src = &plan.srcs[si];
+        size_t n = src->row_count;
+
+        int need_col[TSDB_MAX_COLS];
+        memset(need_col, 0, sizeof(need_col));
+        need_col[ts_col]  = 1;
+        need_col[val_col] = 1;
+        if (q->where) {
+            qast_expr_t *stk[64]; int tp = 0;
+            if (q->where) stk[tp++] = q->where;
+            while (tp > 0) {
+                qast_expr_t *e = stk[--tp];
+                if (!e) continue;
+                if (e->kind == QAST_IDENT) { int c = resolve_col(s, e->v.s); if (c >= 0) need_col[c] = 1; }
+                if (e->lhs && tp < 63) stk[tp++] = e->lhs;
+                if (e->rhs && tp < 63) stk[tp++] = e->rhs;
+                for (int a = 0; a < e->nargs && tp < 63; a++) stk[tp++] = e->args[a];
+            }
+        }
+
+        void **bufs = calloc((size_t)s->ncols, sizeof(void *));
+        tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
+        if (!bufs || !syms) { free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto done; }
+
+        int src_rc = TSDB_OK;
+        for (int c = 0; c < s->ncols; c++) {
+            if (!need_col[c]) continue;
+            syms[c] = s->cols[c].symtab;
+            size_t w = tsdb_type_width(s->cols[c].type);
+            if (src->mem) {
+                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+            } else {
+                bufs[c] = malloc(w * n);
+                if (!bufs[c]) { src_rc = TSDB_ERR_NOMEM; break; }
+                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                src_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                if (src_rc != TSDB_OK) break;
+                tsdb_block_meta_t *hit = NULL;
+                for (size_t b = 0; b < nb; b++)
+                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
+                        hit = &metas[b]; break;
+                    }
+                if (!hit) { free(metas); src_rc = TSDB_ERR_CORRUPT; break; }
+                src_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
+                free(metas);
+                if (src_rc != TSDB_OK) break;
+            }
+        }
+
+        if (src_rc == TSDB_OK) {
+            /* Apply WHERE bitmap. */
+            size_t nw2 = (n + 63) / 64;
+            uint64_t *bm = malloc(nw2 * sizeof(uint64_t));
+            if (!bm) { src_rc = TSDB_ERR_NOMEM; }
+            if (bm) {
+                for (size_t i = 0; i < nw2; i++) bm[i] = ~(uint64_t)0;
+                size_t tail = nw2 * 64 - n;
+                if (tail) bm[nw2 - 1] &= (~(uint64_t)0) >> tail;
+                if (q->where) {
+                    eval_ctx_t ctx = {0};
+                    ctx.schema = s; ctx.col_bufs = bufs; ctx.col_syms = syms; ctx.nrows = n;
+                    src_rc = apply_filter_expr(&ctx, q->where, bm);
+                }
+                if (src_rc == TSDB_OK) {
+                    tsdb_type_t vtype = s->cols[val_col].type;
+                    for (size_t row = 0; row < n; row++) {
+                        if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
+                        if (pts_n >= pts_cap) {
+                            pts_cap *= 2;
+                            interp_pt_t *tmp = realloc(pts, pts_cap * sizeof(interp_pt_t));
+                            if (!tmp) { src_rc = TSDB_ERR_NOMEM; break; }
+                            pts = tmp;
+                        }
+                        int64_t ts_val;
+                        memcpy(&ts_val, &((const int64_t *)bufs[ts_col])[row], 8);
+                        double val_f;
+                        if (vtype == TSDB_TYPE_FLOAT64) {
+                            memcpy(&val_f, &((const uint64_t *)bufs[val_col])[row], 8);
+                        } else {
+                            int64_t vi;
+                            memcpy(&vi, &((const int64_t *)bufs[val_col])[row], 8);
+                            val_f = (double)vi;
+                        }
+                        pts[pts_n].ts  = ts_val;
+                        pts[pts_n].val = val_f;
+                        pts_n++;
+                    }
+                }
+                free(bm);
+            }
+        }
+
+        for (int c = 0; c < s->ncols; c++)
+            if (!src->mem && bufs[c]) free(bufs[c]);
+        free(bufs); free(syms);
+
+        if (src_rc != TSDB_OK) { rc = src_rc; goto done; }
+    }
+
+    /* Phase 2: sort by ts. */
+    if (pts_n < 2) {
+        /* Not enough points to interpolate — return empty result. */
+        goto done;
+    }
+    qsort(pts, pts_n, sizeof(interp_pt_t), interp_pt_cmp);
+
+    /* Phase 3: walk aligned grid and emit interpolated rows. */
+    int64_t grid_start = (pts[0].ts / interval_ns) * interval_ns;
+    int64_t grid_end   = ((pts[pts_n - 1].ts + interval_ns - 1) / interval_ns) * interval_ns;
+    size_t limit_rows  = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+
+    /* ts_col projection index (may or may not be in projs[0]). */
+    int ts_proj = -1;
+    for (int p = 0; p < nprojs; p++)
+        if (projs[p].kind == PROJ_COL && projs[p].col == ts_col) { ts_proj = p; break; }
+
+    for (int64_t bucket = grid_start; bucket <= grid_end; bucket += interval_ns) {
+        if ((size_t)r->nrows >= limit_rows) break;
+
+        /* Binary search: find leftmost point with ts >= bucket. */
+        size_t lo_idx = pts_n; /* index of first point >= bucket */
+        {
+            size_t a = 0, b = pts_n;
+            while (a < b) {
+                size_t m = a + (b - a) / 2;
+                if (pts[m].ts < bucket) a = m + 1; else b = m;
+            }
+            lo_idx = a;
+        }
+
+        double interp_val;
+
+        if (lo_idx < pts_n && pts[lo_idx].ts == bucket) {
+            /* Exact match. */
+            interp_val = pts[lo_idx].val;
+        } else if (lo_idx == 0 || lo_idx >= pts_n) {
+            /* No surrounding bracket — skip. */
+            continue;
+        } else {
+            /* Linear interpolation between pts[lo_idx-1] and pts[lo_idx]. */
+            int64_t t0 = pts[lo_idx - 1].ts;
+            int64_t t1 = pts[lo_idx].ts;
+            double  v0 = pts[lo_idx - 1].val;
+            double  v1 = pts[lo_idx].val;
+            double  dt = (double)(t1 - t0);
+            if (dt == 0.0) {
+                interp_val = v0;
+            } else {
+                interp_val = v0 + (v1 - v0) * (double)(bucket - t0) / dt;
+            }
+        }
+
+        rc = result_reserve_rows(r, r->nrows + 1);
+        if (rc != TSDB_OK) goto done;
+
+        for (int p = 0; p < nprojs; p++) {
+            if (p == ts_proj) {
+                int64_t bv = bucket;
+                uint64_t bits; memcpy(&bits, &bv, 8);
+                ((uint64_t *)r->col_data[p])[r->nrows] = bits;
+            } else if (projs[p].kind == PROJ_WIN_INTERP) {
+                uint64_t bits; memcpy(&bits, &interp_val, 8);
+                ((uint64_t *)r->col_data[p])[r->nrows] = bits;
+            }
+            /* Other projections (e.g. additional PROJ_COL) are left as 0. */
+        }
+        r->nrows++;
+    }
+
+done:
+    free(pts);
     scan_plan_free(&plan);
     return rc;
 }
@@ -2734,6 +3376,31 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     int rc = build_projections(q, s, &projs, &nprojs, &has_agg, &has_window,
                                &has_ts_agg, &has_interp, err, errcap);
     if (rc != TSDB_OK) return rc;
+
+    /* INTERP dispatch — grid-aligned linear interpolation.
+     * Must be checked before the general window function validation below
+     * because interp() is classified as a window call but has its own
+     * execution path that allows combining with WHERE and ORDER BY. */
+    if (has_interp) {
+        if (has_agg || q->has_sample_by || q->ngroup_by > 0 ||
+            q->has_latest_on || q->has_asof_join) {
+            if (projs) { for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]); free(projs); }
+            eset(err, errcap,
+                 "interp() cannot be combined with aggregates, GROUP BY, "
+                 "SAMPLE BY, LATEST ON, or ASOF JOIN");
+            return TSDB_ERR_UNSUPPORTED;
+        }
+        /* Allocate result columns. */
+        rc = result_reserve_cols(r, nprojs);
+        if (rc != TSDB_OK) { free(projs); return rc; }
+        for (int i = 0; i < nprojs; i++) {
+            rc = result_set_col(r, i, projs[i].name, projs[i].out_type, NULL);
+            if (rc != TSDB_OK) { free(projs); return rc; }
+        }
+        int irc = exec_interp(db, tbl, q, r, projs, nprojs, err, errcap);
+        free(projs);
+        return irc;
+    }
 
     /* Window functions only valid in plain non-agg SELECT (no GROUP BY,
      * no SAMPLE BY, no LATEST ON, no ASOF JOIN). */

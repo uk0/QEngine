@@ -336,23 +336,119 @@ static void test_error_mixed_agg(void) {
 }
 
 /* =========================================================================
- * Test 9: interp() stub returns unsupported error
+ * Test 9: interp() — linear interpolation over aligned grid
  * ========================================================================= */
-static void test_interp_stub(void) {
+static void test_interp(void) {
     const char *dir = "/tmp/tsdb_wfn_interp";
+    tsdb_db_t *db = open_fresh_db(dir);
+    tsdb_table_t *tbl = make_table(db, "t");
+
+    /* Insert 3 points: at 0ns, 2s, 4s with values 0, 2.0, 4.0.
+     * Grid interval: 1s = 1000000000 ns.
+     * Expected grid points: 0s, 1s, 2s, 3s, 4s → 0, 1, 2, 3, 4. */
+    int64_t ts[] = { 0LL, 2000000000LL, 4000000000LL };
+    int64_t vs[] = { 0LL, 2LL, 4LL };
+    insert_rows(tbl, ts, vs, 3);
+
+    /* SELECT ts, interp(val, 1000000000) FROM t */
+    tsdb_result_t *r = run_query(db,
+        "SELECT ts, interp(val, 1000000000) FROM t");
+    if (tsdb_result_ncols(r) != 2)
+        FAIL("interp: expected 2 columns, got %d", tsdb_result_ncols(r));
+
+    /* Should produce 5 rows: ts=0,1s,2s,3s,4s → val=0,1,2,3,4 */
+    int row = 0;
+    double expected_vals[] = { 0.0, 1.0, 2.0, 3.0, 4.0 };
+    while (tsdb_result_next(r)) {
+        if (row >= 5) FAIL("interp: too many rows");
+        double val = tsdb_result_f64(r, 1);
+        EXPECT_CLOSE(val, expected_vals[row], 1e-9, "interp val");
+        row++;
+    }
+    if (row != 5) FAIL("interp: expected 5 rows, got %d", row);
+
+    tsdb_result_free(r);
+    tsdb_close(db);
+    printf("  PASS test_interp\n");
+}
+
+/* =========================================================================
+ * Test 10: interp() — sparse data with gap (missing bucket, skip)
+ * ========================================================================= */
+static void test_interp_gap(void) {
+    const char *dir = "/tmp/tsdb_wfn_interp_gap";
+    tsdb_db_t *db = open_fresh_db(dir);
+    tsdb_table_t *tbl = make_table(db, "t");
+
+    /* Only two points: 0ns and 5s. Grid: 1s. Buckets: 0,1,2,3,4,5.
+     * 0 and 5 are exact hits; 1,2,3,4 are interpolated.
+     * val at 0 = 0, val at 5s = 10 → step per second = 2. */
+    int64_t ts[] = { 0LL, 5000000000LL };
+    int64_t vs[] = { 0LL, 10LL };
+    insert_rows(tbl, ts, vs, 2);
+
+    tsdb_result_t *r = run_query(db,
+        "SELECT ts, interp(val, 1000000000) FROM t");
+
+    int row = 0;
+    double expected[] = { 0.0, 2.0, 4.0, 6.0, 8.0, 10.0 };
+    while (tsdb_result_next(r)) {
+        if (row >= 6) FAIL("interp_gap: too many rows");
+        double val = tsdb_result_f64(r, 1);
+        EXPECT_CLOSE(val, expected[row], 1e-9, "interp_gap val");
+        row++;
+    }
+    if (row != 6) FAIL("interp_gap: expected 6 rows, got %d", row);
+
+    tsdb_result_free(r);
+    tsdb_close(db);
+    printf("  PASS test_interp_gap\n");
+}
+
+/* =========================================================================
+ * Test 11: interp() — LIMIT pushdown
+ * ========================================================================= */
+static void test_interp_limit(void) {
+    const char *dir = "/tmp/tsdb_wfn_interp_limit";
+    tsdb_db_t *db = open_fresh_db(dir);
+    tsdb_table_t *tbl = make_table(db, "t");
+
+    int64_t ts[] = { 0LL, 10000000000LL };
+    int64_t vs[] = { 0LL, 10LL };
+    insert_rows(tbl, ts, vs, 2);
+
+    tsdb_result_t *r = run_query(db,
+        "SELECT ts, interp(val, 1000000000) FROM t LIMIT 3");
+    int row = 0;
+    while (tsdb_result_next(r)) row++;
+    if (row != 3) FAIL("interp_limit: expected 3 rows, got %d", row);
+
+    tsdb_result_free(r);
+    tsdb_close(db);
+    printf("  PASS test_interp_limit\n");
+}
+
+/* =========================================================================
+ * Test 12: interp() error — bad arguments
+ * ========================================================================= */
+static void test_interp_errors(void) {
+    const char *dir = "/tmp/tsdb_wfn_interp_err";
     tsdb_db_t *db = open_fresh_db(dir);
     make_table(db, "t");
 
+    /* Missing interval arg. */
     tsdb_result_t *r = NULL;
-    int rc = tsdb_query(db,
-        "SELECT interp(val, 10000000000) FROM t", &r);
-    if (rc == TSDB_OK) {
-        tsdb_result_free(r);
-        FAIL("interp() stub should return error");
-    }
+    int rc = tsdb_query(db, "SELECT interp(val) FROM t", &r);
+    if (rc == TSDB_OK) { tsdb_result_free(r); FAIL("interp_errors: should fail with 1 arg"); }
+    tsdb_result_free(r); r = NULL;
+
+    /* Combined with aggregate — should fail. */
+    rc = tsdb_query(db, "SELECT sum(val), interp(val, 1000000000) FROM t", &r);
+    if (rc == TSDB_OK) { tsdb_result_free(r); FAIL("interp_errors: should fail with aggregate"); }
     tsdb_result_free(r);
+
     tsdb_close(db);
-    printf("  PASS test_interp_stub\n");
+    printf("  PASS test_interp_errors\n");
 }
 
 /* =========================================================================
@@ -369,7 +465,10 @@ int main(void) {
     test_mavg_window1();
     test_combined();
     test_error_mixed_agg();
-    test_interp_stub();
+    test_interp();
+    test_interp_gap();
+    test_interp_limit();
+    test_interp_errors();
 
     printf("=== ALL WINDOW FN TESTS PASSED ===\n");
     return 0;
