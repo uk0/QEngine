@@ -96,6 +96,17 @@ int tsdb_create_table_ex(tsdb_db_t *db,
                          const char *ts_col,
                          tsdb_create_partition_t partition);
 
+/* Fullest variant: partition granularity + per-table block_points.
+ * block_points == 0 resolves to the db's default (tsdb_db_set_default_block_points
+ * or the library default TSDB_BLOCK_POINTS).  Values outside [1024, 8192] are
+ * silently clamped. */
+int tsdb_create_table_ex2(tsdb_db_t *db,
+                           const char *name,
+                           const tsdb_col_t *cols, size_t ncols,
+                           const char *ts_col,
+                           tsdb_create_partition_t partition,
+                           int block_points);
+
 int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out);
 int tsdb_drop_table(tsdb_db_t *db, const char *name);
 

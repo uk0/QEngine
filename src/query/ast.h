@@ -178,6 +178,9 @@ typedef enum {
     QAST_STMT_CREATE_STABLE,
     QAST_STMT_DROP_STABLE,
     QAST_STMT_CREATE_CHILD_TABLE,  /* CREATE TABLE name USING stable TAGS(...) */
+    /* Normal table DDL: CREATE TABLE name (col TYPE, ...) TIMESTAMP(ts)
+     * [WITH (BLOCK_POINTS=N, PARTITION='hour'|'day')] */
+    QAST_STMT_CREATE_TABLE,
     /* ALTER TABLE t ADD COLUMN c TYPE */
     QAST_STMT_ALTER_ADD_COLUMN,
     /* TMQ consumer-group statements */
@@ -214,6 +217,16 @@ typedef struct {
         struct { tsdb_stable_t spec; }       create_stable;       /* QAST_STMT_CREATE_STABLE */
         struct { char name[64]; }            drop_stable;          /* QAST_STMT_DROP_STABLE */
         struct { tsdb_child_table_t spec; }  create_child_table;   /* QAST_STMT_CREATE_CHILD_TABLE */
+        /* QAST_STMT_CREATE_TABLE — normal table with explicit column list. */
+        struct {
+            char                     name[64];
+            int                      ncols;
+            char                     col_names[TSDB_STABLE_MAX_COLS][64];
+            tsdb_type_t              col_types[TSDB_STABLE_MAX_COLS];
+            char                     ts_col[64];
+            int                      block_points;    /* 0 = db default   */
+            int                      partition_hour;  /* 0 = DAY, 1 = HOUR */
+        } create_table;
         /* ALTER TABLE t ADD COLUMN c TYPE */
         struct {
             char         table[64];

@@ -827,21 +827,123 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        /* CREATE TABLE name USING stable_name TAGS (val, val, ...) */
+        /* CREATE TABLE — two shapes:
+         *   (a) CREATE TABLE name USING stable TAGS(...)          — child table
+         *   (b) CREATE TABLE name (col TYPE, ...) TIMESTAMP(ts)
+         *       [WITH (BLOCK_POINTS=N, PARTITION='hour'|'day')]   — normal table
+         * Shape is decided by whether the token after the name is USING or '('. */
         if (accept(&p, QTOK_TABLE)) {
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+            }
+            char tbl_name[64];
+            tok_copy(&p.tok, tbl_name, sizeof(tbl_name));
+            advance(&p);
+
+            /* ----- Shape (b): normal table with column list --------------- */
+            if (p.tok.kind == QTOK_LPAREN) {
+                out->kind = QAST_STMT_CREATE_TABLE;
+                memset(&out->u.create_table, 0, sizeof(out->u.create_table));
+                snprintf(out->u.create_table.name,
+                         sizeof(out->u.create_table.name), "%s", tbl_name);
+                advance(&p);  /* consume '(' */
+                int nc = 0;
+                while (!p.errored && p.tok.kind != QTOK_RPAREN && p.tok.kind != QTOK_EOF) {
+                    if (nc >= TSDB_STABLE_MAX_COLS) {
+                        perr(&p, "too many columns"); return TSDB_ERR_PARSE;
+                    }
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected column name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, out->u.create_table.col_names[nc],
+                             sizeof(out->u.create_table.col_names[nc]));
+                    advance(&p);
+                    /* Column type — TIMESTAMP, INT64, FLOAT64, SYMBOL */
+                    tsdb_type_t ty = 0;
+                    if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "timestamp")) { ty = TSDB_TYPE_TIMESTAMP; advance(&p); }
+                    else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "int64"))   { ty = TSDB_TYPE_INT64;   advance(&p); }
+                    else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "float64")) { ty = TSDB_TYPE_FLOAT64; advance(&p); }
+                    else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "symbol"))  { ty = TSDB_TYPE_SYMBOL;  advance(&p); }
+                    else {
+                        perr(&p, "expected column type (TIMESTAMP/INT64/FLOAT64/SYMBOL)");
+                        return TSDB_ERR_PARSE;
+                    }
+                    out->u.create_table.col_types[nc] = ty;
+                    nc++;
+                    if (!accept(&p, QTOK_COMMA)) break;
+                }
+                if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+                out->u.create_table.ncols = nc;
+
+                /* TIMESTAMP(ts_col) designator */
+                if (!(p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "timestamp"))) {
+                    perr(&p, "expected TIMESTAMP(ts_col) after column list"); return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected timestamp column name"); return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, out->u.create_table.ts_col,
+                         sizeof(out->u.create_table.ts_col));
+                advance(&p);
+                if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+
+                /* Optional WITH (...) clause */
+                if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "with")) {
+                    advance(&p);
+                    if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+                    while (!p.errored && p.tok.kind != QTOK_RPAREN && p.tok.kind != QTOK_EOF) {
+                        /* "PARTITION" is a reserved keyword (QTOK_PARTITION); accept
+                         * it here as the option name without the IDENT-only guard. */
+                        int is_bp   = (p.tok.kind == QTOK_IDENT &&
+                                       ident_ci(&p.tok, "block_points"));
+                        int is_part = (p.tok.kind == QTOK_PARTITION) ||
+                                      (p.tok.kind == QTOK_IDENT &&
+                                       ident_ci(&p.tok, "partition"));
+                        if (!is_bp && !is_part) {
+                            perr(&p, "unknown option (expected BLOCK_POINTS or PARTITION)");
+                            return TSDB_ERR_PARSE;
+                        }
+                        advance(&p);
+                        if (expect(&p, QTOK_EQ) != TSDB_OK) return TSDB_ERR_PARSE;
+                        if (is_bp) {
+                            if (p.tok.kind != QTOK_NUMBER) {
+                                perr(&p, "BLOCK_POINTS expects integer"); return TSDB_ERR_PARSE;
+                            }
+                            out->u.create_table.block_points = (int)p.tok.i;
+                            advance(&p);
+                        } else {
+                            if (p.tok.kind != QTOK_STRING) {
+                                perr(&p, "PARTITION expects 'hour' or 'day'"); return TSDB_ERR_PARSE;
+                            }
+                            char *s = str_literal(&p, &p.tok);
+                            if (!s) return TSDB_ERR_NOMEM;
+                            if (!strcasecmp(s, "hour"))      out->u.create_table.partition_hour = 1;
+                            else if (!strcasecmp(s, "day"))  out->u.create_table.partition_hour = 0;
+                            else {
+                                perr(&p, "PARTITION expects 'hour' or 'day'"); return TSDB_ERR_PARSE;
+                            }
+                            advance(&p);
+                        }
+                        if (!accept(&p, QTOK_COMMA)) break;
+                    }
+                    if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+                }
+
+                accept(&p, QTOK_SEMI);
+                return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+            }
+
+            /* ----- Shape (a): child table via USING ------------------------ */
             out->kind = QAST_STMT_CREATE_CHILD_TABLE;
             tsdb_child_table_t *ct = &out->u.create_child_table.spec;
             memset(ct, 0, sizeof(*ct));
-
-            if (p.tok.kind != QTOK_IDENT) {
-                perr(&p, "expected child table name"); return TSDB_ERR_PARSE;
-            }
-            tok_copy(&p.tok, ct->name, sizeof(ct->name));
-            advance(&p);
+            snprintf(ct->name, sizeof(ct->name), "%s", tbl_name);
 
             /* USING stable_name */
             if (p.tok.kind != QTOK_USING) {
-                perr(&p, "expected USING after child table name"); return TSDB_ERR_PARSE;
+                perr(&p, "expected USING or '(' after table name"); return TSDB_ERR_PARSE;
             }
             advance(&p);
             if (p.tok.kind != QTOK_IDENT) {

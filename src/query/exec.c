@@ -4892,6 +4892,32 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         else { result_status(r, "ERR: child table catalog failed"); }
         break;
     }
+    case QAST_STMT_CREATE_TABLE: {
+        /* Build tsdb_col_t[] pointing at the AST's in-place storage.
+         * The cols[].name pointers stay alive for the duration of this
+         * call; tsdb_schema_create_ex copies into its own buffers. */
+        tsdb_col_t cols[TSDB_STABLE_MAX_COLS];
+        for (int i = 0; i < stmt.u.create_table.ncols; i++) {
+            cols[i].name = stmt.u.create_table.col_names[i];
+            cols[i].type = stmt.u.create_table.col_types[i];
+        }
+        tsdb_create_partition_t part = stmt.u.create_table.partition_hour
+                                          ? TSDB_CREATE_PART_HOUR
+                                          : TSDB_CREATE_PART_DAY;
+        rc = tsdb_create_table_ex2(db,
+                                    stmt.u.create_table.name,
+                                    cols,
+                                    (size_t)stmt.u.create_table.ncols,
+                                    stmt.u.create_table.ts_col,
+                                    part,
+                                    stmt.u.create_table.block_points);
+        if (rc == TSDB_OK)                 rc = result_status(r, "OK: table created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: table exists"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_SCHEMA) { result_status(r, "ERR: schema error (missing or non-timestamp ts col)"); rc = TSDB_ERR_SCHEMA; }
+        else if (rc == TSDB_ERR_INVAL)  { result_status(r, "ERR: invalid arguments"); rc = TSDB_ERR_INVAL; }
+        else                               result_status(r, "ERR: create table failed");
+        break;
+    }
     case QAST_STMT_ALTER_ADD_COLUMN: {
         rc = tsdb_alter_table_add_column(db,
             stmt.u.alter_add_column.table,
@@ -5207,6 +5233,10 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     case QAST_STMT_CREATE_CHILD_TABLE:
         *out_priv     = TSDB_PRIV_DDL;
         *out_resource = stmt->u.create_child_table.spec.name;
+        break;
+    case QAST_STMT_CREATE_TABLE:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.create_table.name;
         break;
     case QAST_STMT_ALTER_ADD_COLUMN:
         *out_priv     = TSDB_PRIV_DDL;

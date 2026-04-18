@@ -161,7 +161,71 @@ int main(void) {
         tsdb_schema_free(s);
     }
 
-    /* ---- 5. v2 schema on disk reads back with default block_points ---- */
+    /* ---- 5. QTL CREATE TABLE syntax with BLOCK_POINTS ----------------- */
+    {
+        char ddir[256]; snprintf(ddir, sizeof(ddir), "%s/db_qtl", dir);
+        tsdb_db_t *db = NULL;
+        CHECK(tsdb_open(ddir, &db) == TSDB_OK, "tsdb_open for QTL test");
+
+        tsdb_result_t *rr = NULL;
+        /* block_points=1024 via WITH clause. */
+        int r1 = tsdb_query(db,
+            "CREATE TABLE qtl_t (ts TIMESTAMP, v INT64) TIMESTAMP(ts) "
+            "WITH (BLOCK_POINTS=1024);", &rr);
+        CHECK(r1 == TSDB_OK, "QTL CREATE TABLE with block_points=1024");
+        if (rr) tsdb_result_free(rr); rr = NULL;
+
+        /* Without WITH clause — defaults apply. */
+        int r2 = tsdb_query(db,
+            "CREATE TABLE qtl_def (ts TIMESTAMP, v INT64) TIMESTAMP(ts);", &rr);
+        CHECK(r2 == TSDB_OK, "QTL CREATE TABLE default block_points");
+        if (rr) tsdb_result_free(rr); rr = NULL;
+
+        /* WITH PARTITION='hour' */
+        int r3 = tsdb_query(db,
+            "CREATE TABLE qtl_h (ts TIMESTAMP, v INT64) TIMESTAMP(ts) "
+            "WITH (BLOCK_POINTS=2048, PARTITION='hour');", &rr);
+        CHECK(r3 == TSDB_OK, "QTL CREATE TABLE with HOUR partition");
+        if (rr) tsdb_result_free(rr); rr = NULL;
+
+        /* Bad: block_points below clamp floor — schema clamps silently. */
+        int r4 = tsdb_query(db,
+            "CREATE TABLE qtl_low (ts TIMESTAMP, v INT64) TIMESTAMP(ts) "
+            "WITH (BLOCK_POINTS=10);", &rr);
+        CHECK(r4 == TSDB_OK, "QTL: block_points=10 accepted (clamps to 1024)");
+        if (rr) tsdb_result_free(rr); rr = NULL;
+
+        /* Error: no TIMESTAMP designator. */
+        int r5 = tsdb_query(db,
+            "CREATE TABLE qtl_bad (ts TIMESTAMP, v INT64);", &rr);
+        CHECK(r5 == TSDB_ERR_PARSE, "QTL: missing TIMESTAMP() → parse error");
+        if (rr) tsdb_result_free(rr); rr = NULL;
+
+        tsdb_close(db);
+
+        /* Re-open + verify block_points persisted per-table. */
+        char t1[512]; snprintf(t1, sizeof(t1), "%s/qtl_t",   ddir);
+        char td[512]; snprintf(td, sizeof(td), "%s/qtl_def", ddir);
+        char th[512]; snprintf(th, sizeof(th), "%s/qtl_h",   ddir);
+        char tl[512]; snprintf(tl, sizeof(tl), "%s/qtl_low", ddir);
+
+        tsdb_schema_t *s1 = NULL, *sd = NULL, *sh = NULL, *sl = NULL;
+        CHECK(tsdb_schema_open(t1, &s1) == TSDB_OK, "schema_open qtl_t");
+        CHECK(s1 && s1->block_points == 1024, "qtl_t has block_points=1024");
+        CHECK(tsdb_schema_open(td, &sd) == TSDB_OK, "schema_open qtl_def");
+        CHECK(sd && sd->block_points == TSDB_BLOCK_POINTS,
+              "qtl_def inherits library default");
+        CHECK(tsdb_schema_open(th, &sh) == TSDB_OK, "schema_open qtl_h");
+        CHECK(sh && sh->block_points == 2048, "qtl_h block_points=2048");
+        CHECK(sh && sh->partition_unit == TSDB_PARTITION_HOUR,
+              "qtl_h partition=hour persisted");
+        CHECK(tsdb_schema_open(tl, &sl) == TSDB_OK, "schema_open qtl_low");
+        CHECK(sl && sl->block_points == 1024, "qtl_low clamped to 1024");
+        tsdb_schema_free(s1); tsdb_schema_free(sd);
+        tsdb_schema_free(sh); tsdb_schema_free(sl);
+    }
+
+    /* ---- 6. v2 schema on disk reads back with default block_points ---- */
     {
         char d[256]; snprintf(d, sizeof(d), "%s/t_v2", dir); mkdir(d, 0755);
         tsdb_schema_t *s = NULL;

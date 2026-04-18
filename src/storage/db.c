@@ -227,12 +227,14 @@ static void maybe_start_gc_for_table(tsdb_db_t *db, tsdb_table_internal_t *t);
 
 /* ---- tsdb_create_table -------------------------------------------------- */
 
-/* Internal: create table with optional hook suppression. */
+/* Internal: create table with optional hook suppression.
+ * block_points == 0 means "use db->default_block_points (or library default)". */
 static int create_table_impl(tsdb_db_t *db,
                               const char *name,
                               const tsdb_col_t *cols, size_t ncols,
                               const char *ts_col,
                               tsdb_partition_unit_t part_unit,
+                              int block_points,
                               int suppress_hook)
 {
     if (!db || !name || !cols || ncols == 0 || !ts_col) return TSDB_ERR_INVAL;
@@ -254,9 +256,13 @@ static int create_table_impl(tsdb_db_t *db,
     char dir[4096];
     table_dir(db->data_dir, name, dir, sizeof(dir));
 
+    /* Resolve block_points: explicit arg wins; otherwise fall back to the
+     * db-wide default (0 → library default inside schema_create_ex). */
+    int bp = (block_points > 0) ? block_points : db->default_block_points;
+
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_create_ex(dir, name, cols, (int)ncols, ts_col,
-                                    part_unit, db->default_block_points, &schema);
+                                    part_unit, bp, &schema);
     if (rc != TSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return rc;
@@ -317,7 +323,9 @@ int tsdb_create_table(tsdb_db_t *db,
                       const char *ts_col)
 {
     return create_table_impl(db, name, cols, ncols, ts_col,
-                             TSDB_PARTITION_DAY, 0 /* sync */);
+                             TSDB_PARTITION_DAY,
+                             /*block_points*/ 0,
+                             /*suppress_hook*/ 0);
 }
 
 int tsdb_create_table_ex(tsdb_db_t *db,
@@ -329,7 +337,24 @@ int tsdb_create_table_ex(tsdb_db_t *db,
     tsdb_partition_unit_t unit = (partition == TSDB_CREATE_PART_HOUR)
                                   ? TSDB_PARTITION_HOUR
                                   : TSDB_PARTITION_DAY;
-    return create_table_impl(db, name, cols, ncols, ts_col, unit, 0 /* sync */);
+    return create_table_impl(db, name, cols, ncols, ts_col, unit,
+                             /*block_points*/ 0,
+                             /*suppress_hook*/ 0);
+}
+
+int tsdb_create_table_ex2(tsdb_db_t *db,
+                          const char *name,
+                          const tsdb_col_t *cols, size_t ncols,
+                          const char *ts_col,
+                          tsdb_create_partition_t partition,
+                          int block_points)
+{
+    tsdb_partition_unit_t unit = (partition == TSDB_CREATE_PART_HOUR)
+                                  ? TSDB_PARTITION_HOUR
+                                  : TSDB_PARTITION_DAY;
+    return create_table_impl(db, name, cols, ncols, ts_col, unit,
+                             block_points,
+                             /*suppress_hook*/ 0);
 }
 
 int tsdb_create_table_local(tsdb_db_t *db,
@@ -338,7 +363,9 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              const char *ts_col)
 {
     return create_table_impl(db, name, cols, ncols, ts_col,
-                             TSDB_PARTITION_DAY, 1 /* no sync */);
+                             TSDB_PARTITION_DAY,
+                             /*block_points*/ 0,
+                             /*suppress_hook*/ 1);
 }
 
 /* ---- tsdb_open_table ---------------------------------------------------- */
