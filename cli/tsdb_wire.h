@@ -47,6 +47,8 @@ typedef enum {
     MSG_HELLO_OK          =  2,
     MSG_ERROR             =  3,
     MSG_PING              =  4,   /* PONG = same id, FLAG_PONG set */
+    MSG_AUTH_LOGIN        =  5,   /* payload: [u8 ulen][user][u8 plen][pass] */
+    MSG_AUTH_OK           =  6,   /* payload: 32-byte hex token (no NUL) */
     MSG_CREATE_GROUP      = 10,
     MSG_LIST_GROUPS       = 11,
     MSG_DROP_GROUP        = 12,

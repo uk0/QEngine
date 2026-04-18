@@ -705,6 +705,50 @@ static int handle_drop_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
  */
 #define QUERY_CHUNK_ROWS 4096
 
+/* ---- AUTH_LOGIN handler -------------------------------------------------- */
+/*
+ * Payload: [u8 ulen][user bytes][u8 plen][password bytes]
+ * On success, populates io->auth_token[33] and replies TSDB_MT_AUTH_OK with
+ * the 32-char hex token as payload.
+ * On failure, sends ERROR with TSDB_ERR_PERMISSION.
+ */
+static int handle_auth_login(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
+                              const uint8_t *payload, uint32_t plen)
+{
+    const uint8_t *p   = payload;
+    const uint8_t *end = payload + plen;
+
+    if (p + 1 > end) return send_error(io, req_id, TSDB_ERR_INVAL, "auth: short");
+    uint8_t ulen = *p++;
+    if (p + ulen > end) return send_error(io, req_id, TSDB_ERR_INVAL, "auth: user short");
+    char user[64] = {0};
+    size_t uc = ulen < sizeof(user) - 1 ? ulen : sizeof(user) - 1;
+    memcpy(user, p, uc);
+    p += ulen;
+
+    if (p + 1 > end) return send_error(io, req_id, TSDB_ERR_INVAL, "auth: pass len short");
+    uint8_t plen8 = *p++;
+    if (p + plen8 > end) return send_error(io, req_id, TSDB_ERR_INVAL, "auth: pass short");
+    char pass[128] = {0};
+    size_t pc = plen8 < sizeof(pass) - 1 ? plen8 : sizeof(pass) - 1;
+    memcpy(pass, p, pc);
+
+    char tok[33] = {0};
+    int rc = tsdb_auth_authenticate(srv->db, user, pass, tok, sizeof(tok));
+    if (rc != TSDB_OK) {
+        /* Zero any previous token — a failed login must not leave stale state. */
+        memset(io->auth_token, 0, sizeof(io->auth_token));
+        return send_error(io, req_id, TSDB_ERR_PERMISSION, "invalid credentials");
+    }
+
+    /* Persist on the connection state; surface in metric. */
+    memcpy(io->auth_token, tok, sizeof(io->auth_token));
+    tsdb_metric_inc("qengine_auth_logins_total");
+
+    return tsdb_proto_send_io(io, TSDB_MT_AUTH_OK, TSDB_FLAG_FIN,
+                              req_id, tok, 32);
+}
+
 static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                         const uint8_t *payload, uint32_t plen) {
     int fd = io->fd; (void)fd;
@@ -726,12 +770,24 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     int qlen = (q_plen < sizeof(qtl) - 1) ? (int)q_plen : (int)sizeof(qtl) - 1;
     memcpy(qtl, q_bytes, qlen);
 
+    /* Auth gate — require_auth rejects queries sent before TSDB_MT_AUTH_LOGIN
+     * establishes a token; in bypass mode an empty token falls through to
+     * the non-authenticated tsdb_query (legacy behaviour). */
+    int have_token = (io->auth_token[0] != '\0');
+    if (srv->opts.require_auth && !have_token) {
+        tsdb_metric_inc("qengine_auth_denied_total");
+        return send_error(io, req_id, TSDB_ERR_PERMISSION,
+                           "auth required: send AUTH_LOGIN before QUERY");
+    }
+
     /* Time the query for histogram metric. */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     tsdb_result_t *res = NULL;
-    int rc = tsdb_query(srv->db, qtl, &res);
+    int rc = have_token
+        ? tsdb_query_auth(srv->db, io->auth_token, qtl, &res)
+        : tsdb_query(srv->db, qtl, &res);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed_ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
@@ -1001,6 +1057,10 @@ static void *connection_handler(void *arg) {
         case TSDB_MT_PING:
             tsdb_proto_send_io(io, TSDB_MT_PING, TSDB_FLAG_PONG | TSDB_FLAG_FIN,
                                hdr.req_id, payload, hdr.payload_len);
+            break;
+
+        case TSDB_MT_AUTH_LOGIN:
+            handle_auth_login(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
         case TSDB_MT_CREATE_TABLE:

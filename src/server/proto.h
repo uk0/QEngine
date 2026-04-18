@@ -48,6 +48,10 @@ typedef enum {
     TSDB_MT_HELLO_OK           = 2,
     TSDB_MT_ERROR              = 3,
     TSDB_MT_PING               = 4,
+    /* AUTH_LOGIN payload: [u8 ulen][user][u8 plen][pass]
+     * AUTH_OK    payload: 32-byte lowercase hex token (no NUL) */
+    TSDB_MT_AUTH_LOGIN         = 5,
+    TSDB_MT_AUTH_OK            = 6,
 
     /* Group / device management */
     TSDB_MT_CREATE_GROUP       = 10,

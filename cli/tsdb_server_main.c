@@ -191,6 +191,7 @@ int main(int argc, char **argv) {
         .tls_cert      = cfg.tls_cert[0] ? cfg.tls_cert : NULL,
         .tls_key       = cfg.tls_key[0]  ? cfg.tls_key  : NULL,
         .tls_ca        = cfg.tls_ca[0]   ? cfg.tls_ca   : NULL,
+        .require_auth  = cfg.require_auth,
     };
     rc = tsdb_server_start(&opts, &g_srv);
     if (rc != TSDB_OK) {

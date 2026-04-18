@@ -7,6 +7,7 @@
 #ifndef TSDB_SERVER_SERVER_H
 #define TSDB_SERVER_SERVER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "../../include/tsdb.h"
 
@@ -26,6 +27,11 @@ typedef struct {
     const char *tls_cert;      /* PEM server certificate file path */
     const char *tls_key;       /* PEM server private key file path */
     const char *tls_ca;        /* PEM CA bundle for mTLS client auth (may be NULL) */
+    /* When true, the server rejects QUERY / WRITE_BATCH / DDL frames that
+     * arrive before the connection has authenticated via TSDB_MT_AUTH_LOGIN.
+     * When false (default, legacy), unauthenticated frames run in bypass
+     * mode through tsdb_query — matches pre-RBAC behaviour. */
+    bool        require_auth;
 } tsdb_server_opts_t;
 
 /*

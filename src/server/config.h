@@ -56,7 +56,12 @@ typedef struct {
     char     bind[128];
     int      max_conns;
     int      write_workers;
+    /* Legacy preshared bypass token — reserved, not wired in current server.
+     * RBAC enforcement uses require_auth + TSDB_MT_AUTH_LOGIN instead. */
     char     auth_token[128];
+    /* When true, reject QUERY/WRITE frames that arrive before TSDB_MT_AUTH_LOGIN
+     * succeeds for this connection.  Default: false (bypass, legacy). */
+    bool     require_auth;
     int64_t  request_timeout_ns;
 
     /* -- storage -- */

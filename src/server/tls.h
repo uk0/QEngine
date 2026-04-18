@@ -49,9 +49,13 @@ typedef struct tsdb_tls_conn tsdb_tls_conn_t;
 typedef struct {
     int              fd;     /* underlying TCP socket */
     tsdb_tls_conn_t *tls;   /* NULL → plaintext */
+    /* Per-connection session state.  Populated by TSDB_MT_AUTH_LOGIN.
+     * 32 hex chars + NUL; empty string means "not authenticated yet". */
+    char             auth_token[33];
 } tsdb_io_t;
 
-/* Convenient initialiser macros. */
+/* Convenient initialiser macros.  Designated initialisers zero-fill unlisted
+ * fields (C99 guarantee), so auth_token starts empty. */
 #define TSDB_IO_PLAIN(fd_)   ((tsdb_io_t){ .fd = (fd_), .tls = NULL })
 #define TSDB_IO_TLS(fd_, c_) ((tsdb_io_t){ .fd = (fd_), .tls = (c_) })
 

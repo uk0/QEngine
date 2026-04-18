@@ -144,6 +144,7 @@ void tsdb_config_defaults(tsdb_config_t *cfg) {
     snprintf(cfg->bind, sizeof(cfg->bind), "0.0.0.0:28090");
     cfg->max_conns          = 1024;
     cfg->write_workers      = 0;
+    cfg->require_auth       = false;
     cfg->request_timeout_ns = 30LL * 1000000000LL;
 
     /* storage */
@@ -230,6 +231,7 @@ static int kv_apply(tsdb_config_t *cfg, const char *key, const char *val,
     if (!strcmp(key, "max_conns"))           { int64_t x; if (parse_int64(val, &x)<0) BAD("max_conns: bad int"); cfg->max_conns=(int)x; return 0; }
     if (!strcmp(key, "write_workers"))       { int64_t x; if (parse_int64(val, &x)<0) BAD("write_workers: bad int"); cfg->write_workers=(int)x; return 0; }
     if (!strcmp(key, "auth_token"))          { snprintf(cfg->auth_token, sizeof(cfg->auth_token), "%s", val); return 0; }
+    if (!strcmp(key, "require_auth"))        { if (parse_bool(val,&cfg->require_auth)<0) BAD("require_auth"); return 0; }
     if (!strcmp(key, "request_timeout"))     { if (parse_duration_ns(val, &cfg->request_timeout_ns)<0) BAD("request_timeout: bad duration"); return 0; }
 
     /* -- storage -- */
@@ -434,7 +436,7 @@ static const char *env_for(const char *key, char *buf, size_t cap) {
 
 void tsdb_config_apply_env(tsdb_config_t *cfg) {
     static const char *keys[] = {
-        "bind","influx_bind","metrics_bind","max_conns","write_workers","auth_token","request_timeout",
+        "bind","influx_bind","metrics_bind","max_conns","write_workers","auth_token","require_auth","request_timeout",
         "data_dir","data_dirs","data_dirs_strategy","wal_policy","wal_sync_interval",
         "block_points","default_partition","default_codec","max_partition_bytes",
         "default_retention","retention_sweep_every","shards","flush_rows_threshold",
