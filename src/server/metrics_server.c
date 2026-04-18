@@ -111,6 +111,14 @@ static void write_all(int fd, const char *buf, size_t len) {
 static void *handle_connection(void *arg) {
     int fd = (int)(intptr_t)arg;
 
+    /* 5-second read + write deadline — stops a slow-loris-style client
+     * from pinning a thread forever.  Pre-dashboard era there was no
+     * deadline, which is fine for Prometheus scraping but leaves the
+     * server-side thread count unbounded under dashboard reload spam. */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     /* Read request headers (stop at \r\n\r\n or buffer full). */
     char req[2048];
     size_t pos = 0;
@@ -533,7 +541,11 @@ int tsdb_metrics_server_start(const char *bind_addr, tsdb_metrics_server_t **out
         close(fd);
         return -1;
     }
-    if (listen(fd, 32) < 0) {
+    /* Larger backlog: when several dashboard tabs + Prometheus scrape
+     * the same node, connection arrivals burst.  32 was enough for
+     * scrapes-only but gets noisy with the embedded dashboard polling
+     * /health + /metrics + /cluster every 2–5 s per tab. */
+    if (listen(fd, 512) < 0) {
         close(fd);
         return -1;
     }
