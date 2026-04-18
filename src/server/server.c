@@ -409,6 +409,41 @@ static int send_error(tsdb_io_t *io, uint64_t req_id, int err_code, const char *
     return rc;
 }
 
+/* ---- Auth gate (shared by WRITE/DDL/SUBSCRIBE) --------------------------- */
+/*
+ * Returns TSDB_OK if the request may proceed, TSDB_ERR_PERMISSION otherwise.
+ * On denial, sends TSDB_MT_ERROR with the supplied err_msg and returns the
+ * error code — the caller should propagate it back to the dispatch loop.
+ *
+ * Behaviour matrix:
+ *   require_auth=true,  no token → deny "auth required"
+ *   require_auth=false, no token → allow (legacy bypass)
+ *   token present → delegate to tsdb_auth_check(token, priv, resource).
+ *     A bogus / revoked token, or a valid token lacking priv on resource,
+ *     returns TSDB_ERR_PERMISSION.
+ */
+static int auth_gate(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
+                      int priv, const char *resource)
+{
+    int have_token = (io->auth_token[0] != '\0');
+    if (!have_token) {
+        if (srv->opts.require_auth) {
+            tsdb_metric_inc("qengine_auth_denied_total");
+            send_error(io, req_id, TSDB_ERR_PERMISSION,
+                       "auth required: send AUTH_LOGIN first");
+            return TSDB_ERR_PERMISSION;
+        }
+        return TSDB_OK;   /* legacy bypass */
+    }
+    int rc = tsdb_auth_check(srv->db, io->auth_token, priv, resource);
+    if (rc != TSDB_OK) {
+        tsdb_metric_inc("qengine_auth_denied_total");
+        send_error(io, req_id, TSDB_ERR_PERMISSION, "permission denied");
+        return TSDB_ERR_PERMISSION;
+    }
+    return TSDB_OK;
+}
+
 /* ---- WRITE_BATCH decoder ------------------------------------------------- */
 /*
  * Wire columnar payload (from wire-protocol.md):
@@ -439,6 +474,10 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     memcpy(table_name, p, copy);
     table_name[copy] = '\0';
     p += tnlen;
+
+    /* RBAC gate: require_auth + INSERT-on-table. */
+    if (auth_gate(srv, io, req_id, TSDB_PRIV_INSERT, table_name) != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
 
     NEED(6);
     uint16_t ncols;
@@ -647,6 +686,10 @@ static int handle_create_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_i
     char tname[256]; int tc = (tnlen<255)?tnlen:255;
     memcpy(tname, p, tc); tname[tc]='\0'; p+=tnlen;
 
+    /* RBAC gate: require_auth + DDL privilege on target table. */
+    if (auth_gate(srv, io, req_id, TSDB_PRIV_DDL, tname) != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
+
     NEED2(1); uint8_t tslen = *p++;
     NEED2(tslen);
     char ts_col[256]; int tsc=(tslen<255)?tslen:255;
@@ -689,6 +732,10 @@ static int handle_drop_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     char tname[256];
     int n = (plen<255)?(int)plen:255;
     memcpy(tname, payload, n); tname[n]='\0';
+
+    if (auth_gate(srv, io, req_id, TSDB_PRIV_DDL, tname) != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
+
     int rc = tsdb_drop_table(srv->db, tname);
     if (rc != TSDB_OK)
         return send_error(io, req_id, rc, "drop_table failed");
@@ -983,6 +1030,11 @@ static int handle_subscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
              * Treat as plain name already copied above. */
         }
     }
+
+    /* RBAC gate: subscription reads data — need SELECT on the table. */
+    if (auth_gate(srv, io, req_id, TSDB_PRIV_SELECT, table[0] ? table : "*")
+        != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
 
     uint64_t sub_id = sub_list_add(&srv->subs, table, fd, req_id,
                                     filter_col, filter_val);

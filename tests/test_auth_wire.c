@@ -70,6 +70,23 @@ static int send_query(int fd, uint64_t req_id, const char *qtl) {
                             (const uint8_t *)qtl, strlen(qtl));
 }
 
+/* Minimal well-formed WRITE_BATCH payload: just the table name; the server's
+ * auth gate fires before it reads the columnar body, so the rest can be empty. */
+static int send_write_stub(int fd, uint64_t req_id, const char *table) {
+    uint8_t buf[64];
+    uint8_t tnlen = (uint8_t)strlen(table);
+    buf[0] = tnlen;
+    memcpy(buf + 1, table, tnlen);
+    return tsdb_proto_send(fd, TSDB_MT_WRITE_BATCH, 0, req_id,
+                           buf, (size_t)(1 + tnlen));
+}
+
+/* Minimal DROP_TABLE payload: just the table name bytes. */
+static int send_drop_table(int fd, uint64_t req_id, const char *table) {
+    return tsdb_proto_send(fd, TSDB_MT_DROP_TABLE, 0, req_id,
+                           (const uint8_t *)table, strlen(table));
+}
+
 static int recv_frame(int fd, tsdb_frame_hdr_t *hdr, uint8_t **payload) {
     return tsdb_proto_recv(fd, hdr, payload);
 }
@@ -240,6 +257,34 @@ static void phase_normal_cannot_create_function(int port) {
     close(fd);
 }
 
+/* ---- Phase 7 + 8 — gate covers WRITE_BATCH / DROP_TABLE too -------------- */
+
+static void phase_write_drop_gated(int port) {
+    printf("\n[7] WRITE_BATCH before LOGIN -> ERROR/PERMISSION\n");
+    int fd = client_connect(port);
+    CHECK(fd >= 0, "connect");
+    if (fd < 0) return;
+
+    send_write_stub(fd, 70, "t");
+    tsdb_frame_hdr_t hdr; uint8_t *pl = NULL;
+    recv_frame(fd, &hdr, &pl);
+    CHECK(hdr.type == TSDB_MT_ERROR, "WRITE_BATCH denied");
+    CHECK(payload_err_rc(pl) == TSDB_ERR_PERMISSION, "rc == PERMISSION");
+    free(pl); pl = NULL;
+    close(fd);
+
+    printf("\n[8] DROP_TABLE before LOGIN -> ERROR/PERMISSION\n");
+    fd = client_connect(port);
+    CHECK(fd >= 0, "connect");
+    if (fd < 0) return;
+    send_drop_table(fd, 80, "t");
+    recv_frame(fd, &hdr, &pl);
+    CHECK(hdr.type == TSDB_MT_ERROR, "DROP_TABLE denied");
+    CHECK(payload_err_rc(pl) == TSDB_ERR_PERMISSION, "rc == PERMISSION");
+    free(pl);
+    close(fd);
+}
+
 /* ---- Phase 6 ------------------------------------------------------------- */
 
 static void phase_bypass_mode(void) {
@@ -276,6 +321,7 @@ int main(void) {
     phase_login_then_query(port);
     phase_wrong_password(port);
     phase_normal_cannot_create_function(port);
+    phase_write_drop_gated(port);
     phase_bypass_mode();
 
     stop_server();
