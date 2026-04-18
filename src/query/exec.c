@@ -165,12 +165,14 @@ static int result_reserve_cols(tsdb_result_t *r, int n) {
     return TSDB_OK;
 }
 
-static int result_reserve_rows(tsdb_result_t *r, size_t want) {
-    if (want <= r->cap_rows) return TSDB_OK;
+/* Slow path for result_reserve_rows — called only when growth is required.
+ * Kept out-of-line so the inlined fast path is a single comparison. */
+static __attribute__((noinline))
+int result_reserve_rows_grow(tsdb_result_t *r, size_t want) {
     size_t ncap = r->cap_rows ? r->cap_rows : 1024;
     while (ncap < want) ncap *= 2;
     for (int c = 0; c < r->ncols; c++) {
-        size_t w = 8; /* all result types are 8 bytes (timestamp/int64/float64/sym→u32 promoted to u64) */
+        size_t w = 8; /* all result types fit in 8 bytes (ts/i64/f64/sym→u32→u64) */
         void *np = realloc(r->col_data[c], w * ncap);
         if (!np) return TSDB_ERR_NOMEM;
         r->col_data[c] = np;
@@ -179,7 +181,16 @@ static int result_reserve_rows(tsdb_result_t *r, size_t want) {
     return TSDB_OK;
 }
 
-static void result_append_cell(tsdb_result_t *r, int col, uint64_t bits) {
+/* Hot path: caller already knows nrows + N will fit under cap_rows in the
+ * common case.  Compiler inlines the comparison; the grow branch is cold. */
+static inline __attribute__((always_inline))
+int result_reserve_rows(tsdb_result_t *r, size_t want) {
+    if (__builtin_expect(want <= r->cap_rows, 1)) return TSDB_OK;
+    return result_reserve_rows_grow(r, want);
+}
+
+static inline __attribute__((always_inline))
+void result_append_cell(tsdb_result_t *r, int col, uint64_t bits) {
     ((uint64_t *)r->col_data[col])[r->nrows] = bits;
 }
 
@@ -4336,11 +4347,69 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             /* Simple row projection (and window functions). */
             const int64_t *ts_col_buf =
                 (const int64_t *)bufs[s->ts_col_idx];
+
+            /* Hoist the growth check: worst case is every row in this block
+             * passes the filter.  One reserve call covers all rows; the
+             * per-row reserve inside the loop becomes redundant. */
+            {
+                size_t upper = r->nrows + n;
+                if (q->has_limit && upper > (size_t)limit) upper = (size_t)limit;
+                if (upper > r->cap_rows)
+                    result_reserve_rows_grow(r, upper);
+            }
+
+            /* Precompute per-projection source pointers + widths.  In the
+             * inner row loop these values are constant, so we hoist them
+             * out to dodge per-row schema lookups + width branches. */
+            const void *proj_src[TSDB_MAX_COLS];
+            uint8_t     proj_w   [TSDB_MAX_COLS];
+            int         all_simple_w8 = (nprojs > 0);
+            for (int pi = 0; pi < nprojs; pi++) {
+                proj_src[pi] = NULL;
+                proj_w  [pi] = 0;
+                proj_t *pp = &projs[pi];
+                if (pp->kind == PROJ_COL && pp->col >= 0) {
+                    proj_w  [pi] = (uint8_t)tsdb_type_width(s->cols[pp->col].type);
+                    proj_src[pi] = bufs[pp->col];
+                    if (proj_w[pi] != 8) all_simple_w8 = 0;
+                } else {
+                    all_simple_w8 = 0;
+                }
+            }
+
+            /* Fast path: all projections are 8-byte column reads (the
+             * common shape for SELECT col1, col2, … FROM t WHERE …).
+             * Iterate the bitmap word-by-word; use CTZ to jump between
+             * set bits without per-position bit tests — big win at low
+             * selectivity, neutral at high. */
+            if (all_simple_w8) {
+                size_t nwords = (n + 63) / 64;
+                for (size_t wi = 0; wi < nwords; wi++) {
+                    uint64_t m = bm[wi];
+                    while (m) {
+                        if (rows_emitted >= limit) goto limit_hit;
+                        int bit = __builtin_ctzll(m);
+                        m &= (m - 1);
+                        size_t i = wi * 64 + (size_t)bit;
+                        if (i >= n) break;
+                        size_t outrow = r->nrows;
+                        for (int pi = 0; pi < nprojs; pi++) {
+                            ((uint64_t *)r->col_data[pi])[outrow] =
+                                ((const uint64_t *)proj_src[pi])[i];
+                        }
+                        r->nrows = outrow + 1;
+                        rows_emitted++;
+                    }
+                }
+            limit_hit:;
+                /* fast-path emitted; skip the generic loop below. */
+                goto row_proj_done;
+            }
+
             for (size_t i = 0; i < n; i++) {
                 if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
                 if (rows_emitted >= limit) break;
 
-                result_reserve_rows(r, r->nrows + 1);
                 int64_t cur_ts = ts_col_buf ? ts_col_buf[i] : 0;
 
                 for (int pi = 0; pi < nprojs; pi++) {
@@ -4435,6 +4504,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 r->nrows++;
                 rows_emitted++;
             }
+        row_proj_done:;
         }
 
         free(bm);
