@@ -2,6 +2,7 @@
 #include "lex.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "../catalog/stable.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -600,6 +601,27 @@ static int parse_props_device(parser_t *p, tsdb_device_t *d) {
     return TSDB_OK;
 }
 
+/* Return 1 if tok can be used as a column/table name (ident or non-DDL keyword
+ * like REGION, GROUP, etc. that might appear in user data). */
+static int tok_is_name_like(const qtok_t *t) {
+    if (t->kind == QTOK_IDENT) return 1;
+    /* Allow keywords that commonly appear in identifiers */
+    switch (t->kind) {
+    case QTOK_GROUP:     case QTOK_REGION:   case QTOK_ON:
+    case QTOK_ORDER:     case QTOK_DESC:     case QTOK_ASC:
+    case QTOK_FILL:      case QTOK_PREV:     case QTOK_IN:
+    case QTOK_PROFILE:   case QTOK_FACTOR:   case QTOK_LIMIT:
+    case QTOK_RETENTION: case QTOK_REPLICA:  case QTOK_PARTITION:
+    case QTOK_SAMPLE:    case QTOK_BY:       case QTOK_SESSION:
+    case QTOK_JOIN:      case QTOK_LATEST:   case QTOK_DEVICE:
+    case QTOK_TRUE:      case QTOK_FALSE:    case QTOK_NULL_KW:
+    case QTOK_LIST:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* ---- qparse_stmt -------------------------------------------------------- */
 
 int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
@@ -672,7 +694,172 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP or DEVICE after CREATE");
+        /* CREATE STABLE name (col type, ...) TAGS (tag_col type, ...) */
+        if (accept(&p, QTOK_STABLE)) {
+            out->kind = QAST_STMT_CREATE_STABLE;
+            tsdb_stable_t *st = &out->u.create_stable.spec;
+            memset(st, 0, sizeof(*st));
+            st->ts_col_idx = -1;
+
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected stable name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, st->name, sizeof(st->name));
+            advance(&p);
+
+            /* Parse column list: (col_name type, ...) */
+            if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            while (!p.errored && p.tok.kind != QTOK_RPAREN && p.tok.kind != QTOK_EOF) {
+                if (st->ncols >= TSDB_STABLE_MAX_COLS) {
+                    perr(&p, "too many columns in STABLE"); return TSDB_ERR_PARSE;
+                }
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected column name"); return TSDB_ERR_PARSE;
+                }
+                tsdb_stable_col_t *col = &st->cols[st->ncols];
+                tok_copy(&p.tok, col->name, sizeof(col->name));
+                advance(&p);
+                /* type keyword: TIMESTAMP, INT64, FLOAT64, SYMBOL — lexed as IDENT */
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected column type"); return TSDB_ERR_PARSE;
+                }
+                if (ident_ci(&p.tok, "timestamp")) {
+                    col->type = TSDB_TYPE_TIMESTAMP;
+                    if (st->ts_col_idx < 0) st->ts_col_idx = st->ncols;
+                } else if (ident_ci(&p.tok, "int64")) {
+                    col->type = TSDB_TYPE_INT64;
+                } else if (ident_ci(&p.tok, "float64")) {
+                    col->type = TSDB_TYPE_FLOAT64;
+                } else if (ident_ci(&p.tok, "symbol")) {
+                    col->type = TSDB_TYPE_SYMBOL;
+                } else {
+                    perr(&p, "unknown column type '%.*s'", (int)p.tok.len, p.tok.start);
+                    return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                st->ncols++;
+                if (!accept(&p, QTOK_COMMA)) break;
+                if (p.tok.kind == QTOK_RPAREN) break; /* trailing comma */
+            }
+            if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            if (st->ts_col_idx < 0) st->ts_col_idx = 0; /* default to first col */
+
+            /* Parse TAGS (tag_col type, ...) */
+            if (p.tok.kind != QTOK_TAGS) {
+                perr(&p, "expected TAGS after column list"); return TSDB_ERR_PARSE;
+            }
+            advance(&p);
+            if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            while (!p.errored && p.tok.kind != QTOK_RPAREN && p.tok.kind != QTOK_EOF) {
+                if (st->ntag_cols >= TSDB_STABLE_MAX_TAG_COLS) {
+                    perr(&p, "too many tag columns in STABLE"); return TSDB_ERR_PARSE;
+                }
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected tag column name"); return TSDB_ERR_PARSE;
+                }
+                tsdb_stable_col_t *tc = &st->tag_cols[st->ntag_cols];
+                tok_copy(&p.tok, tc->name, sizeof(tc->name));
+                advance(&p);
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected tag column type"); return TSDB_ERR_PARSE;
+                }
+                if (ident_ci(&p.tok, "int64")) {
+                    tc->type = TSDB_TYPE_INT64;
+                } else if (ident_ci(&p.tok, "float64")) {
+                    tc->type = TSDB_TYPE_FLOAT64;
+                } else if (ident_ci(&p.tok, "symbol")) {
+                    tc->type = TSDB_TYPE_SYMBOL;
+                } else {
+                    perr(&p, "unknown tag type '%.*s'", (int)p.tok.len, p.tok.start);
+                    return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                st->ntag_cols++;
+                if (!accept(&p, QTOK_COMMA)) break;
+                if (p.tok.kind == QTOK_RPAREN) break;
+            }
+            if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* CREATE TABLE name USING stable_name TAGS (val, val, ...) */
+        if (accept(&p, QTOK_TABLE)) {
+            out->kind = QAST_STMT_CREATE_CHILD_TABLE;
+            tsdb_child_table_t *ct = &out->u.create_child_table.spec;
+            memset(ct, 0, sizeof(*ct));
+
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected child table name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, ct->name, sizeof(ct->name));
+            advance(&p);
+
+            /* USING stable_name */
+            if (p.tok.kind != QTOK_USING) {
+                perr(&p, "expected USING after child table name"); return TSDB_ERR_PARSE;
+            }
+            advance(&p);
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected stable name after USING"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, ct->stable_name, sizeof(ct->stable_name));
+            advance(&p);
+
+            /* TAGS (val, val, ...) */
+            if (p.tok.kind != QTOK_TAGS) {
+                perr(&p, "expected TAGS after stable name"); return TSDB_ERR_PARSE;
+            }
+            advance(&p);
+            if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            while (!p.errored && p.tok.kind != QTOK_RPAREN && p.tok.kind != QTOK_EOF) {
+                if (ct->ntags >= TSDB_STABLE_MAX_TAG_COLS) {
+                    perr(&p, "too many tag values"); return TSDB_ERR_PARSE;
+                }
+                tsdb_tag_val_t *tv = &ct->tags[ct->ntags];
+                if (p.tok.kind == QTOK_STRING) {
+                    tv->type = TSDB_TYPE_SYMBOL;
+                    char *sv = str_literal(&p, &p.tok);
+                    if (!sv) return TSDB_ERR_NOMEM;
+                    size_t slen = strlen(sv);
+                    if (slen >= sizeof(tv->v.s)) slen = sizeof(tv->v.s) - 1;
+                    memcpy(tv->v.s, sv, slen);
+                    tv->v.s[slen] = '\0';
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_NUMBER) {
+                    tv->type = TSDB_TYPE_INT64;
+                    tv->v.i  = p.tok.i;
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_FLOAT) {
+                    tv->type = TSDB_TYPE_FLOAT64;
+                    tv->v.f  = p.tok.f;
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_MINUS) {
+                    advance(&p);
+                    if (p.tok.kind == QTOK_NUMBER) {
+                        tv->type = TSDB_TYPE_INT64;
+                        tv->v.i  = -p.tok.i;
+                        advance(&p);
+                    } else if (p.tok.kind == QTOK_FLOAT) {
+                        tv->type = TSDB_TYPE_FLOAT64;
+                        tv->v.f  = -p.tok.f;
+                        advance(&p);
+                    } else {
+                        perr(&p, "expected number after '-' in TAGS"); return TSDB_ERR_PARSE;
+                    }
+                } else {
+                    perr(&p, "expected tag value (string or number)"); return TSDB_ERR_PARSE;
+                }
+                ct->ntags++;
+                if (!accept(&p, QTOK_COMMA)) break;
+                if (p.tok.kind == QTOK_RPAREN) break;
+            }
+            if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, STABLE, or TABLE after CREATE");
         return TSDB_ERR_PARSE;
     }
 
@@ -713,7 +900,19 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP or DEVICE after DROP");
+        /* DROP STABLE name */
+        if (accept(&p, QTOK_STABLE)) {
+            out->kind = QAST_STMT_DROP_STABLE;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected stable name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_stable.name, sizeof(out->u.drop_stable.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, or STABLE after DROP");
         return TSDB_ERR_PARSE;
     }
 

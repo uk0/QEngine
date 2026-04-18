@@ -27,6 +27,9 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"device",    QTOK_DEVICE},
     {"retention", QTOK_RETENTION},{"profile",   QTOK_PROFILE},   {"region",    QTOK_REGION},
     {"replica",   QTOK_REPLICA},  {"factor",    QTOK_FACTOR},
+    /* STable DDL */
+    {"stable",    QTOK_STABLE},   {"using",     QTOK_USING},     {"tags",      QTOK_TAGS},
+    {"table",     QTOK_TABLE},
     /* ASOF JOIN */
     {"asof",         QTOK_ASOF},         {"join",         QTOK_JOIN},
     /* Advanced windows — state_window / event_window lex as single IDENT
@@ -72,6 +75,10 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_RETENTION: return "RETENTION"; case QTOK_PROFILE: return "PROFILE";
     case QTOK_REGION: return "REGION"; case QTOK_REPLICA: return "REPLICA";
     case QTOK_FACTOR: return "FACTOR";
+    case QTOK_STABLE: return "STABLE";
+    case QTOK_USING: return "USING";
+    case QTOK_TAGS: return "TAGS";
+    case QTOK_TABLE: return "TABLE";
     case QTOK_ASOF: return "ASOF";
     case QTOK_JOIN: return "JOIN";
     case QTOK_SESSION:      return "SESSION";

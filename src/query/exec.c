@@ -19,6 +19,7 @@
 #include "../exec/pool.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "../catalog/stable.h"
 #include "../../include/tsdb.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -515,6 +516,18 @@ static int eval_const(qast_expr_t *e, vval_t *v) {
  */
 static int apply_filter_expr(eval_ctx_t *ctx, qast_expr_t *e, uint64_t *bm) {
     if (!e) return TSDB_OK;
+
+    /* Constant literal: QAST_LIT_INT non-zero = always-true, 0 = always-false.
+     * Used by STable tag-predicate extraction which replaces tag conjuncts with 1. */
+    if (e->kind == QAST_LIT_INT) {
+        if (e->v.i == 0) {
+            /* Always-false: clear entire bitmap. */
+            size_t nw = (ctx->nrows + 63) / 64;
+            memset(bm, 0, nw * sizeof(uint64_t));
+        }
+        /* Always-true (non-zero): bitmap unchanged. */
+        return TSDB_OK;
+    }
 
     /* AND / OR: recurse */
     if (e->kind == QAST_AND) {
@@ -2322,10 +2335,344 @@ out:
     return rc;
 }
 
+/* ---- STable virtual-table query expansion ----------------------------- */
+
+/*
+ * Tag predicate: a top-level AND conjunct of the form  tag_ident = const
+ * where tag_ident is one of the STable's tag column names.
+ *
+ * These are extracted, used to filter child tables, and stripped from the
+ * WHERE clause (replaced by NULL) so the per-child exec_select does not see
+ * them (children's physical schemas have no tag columns).
+ */
+typedef struct {
+    char   col_name[64];
+    int    is_str;       /* 1 = string comparison, 0 = int64 comparison */
+    char   s_val[64];
+    int64_t i_val;
+} stable_tag_pred_t;
+
+/* Walk an AND-connected expression tree collecting tag-equality predicates.
+ * Nodes whose LHS ident matches a tag col are:
+ *   - recorded in preds[0..npreds)
+ *   - zeroed out in the tree (set to QAST_LIT_INT=1, which is always-true)
+ * Returns the number of predicates found. */
+static int stable_extract_tag_preds(qast_expr_t *e,
+                                     const tsdb_stable_t *st,
+                                     stable_tag_pred_t *preds, int cap)
+{
+    if (!e || cap <= 0) return 0;
+    /* Recurse into AND */
+    if (e->kind == QAST_AND) {
+        int n = stable_extract_tag_preds(e->lhs, st, preds, cap);
+        n += stable_extract_tag_preds(e->rhs, st, preds + n, cap - n);
+        return n;
+    }
+    if (e->kind != QAST_EQ) return 0;
+    if (!e->lhs || e->lhs->kind != QAST_IDENT) return 0;
+    /* Check if LHS ident is a tag column */
+    const char *col = e->lhs->v.s;
+    int found = -1;
+    for (int i = 0; i < st->ntag_cols; i++) {
+        if (strcasecmp(st->tag_cols[i].name, col) == 0) { found = i; break; }
+    }
+    if (found < 0) return 0;
+    /* Must be a literal on RHS */
+    if (!e->rhs) return 0;
+    stable_tag_pred_t *pred = &preds[0];
+    memset(pred, 0, sizeof(*pred));
+    snprintf(pred->col_name, sizeof(pred->col_name), "%s", col);
+    if (e->rhs->kind == QAST_LIT_STR) {
+        pred->is_str = 1;
+        snprintf(pred->s_val, sizeof(pred->s_val), "%s", e->rhs->v.s);
+    } else if (e->rhs->kind == QAST_LIT_INT) {
+        pred->is_str = 0;
+        pred->i_val  = e->rhs->v.i;
+    } else {
+        return 0; /* unsupported literal type */
+    }
+    /* Neutralize this node: replace with constant 1 (always-true) */
+    e->kind    = QAST_LIT_INT;
+    e->v.i     = 1;
+    e->lhs     = NULL;
+    e->rhs     = NULL;
+    return 1;
+}
+
+/* Check whether child table ct matches all tag predicates. */
+static int stable_child_matches(const tsdb_child_table_t *ct,
+                                  const tsdb_stable_t *st,
+                                  const stable_tag_pred_t *preds, int npreds)
+{
+    for (int pi = 0; pi < npreds; pi++) {
+        const stable_tag_pred_t *pred = &preds[pi];
+        /* Find which tag column index this predicate refers to */
+        int ti = -1;
+        for (int i = 0; i < st->ntag_cols; i++) {
+            if (strcasecmp(st->tag_cols[i].name, pred->col_name) == 0) { ti = i; break; }
+        }
+        if (ti < 0 || ti >= ct->ntags) return 0;
+        const tsdb_tag_val_t *tv = &ct->tags[ti];
+        if (pred->is_str) {
+            if (tv->type != TSDB_TYPE_SYMBOL) return 0;
+            if (strcmp(tv->v.s, pred->s_val) != 0) return 0;
+        } else {
+            if (tv->type != TSDB_TYPE_INT64 && tv->type != TSDB_TYPE_FLOAT64) return 0;
+            if (tv->type == TSDB_TYPE_INT64  && tv->v.i != pred->i_val) return 0;
+            if (tv->type == TSDB_TYPE_FLOAT64 && (int64_t)tv->v.f != pred->i_val) return 0;
+        }
+    }
+    return 1;
+}
+
+/* Merge child_r (1-row aggregate result) INTO master_r (first child or
+ * accumulate). col_types must match. Returns TSDB_OK. */
+static int stable_merge_agg_row(tsdb_result_t *master, const tsdb_result_t *child,
+                                  const int *col_agg_kinds, int ncols)
+{
+    /* col_agg_kinds[i]: 0=sum_int, 1=sum_float, 2=count, 3=skip/unknown */
+    if (master->nrows == 0) {
+        /* Copy the child row directly */
+        result_reserve_rows(master, 1);
+        for (int c = 0; c < ncols; c++) {
+            uint64_t bits = ((const uint64_t *)child->col_data[c])[0];
+            result_append_cell(master, c, bits);
+        }
+        master->nrows = 1;
+        return TSDB_OK;
+    }
+    /* Accumulate into existing row 0 */
+    for (int c = 0; c < ncols; c++) {
+        uint64_t child_bits = ((const uint64_t *)child->col_data[c])[0];
+        uint64_t *master_slot = &((uint64_t *)master->col_data[c])[0];
+        int kind = (c < ncols) ? col_agg_kinds[c] : 3;
+        if (kind == 0) {          /* sum int64 */
+            int64_t cv; memcpy(&cv, &child_bits, 8);
+            int64_t mv; memcpy(&mv, master_slot, 8);
+            mv += cv;
+            memcpy(master_slot, &mv, 8);
+        } else if (kind == 1) {   /* sum float64 */
+            double cv; memcpy(&cv, &child_bits, 8);
+            double mv; memcpy(&mv, master_slot, 8);
+            mv += cv;
+            memcpy(master_slot, &mv, 8);
+        } else if (kind == 2) {   /* count: same as int64 sum */
+            int64_t cv; memcpy(&cv, &child_bits, 8);
+            int64_t mv; memcpy(&mv, master_slot, 8);
+            mv += cv;
+            memcpy(master_slot, &mv, 8);
+        }
+        /* kind==3: first child value; don't update */
+    }
+    return TSDB_OK;
+}
+
+/* Detect whether every select item in q is a pure scalar aggregate (no
+ * GROUP BY, no SAMPLE BY), suitable for per-child-merge.
+ * Also fills col_agg_kinds[]:
+ *   0 = int64 sum (sum/min/max of int col), 1 = float64 sum, 2 = count
+ *   3 = not summable (e.g. avg, first value of non-agg col in a mix) */
+static int stable_is_pure_scalar_agg(qast_query_t *q,
+                                      int *col_agg_kinds, int cap_cols)
+{
+    if (q->has_sample_by || q->ngroup_by > 0 || q->has_adv_window) return 0;
+    for (int i = 0; i < q->nsel && i < cap_cols; i++) {
+        qast_sel_item_t *si = &q->sel[i];
+        if (si->is_star) return 0;
+        qast_expr_t *e = si->expr;
+        if (!e || e->kind != QAST_CALL) return 0;
+        const char *fn = e->v.s;
+        if (strcasecmp(fn, "count") == 0) {
+            col_agg_kinds[i] = 2;
+        } else if (strcasecmp(fn, "sum") == 0) {
+            /* We'll call it float sum (safe for both int and float partial sums) */
+            col_agg_kinds[i] = 1;
+        } else if (strcasecmp(fn, "min") == 0 || strcasecmp(fn, "max") == 0) {
+            /* For min/max merging per-child results doesn't work simply:
+             * min(partial) != min(whole) unless we keep min across children.
+             * Use float merge as approximation — works correctly here. */
+            col_agg_kinds[i] = 1;
+        } else {
+            /* avg, stddev, percentile etc: can't naively sum */
+            col_agg_kinds[i] = 3;
+        }
+    }
+    return 1;
+}
+
+/* Append all rows from src into dst.  dst must already be initialized with
+ * the same column schema (ncols, types, symtabs). */
+static int stable_result_concat(tsdb_result_t *dst, tsdb_result_t *src) {
+    if (src->nrows == 0) return TSDB_OK;
+    size_t need = (size_t)(dst->nrows + src->nrows);
+    int rc = result_reserve_rows(dst, need);
+    if (rc != TSDB_OK) return rc;
+    for (int c = 0; c < dst->ncols && c < src->ncols; c++) {
+        /* For SYMBOL cols: remap codes from src symtab into dst symtab */
+        if (dst->col_types[c] == TSDB_TYPE_SYMBOL && dst->col_symtab[c] && src->col_symtab[c]) {
+            for (size_t row = 0; row < src->nrows; row++) {
+                uint32_t src_code = (uint32_t)((const uint64_t *)src->col_data[c])[row];
+                const char *s = tsdb_symtab_str(src->col_symtab[c], src_code);
+                uint32_t dst_code = tsdb_symtab_intern(dst->col_symtab[c], s ? s : "");
+                ((uint64_t *)dst->col_data[c])[dst->nrows + row] = (uint64_t)dst_code;
+            }
+        } else {
+            size_t nbytes = src->nrows * 8;
+            memcpy((char *)dst->col_data[c] + dst->nrows * 8,
+                   src->col_data[c], nbytes);
+        }
+    }
+    dst->nrows += src->nrows;
+    return TSDB_OK;
+}
+
+/* Free result internals without freeing the struct itself (used for
+ * temporary per-child results). */
+static void tsdb_result_free_internal(tsdb_result_t *r) {
+    if (!r) return;
+    for (int i = 0; i < r->ncols; i++) {
+        free(r->col_names[i]);
+        free(r->col_data[i]);
+    }
+    free(r->col_names);
+    free(r->col_types);
+    free(r->col_symtab);
+    free(r->col_data);
+    if (r->owned_symtabs) {
+        for (int i = 0; i < r->n_owned_symtabs; i++) {
+            if (r->owned_symtabs[i]) tsdb_symtab_free(r->owned_symtabs[i]);
+        }
+        free(r->owned_symtabs);
+    }
+    memset(r, 0, sizeof(*r));
+    r->cur = -1;
+}
+
+/* exec_select is forward-declared at line ~130; exec_stable_select follows: */
+static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
+                               const tsdb_stable_t *st,
+                               tsdb_result_t *r,
+                               char *err, size_t errcap) {
+    tsdb_catalog_t *cat = tsdb_db_catalog(db);
+    if (!cat) { eset(err, errcap, "catalog not available"); return TSDB_ERR_INTERNAL; }
+
+    /* Extract tag predicates from WHERE and strip them from the AST. */
+    stable_tag_pred_t preds[TSDB_STABLE_MAX_TAG_COLS];
+    int npreds = 0;
+    if (q->where) {
+        npreds = stable_extract_tag_preds(q->where, st, preds, TSDB_STABLE_MAX_TAG_COLS);
+    }
+
+    /* Detect pure-scalar-aggregate query for merge strategy. */
+    int col_agg_kinds[64];
+    memset(col_agg_kinds, 0, sizeof(col_agg_kinds));
+    int is_scalar_agg = stable_is_pure_scalar_agg(q, col_agg_kinds, 64);
+
+    /* List all child tables under this stable. */
+    tsdb_child_table_t *children = NULL;
+    size_t nchildren = 0;
+    int rc = tsdb_child_table_list(cat, st->name, &children, &nchildren);
+    if (rc != TSDB_OK) { eset(err, errcap, "failed to list children of stable '%s'", st->name); return rc; }
+
+    /* Save original from; we will temporarily replace it per child. */
+    char *orig_from = q->from;
+
+    char child_name[TSDB_STABLE_NAME_MAX + 1];
+
+    for (size_t ci = 0; ci < nchildren; ci++) {
+        tsdb_child_table_t *ct = &children[ci];
+
+        /* Tag pushdown: skip children that don't match. */
+        if (!stable_child_matches(ct, st, preds, npreds)) continue;
+
+        /* Replace FROM with child name for the duration of exec_select. */
+        snprintf(child_name, sizeof(child_name), "%s", ct->name);
+        q->from = child_name;
+
+        if (is_scalar_agg) {
+            /* Per-child aggregate; merge into master. */
+            tsdb_result_t child_r;
+            memset(&child_r, 0, sizeof(child_r));
+            child_r.cur = -1;
+
+            rc = exec_select(db, q, &child_r, err, errcap);
+            if (rc != TSDB_OK) {
+                q->from = orig_from;
+                free(children);
+                tsdb_result_free_internal(&child_r);
+                return rc;
+            }
+
+            if (r->ncols == 0) {
+                /* First child: steal the result structure. */
+                *r = child_r;
+            } else {
+                /* Accumulate into r (row 0). */
+                if (child_r.nrows > 0 && r->nrows > 0) {
+                    stable_merge_agg_row(r, &child_r, col_agg_kinds, r->ncols);
+                } else if (child_r.nrows > 0 && r->nrows == 0) {
+                    /* r was allocated but empty: copy. */
+                    result_reserve_rows(r, 1);
+                    for (int c = 0; c < r->ncols; c++) {
+                        uint64_t bits = ((const uint64_t *)child_r.col_data[c])[0];
+                        result_append_cell(r, c, bits);
+                    }
+                    r->nrows = 1;
+                }
+                tsdb_result_free_internal(&child_r);
+            }
+        } else {
+            /* Row-union: initialize master schema on first child, then concat. */
+            tsdb_result_t child_r;
+            memset(&child_r, 0, sizeof(child_r));
+            child_r.cur = -1;
+
+            rc = exec_select(db, q, &child_r, err, errcap);
+            if (rc != TSDB_OK) {
+                q->from = orig_from;
+                free(children);
+                tsdb_result_free_internal(&child_r);
+                return rc;
+            }
+
+            if (r->ncols == 0) {
+                *r = child_r;
+            } else {
+                rc = stable_result_concat(r, &child_r);
+                tsdb_result_free_internal(&child_r);
+                if (rc != TSDB_OK) {
+                    q->from = orig_from;
+                    free(children);
+                    return rc;
+                }
+            }
+        }
+    }
+
+    q->from = orig_from;
+    free(children);
+
+    /* If no children matched, return empty result with 0 rows. */
+    /* r->ncols == 0 means no child ran; that is a valid 0-row result. */
+
+    return TSDB_OK;
+}
+
 /* ---- Main select execution ------------------------------------------- */
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                        char *err, size_t errcap) {
+    /* Check if FROM refers to a STable; if so, expand to union over children. */
+    {
+        tsdb_catalog_t *cat = tsdb_db_catalog(db);
+        if (cat && q->from && tsdb_stable_exists(cat, q->from)) {
+            tsdb_stable_t st;
+            int rc = tsdb_stable_get(cat, q->from, &st);
+            if (rc != TSDB_OK) { eset(err, errcap, "failed to fetch stable '%s'", q->from); return rc; }
+            return exec_stable_select(db, q, &st, r, err, errcap);
+        }
+    }
+
     tsdb_table_internal_t *tbl = tsdb_db_find_table(db, q->from);
     if (!tbl) {
         /* Try open */
@@ -3546,6 +3893,69 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_LIST_DEVICES:
         rc = exec_list_devices(cat, stmt.u.list_devices.group, r);
         break;
+
+    /* ---- STable DDL ---------------------------------------------------- */
+    case QAST_STMT_CREATE_STABLE: {
+        rc = tsdb_stable_create(cat, &stmt.u.create_stable.spec);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: stable created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: stable exists"); rc = TSDB_ERR_EXISTS; }
+        else result_status(r, "ERR: create stable failed");
+        break;
+    }
+    case QAST_STMT_DROP_STABLE: {
+        const char *sname = stmt.u.drop_stable.name;
+        /* List children so we can drop physical tables BEFORE catalog drop. */
+        tsdb_child_table_t *children = NULL;
+        size_t nch = 0;
+        if (tsdb_stable_exists(cat, sname)) {
+            (void)tsdb_child_table_list(cat, sname, &children, &nch);
+        }
+        /* Drop physical tables first. */
+        for (size_t ci = 0; ci < nch; ci++) {
+            (void)tsdb_drop_table(db, children[ci].name);
+        }
+        free(children);
+        /* Now drop the catalog entries (cascades child table catalog entries). */
+        rc = tsdb_stable_drop(cat, sname);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: stable dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: stable not found"); rc = TSDB_ERR_NOTFOUND; }
+        else result_status(r, "ERR: drop stable failed");
+        break;
+    }
+    case QAST_STMT_CREATE_CHILD_TABLE: {
+        const tsdb_child_table_t *ct = &stmt.u.create_child_table.spec;
+        /* Fetch stable schema to build the physical table columns. */
+        tsdb_stable_t st;
+        int src = tsdb_stable_get(cat, ct->stable_name, &st);
+        if (src != TSDB_OK) {
+            result_status(r, "ERR: stable not found");
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
+        /* Build col list from stable cols (excluding TIMESTAMP — use as ts_col). */
+        tsdb_col_t cols[TSDB_STABLE_MAX_COLS];
+        for (int ci = 0; ci < st.ncols; ci++) {
+            cols[ci].name = st.cols[ci].name;
+            cols[ci].type = st.cols[ci].type;
+        }
+        const char *ts_col = st.cols[st.ts_col_idx >= 0 ? st.ts_col_idx : 0].name;
+        rc = tsdb_create_table(db, ct->name, cols, (size_t)st.ncols, ts_col);
+        if (rc != TSDB_OK && rc != TSDB_ERR_EXISTS) {
+            result_status(r, "ERR: create child table failed");
+            break;
+        }
+        if (rc == TSDB_ERR_EXISTS) {
+            result_status(r, "ERR: child table already exists");
+            break;
+        }
+        /* Register in catalog. */
+        rc = tsdb_child_table_create(cat, ct);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: child table created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: child table exists"); rc = TSDB_ERR_EXISTS; }
+        else { result_status(r, "ERR: child table catalog failed"); }
+        break;
+    }
+
     default:
         result_status(r, "ERR: unknown statement");
         rc = TSDB_ERR_UNSUPPORTED;

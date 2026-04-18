@@ -35,6 +35,7 @@
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
 #include "../catalog/device.h"
+#include "../catalog/stable.h"
 
 typedef enum {
     /* Literals */
@@ -168,6 +169,10 @@ typedef enum {
     QAST_STMT_CREATE_DEVICE,
     QAST_STMT_DROP_DEVICE,
     QAST_STMT_LIST_DEVICES,
+    /* STable DDL */
+    QAST_STMT_CREATE_STABLE,
+    QAST_STMT_DROP_STABLE,
+    QAST_STMT_CREATE_CHILD_TABLE,  /* CREATE TABLE name USING stable TAGS(...) */
 } qast_stmt_kind_t;
 
 typedef struct {
@@ -180,6 +185,10 @@ typedef struct {
         struct { tsdb_device_t spec; } create_device;    /* QAST_STMT_CREATE_DEVICE */
         struct { char group[64]; char id[128]; } drop_device;  /* QAST_STMT_DROP_DEVICE */
         struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
+        /* STable DDL */
+        struct { tsdb_stable_t spec; }       create_stable;       /* QAST_STMT_CREATE_STABLE */
+        struct { char name[64]; }            drop_stable;          /* QAST_STMT_DROP_STABLE */
+        struct { tsdb_child_table_t spec; }  create_child_table;   /* QAST_STMT_CREATE_CHILD_TABLE */
     } u;
 } qast_stmt_t;
 
