@@ -565,14 +565,27 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
         }
     }
 
+    /* Pull the ts-sorted permutation from the memtable's skip-list once.
+     * When inserts arrived in-order this is the identity permutation and
+     * the call is O(n); for out-of-order inserts it's a level-0 traversal
+     * that yields each row in ascending ts order.  Blocks emitted below
+     * inherit that order even when writes were out of sequence, which
+     * tightens per-block ts_min/ts_max zone maps. */
+    size_t *sorted_all = malloc(nrows * sizeof(size_t));
+    if (!sorted_all) { free(days); return TSDB_ERR_NOMEM; }
+    if (tsdb_memtable_sorted_indices(m, sorted_all) != TSDB_OK) {
+        for (size_t i = 0; i < nrows; i++) sorted_all[i] = i;
+    }
+
     for (int d = 0; d < ndays; d++) {
         int64_t bucket = days[d];
 
-        /* Collect row indices for this partition bucket. */
+        /* Collect row indices for this partition bucket, in ts order. */
         size_t *row_idx = malloc(nrows * sizeof(size_t));
-        if (!row_idx) { free(days); return TSDB_ERR_NOMEM; }
+        if (!row_idx) { free(sorted_all); free(days); return TSDB_ERR_NOMEM; }
         size_t day_nrows = 0;
-        for (size_t r = 0; r < nrows; r++) {
+        for (size_t k = 0; k < nrows; k++) {
+            size_t r = sorted_all[k];
             if (ts_part_index(ts_buf[r], part_unit) == bucket) row_idx[day_nrows++] = r;
         }
         if (day_nrows == 0) { free(row_idx); continue; }
@@ -586,18 +599,18 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
 
         char part_dir[4096];
         snprintf(part_dir, sizeof(part_dir), "%s/%s", s->dir, part_name);
-        if (tsdb_mkdir_p(part_dir) < 0) { free(row_idx); free(days); return TSDB_ERR_IO; }
+        if (tsdb_mkdir_p(part_dir) < 0) { free(row_idx); free(days); free(sorted_all); return TSDB_ERR_IO; }
 
         /* Write each column. */
         for (int ci = 0; ci < s->ncols; ci++) {
             tsdb_type_t   type  = s->cols[ci].type;
             size_t        width = tsdb_type_width(type);
             const uint8_t *col_buf = (const uint8_t *)tsdb_memtable_col(m, ci);
-            if (!col_buf) { free(row_idx); free(days); return TSDB_ERR_INTERNAL; }
+            if (!col_buf) { free(row_idx); free(days); free(sorted_all); return TSDB_ERR_INTERNAL; }
 
             col_writer_t w;
             int rc = col_writer_open(&w, part_dir, s->cols[ci].name);
-            if (rc != TSDB_OK) { free(row_idx); free(days); return rc; }
+            if (rc != TSDB_OK) { free(row_idx); free(days); free(sorted_all); return rc; }
 
             /* Wire up raw-block hook if available. */
             w.raw_block_fn    = raw_fn;
@@ -620,7 +633,7 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                 uint8_t *chunk_buf = malloc(chunk * width);
                 if (!chunk_buf) {
                     col_writer_close(&w);
-                    free(row_idx); free(days);
+                    free(row_idx); free(days); free(sorted_all);
                     return TSDB_ERR_NOMEM;
                 }
 
@@ -650,18 +663,19 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                 free(chunk_buf);
                 if (rc != TSDB_OK) {
                     col_writer_close(&w);
-                    free(row_idx); free(days);
+                    free(row_idx); free(days); free(sorted_all);
                     return rc;
                 }
                 base += chunk;
             }
 
             rc = col_writer_close(&w);
-            if (rc != TSDB_OK) { free(row_idx); free(days); return rc; }
+            if (rc != TSDB_OK) { free(row_idx); free(days); free(sorted_all); return rc; }
         }
         free(row_idx);
     }
     free(days);
+    free(sorted_all);
     return TSDB_OK;
 }
 

@@ -83,6 +83,26 @@ const void *tsdb_memtable_col(tsdb_memtable_t *m, int col);
  */
 int tsdb_memtable_extend_for_new_column(tsdb_memtable_t *m);
 
+/*
+ * Fill out_idx with the memtable's row positions in ascending ts-order.
+ * out_idx must have capacity for at least tsdb_memtable_rows(m) entries.
+ * Ties on ts are resolved stably by insertion order.
+ *
+ * When the skip-list is unavailable (e.g. allocation failed, or the
+ * memtable is a legacy variant), falls back to writing insertion order.
+ *
+ * Returns TSDB_OK on success or negative error on bad arguments.
+ */
+int tsdb_memtable_sorted_indices(tsdb_memtable_t *m, size_t *out_idx);
+
+/*
+ * Fast-path signal: returns non-zero if every insert since the last
+ * clear arrived in non-decreasing ts order.  Callers can skip the
+ * sorted_indices call entirely in that case and use the identity
+ * permutation.  Always returns 1 before the first row is inserted.
+ */
+int tsdb_memtable_is_sorted(tsdb_memtable_t *m);
+
 #ifdef __cplusplus
 }
 #endif
