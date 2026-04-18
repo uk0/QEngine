@@ -14,15 +14,30 @@
 #include <errno.h>
 #include <pthread.h>
 
-/* ---- CRC32C (software, 8-bytes-at-a-time Sarwate) ----------------------- */
+/* ---- CRC32C hardware dispatch ------------------------------------------- *
+ *
+ * Three implementations register at init time via pthread_once; the best
+ * one available at runtime is picked and stored in crc32c_step_fn:
+ *
+ *   1. x86 SSE4.2 — _mm_crc32_u64  (~15–20 GB/s)
+ *   2. ARMv8 CRC  — __crc32cd      (~15 GB/s on Apple Silicon / Neoverse)
+ *   3. Sarwate table, 8 bytes/step (~1.5 GB/s, C11 fallback)
+ *
+ * The `step` functions take a running CRC in its internal form (before the
+ * final XOR 0xFFFFFFFF) and return the updated running CRC.  Public
+ * tsdb_crc32c applies the XOR at the boundaries; tsdb_crc32c_update lets
+ * callers compose multiple chunks without paying twice.
+ *
+ * Castagnoli (iSCSI) reflected polynomial: 0x82F63B78.
+ * Test vector: tsdb_crc32c("123456789", 9) == 0xE3069283.
+ */
 
-/* Castagnoli (iSCSI) reflected polynomial. */
 #define CRC32C_POLY 0x82F63B78u
 
 static uint32_t crc32c_table[8][256];
 static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
 
-static void crc32c_init_table(void) {
+static void crc32c_build_table(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int k = 0; k < 8; k++)
@@ -38,13 +53,9 @@ static void crc32c_init_table(void) {
     }
 }
 
-uint32_t tsdb_crc32c(const void *data, size_t n) {
-    pthread_once(&crc32c_once, crc32c_init_table);
-
-    const uint8_t *p = (const uint8_t *)data;
-    uint32_t crc = 0xFFFFFFFFu;
-
-    /* Process 8 bytes at a time. */
+/* Scalar Sarwate step — always compiled as the lowest-common-denominator
+ * fallback.  Operates on the internal running CRC (pre-final-XOR). */
+static uint32_t crc32c_step_sw(uint32_t crc, const uint8_t *p, size_t n) {
     while (n >= 8) {
         uint32_t w0, w1;
         memcpy(&w0, p,     4);
@@ -62,11 +73,125 @@ uint32_t tsdb_crc32c(const void *data, size_t n) {
         p += 8;
         n -= 8;
     }
-    /* Remaining bytes. */
     while (n-- > 0)
         crc = crc32c_table[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
 
-    return crc ^ 0xFFFFFFFFu;
+#if defined(__x86_64__) || defined(__i386__)
+#  include <nmmintrin.h>        /* _mm_crc32_u64 / _mm_crc32_u8 */
+#  include <cpuid.h>
+
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_step_hw_x86(uint32_t crc, const uint8_t *p, size_t n) {
+#  if defined(__x86_64__)
+    while (n >= 8) {
+        uint64_t v;
+        memcpy(&v, p, 8);
+        crc = (uint32_t)_mm_crc32_u64((uint64_t)crc, v);
+        p += 8; n -= 8;
+    }
+#  endif
+    while (n >= 4) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        crc = _mm_crc32_u32(crc, v);
+        p += 4; n -= 4;
+    }
+    while (n-- > 0) crc = _mm_crc32_u8(crc, *p++);
+    return crc;
+}
+
+static int x86_has_sse42(void) {
+    unsigned eax, ebx, ecx, edx;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return 0;
+    return (ecx & (1u << 20)) != 0;   /* CPUID.1:ECX.SSE4_2 */
+}
+#endif  /* x86 */
+
+#if defined(__aarch64__)
+#  include <arm_acle.h>
+#  if defined(__linux__)
+#    include <sys/auxv.h>
+#    ifdef __has_include
+#      if __has_include(<asm/hwcap.h>)
+#        include <asm/hwcap.h>
+#      endif
+#    endif
+#  endif
+
+__attribute__((target("+crc")))
+static uint32_t crc32c_step_hw_arm(uint32_t crc, const uint8_t *p, size_t n) {
+    while (n >= 8) {
+        uint64_t v;
+        memcpy(&v, p, 8);
+        crc = __crc32cd(crc, v);
+        p += 8; n -= 8;
+    }
+    while (n >= 4) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        crc = __crc32cw(crc, v);
+        p += 4; n -= 4;
+    }
+    while (n-- > 0) crc = __crc32cb(crc, *p++);
+    return crc;
+}
+
+static int arm_has_crc(void) {
+#  if defined(__APPLE__)
+    return 1;   /* every arm64 Apple chip has CRC32 */
+#  elif defined(__linux__) && defined(HWCAP_CRC32)
+    return (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+#  else
+    return 0;
+#  endif
+}
+#endif  /* aarch64 */
+
+typedef uint32_t (*crc32c_step_fn_t)(uint32_t, const uint8_t *, size_t);
+static crc32c_step_fn_t crc32c_step_fn = NULL;
+static const char       *crc32c_impl_name = "sarwate";
+
+static void crc32c_init(void) {
+    crc32c_build_table();
+    crc32c_step_fn   = crc32c_step_sw;
+    crc32c_impl_name = "sarwate";
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (x86_has_sse42()) {
+        crc32c_step_fn   = crc32c_step_hw_x86;
+        crc32c_impl_name = "sse4.2";
+    }
+#elif defined(__aarch64__)
+    if (arm_has_crc()) {
+        crc32c_step_fn   = crc32c_step_hw_arm;
+        crc32c_impl_name = "armv8-crc";
+    }
+#endif
+}
+
+/* Incremental update — callers supply the running CRC in its finalised form
+ * (i.e. the value they would send on the wire).  Internally we convert to
+ * the pre-finalisation domain, step, then re-finalise. */
+uint32_t tsdb_crc32c_update(uint32_t crc, const void *data, size_t n) {
+    pthread_once(&crc32c_once, crc32c_init);
+    uint32_t running = crc ^ 0xFFFFFFFFu;
+    running = crc32c_step_fn(running, (const uint8_t *)data, n);
+    return running ^ 0xFFFFFFFFu;
+}
+
+uint32_t tsdb_crc32c(const void *data, size_t n) {
+    pthread_once(&crc32c_once, crc32c_init);
+    uint32_t running = 0xFFFFFFFFu;
+    running = crc32c_step_fn(running, (const uint8_t *)data, n);
+    return running ^ 0xFFFFFFFFu;
+}
+
+/* Diagnostic: returns "sse4.2" / "armv8-crc" / "sarwate". */
+const char *tsdb_crc32c_impl(void) {
+    pthread_once(&crc32c_once, crc32c_init);
+    return crc32c_impl_name;
 }
 
 /* ---- Header serialise / parse ------------------------------------------- */
@@ -196,20 +321,10 @@ int tsdb_proto_send(int fd, uint8_t type, uint16_t flags, uint64_t req_id,
     uint8_t raw_hdr[TSDB_PROTO_HDR_SIZE];
     tsdb_frame_write_hdr(&hdr, raw_hdr);
 
-    /* Compute CRC32C incrementally over header[4..24) + payload. */
-    pthread_once(&crc32c_once, crc32c_init_table);
-    uint32_t running = 0xFFFFFFFFu;
-    {
-        const uint8_t *hp = raw_hdr + 4;
-        for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
-            running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
-    }
-    if (payload && n > 0) {
-        const uint8_t *pp = (const uint8_t *)payload;
-        for (size_t i = 0; i < n; i++)
-            running = crc32c_table[0][(running ^ pp[i]) & 0xFF] ^ (running >> 8);
-    }
-    uint32_t crc = running ^ 0xFFFFFFFFu;
+    /* CRC32C over header[4..24) + payload, via hardware-dispatched step. */
+    uint32_t crc = 0;
+    crc = tsdb_crc32c_update(crc, raw_hdr + 4, TSDB_PROTO_HDR_SIZE - 4);
+    if (payload && n > 0) crc = tsdb_crc32c_update(crc, payload, n);
 
     uint8_t crc_bytes[4];
     crc_bytes[0] = (uint8_t)(crc);
@@ -260,17 +375,10 @@ int tsdb_proto_recv(int fd, tsdb_frame_hdr_t *hdr, uint8_t **out_payload) {
                         | ((uint32_t)crc_bytes[2] << 16)
                         | ((uint32_t)crc_bytes[3] << 24);
 
-    /* Compute expected CRC over header[4..24) + payload. */
-    pthread_once(&crc32c_once, crc32c_init_table);
-    uint32_t running = 0xFFFFFFFFu;
-    const uint8_t *hp = raw_hdr + 4;
-    for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
-        running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
-    if (payload && hdr->payload_len > 0) {
-        for (size_t i = 0; i < hdr->payload_len; i++)
-            running = crc32c_table[0][(running ^ payload[i]) & 0xFF] ^ (running >> 8);
-    }
-    uint32_t computed_crc = running ^ 0xFFFFFFFFu;
+    uint32_t computed_crc = 0;
+    computed_crc = tsdb_crc32c_update(computed_crc, raw_hdr + 4, TSDB_PROTO_HDR_SIZE - 4);
+    if (payload && hdr->payload_len > 0)
+        computed_crc = tsdb_crc32c_update(computed_crc, payload, hdr->payload_len);
 
     if (computed_crc != stored_crc) {
         free(payload);
@@ -330,17 +438,10 @@ int tsdb_proto_send_io(tsdb_io_t *io, uint8_t type, uint16_t flags,
     uint8_t raw_hdr[TSDB_PROTO_HDR_SIZE];
     tsdb_frame_write_hdr(&hdr, raw_hdr);
 
-    pthread_once(&crc32c_once, crc32c_init_table);
-    uint32_t running = 0xFFFFFFFFu;
-    const uint8_t *hp = raw_hdr + 4;
-    for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
-        running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
-    if (payload && n > 0) {
-        const uint8_t *pp = (const uint8_t *)payload;
-        for (size_t i = 0; i < n; i++)
-            running = crc32c_table[0][(running ^ pp[i]) & 0xFF] ^ (running >> 8);
-    }
-    uint32_t crc = running ^ 0xFFFFFFFFu;
+    uint32_t crc = 0;
+    crc = tsdb_crc32c_update(crc, raw_hdr + 4, TSDB_PROTO_HDR_SIZE - 4);
+    if (payload && n > 0) crc = tsdb_crc32c_update(crc, payload, n);
+
     uint8_t crc_bytes[4];
     crc_bytes[0]=(uint8_t)(crc);      crc_bytes[1]=(uint8_t)(crc>>8);
     crc_bytes[2]=(uint8_t)(crc>>16);  crc_bytes[3]=(uint8_t)(crc>>24);
@@ -389,16 +490,10 @@ int tsdb_proto_recv_io(tsdb_io_t *io, tsdb_frame_hdr_t *hdr,
                         | ((uint32_t)crc_bytes[2] << 16)
                         | ((uint32_t)crc_bytes[3] << 24);
 
-    pthread_once(&crc32c_once, crc32c_init_table);
-    uint32_t running = 0xFFFFFFFFu;
-    const uint8_t *hp = raw_hdr + 4;
-    for (size_t i = 0; i < (TSDB_PROTO_HDR_SIZE - 4); i++)
-        running = crc32c_table[0][(running ^ hp[i]) & 0xFF] ^ (running >> 8);
-    if (payload && hdr->payload_len > 0) {
-        for (size_t i = 0; i < hdr->payload_len; i++)
-            running = crc32c_table[0][(running ^ payload[i]) & 0xFF] ^ (running >> 8);
-    }
-    uint32_t computed_crc = running ^ 0xFFFFFFFFu;
+    uint32_t computed_crc = 0;
+    computed_crc = tsdb_crc32c_update(computed_crc, raw_hdr + 4, TSDB_PROTO_HDR_SIZE - 4);
+    if (payload && hdr->payload_len > 0)
+        computed_crc = tsdb_crc32c_update(computed_crc, payload, hdr->payload_len);
 
     if (computed_crc != stored_crc) {
         free(payload);

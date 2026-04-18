@@ -114,8 +114,17 @@ int  tsdb_frame_read_hdr(const uint8_t in[24], tsdb_frame_hdr_t *out);
 
 /* ---- CRC32C (Castagnoli / iSCSI polynomial) ------------------------------ */
 
-/* Software CRC32C over arbitrary bytes. */
+/* One-shot CRC32C over arbitrary bytes.  Dispatches at runtime to the best
+ * available implementation (SSE4.2 / ARMv8 CRC / Sarwate fallback). */
 uint32_t tsdb_crc32c(const void *data, size_t n);
+
+/* Incremental variant: feed multiple chunks, carrying the running CRC in
+ * its finalised wire form.  Start the chain with 0. */
+uint32_t tsdb_crc32c_update(uint32_t crc, const void *data, size_t n);
+
+/* Returns the name of the currently-selected CRC32C implementation.  One of
+ * "sse4.2", "armv8-crc", or "sarwate".  Intended for diagnostics. */
+const char *tsdb_crc32c_impl(void);
 
 /* ---- Frame I/O ----------------------------------------------------------- */
 
