@@ -23,12 +23,19 @@
 #include <errno.h>
 #include <pthread.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+
+/* Process start time — set on first tsdb_metrics_server_start call.
+ * Used by /health to report uptime in seconds. */
+static time_t g_start_epoch = 0;
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static void record_start(void) { g_start_epoch = time(NULL); }
 
 /* ---- Server struct -------------------------------------------------------- */
 
@@ -74,13 +81,16 @@ static void *handle_connection(void *arg) {
         return NULL;
     }
 
-    /* Parse first line: "GET /metrics HTTP/1.x" */
-    int is_metrics = 0;
-    if (strncmp(req, "GET /metrics", 12) == 0) {
-        is_metrics = 1;
-    }
+    /* Parse first line: "GET <path> HTTP/1.x". */
+    int route_metrics = 0;
+    int route_health  = 0;
+    int route_dash    = 0;
+    if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
+    else if (strncmp(req, "GET /health", 11) == 0)       route_health  = 1;
+    else if (strncmp(req, "GET / ", 6) == 0 ||
+             strncmp(req, "GET /index", 10) == 0)        route_dash    = 1;
 
-    if (is_metrics) {
+    if (route_metrics) {
         size_t body_len = 0;
         char *body = tsdb_metrics_render(&body_len);
         if (!body) {
@@ -90,7 +100,6 @@ static void *handle_connection(void *arg) {
                 "Connection: close\r\n\r\n";
             write_all(fd, err, strlen(err));
         } else {
-            /* Build response header. */
             char hdr[256];
             int hlen = snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 200 OK\r\n"
@@ -102,6 +111,97 @@ static void *handle_connection(void *arg) {
             write_all(fd, body, body_len);
             free(body);
         }
+    } else if (route_health) {
+        /* Minimal liveness payload — kept JSON-only so k8s / curl
+         * integrations parse it trivially.  Uptime is seconds since the
+         * first metrics_server_start call this process. */
+        time_t now = time(NULL);
+        long uptime = (long)(now - g_start_epoch);
+        if (uptime < 0) uptime = 0;
+        char body[256];
+        int blen = snprintf(body, sizeof(body),
+            "{\"status\":\"ok\",\"uptime_s\":%ld,\"pid\":%d}\n",
+            uptime, (int)getpid());
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)blen);
+    } else if (route_dash) {
+        /* Single-page HTML dashboard.  No external assets; fetches
+         * /health + /metrics from the same origin via XHR every 2 s
+         * and displays headline numbers. */
+        static const char DASH[] =
+"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+"<title>QEngine — health</title>"
+"<style>"
+"body{font:14px/1.4 -apple-system,system-ui,sans-serif;color:#222;background:#f6f7f9;margin:0;padding:24px}"
+"h1{font-size:18px;margin:0 0 16px;display:flex;align-items:center;gap:8px}"
+".badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;color:#fff;background:#22c55e}"
+".badge.bad{background:#ef4444}.badge.warn{background:#f59e0b}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}"
+".card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:14px}"
+".k{color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:.04em}"
+".v{font-size:22px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}"
+".sub{color:#6b7280;font-size:11px;margin-top:2px}"
+"footer{color:#6b7280;font-size:11px;margin-top:24px}"
+"</style></head><body>"
+"<h1>QEngine <span id=\"st\" class=\"badge\">loading</span></h1>"
+"<div class=\"grid\" id=\"g\"></div>"
+"<footer>polling /health + /metrics every 2 s  ·  refreshed <span id=\"t\">-</span></footer>"
+"<script>"
+"const cells=["
+"['uptime_s','Uptime','s'],"
+"['qengine_connections_active','Active connections',''],"
+"['qengine_queries_total','Queries total',''],"
+"['qengine_rows_written_total','Rows written',''],"
+"['qengine_bytes_written_total','Bytes written','B'],"
+"['qengine_query_errors_total','Query errors',''],"
+"['qengine_flushes_total','Flushes',''],"
+"['qengine_bloom_skips_total','Bloom skips',''],"
+"['qengine_auth_denied_total','Auth denied',''],"
+"['qengine_auth_logins_total','Auth logins','']"
+"];"
+"function fmt(v,u){if(v>=1e9)return (v/1e9).toFixed(1)+'G'+u;"
+"if(v>=1e6)return (v/1e6).toFixed(1)+'M'+u;if(v>=1e3)return (v/1e3).toFixed(1)+'k'+u;"
+"return v+u;}"
+"async function tick(){try{"
+" const h=await (await fetch('/health')).json();"
+" document.getElementById('st').textContent='ok';"
+" document.getElementById('st').className='badge';"
+" const r=await (await fetch('/metrics')).text();"
+" const m={};r.split('\\n').forEach(l=>{"
+"  if(l.startsWith('#'))return;const p=l.indexOf(' ');"
+"  if(p<0)return;const k=l.substring(0,p);const v=parseFloat(l.substring(p+1));"
+"  if(!Number.isNaN(v))m[k]=v;});"
+" m.uptime_s=h.uptime_s;"
+" document.getElementById('g').innerHTML=cells.map(c=>{"
+"  const v=m[c[0]]??0;"
+"  return `<div class=card><div class=k>${c[1]}</div><div class=v>${fmt(v,c[2])}</div><div class=sub>${c[0]}</div></div>`;"
+" }).join('');"
+" document.getElementById('t').textContent=new Date().toLocaleTimeString();"
+"}catch(e){"
+" document.getElementById('st').textContent='unreachable';"
+" document.getElementById('st').className='badge bad';"
+"}}"
+"tick();setInterval(tick,2000);"
+"</script></body></html>";
+        size_t body_len = sizeof(DASH) - 1;
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            body_len);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, DASH, body_len);
     } else {
         const char *not_found =
             "HTTP/1.1 404 Not Found\r\n"
@@ -165,6 +265,8 @@ static int parse_bind(const char *addr, char *host_out, size_t hcap, int *port_o
 int tsdb_metrics_server_start(const char *bind_addr, tsdb_metrics_server_t **out) {
     *out = NULL;
     if (!bind_addr || bind_addr[0] == '\0') return 0; /* disabled */
+
+    pthread_once(&g_once, record_start);
 
     char host[128];
     int  port;
