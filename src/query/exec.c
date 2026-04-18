@@ -10,6 +10,8 @@
 #include "../storage/part.h"
 #include "../core/arena.h"
 #include "../core/symbol.h"
+#include "../core/bits.h"
+#include "../compress/codec.h"
 #include "../exec/agg.h"
 #include "../exec/tdigest.h"
 #include "../exec/filter.h"
@@ -59,6 +61,69 @@ void tsdb_set_query_pool_size(int n) {
 }
 
 /* struct tsdb_result is defined in result_internal.h (shared with federation). */
+
+/* Forward declaration: scan_src_t is used in bloom_can_skip_block before
+ * its full definition.  Full typedef appears in the Scan state section below. */
+typedef struct scan_src scan_src_t;
+
+/* ---- Bloom filter block-skip statistics --------------------------------- */
+
+/* Counts blocks skipped by Bloom filter in the most recent query.
+ * Reset to 0 at the start of each serial SELECT scan.
+ * Thread-local per-query; works correctly for single-threaded serial path. */
+static uint64_t g_bloom_blocks_skipped = 0;
+static uint64_t g_bloom_blocks_total   = 0;
+
+/* Test-visible accessor. */
+uint64_t tsdb_bloom_stats_skipped(void) { return g_bloom_blocks_skipped; }
+uint64_t tsdb_bloom_stats_total(void)   { return g_bloom_blocks_total; }
+
+/* ---- Bloom pre-filter: extract AND-connected SYMBOL EQ predicates -------
+ *
+ * Walk WHERE through AND nodes only (stop at OR/NOT — conservative).
+ * For each EQ node with a SYMBOL column LHS and string constant RHS,
+ * record (col_idx, code). Returns the number of constraints collected.
+ * A bloom miss on ANY one of them means the block is skippable.
+ */
+typedef struct {
+    int      col;   /* schema column index */
+    uint32_t code;  /* symbol code */
+} bloom_constraint_t;
+
+#define BLOOM_CONSTRAINT_MAX 8
+
+static int extract_bloom_constraints(qast_expr_t *e, tsdb_schema_t *s,
+                                      bloom_constraint_t *out, int cap)
+{
+    if (!e || cap <= 0) return 0;
+    /* AND: recurse both sides */
+    if (e->kind == QAST_AND) {
+        int n = extract_bloom_constraints(e->lhs, s, out, cap);
+        n += extract_bloom_constraints(e->rhs, s, out + n, cap - n);
+        return n;
+    }
+    /* Only process EQ */
+    if (e->kind != QAST_EQ) return 0;
+    if (!e->lhs || !e->rhs) return 0;
+    if (e->lhs->kind != QAST_IDENT) return 0;
+    int col = tsdb_schema_col_idx(s, e->lhs->v.s);
+    if (col < 0) return 0;
+    if (s->cols[col].type != TSDB_TYPE_SYMBOL) return 0;
+    if (e->rhs->kind != QAST_LIT_STR) return 0;
+    /* Look up the code (may not exist yet if symbol was never seen). */
+    uint32_t code = tsdb_symtab_lookup(s->cols[col].symtab, e->rhs->v.s);
+    if (code == TSDB_SYMBOL_INVALID) {
+        /* Symbol doesn't exist at all — mark with a sentinel (we still record
+         * it; any bloom will miss bit 0 of code=UINT32_MAX which we handle). */
+        /* Actually: mark col = -1 so the caller knows "skip everything". */
+        out[0].col  = -1;   /* sentinel: symbol not in table, skip all blocks */
+        out[0].code = 0;
+        return 1;
+    }
+    out[0].col  = col;
+    out[0].code = code;
+    return 1;
+}
 
 /* Forward declarations */
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -120,14 +185,60 @@ static int result_set_col(tsdb_result_t *r, int i, const char *name, tsdb_type_t
 
 /* ---- Scan state: list of blocks to read -------------------------------- */
 
-typedef struct {
+struct scan_src {
     /* Per source: either a memtable or a (part, block-index) */
     tsdb_memtable_t  *mem;             /* NULL if from disk */
     tsdb_part_t      *part;            /* NULL if from memtable */
     tsdb_block_meta_t meta;            /* only valid when part != NULL */
     size_t            row_count;       /* rows in this source segment */
     int64_t           ts_min, ts_max;
-} scan_src_t;
+};
+/* typedef scan_src_t was forward-declared above bloom_can_skip_block */
+
+/*
+ * Check whether a block can be skipped using Bloom filter constraints.
+ *
+ * For each AND-connected SYMBOL EQ constraint:
+ *   - Find the SYMBOL column's block at (ts_min, count) — same block index.
+ *   - If TSDB_BF_HAS_BLOOM set and bloom_test returns 0 → definitely skip.
+ *
+ * Returns 1 if the block can be skipped; 0 otherwise.
+ */
+static int bloom_can_skip_block(tsdb_part_t *part, tsdb_schema_t *s,
+                                 const scan_src_t *src,
+                                 const bloom_constraint_t *bc, int nbc)
+{
+    if (nbc == 0) return 0;
+
+    for (int i = 0; i < nbc; i++) {
+        int col = bc[i].col;
+        if (col < 0) {
+            /* Sentinel: symbol doesn't exist in the table at all. */
+            return 1;
+        }
+        /* Find this column's block metadata matching current source block. */
+        tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+        int rc = tsdb_part_col_blocks(part, col, &metas, &nb);
+        if (rc != TSDB_OK || !metas) continue;
+
+        tsdb_block_meta_t *hit = NULL;
+        for (size_t b = 0; b < nb; b++) {
+            if (metas[b].ts_min == src->meta.ts_min &&
+                metas[b].count  == src->meta.count) {
+                hit = &metas[b]; break;
+            }
+        }
+        int can_skip = 0;
+        if (hit && (hit->flags & TSDB_BF_HAS_BLOOM)) {
+            if (!tsdb_bloom_test(hit->bloom, bc[i].code)) {
+                can_skip = 1;
+            }
+        }
+        free(metas);
+        if (can_skip) return 1;
+    }
+    return 0;
+}
 
 typedef struct {
     scan_src_t *srcs;
@@ -1691,17 +1802,27 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                              ? &plan_ts_prune : NULL);
     if (rc != TSDB_OK) { free(projs); return rc; }
 
-    /* Special case: SAMPLE BY + has_agg: handle bucket-grouped aggregation. */
-    /* For MVP, we don't implement bucket output here; fallback to row-per-bucket
-     * via an in-memory bucket map if SAMPLE BY + aggregate; otherwise simple scan. */
+    /* Special case: SAMPLE BY + has_agg: handle bucket-grouped aggregation.
+     * Streaming emit: bucket state is flushed to result immediately when a new
+     * bucket boundary is crossed. Only one bkt_state_t is live at any time.
+     * Cross-source merging is correct because cur_state persists across the
+     * outer source loop — a bucket that straddles two scan sources is merged
+     * before emission.
+     */
 
     int has_sample = q->has_sample_by;
 
-    /* Bucket output state: only used when has_sample && has_agg */
+    /* Single bucket accumulator for streaming SAMPLE BY. */
     typedef struct { int64_t bucket; double sum_f; int64_t sum_i; double min_f, max_f;
                      int64_t min_i, max_i; uint64_t count; } bkt_state_t;
-    bkt_state_t *bkts = NULL; size_t nbkt = 0, bkt_cap = 0;
-    int64_t cur_bucket = INT64_MIN;
+
+    /* cur_state holds the bucket currently being aggregated.
+     * cur_bucket == INT64_MIN means no bucket has been opened yet. */
+    bkt_state_t cur_state;
+    memset(&cur_state, 0, sizeof(cur_state));
+    cur_state.min_f = INFINITY;  cur_state.max_f = -INFINITY;
+    cur_state.min_i = INT64_MAX; cur_state.max_i = INT64_MIN;
+    int64_t cur_bucket = INT64_MIN;  /* sentinel: no active bucket */
 
     size_t rows_emitted = 0;
     size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
@@ -1896,6 +2017,18 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     ts_range_init(&ts_r);
     if (q->where) extract_ts_bounds(q->where, s, &ts_r);
 
+    /* Extract AND-connected SYMBOL EQ constraints for Bloom pre-filter. */
+    bloom_constraint_t bloom_bc[BLOOM_CONSTRAINT_MAX];
+    int bloom_nbc = 0;
+    if (q->where) {
+        bloom_nbc = extract_bloom_constraints(q->where, s,
+                                               bloom_bc, BLOOM_CONSTRAINT_MAX);
+    }
+
+    /* Reset bloom stats for this query. */
+    g_bloom_blocks_skipped = 0;
+    g_bloom_blocks_total   = 0;
+
     /* SIMD gather scratch (64 KB), reused across blocks for the serial path. */
     if (has_agg) {
         serial_agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
@@ -1911,6 +2044,16 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if ((ts_r.has_lo || ts_r.has_hi) &&
             ts_range_excludes(&ts_r, src->ts_min, src->ts_max))
             continue;
+
+        /* Bloom filter pre-check: skip block if SYMBOL is provably absent.
+         * Only applies to disk blocks (memtable has no bloom). */
+        if (bloom_nbc > 0 && src->part) {
+            g_bloom_blocks_total++;
+            if (bloom_can_skip_block(src->part, s, src, bloom_bc, bloom_nbc)) {
+                g_bloom_blocks_skipped++;
+                continue;
+            }
+        }
 
         /* Allocate per-column decode buffers for this source. */
         void **bufs = calloc((size_t)s->ncols, sizeof(void *));
@@ -2010,52 +2153,109 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                     agg_update(&projs[pi], s, bufs, n, bm, serial_agg_scratch);
             }
         } else if (has_agg && has_sample) {
-            /* Bucket aggregation over the ts column (int64). */
+            /* Streaming bucket aggregation: emit each bucket as soon as we
+             * observe a new bucket boundary.  cur_state persists across source
+             * boundaries so that a bucket spanning two scan sources is merged
+             * correctly — no double-emit, no lost rows. */
             const int64_t *tscol = (const int64_t *)bufs[s->ts_col_idx];
             int64_t bnum = q->sample_by.ns;
             if (bnum <= 0) bnum = 1;
             for (size_t i = 0; i < n; i++) {
                 if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
                 int64_t b = tscol[i] - (tscol[i] % bnum);
+
                 if (b != cur_bucket) {
-                    /* flush prior bucket to result */
-                    if (nbkt > 0 && bkts[nbkt - 1].count > 0) {
-                        /* already in bkts, nothing to do */
+                    /* Emit the completed bucket that just closed. */
+                    if (cur_bucket != INT64_MIN && cur_state.count > 0) {
+                        rc = result_reserve_rows(r, r->nrows + 1);
+                        if (rc != TSDB_OK) {
+                            free(bm);
+                            for (int c = 0; c < s->ncols; c++)
+                                if (!src->mem && bufs[c]) free(bufs[c]);
+                            free(bufs); free(syms); goto done;
+                        }
+                        for (int pi = 0; pi < nprojs; pi++) {
+                            proj_t *p = &projs[pi];
+                            if (p->kind == PROJ_TS_BUCKET) {
+                                uint64_t bits; memcpy(&bits, &cur_state.bucket, 8);
+                                result_append_cell(r, pi, bits);
+                            } else if (p->kind == PROJ_AGG_SUM) {
+                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                           ? cur_state.sum_f : (double)cur_state.sum_i;
+                                uint64_t bits; memcpy(&bits, &v, 8);
+                                result_append_cell(r, pi, bits);
+                            } else if (p->kind == PROJ_AGG_AVG) {
+                                double v = 0;
+                                if (cur_state.count > 0) {
+                                    v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                        ? (cur_state.sum_f / (double)cur_state.count)
+                                        : ((double)cur_state.sum_i / (double)cur_state.count);
+                                }
+                                uint64_t bits; memcpy(&bits, &v, 8);
+                                result_append_cell(r, pi, bits);
+                            } else if (p->kind == PROJ_AGG_MIN) {
+                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                           ? cur_state.min_f : (double)cur_state.min_i;
+                                uint64_t bits; memcpy(&bits, &v, 8);
+                                result_append_cell(r, pi, bits);
+                            } else if (p->kind == PROJ_AGG_MAX) {
+                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
+                                           ? cur_state.max_f : (double)cur_state.max_i;
+                                uint64_t bits; memcpy(&bits, &v, 8);
+                                result_append_cell(r, pi, bits);
+                            } else if (p->kind == PROJ_AGG_COUNT) {
+                                int64_t v = (int64_t)cur_state.count;
+                                uint64_t bits; memcpy(&bits, &v, 8);
+                                result_append_cell(r, pi, bits);
+                            } else {
+                                /* PROJ_COL not supported in bucket mode */
+                                result_append_cell(r, pi, 0);
+                            }
+                        }
+                        r->nrows++;
+                        rows_emitted++;
+                        /* LIMIT pushdown: stop scanning further rows if limit hit */
+                        if (q->has_limit && rows_emitted >= limit) break;
                     }
-                    /* start new bucket row */
-                    if (nbkt >= bkt_cap) {
-                        bkt_cap = bkt_cap ? bkt_cap * 2 : 64;
-                        bkts = realloc(bkts, bkt_cap * sizeof(bkt_state_t));
-                    }
-                    memset(&bkts[nbkt], 0, sizeof(bkt_state_t));
-                    bkts[nbkt].min_f =  INFINITY;
-                    bkts[nbkt].max_f = -INFINITY;
-                    bkts[nbkt].min_i = INT64_MAX;
-                    bkts[nbkt].max_i = INT64_MIN;
-                    bkts[nbkt].bucket = b;
-                    nbkt++;
+
+                    /* Open fresh bucket state for b. */
+                    memset(&cur_state, 0, sizeof(cur_state));
+                    cur_state.min_f =  INFINITY;
+                    cur_state.max_f = -INFINITY;
+                    cur_state.min_i = INT64_MAX;
+                    cur_state.max_i = INT64_MIN;
+                    cur_state.bucket = b;
                     cur_bucket = b;
                 }
-                /* Update this bucket with each projection that needs it */
+
+                /* Accumulate row into current bucket. */
                 for (int pi = 0; pi < nprojs; pi++) {
                     if (projs[pi].kind < PROJ_AGG_FIRST || projs[pi].kind > PROJ_AGG_COUNT) continue;
                     int col = projs[pi].col;
-                    if (projs[pi].kind == PROJ_AGG_COUNT) { bkts[nbkt - 1].count++; continue; }
+                    if (projs[pi].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; }
                     if (col < 0) continue;
                     tsdb_type_t ct = s->cols[col].type;
                     if (ct == TSDB_TYPE_FLOAT64) {
                         double x = ((const double *)bufs[col])[i];
-                        bkts[nbkt - 1].sum_f += x;
-                        if (x < bkts[nbkt - 1].min_f) bkts[nbkt - 1].min_f = x;
-                        if (x > bkts[nbkt - 1].max_f) bkts[nbkt - 1].max_f = x;
+                        cur_state.sum_f += x;
+                        if (x < cur_state.min_f) cur_state.min_f = x;
+                        if (x > cur_state.max_f) cur_state.max_f = x;
                     } else {
                         int64_t x = ((const int64_t *)bufs[col])[i];
-                        bkts[nbkt - 1].sum_i += x;
-                        if (x < bkts[nbkt - 1].min_i) bkts[nbkt - 1].min_i = x;
-                        if (x > bkts[nbkt - 1].max_i) bkts[nbkt - 1].max_i = x;
+                        cur_state.sum_i += x;
+                        if (x < cur_state.min_i) cur_state.min_i = x;
+                        if (x > cur_state.max_i) cur_state.max_i = x;
                     }
-                    bkts[nbkt - 1].count++;
+                    cur_state.count++;
                 }
+            }
+            /* Early-exit the source loop if LIMIT already satisfied */
+            if (q->has_limit && rows_emitted >= limit) {
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (!src->mem && bufs[c]) free(bufs[c]);
+                free(bufs); free(syms);
+                goto post_scan;
             }
         } else {
             /* Simple row projection. */
@@ -2092,7 +2292,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         free(bufs); free(syms);
     }
 
-    /* Write aggregates or bucket output. */
+post_scan:
+    /* Write aggregates or final bucket flush. */
     if (has_agg && !has_sample) {
         rc = result_reserve_rows(r, 1);
         if (rc != TSDB_OK) goto done;
@@ -2100,44 +2301,47 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         r->nrows = 1;
         /* tdigests freed by the done: path */
     } else if (has_agg && has_sample) {
-        rc = result_reserve_rows(r, nbkt);
-        if (rc != TSDB_OK) { free(bkts); goto done; }
-        for (size_t bi = 0; bi < nbkt && r->nrows < limit; bi++) {
+        /* Flush the last (still-open) bucket, if any rows were seen and
+         * the LIMIT has not already been reached. */
+        if (cur_bucket != INT64_MIN && cur_state.count > 0 &&
+            !(q->has_limit && rows_emitted >= limit)) {
+            rc = result_reserve_rows(r, r->nrows + 1);
+            if (rc != TSDB_OK) goto done;
             for (int pi = 0; pi < nprojs; pi++) {
                 proj_t *p = &projs[pi];
                 if (p->kind == PROJ_TS_BUCKET) {
-                    uint64_t bits; memcpy(&bits, &bkts[bi].bucket, 8);
+                    uint64_t bits; memcpy(&bits, &cur_state.bucket, 8);
                     result_append_cell(r, pi, bits);
                 } else if (p->kind == PROJ_AGG_SUM) {
                     double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? bkts[bi].sum_f : (double)bkts[bi].sum_i;
+                               ? cur_state.sum_f : (double)cur_state.sum_i;
                     uint64_t bits; memcpy(&bits, &v, 8);
                     result_append_cell(r, pi, bits);
                 } else if (p->kind == PROJ_AGG_AVG) {
                     double v = 0;
-                    if (bkts[bi].count > 0) {
+                    if (cur_state.count > 0) {
                         v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                            ? (bkts[bi].sum_f / bkts[bi].count)
-                            : ((double)bkts[bi].sum_i / bkts[bi].count);
+                            ? (cur_state.sum_f / (double)cur_state.count)
+                            : ((double)cur_state.sum_i / (double)cur_state.count);
                     }
                     uint64_t bits; memcpy(&bits, &v, 8);
                     result_append_cell(r, pi, bits);
                 } else if (p->kind == PROJ_AGG_MIN) {
                     double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? bkts[bi].min_f : (double)bkts[bi].min_i;
+                               ? cur_state.min_f : (double)cur_state.min_i;
                     uint64_t bits; memcpy(&bits, &v, 8);
                     result_append_cell(r, pi, bits);
                 } else if (p->kind == PROJ_AGG_MAX) {
                     double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? bkts[bi].max_f : (double)bkts[bi].max_i;
+                               ? cur_state.max_f : (double)cur_state.max_i;
                     uint64_t bits; memcpy(&bits, &v, 8);
                     result_append_cell(r, pi, bits);
                 } else if (p->kind == PROJ_AGG_COUNT) {
-                    int64_t v = (int64_t)bkts[bi].count;
+                    int64_t v = (int64_t)cur_state.count;
                     uint64_t bits; memcpy(&bits, &v, 8);
                     result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_COL) {
-                    /* Not supported in bucket mode, write 0 */
+                } else {
+                    /* PROJ_COL not supported in bucket mode */
                     result_append_cell(r, pi, 0);
                 }
             }
@@ -2152,7 +2356,6 @@ done:
         for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
         free(projs);
     }
-    free(bkts);
     scan_plan_free(&plan);
     return rc;
 }
