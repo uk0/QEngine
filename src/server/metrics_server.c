@@ -14,6 +14,7 @@
 
 #include "metrics_server.h"
 #include "metrics.h"
+#include "../cluster/disk_weight.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,56 @@
 static time_t g_start_epoch = 0;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void record_start(void) { g_start_epoch = time(NULL); }
+
+/* /cluster provider registry (see header).  Atomic-store via pointer
+ * writes, which are word-sized on every platform we target. */
+static tsdb_cluster_json_fn g_cluster_fn  = NULL;
+static void                *g_cluster_ud  = NULL;
+static char                 g_data_dir[4096] = {0};
+
+void tsdb_metrics_server_set_cluster_provider(tsdb_cluster_json_fn fn,
+                                               void *userdata) {
+    g_cluster_ud = userdata;
+    g_cluster_fn = fn;
+}
+
+void tsdb_metrics_server_set_data_dir(const char *path) {
+    if (!path) { g_data_dir[0] = '\0'; return; }
+    snprintf(g_data_dir, sizeof(g_data_dir), "%s", path);
+}
+
+/* Build the default synthetic /cluster JSON used when no provider is
+ * registered.  Reports the single local node with disk capacity. */
+static int build_standalone_cluster_json(char *buf, size_t cap) {
+    long uptime = (long)(time(NULL) - g_start_epoch);
+    if (uptime < 0) uptime = 0;
+    uint64_t total = 0, free_b = 0;
+    int vn = 0;
+    if (g_data_dir[0]) {
+        vn = tsdb_disk_weight_detail(g_data_dir,
+                                      TSDB_DISK_WEIGHT_DEFAULT_PER_TB,
+                                      &total, &free_b);
+    }
+    char host[128] = "self";
+    gethostname(host, sizeof(host) - 1);
+    host[sizeof(host) - 1] = '\0';
+    return snprintf(buf, cap,
+        "{\"mode\":\"standalone\","
+        "\"local_id\":0,"
+        "\"nodes\":[{"
+            "\"id\":0,"
+            "\"addr\":\"%s\","
+            "\"state\":\"ALIVE\","
+            "\"ver\":0,"
+            "\"uptime_s\":%ld,"
+            "\"pid\":%d,"
+            "\"disk\":{\"total_bytes\":%llu,\"free_bytes\":%llu,"
+                      "\"data_dir\":\"%s\",\"vn_weight\":%d}"
+        "}]}\n",
+        host, uptime, (int)getpid(),
+        (unsigned long long)total, (unsigned long long)free_b,
+        g_data_dir, vn);
+}
 
 /* ---- Server struct -------------------------------------------------------- */
 
@@ -85,8 +136,10 @@ static void *handle_connection(void *arg) {
     int route_metrics = 0;
     int route_health  = 0;
     int route_dash    = 0;
+    int route_cluster = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /health", 11) == 0)       route_health  = 1;
+    else if (strncmp(req, "GET /cluster", 12) == 0)      route_cluster = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
              strncmp(req, "GET /index", 10) == 0)        route_dash    = 1;
 
@@ -111,6 +164,25 @@ static void *handle_connection(void *arg) {
             write_all(fd, body, body_len);
             free(body);
         }
+    } else if (route_cluster) {
+        /* Cluster topology.  If the cluster module has registered a
+         * provider we defer to it (full member list + autobalance);
+         * otherwise we synthesise a single-node JSON so the dashboard
+         * has something consistent to render. */
+        char body[8192];
+        int blen = 0;
+        if (g_cluster_fn) blen = g_cluster_fn(g_cluster_ud, body, sizeof(body));
+        if (blen <= 0)    blen = build_standalone_cluster_json(body, sizeof(body));
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)blen);
     } else if (route_health) {
         /* Minimal liveness payload — kept JSON-only so k8s / curl
          * integrations parse it trivially.  Uptime is seconds since the
@@ -170,6 +242,14 @@ static void *handle_connection(void *arg) {
 ".idtbl{width:100%;font-size:12px;border-collapse:collapse}"
 ".idtbl td{padding:4px 0;color:var(--mu)}"
 ".idtbl td.val{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right}"
+".idtbl thead td{color:var(--mu);font-size:10px;text-transform:uppercase;"
+"letter-spacing:.05em;font-weight:600}"
+".idtbl tbody td{padding:4px 8px;border-top:1px solid var(--bd)}"
+".pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:10px;font-weight:500}"
+".pill.alive{background:#dcfce7;color:#166534}"
+".pill.suspect{background:#fef3c7;color:#92400e}"
+".pill.dead{background:#fee2e2;color:#991b1b}"
+".pill.joining{background:#dbeafe;color:#1e40af}"
 ".log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;"
 "max-height:240px;overflow:auto}"
 ".log .row{display:flex;gap:8px;padding:4px 0;border-bottom:1px dotted var(--bd)}"
@@ -206,6 +286,14 @@ static void *handle_connection(void *arg) {
 
 "<section><div class=secttl>Counters</div>"
 "<div class=\"grid cards\" id=g></div></section>"
+
+"<section><div class=secttl>Cluster topology</div>"
+"<div class=card>"
+"<div class=sub id=cmode style=\"margin-bottom:6px\">-</div>"
+"<table class=idtbl id=ctbl><thead>"
+"<tr><td>id</td><td>addr</td><td>state</td><td>disk</td><td>vn-weight</td>"
+"<td class=val>uptime</td></tr></thead>"
+"<tbody id=cbody></tbody></table></div></section>"
 
 "<section><div class=secttl>Events (last 50)</div>"
 "<div class=card><div class=log id=log></div></div></section>"
@@ -299,7 +387,30 @@ static void *handle_connection(void *arg) {
 "}catch(e){"
 " document.getElementById('st').textContent='unreachable';"
 " document.getElementById('st').className='badge bad';}}"
+"function fmtBytes(b){if(!b)return '-';"
+"const u=['B','K','M','G','T','P'];let i=0,v=b;"
+"while(v>=1024&&i<u.length-1){v/=1024;i++;}"
+"return (Math.round(v*10)/10)+u[i];}"
+"async function tickCluster(){try{"
+" const c=await (await fetch('/cluster')).json();"
+" document.getElementById('cmode').textContent="
+"   'mode: '+(c.mode||'cluster')+'   ·   local_id: '+(c.local_id||0)"
+"   +(c.autobalance?('   ·   ema_writes_sec: '+c.autobalance.ema_writes_sec):'');"
+" const rows=(c.nodes||[]).map(n=>{"
+"  const s=(n.state||'ALIVE').toLowerCase();"
+"  const d=n.disk||{};"
+"  const cap=d.total_bytes?(fmtBytes(d.free_bytes||0)+' / '+fmtBytes(d.total_bytes)):'-';"
+"  const up=n.uptime_s?fmtSec(n.uptime_s):'-';"
+"  return `<tr><td>${n.id}</td><td>${n.addr||'-'}</td>"
+"<td><span class=\"pill ${s}\">${(n.state||'ALIVE')}</span></td>"
+"<td>${cap}</td><td>${d.vn_weight||n.weight||'-'}</td>"
+"<td class=val>${up}</td></tr>`;}).join('');"
+" document.getElementById('cbody').innerHTML=rows||'<tr><td colspan=6>no nodes</td></tr>';"
+"}catch(e){"
+" document.getElementById('cbody').innerHTML="
+"   '<tr><td colspan=6 class=sub>/cluster unreachable: '+e.message+'</td></tr>';}}"
 "tick();setInterval(tick,2000);"
+"tickCluster();setInterval(tickCluster,5000);"
 "</script></body></html>";
         size_t body_len = sizeof(DASH) - 1;
         char hdr[256];

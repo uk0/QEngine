@@ -212,6 +212,10 @@ int main(int argc, char **argv) {
     /* Start Prometheus metrics HTTP endpoint if configured. */
     tsdb_metrics_server_t *ms = NULL;
     if (cfg.metrics_bind[0]) {
+        /* Tell the metrics endpoint about the data dir so /cluster's
+         * standalone fallback can report disk capacity + auto-derived
+         * weighted-hashring vn count. */
+        tsdb_metrics_server_set_data_dir(cfg.data_dir);
         rc = tsdb_metrics_server_start(cfg.metrics_bind, &ms);
         if (rc != 0) {
             TSDB_LOG_ERROR("main", "metrics server start(%s) failed", cfg.metrics_bind);

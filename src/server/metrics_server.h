@@ -35,6 +35,26 @@ void tsdb_metrics_server_stop(tsdb_metrics_server_t *ms);
 /* Actual bound port (useful when port was 0). */
 int  tsdb_metrics_server_port(const tsdb_metrics_server_t *ms);
 
+/* ---- /cluster provider hook --------------------------------------------- *
+ * By default GET /cluster returns a synthetic single-node JSON so a plain
+ * tsdb-server still reports sensible topology data.  Cluster-aware code
+ * (src/cluster/node.c, tsdb_node_main.c) can install a provider that
+ * returns the true membership + autobalance snapshot.
+ *
+ * Provider signature:
+ *   len = fn(userdata, buf, cap);
+ * must write a NUL-unterminated JSON body into buf[0..cap-1] and return
+ * the number of bytes written (0 on failure).
+ */
+typedef int (*tsdb_cluster_json_fn)(void *userdata, char *buf, size_t cap);
+
+void tsdb_metrics_server_set_cluster_provider(tsdb_cluster_json_fn fn,
+                                               void *userdata);
+
+/* Optional data directory override used by the default /cluster response
+ * (so it can report total_bytes / free_bytes from statvfs). */
+void tsdb_metrics_server_set_data_dir(const char *path);
+
 #ifdef __cplusplus
 }
 #endif
