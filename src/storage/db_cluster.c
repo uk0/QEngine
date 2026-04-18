@@ -191,9 +191,30 @@ static int cluster_on_raw_block(void *ud, tsdb_db_t *db,
                                    meta, block_bytes, block_bytes_len, 2);
 }
 
-/* ---- Node ID generation -------------------------------------------------- */
+/* ---- Node ID generation -------------------------------------------------- *
+ *
+ * Persist the id to <data_dir>/node_id.  Same data_dir (same container
+ * volume, same physical host) keeps the same id across restarts, so
+ * peer gossip state doesn't accumulate a trail of ghost DEAD entries
+ * every time a node is recreated.  First boot generates a fresh id
+ * seeded by bind address + current time; subsequent boots read the file.
+ */
+static tsdb_node_id_t generate_node_id(const char *data_dir, const char *addr) {
+    char path[4096];
+    if (data_dir) {
+        snprintf(path, sizeof(path), "%s/node_id", data_dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            uint64_t v = 0;
+            if (fscanf(f, "%llu", (unsigned long long *)&v) == 1 && v != 0) {
+                fclose(f);
+                return (tsdb_node_id_t)v;
+            }
+            fclose(f);
+        }
+    }
 
-static tsdb_node_id_t generate_node_id(const char *addr) {
+    /* Fresh id — FNV-1a of (addr || time_ns). */
     uint64_t h = 14695981039346656037ULL;
     if (addr) {
         for (const char *p = addr; *p; p++) {
@@ -206,7 +227,23 @@ static tsdb_node_id_t generate_node_id(const char *addr) {
     uint64_t t = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
     h ^= t;
     h *= 1099511628211ULL;
-    return h ? h : 1ULL;
+    if (h == 0) h = 1ULL;
+
+    /* Persist it atomically: write to tmp + rename.  Best-effort — if
+     * the write fails we just return the id and next restart will
+     * generate a fresh one (degrading gracefully to the old behaviour). */
+    if (data_dir) {
+        char tmp[4096];
+        snprintf(tmp, sizeof(tmp), "%s/node_id.tmp", data_dir);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            fprintf(f, "%llu\n", (unsigned long long)h);
+            fflush(f);
+            fclose(f);
+            (void)rename(tmp, path);
+        }
+    }
+    return h;
 }
 
 /* ---- Public cluster API -------------------------------------------------- */
@@ -241,7 +278,7 @@ int tsdb_open_cluster(const char *data_dir,
         snprintf(gossip_addr, sizeof(gossip_addr), "%s:%d", host, rpc_port - 1);
     }
 
-    tsdb_node_id_t node_id = generate_node_id(bind_addr);
+    tsdb_node_id_t node_id = generate_node_id(data_dir, bind_addr);
 
     tsdb_cluster_t *cluster = tsdb_cluster_new(db, node_id,
                                                bind_addr  ? bind_addr  : "0.0.0.0:28081",
