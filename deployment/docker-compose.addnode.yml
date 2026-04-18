@@ -1,42 +1,46 @@
-# docker-compose.addnode.yml — 演示怎么往已有集群动态加入一个节点。
+# docker-compose.addnode.yml — add a 4th node to an existing QEngine cluster.
 #
-# 前提：docker-compose.cluster.yml 已起好了 3 节点 cluster (qengine-cnode-1/2/3)
-# 并且 bridge network "tsdb-cnet" 已存在。
+# Prerequisite: docker-compose.cluster.yml is already running with
+# nodes qengine-cnode-1/2/3 and the bridge network tsdb-cnet exists.
 #
-# 用法：
-#   # 起一个新节点（4 号），seed 指向任意现有节点
+# Usage:
+#   # bring a new node (4th) online, seeding off any existing node
 #   docker compose -f docker-compose.addnode.yml up -d
 #
-#   # 观察集群视图会在 1-2 秒内把 node4 加进去
-#   curl http://lvm1:29311/cluster | python3 -m json.tool   # 应看到 4 个 nodes
-#   curl http://lvm1:29314/cluster                          # node4 自己的视图
+#   # within 1–2 seconds gossip will include node4 in the cluster view
+#   curl http://host:29311/cluster | python3 -m json.tool   # expect 4 nodes
+#   curl http://host:29314/cluster                            # node4's view
 #
-#   # 撤下来
+#   # take it back down
 #   docker compose -f docker-compose.addnode.yml down
 #
-# 想要第 5、第 6 节点就 cp 这个文件改名 + 改 container_name + ports + volume。
-# 生产环境里这一串由运维自动化编排（比如 Ansible / K8s StatefulSet）。
+# To add a 5th / 6th node: copy this file, change container_name,
+# host-side ports, volume name, and TSDB_RPC_BIND.  The seed list
+# can reference any currently-ALIVE node.  In production this is
+# typically driven by Ansible / Kubernetes StatefulSet templates.
 
 services:
 
   node4:
-    image: qengine/tsdb:dev       # 已经由 docker-compose.cluster.yml build 好
+    image: qengine/tsdb:dev        # already built by docker-compose.cluster.yml
     container_name: qengine-cnode-4
     hostname: qengine-cnode-4
     environment:
-      TSDB_ROLE:          cluster-node
-      TSDB_DATA_DIR:      /var/lib/tsdb
-      TSDB_BIND:          0.0.0.0:28090
-      TSDB_RPC_BIND:      qengine-cnode-4:28081
-      TSDB_METRICS_BIND:  0.0.0.0:28094
-      TSDB_IOPOLICY:      hdd
-      # Seed 指向 node1 的 gossip 地址（= RPC - 1）
-      TSDB_SEEDS:         qengine-cnode-1:28080
+      TSDB_ROLE:                   cluster-node
+      TSDB_DATA_DIR:               /var/lib/tsdb
+      TSDB_BIND:                   0.0.0.0:28090
+      TSDB_RPC_BIND:               qengine-cnode-4:28081
+      TSDB_METRICS_BIND:           0.0.0.0:28094
+      TSDB_IOPOLICY:               hdd
+      TSDB_REPLICA_CONNS_PER_PEER: "16"
+      # TSDB_WAL_ONLY_COMMIT:        "1"   # see note in cluster.yml
+      # Seed points to node1's gossip address (= RPC port − 1).
+      TSDB_SEEDS:                  qengine-cnode-1:28080
     ports:
-      - "29304:28090"     # 客户端
+      - "29304:28090"     # client
       - "29314:28094"     # dashboard
     volumes:
-      - /home/nas/tsdb/cnode4/data:/var/lib/tsdb
+      - cnode4-data:/var/lib/tsdb
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-4]
@@ -49,7 +53,11 @@ services:
       start_period: 5s
 
 networks:
-  # 复用 cluster.yml 创建的那张网络；external: true 不会再建一张。
+  # Reuse the network created by cluster.yml; external: true means
+  # compose will not create a second network.
   tsdb-cnet:
     external: true
     name: tsdb-cnet
+
+volumes:
+  cnode4-data:

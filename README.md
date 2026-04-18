@@ -29,8 +29,9 @@ tsdb-cli  ──TCP v1──▶  tsdb-server ⇄ cluster (gossip + hashring + au
 
 | Axis | Measured (Apple Silicon, Release) |
 |------|-----------------------------------|
-| Ingest (single TCP connection) | **4.75 M rows/s** |
-| Ingest (10 clients concurrent) | **7.6 M rows/s** |
+| Ingest — single-node, single TCP connection | **4.75 M rows/s** |
+| Ingest — single-node, 10 clients concurrent | **7.6 M rows/s** |
+| Ingest — **4-node HDD cluster, 64 writers** | **2.97 M rows/s** |
 | Compression (trades mixed) | **92.48×** (0.30 B/point) |
 | QUERY latency p50 (TCP round-trip) | **0.27 ms** |
 | count(\*) 5 M rows (8 threads) | **2.30 ms p50** |
@@ -112,28 +113,86 @@ int main(void) {
 
 ## Quick start — Docker cluster
 
+The recommended production layout lives in
+`deployment/docker-compose.cluster.yml`: 3 nodes on a dedicated bridge
+network, named volumes for data, HDD-tuned I/O, and a 16-way per-peer
+replica connection pool enabled by default.
+
 ```bash
-# 3-node cluster on localhost (one tsdb cluster)
-docker compose up -d
+cd deployment
+
+# build the image and bring up a 3-node cluster
+docker compose -f docker-compose.cluster.yml build
+docker compose -f docker-compose.cluster.yml up -d
 
 # verify all alive
-docker compose exec node1 tsdb-cli --host node1 --port 28090 <<EOF
-STATS;
-EOF
+curl -s http://localhost:29311/cluster | python3 -m json.tool
+#     ^ node1 dashboard JSON — expect 3 ALIVE nodes after ~2s
 
-# write to any node, read from any node
-docker compose exec node1 tsdb-cli --host node1 --port 28090 <<EOF
+# open the HTML dashboard (metrics, cluster view, recent writes)
+open http://localhost:29311/
+
+# write + read via any node using the CLI
+docker compose -f docker-compose.cluster.yml exec node1 \
+  tsdb-cli --host qengine-cnode-1 --port 28090 <<'EOF'
 CREATE GROUP k8s_prod (region='us-east-1', retention='7d');
 CREATE DEVICE pod_42 IN GROUP k8s_prod (type='pod');
 EOF
 
-docker compose exec node2 tsdb-cli --host node2 --port 28090 <<EOF
+docker compose -f docker-compose.cluster.yml exec node2 \
+  tsdb-cli --host qengine-cnode-2 --port 28090 <<'EOF'
 LIST DEVICES IN GROUP k8s_prod;
 EOF
 
-# tear down
-docker compose down -v
+# tear down (keep volumes)
+docker compose -f docker-compose.cluster.yml down
+
+# tear down and wipe data
+docker compose -f docker-compose.cluster.yml down -v
 ```
+
+### Add a 4th node dynamically
+
+Once the base cluster is up, extend it without restart using
+`deployment/docker-compose.addnode.yml` — it reuses the existing
+`tsdb-cnet` network and seeds off node1:
+
+```bash
+docker compose -f docker-compose.addnode.yml up -d
+
+# within 1–2s gossip picks up the new member
+curl -s http://localhost:29311/cluster | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(len(d["nodes"]),"nodes")'
+# → 4 nodes
+
+curl http://localhost:29314/cluster    # node4's own view
+
+docker compose -f docker-compose.addnode.yml down
+```
+
+To bring up a 5th/6th node, copy `addnode.yml`, change
+`container_name`, `hostname`, host-side ports, the volume name, and
+`TSDB_RPC_BIND`; point `TSDB_SEEDS` at any currently-ALIVE node.
+
+### Cluster-mode throughput
+
+Measured on a 4-node HDD cluster (intra-host docker network) with
+`TSDB_REPLICA_CONNS_PER_PEER=16` and `TSDB_WAL_ONLY_COMMIT=1`:
+
+| Concurrent writers | Ingest rows/s | Batch/s | ms / batch |
+|---:|---:|---:|---:|
+|  4  |   642 k | 157  | 25.5 |
+|  8  |   795 k | 361  | 22.2 |
+| 16  | 2.43 M  | 593  | 27.0 |
+| 32  | 2.59 M  | 633  | 50.6 |
+| 64  | **2.97 M** | **1009** | 63.4 |
+
+The three changes that unlock this shape are documented in
+[Cluster mode → tuning](#cluster-mode): the WAL-only-commit flag,
+early-quorum replica completion, and the per-peer TCP connection
+pool. Without them the same hardware tops out around **220 k rows/s**
+— a single-TCP-connection-per-peer on the primary serialised all
+replication RPCs through one handler thread on each peer.
 
 For a **federated** deployment spanning two regions, use
 `docker compose -f docker-compose.federation.yml up -d` which brings up
@@ -301,11 +360,18 @@ any other's address:
 The cluster layer provides:
 
 - **SWIM-lite gossip** over UDP — node discovery, failure detection
-  (3 missed pings → SUSPECT, 10 s unresponsive → DEAD)
+  (3 missed pings → SUSPECT, 10 s unresponsive → DEAD) with refute
+  recovery for DEAD→ALIVE transitions after restarts
 - **Weighted consistent hashing** — 256 vnodes/node by default, adjustable
   in `[32, 512]` by the auto-balancer
-- **Synchronous replication W=2 of 3** — any replica can coordinate a
-  write; the writer waits for 2 ACKs before returning
+- **Synchronous replication W=2 of 3** with **early-quorum completion** —
+  the coordinator returns as soon as `quorum` ACKs arrive; slow replicas
+  finish in background without blocking client-visible latency
+- **Per-peer TCP connection pool** — primary → each peer uses N concurrent
+  connections (env `TSDB_REPLICA_CONNS_PER_PEER`, default 8). Each conn
+  gets its own peer-side handler thread, so N gives N-way concurrency
+  on replication RPC — the single biggest throughput unlock over the
+  former single-conn design
 - **Raw-block replication** — on flush, the primary ships the compressed
   block bytes directly; replicas append verbatim (no decode, no
   re-encode) — **2.4× faster** than row-level on the same hardware
@@ -313,6 +379,16 @@ The cluster layer provides:
   cpu_pct}` via gossip; overloaded nodes shed vnodes, underloaded ones
   gain vnodes; tunable via `TSDB_BALANCE_{ALPHA,BETA,DAMPEN,INTERVAL_MS}`
   env vars
+
+### Tuning
+
+| Env var | Default | What it changes |
+|---|---|---|
+| `TSDB_REPLICA_CONNS_PER_PEER` | `8` | TCP conns per peer for replication. Bump to 16 for write-heavy 4+ node clusters. |
+| `TSDB_WAL_ONLY_COMMIT` | `0` | When set, `tsdb_batch_commit` only fsyncs the WAL; memtable drains lazily when `is_full()`. Sharply reduces flush count on small-batch workloads. Trade-off: replication hooks fire at flush time, so replication is deferred to the next flush boundary. Durability is preserved via WAL replay on crash. |
+| `TSDB_IOPOLICY` | unset | Set to `hdd` for spinning-disk hosts: madvise SEQUENTIAL, 256 KiB stdio write buffer, `posix_fadvise` on index reads. No-op on SSD/NVMe. |
+| `TSDB_BALANCE_ALPHA` / `BETA` / `DAMPEN` / `INTERVAL_MS` | 0.6 / 0.4 / 0.5 / 30000 | Auto-balance weighting between write-rate load and storage-usage load. |
+| `TSDB_LOG_AUTOBALANCE` | unset | When set, log each VN rebalance event to stderr. Otherwise the controller is silent. |
 
 ---
 
