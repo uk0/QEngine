@@ -9,6 +9,8 @@ storage, SIMD-vectorized execution, clustered with raw-block replication,
 and a purpose-built query language (QTL) with IoT group/device semantics.
 
 > License: AGPLv3 · Status: public preview · Contributions welcome.
+>
+> 中文文档：[README.zh-CN.md](./README.zh-CN.md) · 许可证参考：[LICENSE.zh-CN.md](./LICENSE.zh-CN.md)
 
 ```
 tsdb-cli  ──TCP v1──▶  tsdb-server ⇄ cluster (gossip + hashring + autobalance)
@@ -560,5 +562,8 @@ docs/                   # design notes, research, test plan (gitignored)
 ## License
 
 GNU Affero General Public License v3.0 — see [LICENSE](./LICENSE) for
-the full text. Network-service use (e.g. hosting tsdb as a SaaS) triggers
-AGPLv3 §13 — modifications must be offered as source to remote users.
+the authoritative text. Network-service use (e.g. hosting tsdb as a SaaS)
+triggers AGPLv3 §13 — modifications must be offered as source to remote
+users.
+
+Chinese reference (unofficial, non-binding): [LICENSE.zh-CN.md](./LICENSE.zh-CN.md).
