@@ -80,6 +80,7 @@ typedef struct {
     int64_t  ts_max;
     uint8_t  codec;
     uint16_t flags;    /* TSDB_BF_* bitmask from block header */
+    uint64_t bloom;    /* 64-bit bloom filter (TSDB_BF_HAS_BLOOM must be set); 0 otherwise */
 } tsdb_block_meta_t;
 
 /*

@@ -2,6 +2,7 @@
 
 #include "part.h"
 #include "../compress/codec.h"
+#include "../core/bits.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -218,14 +219,15 @@ static int read_idx_header(const uint8_t *buf, size_t avail,
  */
 static size_t write_idx_entry(uint8_t *buf,
                               uint64_t offset, uint32_t size, uint32_t count,
-                              int64_t ts_min, int64_t ts_max)
+                              int64_t ts_min, int64_t ts_max,
+                              uint64_t bloom)
 {
     put_u64le(buf + 0,  offset);
     put_u32le(buf + 8,  size);
     put_u32le(buf + 12, count);
     put_i64le(buf + 16, ts_min);
     put_i64le(buf + 24, ts_max);
-    put_u64le(buf + 32, 0);
+    put_u64le(buf + 32, bloom);
     return TSDB_IDX_ENTRY_SIZE;
 }
 
@@ -342,6 +344,17 @@ static int col_writer_write_block(col_writer_t *w,
                                                 &codec_used, &blk_flags);
     if (comp_bytes < 0) { free(comp_buf); return TSDB_ERR_INTERNAL; }
 
+    /* For SYMBOL columns: build a 64-bit Bloom filter over all codes in this
+     * block. The filter lives in BlockIndexEntry._reserved (bytes 32-39). */
+    uint64_t bloom = 0;
+    if (type == TSDB_TYPE_SYMBOL) {
+        const uint32_t *codes = (const uint32_t *)raw_vals;
+        for (size_t k = 0; k < count; k++) {
+            bloom = tsdb_bloom_add(bloom, codes[k]);
+        }
+        blk_flags |= TSDB_BF_HAS_BLOOM;
+    }
+
     uint8_t hdr[TSDB_BLOCK_HEADER_SIZE];
     write_block_header(hdr, (uint8_t)codec_used, blk_flags,
                        (uint32_t)count, ts_min, ts_max,
@@ -384,7 +397,7 @@ static int col_writer_write_block(col_writer_t *w,
     }
     uint8_t *entry = w->idx_entries + w->idx_n * TSDB_IDX_ENTRY_SIZE;
     write_idx_entry(entry, w->col_offset, (uint32_t)comp_bytes,
-                    (uint32_t)count, ts_min, ts_max);
+                    (uint32_t)count, ts_min, ts_max, bloom);
     w->idx_n++;
     w->col_offset  += TSDB_BLOCK_HEADER_SIZE + (uint64_t)comp_bytes;
     w->total_rows  += count;
@@ -728,7 +741,9 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
             p->col_metas[ci][b].count  = get_u32le(entry + 12);
             p->col_metas[ci][b].ts_min = get_i64le(entry + 16);
             p->col_metas[ci][b].ts_max = get_i64le(entry + 24);
+            p->col_metas[ci][b].bloom  = get_u64le(entry + 32);
             p->col_metas[ci][b].codec  = TSDB_CODEC_NONE;
+            p->col_metas[ci][b].flags  = 0;
             p->col_meta_n[ci]++;
         }
         fclose(idx_f);

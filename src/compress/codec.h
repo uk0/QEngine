@@ -17,6 +17,7 @@ extern "C" {
 /* Block-header flag bits (stored in BlockHeader.flags u16). */
 #define TSDB_BF_OUTER_LZ  (1u<<0)   /* block data is wrapped with lzlite  */
 #define TSDB_BF_NOT_NULL  (1u<<1)   /* all values present (no null bitmap) */
+#define TSDB_BF_HAS_BLOOM (1u<<2)   /* BlockIndexEntry._reserved holds a 64-bit bloom */
 
 /*
  * Encode an array of `in_count` values of the given type into `out`.

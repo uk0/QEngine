@@ -140,4 +140,51 @@ static inline unsigned tsdb_ctz64(uint64_t x) {
 #endif
 }
 
+/* ---- 64-bit Bloom filter (3 FNV-1a variant hashes) ----------------------
+ *
+ * A single uint64_t holds the 64-bit bitvector.
+ * Three independent hash functions are computed from the input value:
+ *   h0 = FNV-1a(v, seed=0x811c9dc5)
+ *   h1 = FNV-1a(v, seed=0x01000193)   (h0 XOR rotated)
+ *   h2 = FNV-1a(v, seed=0x6b432795)
+ * Each hash selects one bit (hash % 64).
+ *
+ * False-positive probability at k=3 hashes, m=64 bits:
+ *   ~p = (1 - e^(-k*n/m))^k
+ *   For n=10: ~2%   For n=3: ~0.1%
+ */
+static inline uint32_t tsdb_bloom_fnv1a(uint32_t v, uint32_t seed) {
+    /* FNV-1a 32-bit: process 4 bytes of v */
+    uint32_t h = seed;
+    h ^= (uint8_t)(v);         h *= 0x01000193u;
+    h ^= (uint8_t)(v >> 8);    h *= 0x01000193u;
+    h ^= (uint8_t)(v >> 16);   h *= 0x01000193u;
+    h ^= (uint8_t)(v >> 24);   h *= 0x01000193u;
+    return h;
+}
+
+/* Set 3 bits in the 64-bit bloom for symbol code v. */
+static inline uint64_t tsdb_bloom_add(uint64_t bloom, uint32_t v) {
+    uint32_t h0 = tsdb_bloom_fnv1a(v, 0x811c9dc5u);
+    uint32_t h1 = tsdb_bloom_fnv1a(v, 0x01000193u) ^ (h0 >> 5);
+    uint32_t h2 = tsdb_bloom_fnv1a(v, 0x6b432795u) ^ (h0 >> 11);
+    bloom |= (uint64_t)1 << (h0 & 63u);
+    bloom |= (uint64_t)1 << (h1 & 63u);
+    bloom |= (uint64_t)1 << (h2 & 63u);
+    return bloom;
+}
+
+/* Test 3 bits for symbol code v.
+ * Returns 0 if v is DEFINITELY NOT in the set (safe to skip block).
+ * Returns 1 if v MIGHT be in the set (must scan the block). */
+static inline int tsdb_bloom_test(uint64_t bloom, uint32_t v) {
+    uint32_t h0 = tsdb_bloom_fnv1a(v, 0x811c9dc5u);
+    uint32_t h1 = tsdb_bloom_fnv1a(v, 0x01000193u) ^ (h0 >> 5);
+    uint32_t h2 = tsdb_bloom_fnv1a(v, 0x6b432795u) ^ (h0 >> 11);
+    if (!(bloom & ((uint64_t)1 << (h0 & 63u)))) return 0;
+    if (!(bloom & ((uint64_t)1 << (h1 & 63u)))) return 0;
+    if (!(bloom & ((uint64_t)1 << (h2 & 63u)))) return 0;
+    return 1;
+}
+
 #endif

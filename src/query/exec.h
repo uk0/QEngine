@@ -20,4 +20,10 @@ void tsdb_set_query_parallel(int on);
  * Thread-safe. Takes effect for all subsequent queries. */
 void tsdb_set_query_pool_size(int n);
 
+/* Bloom filter block-skip statistics from the most recent serial SELECT.
+ * Skipped = blocks where SYMBOL bloom filter said "definitely not here".
+ * Total   = disk blocks examined by the serial scan loop (before bloom check). */
+uint64_t tsdb_bloom_stats_skipped(void);
+uint64_t tsdb_bloom_stats_total(void);
+
 #endif
