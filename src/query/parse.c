@@ -18,6 +18,9 @@ typedef struct {
     int          errored;
 } parser_t;
 
+/* Forward decls: definitions appear further down. */
+static int ident_ci(const qtok_t *t, const char *s);
+
 static void perr(parser_t *p, const char *fmt, ...) {
     if (p->errored) return;
     p->errored = 1;
@@ -328,6 +331,20 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
     if (accept(&p, QTOK_WHERE)) {
         q->where = parse_expr(&p);
         if (!q->where) return TSDB_ERR_PARSE;
+    }
+
+    /* Top-level PARTITION BY tbname — STable per-child dimension.
+     * Placed between WHERE and SAMPLE BY so it does not collide with the
+     * PARTITION BY consumed inside the later LATEST ON ... PARTITION BY block. */
+    if (p.tok.kind == QTOK_PARTITION) {
+        advance(&p);
+        if (expect(&p, QTOK_BY) != TSDB_OK) return TSDB_ERR_PARSE;
+        if (p.tok.kind != QTOK_IDENT || !ident_ci(&p.tok, "tbname")) {
+            perr(&p, "expected 'tbname' after top-level PARTITION BY (v0.9: only tbname supported)");
+            return TSDB_ERR_PARSE;
+        }
+        advance(&p);
+        q->has_partition_by_tbname = 1;
     }
 
     if (accept(&p, QTOK_SAMPLE)) {

@@ -186,6 +186,39 @@ int main(void) {
         printf("  PASS: tag-pushdown count = 3\n");
     }
 
+    /* ─ Phase 5.5: PARTITION BY tbname (one row per child) ──────────────── */
+    printf("\n[5.5] SELECT count(*) FROM meters PARTITION BY tbname  (expect 2 rows)\n");
+    {
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT count(*) FROM meters PARTITION BY tbname;", &r));
+        ASSERT(r != NULL);
+        ASSERT(tsdb_result_ncols(r) == 2);  /* tbname + count */
+        int found_d1 = 0, found_d2 = 0;
+        int nrows = 0;
+        while (tsdb_result_next(r)) {
+            const char *name = tsdb_result_sym(r, 0);
+            int64_t  cnt  = tsdb_result_i64(r, 1);
+            printf("  tbname=%s count=%lld\n", name ? name : "(null)", (long long)cnt);
+            if (name && strcmp(name, "d1") == 0) { ASSERT(cnt == 3); found_d1 = 1; }
+            if (name && strcmp(name, "d2") == 0) { ASSERT(cnt == 2); found_d2 = 1; }
+            nrows++;
+        }
+        ASSERT(nrows == 2);
+        ASSERT(found_d1 && found_d2);
+        tsdb_result_free(r);
+        printf("  PASS: PARTITION BY tbname emits 2 rows with distinct tbname\n");
+    }
+
+    /* Guard: PARTITION BY tbname on non-stable table must error. */
+    printf("\n[5.6] PARTITION BY tbname on non-stable FROM must reject\n");
+    {
+        tsdb_result_t *r = NULL;
+        int rc = tsdb_query(db, "SELECT count(*) FROM d1 PARTITION BY tbname;", &r);
+        ASSERT(rc != TSDB_OK);
+        if (r) tsdb_result_free(r);
+        printf("  PASS: rejected with rc=%d\n", rc);
+    }
+
     /* ─ Phase 6: DROP STABLE meters ─────────────────────────────────────── */
     printf("\n[6] DROP STABLE meters\n");
     run_ddl(db, "DROP STABLE meters;", 1);

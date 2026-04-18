@@ -3157,6 +3157,8 @@ static int stable_is_pure_scalar_agg(qast_query_t *q,
                                       int *col_agg_kinds, int cap_cols)
 {
     if (q->has_sample_by || q->ngroup_by > 0 || q->has_adv_window) return 0;
+    /* PARTITION BY tbname wants one row per child; never merge. */
+    if (q->has_partition_by_tbname) return 0;
     for (int i = 0; i < q->nsel && i < cap_cols; i++) {
         qast_sel_item_t *si = &q->sel[i];
         if (si->is_star) return 0;
@@ -3204,6 +3206,66 @@ static int stable_result_concat(tsdb_result_t *dst, tsdb_result_t *src) {
         }
     }
     dst->nrows += src->nrows;
+    return TSDB_OK;
+}
+
+/* PARTITION BY tbname helper: append child_r rows into master r, prepending
+ * a synthetic SYMBOL column 'tbname' populated with child_name.
+ *
+ * On the first call (master->ncols == 0) master is allocated with
+ * child.ncols+1 columns, col[0] = tbname (owned symtab), cols[1..n] borrow
+ * schema pointers from child. Subsequent calls re-intern SYMBOL cells that
+ * cross child tables. */
+static int stable_append_child_with_tbname(tsdb_result_t *master,
+                                            tsdb_result_t *child,
+                                            const char *child_name)
+{
+    if (master->ncols == 0) {
+        int rc = result_reserve_cols(master, child->ncols + 1);
+        if (rc != TSDB_OK) return rc;
+
+        /* Owned symtab for tbname column. */
+        tsdb_symtab_t *sym = NULL;
+        if (tsdb_symtab_new(&sym) != TSDB_OK || !sym) return TSDB_ERR_NOMEM;
+        master->owned_symtabs = calloc(1, sizeof(tsdb_symtab_t *));
+        if (!master->owned_symtabs) { tsdb_symtab_free(sym); return TSDB_ERR_NOMEM; }
+        master->owned_symtabs[0] = sym;
+        master->n_owned_symtabs = 1;
+
+        rc = result_set_col(master, 0, "tbname", TSDB_TYPE_SYMBOL, sym);
+        if (rc != TSDB_OK) return rc;
+
+        for (int c = 0; c < child->ncols; c++) {
+            rc = result_set_col(master, c + 1,
+                                child->col_names[c] ? child->col_names[c] : "",
+                                child->col_types[c], child->col_symtab[c]);
+            if (rc != TSDB_OK) return rc;
+        }
+    }
+
+    if (child->nrows == 0) return TSDB_OK;
+
+    int rc = result_reserve_rows(master, master->nrows + child->nrows);
+    if (rc != TSDB_OK) return rc;
+
+    uint32_t tb_code = tsdb_symtab_intern(master->owned_symtabs[0], child_name);
+
+    for (size_t row = 0; row < child->nrows; row++) {
+        ((uint64_t *)master->col_data[0])[master->nrows + row] = (uint64_t)tb_code;
+        for (int c = 0; c < child->ncols; c++) {
+            int dc = c + 1;
+            uint64_t bits = ((const uint64_t *)child->col_data[c])[row];
+            if (master->col_types[dc] == TSDB_TYPE_SYMBOL
+                && master->col_symtab[dc] && child->col_symtab[c]
+                && master->col_symtab[dc] != child->col_symtab[c])
+            {
+                const char *s = tsdb_symtab_str(child->col_symtab[c], (uint32_t)bits);
+                bits = (uint64_t)tsdb_symtab_intern(master->col_symtab[dc], s ? s : "");
+            }
+            ((uint64_t *)master->col_data[dc])[master->nrows + row] = bits;
+        }
+    }
+    master->nrows += child->nrows;
     return TSDB_OK;
 }
 
@@ -3257,6 +3319,11 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
     /* Save original from; we will temporarily replace it per child. */
     char *orig_from = q->from;
+    /* Clear PARTITION BY tbname for the recursive per-child calls: the
+     * feature is consumed here at the stable level; child tables are
+     * regular tables and must not re-trigger the non-stable guard. */
+    int orig_pb_tbname = q->has_partition_by_tbname;
+    q->has_partition_by_tbname = 0;
 
     char child_name[TSDB_STABLE_NAME_MAX + 1];
 
@@ -3270,7 +3337,31 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
         snprintf(child_name, sizeof(child_name), "%s", ct->name);
         q->from = child_name;
 
-        if (is_scalar_agg) {
+        if (orig_pb_tbname) {
+            /* PARTITION BY tbname: emit N rows (one group per child); prepend
+             * synthetic 'tbname' SYMBOL column. Never merges scalar aggregates. */
+            tsdb_result_t child_r;
+            memset(&child_r, 0, sizeof(child_r));
+            child_r.cur = -1;
+
+            rc = exec_select(db, q, &child_r, err, errcap);
+            if (rc != TSDB_OK) {
+                q->from = orig_from;
+                q->has_partition_by_tbname = orig_pb_tbname;
+                free(children);
+                tsdb_result_free_internal(&child_r);
+                return rc;
+            }
+
+            rc = stable_append_child_with_tbname(r, &child_r, ct->name);
+            tsdb_result_free_internal(&child_r);
+            if (rc != TSDB_OK) {
+                q->from = orig_from;
+                q->has_partition_by_tbname = orig_pb_tbname;
+                free(children);
+                return rc;
+            }
+        } else if (is_scalar_agg) {
             /* Per-child aggregate; merge into master. */
             tsdb_result_t child_r;
             memset(&child_r, 0, sizeof(child_r));
@@ -3331,6 +3422,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     }
 
     q->from = orig_from;
+    q->has_partition_by_tbname = orig_pb_tbname;
     free(children);
 
     /* If no children matched, return empty result with 0 rows. */
@@ -3346,7 +3438,13 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     /* Check if FROM refers to a STable; if so, expand to union over children. */
     {
         tsdb_catalog_t *cat = tsdb_db_catalog(db);
-        if (cat && q->from && tsdb_stable_exists(cat, q->from)) {
+        int from_is_stable = (cat && q->from && tsdb_stable_exists(cat, q->from));
+        if (q->has_partition_by_tbname && !from_is_stable) {
+            eset(err, errcap,
+                 "PARTITION BY tbname requires FROM to be a super-table");
+            return TSDB_ERR_PARSE;
+        }
+        if (from_is_stable) {
             tsdb_stable_t st;
             int rc = tsdb_stable_get(cat, q->from, &st);
             if (rc != TSDB_OK) { eset(err, errcap, "failed to fetch stable '%s'", q->from); return rc; }

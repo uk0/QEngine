@@ -139,6 +139,11 @@ typedef struct {
     char           **group_by;
     int              ngroup_by;
 
+    /* Top-level PARTITION BY tbname — STable per-child dimension.
+     * Valid only when FROM is a super-table; forces row-union result
+     * with a synthetic first column 'tbname' (SYMBOL). */
+    int              has_partition_by_tbname;
+
     int              has_order;
     char            *order_col;
     qast_order_dir_t order_dir;
