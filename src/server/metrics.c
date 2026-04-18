@@ -121,6 +121,21 @@ static metric_t g_metrics[] = {
     { "qengine_rawblock_pushes_total",
       "Total raw-block replication pushes sent", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_replicate_sent_total",
+      "Total per-peer WRITE_BATCH RPCs fanned out from this node", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replicate_ack_total",
+      "Total per-peer WRITE_BATCH RPCs that returned OK", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replicate_fail_total",
+      "Total per-peer WRITE_BATCH RPCs that failed (conn dead or peer error)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replica_dial_total",
+      "Total new TCP connections established to peers", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replica_dial_fail_total",
+      "Total failed TCP dial attempts to peers", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_bloom_lookups_total",
       "Total bloom-filter lookup probes", MT_COUNTER, { .c = { 0 } } },
 
