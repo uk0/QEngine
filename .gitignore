@@ -63,3 +63,4 @@ jdbc/target/
 sdk/go/bench5m
 sdk/java/target/
 sdk/go/bin/
+example-go/example-router
