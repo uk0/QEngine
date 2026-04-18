@@ -13,6 +13,7 @@
 #include "../server/server.h"
 #include "../server/metrics_server.h"
 #include "../server/metrics.h"
+#include "disk_weight.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,14 +45,56 @@ static void usage(const char *prog) {
         prog);
 }
 
-/* cluster_json_cb — provide /cluster HTTP payload from the live cluster
- * view.  Registered with metrics_server so the dashboard topology panel
- * shows real gossip membership instead of the standalone fallback. */
+/* cluster_json_cb — provide /cluster HTTP payload.
+ *
+ * tsdb_cluster_stats returns gossip-level node state (id / addr /
+ * state / ver) plus autobalance stats.  Gossip does NOT carry per-node
+ * disk capacity today, so this wrapper also appends a "local" object
+ * with THIS node's statvfs-derived total_bytes / free_bytes / vn_weight
+ * — the dashboard uses it to annotate the self row.  Peer disk is
+ * shown as "-" until the gossip protocol grows the field (separate
+ * change, involves on-wire schema bump).
+ */
+static char g_local_data_dir[4096] = {0};
+
 static int cluster_json_cb(void *ud, char *buf, size_t cap) {
     tsdb_db_t *db = (tsdb_db_t *)ud;
     if (!db) return 0;
     int n = tsdb_cluster_stats(db, buf, cap);
-    return n > 0 ? n : 0;
+    if (n <= 0 || (size_t)n >= cap - 1) return n;
+
+    /* Splice a "local" field in right before the trailing '}'.
+     * tsdb_cluster_stats always ends with '}'; we remove that, append
+     * our field, and re-terminate. */
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\0' || buf[n-1] == ' '))
+        n--;
+    if (n == 0 || buf[n-1] != '}') return n;
+    n--;
+
+    uint64_t total = 0, free_b = 0;
+    int vn = 0;
+    if (g_local_data_dir[0]) {
+        vn = tsdb_disk_weight_detail(g_local_data_dir,
+                                      TSDB_DISK_WEIGHT_DEFAULT_PER_TB,
+                                      &total, &free_b);
+    }
+    char host[128] = "self";
+    gethostname(host, sizeof(host) - 1);
+    host[sizeof(host) - 1] = '\0';
+
+    int add = snprintf(buf + n, cap - (size_t)n,
+        ",\"local\":{"
+            "\"host\":\"%s\","
+            "\"pid\":%d,"
+            "\"uptime_s\":%ld,"
+            "\"disk\":{\"total_bytes\":%llu,\"free_bytes\":%llu,"
+                      "\"data_dir\":\"%s\",\"vn_weight\":%d}"
+        "}}",
+        host, (int)getpid(), 0L,
+        (unsigned long long)total, (unsigned long long)free_b,
+        g_local_data_dir, vn);
+    if (add < 0) return n + 1;   /* should be unreachable */
+    return n + add;
 }
 
 int main(int argc, char **argv) {
@@ -130,9 +173,11 @@ int main(int argc, char **argv) {
     printf("[node] client bind=%s\n", client_bind);
 
     /* /metrics + /health + dashboard + /cluster — latter wired to the
-     * live cluster view via the provider callback. */
+     * live cluster view via the provider callback.  Stash the data_dir
+     * for the callback so it can report local disk capacity. */
     tsdb_metrics_server_t *ms = NULL;
     tsdb_metrics_server_set_data_dir(data_dir);
+    snprintf(g_local_data_dir, sizeof(g_local_data_dir), "%s", data_dir);
     tsdb_metrics_server_set_cluster_provider(cluster_json_cb, db);
     rc = tsdb_metrics_server_start(metrics_bind, &ms);
     if (rc == 0 && ms) {
