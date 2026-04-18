@@ -1,10 +1,14 @@
 /* test_ts_aggregates.c — Tests for TDengine-style TS aggregates:
  *   first(col), last(col), last_row(col), twa(col)
  *
+ * TWA formula: current-value-forward — twa = Σ(v[i]·(ts[i]-ts[i-1])) / total_dt
+ *   Hand example: ts=[0,100,1000] v=[0,10,100]
+ *     wsum = 10*100 + 100*900 = 91000; total_dt=1000 → twa=91.0
+ *
  * Test cases:
  *   1. first/last on 100-row table with ascending ts + val
- *   2. twa on uniform ts + linear val (step-wise-backward convention)
- *   3. twa on non-uniform ts — hand-computed value
+ *   2. twa on uniform ts + linear val (current-value-forward convention)
+ *   3. twa on non-uniform ts — hand-computed value (91.0)
  *   4. WHERE filter + last()
  *   5. SELECT first(val), last(val), twa(val) — 3 cols in one query
  *   6. last_row(val) behaves like last(val) (MVP)
@@ -115,32 +119,31 @@ int main(void) {
 
     /* ----------------------------------------------------------------
      * Test 2: twa(val) uniform ts + linear val
-     *   step-wise-backward: for N=100 points 1s apart, val=1..100:
-     *   twa = sum(v[i] * dt[i+1]) / total_dt
-     *       = (1+2+...+99)*1 / 99  = 4950/99 = 50.0
+     *   current-value-forward: for N=100 points 1s apart, val=1..100:
+     *   twa = Σ v[i]*(ts[i]-ts[i-1]) / total_dt, i=1..99
+     *       = (2+3+...+100)*1s / 99s = 5049/99 = 51.0
      * ---------------------------------------------------------------- */
-    printf("[2] twa(val) uniform ts, linear val (step-wise-backward)\n");
+    printf("[2] twa(val) uniform ts, linear val (current-value-forward)\n");
     {
         tsdb_result_t *r = NULL;
         OK(tsdb_query(db, "SELECT twa(val) FROM t1", &r));
         double tv = 0.0;
         while (tsdb_result_next(r)) tv = tsdb_result_f64(r, 0);
         tsdb_result_free(r);
-        CHECKF(fabs(tv - 50.0) < 0.01,
-               "twa(val)~50.0 (step-wise-backward) got %.4f", tv);
+        CHECKF(fabs(tv - 51.0) < 0.01,
+               "twa(val)~51.0 (current-value-forward) got %.4f", tv);
     }
 
     /* ----------------------------------------------------------------
      * Test 3: twa non-uniform ts hand-computed
      *   Points: (ts=0, v=0), (ts=100, v=10), (ts=1000, v=100)
-     *   step-wise-backward:
-     *     point 0 (v=0) weights gap to next = 100: 0*100 = 0
-     *     point 1 (v=10) weights gap to next = 900: 10*900 = 9000
-     *     point 2 (v=100) last point, weight 0
-     *     twa = 9000 / 1000 = 9.0
+     *   current-value-forward: v[i]*(ts[i]-ts[i-1])
+     *     i=1: v=10, dt=100-0=100  → 10*100  = 1000
+     *     i=2: v=100, dt=1000-100=900 → 100*900 = 90000
+     *     wsum=91000; total_dt=1000-0=1000 → twa=91.0
      *   avg = (0+10+100)/3 = 36.67 — significantly different
      * ---------------------------------------------------------------- */
-    printf("[3] twa non-uniform ts (hand-computed: 9.0)\n");
+    printf("[3] twa non-uniform ts (hand-computed: 91.0)\n");
     {
         const char *dir2 = "/tmp/tsdb_test_ts_agg_t2";
         rm_rf(dir2);
@@ -166,8 +169,8 @@ int main(void) {
         double tv = 0.0;
         while (tsdb_result_next(r)) tv = tsdb_result_f64(r, 0);
         tsdb_result_free(r);
-        CHECKF(fabs(tv - 9.0) < 0.01,
-               "twa non-uniform=9.0 (step-wise-backward) got %.4f", tv);
+        CHECKF(fabs(tv - 91.0) < 0.01,
+               "twa non-uniform=91.0 (current-value-forward) got %.4f", tv);
 
         /* avg = 36.67, markedly different */
         OK(tsdb_query(db2, "SELECT avg(v) FROM t2", &r));
@@ -198,6 +201,7 @@ int main(void) {
 
     /* ----------------------------------------------------------------
      * Test 5: SELECT first(val), last(val), twa(val) — 3 columns
+     *   Same 100-row table → twa=51.0 (current-value-forward)
      * ---------------------------------------------------------------- */
     printf("[5] SELECT first(val), last(val), twa(val) — 3 output cols\n");
     {
@@ -215,7 +219,7 @@ int main(void) {
         CHECK(rows == 1, "nrows==1");
         CHECKF(fv == 1.0,   "first(val)=1.0   got %.2f", fv);
         CHECKF(lv == 100.0, "last(val)=100.0  got %.2f", lv);
-        CHECKF(fabs(tv - 50.0) < 0.01, "twa(val)~50.0    got %.4f", tv);
+        CHECKF(fabs(tv - 51.0) < 0.01, "twa(val)~51.0    got %.4f", tv);
         tsdb_result_free(r);
     }
 

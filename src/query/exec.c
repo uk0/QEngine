@@ -1151,18 +1151,27 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
                     else p->ts_last_i = vi;
                 }
             }
-            /* TWA: step-wise-backward convention --
-             * when we see point i we credit prev_val * (ts[i]-prev_ts).     */
+            /* TWA: current-value-forward convention --
+             * when we see point i we credit v[i] * (ts[i]-ts[i-1]).
+             * Formula: Σ(v[i]·dt[i]) / total_dt, where dt[i]=ts[i]-ts[i-1].
+             * Hand example: ts=[0,10,910], v=[0,10,100]
+             *   dt[1]=10: +10*10=100; dt[2]=900: +100*900=90000 → sum=90100
+             *   total_dt=910-0=910; twa≈99... wait — task spec:
+             *   (0·0 + 10·100 + 100·900)/1000=91. That uses v[0]*0 + v[1]*(t2-t0)..
+             *   Actually task spec: ts=[0,100,1000], v=[0,10,100]
+             *   dt[1]=100: +10*100=1000; dt[2]=900: +100*900=90000 → sum=91000
+             *   total_dt=1000; twa=91.  This is v_cur * (ts_cur - ts_prev). */
             if (p->kind == PROJ_AGG_TS_TWA) {
+                double v_cur = is_f64 ? vf : (double)vi;
                 if (p->twa_last_ts >= 0) {
                     int64_t dt = ts - p->twa_last_ts;
                     if (dt > 0)
-                        p->twa_wsum += p->twa_last_v * (double)dt;
+                        p->twa_wsum += v_cur * (double)dt;
                 }
                 if (ts < p->ts_first) p->ts_first = ts;
                 if (ts > p->ts_last)  p->ts_last  = ts;
                 p->twa_last_ts = ts;
-                p->twa_last_v  = is_f64 ? vf : (double)vi;
+                p->twa_last_v  = v_cur;
             }
         }
     }
