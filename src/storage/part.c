@@ -601,11 +601,15 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
             w.raw_block_day   = part_day_int;
             w.col_idx         = ci;
 
-            /* Write in chunks of TSDB_BLOCK_POINTS. */
+            /* Chunk into blocks using the per-table block size.  Clamped
+             * into [1024, TSDB_BLOCK_POINTS] by schema_create. */
+            size_t sbp = (s->block_points > 0 &&
+                          s->block_points <= TSDB_BLOCK_POINTS)
+                            ? (size_t)s->block_points : (size_t)TSDB_BLOCK_POINTS;
             size_t base = 0;
             while (base < day_nrows) {
                 size_t chunk = day_nrows - base;
-                if (chunk > TSDB_BLOCK_POINTS) chunk = TSDB_BLOCK_POINTS;
+                if (chunk > sbp) chunk = sbp;
 
                 uint8_t *chunk_buf = malloc(chunk * width);
                 if (!chunk_buf) {

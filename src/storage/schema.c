@@ -19,10 +19,22 @@
  *   ... v1 fields ...
  *   [partition_unit u8][_pad u8×3]   -- appended; defaults to DAY on v1 read
  *
- * Readers accept both; on v1, partition_unit silently defaults to DAY.
+ * v3 (2026-04):
+ *   ... v2 fields ...
+ *   [block_points u32]              -- per-table block size; v1/v2 → 8192
+ *
+ * Readers accept all three; older writers always emitted 8192 so v1/v2 files
+ * resolve unambiguously.
  */
 #define SCHEMA_MAGIC   0x53434D41u  /* "SCMA" */
-#define SCHEMA_VERSION 2
+#define SCHEMA_VERSION 3
+
+static int clamp_block_points(int bp) {
+    if (bp <= 0) return TSDB_BLOCK_POINTS;
+    if (bp < 1024) return 1024;
+    if (bp > TSDB_BLOCK_POINTS) return TSDB_BLOCK_POINTS;
+    return bp;
+}
 
 /* ---- portable mkdir-p -------------------------------------------------- */
 
@@ -91,6 +103,11 @@ static int schema_save(tsdb_schema_t *s) {
         WR(&part_unit, 1);
         WR(reserved,  3);
     }
+    /* v3 tail: block_points u32. */
+    {
+        uint32_t bp = (uint32_t)s->block_points;
+        WR(&bp, 4);
+    }
 #undef WR
 
     fclose(f);
@@ -114,13 +131,14 @@ int tsdb_schema_create(const char *dir, const char *name,
                        tsdb_schema_t **out)
 {
     return tsdb_schema_create_ex(dir, name, cols, ncols, ts_col,
-                                  TSDB_PARTITION_DAY, out);
+                                  TSDB_PARTITION_DAY, 0, out);
 }
 
 int tsdb_schema_create_ex(const char *dir, const char *name,
                           const tsdb_col_t *cols, int ncols,
                           const char *ts_col,
                           tsdb_partition_unit_t partition_unit,
+                          int block_points,
                           tsdb_schema_t **out)
 {
     if (!dir || !name || !cols || ncols <= 0 || ncols > TSDB_MAX_COLS || !ts_col || !out)
@@ -152,6 +170,7 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
     s->ncols          = ncols;
     s->ts_col_idx     = ts_idx;
     s->partition_unit = partition_unit;
+    s->block_points   = clamp_block_points(block_points);
     s->dir            = strdup(dir);
     if (!s->dir) { free(s); return TSDB_ERR_NOMEM; }
 
@@ -250,8 +269,10 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     RD(&magic,    4);
     if (magic != SCHEMA_MAGIC) { fclose(f); return TSDB_ERR_CORRUPT; }
     RD(&version, 2);
-    /* Accept v1 and v2. Higher versions are unknown. */
-    if (version != 1 && version != 2) { fclose(f); return TSDB_ERR_UNSUPPORTED; }
+    /* Accept v1, v2, v3. Higher versions are unknown. */
+    if (version != 1 && version != 2 && version != 3) {
+        fclose(f); return TSDB_ERR_UNSUPPORTED;
+    }
     RD(&ncols_raw, 2);
     RD(&ts_idx,    4);
     RD(tbl_name,   TSDB_MAX_NAME + 1);
@@ -267,7 +288,8 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     memcpy(s->name, tbl_name, TSDB_MAX_NAME + 1);
     s->ncols          = ncols;
     s->ts_col_idx     = (int)ts_idx;
-    s->partition_unit = TSDB_PARTITION_DAY;   /* v1 default; v2 overrides below */
+    s->partition_unit = TSDB_PARTITION_DAY;   /* v1 default; v2+ overrides below */
+    s->block_points   = TSDB_BLOCK_POINTS;    /* v1/v2 default; v3 overrides below */
     s->dir            = strdup(dir);
     if (!s->dir) { free(s); fclose(f); return TSDB_ERR_NOMEM; }
 
@@ -296,6 +318,12 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
                 s->partition_unit = (tsdb_partition_unit_t)part_unit;
             }
         }
+    }
+    /* v3 tail: block_points u32. Absent on v1/v2 — keep the default. */
+    if (rc == TSDB_OK && version >= 3) {
+        uint32_t bp = 0;
+        RD(&bp, 4);
+        if (rc == TSDB_OK) s->block_points = clamp_block_points((int)bp);
     }
 #undef RD
     fclose(f);

@@ -252,7 +252,7 @@ static int create_table_impl(tsdb_db_t *db,
 
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_create_ex(dir, name, cols, (int)ncols, ts_col,
-                                    part_unit, &schema);
+                                    part_unit, /*block_points*/ 0, &schema);
     if (rc != TSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return rc;

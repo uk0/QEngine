@@ -36,6 +36,11 @@ typedef struct {
     int                    ts_col_idx;      /* index of designated timestamp column */
     char                  *dir;              /* table directory (heap-allocated) */
     tsdb_partition_unit_t  partition_unit;   /* DAY or HOUR */
+    /* Per-table block size (points/rows per flushed block).  Controls both
+     * the memtable capacity before auto-flush and the chunk size in part.c's
+     * flush loop.  Valid range: [1024, TSDB_BLOCK_POINTS].  Defaults to
+     * TSDB_BLOCK_POINTS for legacy (v1/v2) schemas. */
+    int                    block_points;
 } tsdb_schema_t;
 
 /*
@@ -55,11 +60,15 @@ int tsdb_schema_create(const char *dir, const char *name,
                        const char *ts_col,
                        tsdb_schema_t **out);
 
-/* Create a schema with explicit partition granularity. */
+/* Create a schema with explicit partition granularity.  block_points == 0
+ * resolves to TSDB_BLOCK_POINTS (the default).  Values are clamped into
+ * [1024, TSDB_BLOCK_POINTS]; passing anything outside that range silently
+ * snaps to the closest valid boundary. */
 int tsdb_schema_create_ex(const char *dir, const char *name,
                           const tsdb_col_t *cols, int ncols,
                           const char *ts_col,
                           tsdb_partition_unit_t partition_unit,
+                          int block_points,
                           tsdb_schema_t **out);
 
 /*

@@ -40,9 +40,11 @@ int tsdb_memtable_new(tsdb_schema_t *s, tsdb_memtable_t **out) {
     m->col_bufs = calloc((size_t)s->ncols, sizeof(void*));
     if (!m->col_bufs) { free(m); return TSDB_ERR_NOMEM; }
 
+    int bp = (s->block_points > 0 && s->block_points <= TSDB_BLOCK_POINTS)
+                ? s->block_points : TSDB_BLOCK_POINTS;
     for (int i = 0; i < s->ncols; i++) {
         size_t w = tsdb_type_width(s->cols[i].type);
-        m->col_bufs[i] = malloc(w * TSDB_BLOCK_POINTS);
+        m->col_bufs[i] = malloc(w * (size_t)bp);
         if (!m->col_bufs[i]) {
             for (int j = 0; j < i; j++) free(m->col_bufs[j]);
             free(m->col_bufs);
@@ -77,8 +79,11 @@ int tsdb_memtable_extend_for_new_column(tsdb_memtable_t *m) {
     if (!nb) { pthread_mutex_unlock(&m->lock); return TSDB_ERR_NOMEM; }
     m->col_bufs = nb;
 
+    int bp = (m->schema->block_points > 0 &&
+              m->schema->block_points <= TSDB_BLOCK_POINTS)
+                ? m->schema->block_points : TSDB_BLOCK_POINTS;
     size_t w = tsdb_type_width(m->schema->cols[old_n].type);
-    m->col_bufs[old_n] = malloc(w * TSDB_BLOCK_POINTS);
+    m->col_bufs[old_n] = malloc(w * (size_t)bp);
     if (!m->col_bufs[old_n]) { pthread_mutex_unlock(&m->lock); return TSDB_ERR_NOMEM; }
 
     uint8_t *ns = realloc(m->col_set, (size_t)new_n * sizeof(uint8_t));
@@ -110,7 +115,10 @@ int tsdb_memtable_row_begin(tsdb_memtable_t *m) {
         pthread_mutex_unlock(&m->lock);
         return TSDB_ERR_INVAL;
     }
-    if (m->nrows >= TSDB_BLOCK_POINTS) {
+    int bp_cap = (m->schema->block_points > 0 &&
+                  m->schema->block_points <= TSDB_BLOCK_POINTS)
+                    ? m->schema->block_points : TSDB_BLOCK_POINTS;
+    if (m->nrows >= (size_t)bp_cap) {
         /* Memtable is full — caller must flush and clear. */
         pthread_mutex_unlock(&m->lock);
         return TSDB_ERR_FULL;
@@ -213,7 +221,10 @@ size_t tsdb_memtable_rows(tsdb_memtable_t *m) {
 int tsdb_memtable_is_full(tsdb_memtable_t *m) {
     if (!m) return 0;
     pthread_mutex_lock(&m->lock);
-    int full = (m->nrows >= TSDB_BLOCK_POINTS);
+    int bp = (m->schema->block_points > 0 &&
+              m->schema->block_points <= TSDB_BLOCK_POINTS)
+                ? m->schema->block_points : TSDB_BLOCK_POINTS;
+    int full = (m->nrows >= (size_t)bp);
     pthread_mutex_unlock(&m->lock);
     return full;
 }
