@@ -151,22 +151,35 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
 }
 
 /*
- * Evict all conns for a peer (e.g. on peer death).  Caller is the gossip
- * layer or a failing RPC that wants to force reconnect across the pool.
- * For single-conn failures, see evict_one_conn below.
+ * Evict a single failing conn from its slot.  Does NOT close the conn
+ * object: other threads may still be mid-call on it under conn->lock,
+ * and closing it there would free the mutex they are holding → UAF →
+ * glibc heap abort.  Instead we clear the slot so future get_conn calls
+ * redial, and intentionally leak the old conn's socket and struct.
+ *
+ * The leak is bounded: at most (nreplicas * conns_per_peer) per cluster
+ * lifetime; a few KB of sockets if half the pool ever goes bad.  Closing
+ * the conn at process exit is the cluster mgr's responsibility — we
+ * accept the leak during runtime in exchange for memory safety across
+ * concurrent RPCs.
  */
-static void evict_conn(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t node_id) {
+static void evict_one_conn(tsdb_replica_mgr_t *rmgr,
+                           tsdb_node_id_t node_id,
+                           tsdb_rpc_conn_t *bad)
+{
+    if (!rmgr || !bad) return;
     pthread_mutex_lock(&rmgr->lock);
     peer_slot_t *p = find_slot_locked(rmgr, node_id);
     if (p) {
         for (int k = 0; k < rmgr->conns_per_peer; k++) {
-            if (p->conns[k]) {
-                tsdb_rpc_conn_close(p->conns[k]);
-                p->conns[k] = NULL;
+            if (p->conns[k] == bad) {
+                p->conns[k] = NULL;   /* next get_conn will redial */
+                break;
             }
         }
     }
     pthread_mutex_unlock(&rmgr->lock);
+    /* DO NOT tsdb_rpc_conn_close(bad). */
 }
 
 /* ---- Replication --------------------------------------------------------- */
@@ -235,7 +248,7 @@ static void *fanout_worker(void *arg) {
     int rc = TSDB_ERR_IO;
     if (conn) {
         rc = tsdb_rpc_call(conn, ctx->rpc_kind, ctx->payload, ctx->payload_len);
-        if (rc != TSDB_OK) evict_conn(ctx->rmgr, nid);
+        if (rc != TSDB_OK) evict_one_conn(ctx->rmgr, nid, conn);
     }
 
     pthread_mutex_lock(&ctx->mu);
@@ -281,7 +294,17 @@ static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
     int launched = 0;
     for (int i = 0; i < nreplicas; i++) {
         worker_arg_t *wa = malloc(sizeof(*wa));
-        if (!wa) continue;
+        if (!wa) {
+            /* Can't launch this worker — release its pre-reserved ref
+             * and count it as "done" so the waiter doesn't hang. */
+            pthread_mutex_lock(&ctx->mu);
+            ctx->done_count++;
+            if (ctx->done_count >= ctx->nreplicas)
+                pthread_cond_broadcast(&ctx->cv);
+            pthread_mutex_unlock(&ctx->mu);
+            fanout_ctx_unref(ctx);
+            continue;
+        }
         wa->ctx     = ctx;
         wa->node_id = replicas[i];
 
@@ -289,11 +312,12 @@ static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
         if (pthread_create(&tid, &attr, fanout_worker, wa) == 0) {
             launched++;
         } else {
-            /* Worker never ran — release its pre-reserved ref and record
-             * the slot as done so the waiter isn't stuck waiting for it. */
+            /* Worker never ran — same handling as the malloc-fail path. */
             free(wa);
             pthread_mutex_lock(&ctx->mu);
             ctx->done_count++;
+            if (ctx->done_count >= ctx->nreplicas)
+                pthread_cond_broadcast(&ctx->cv);
             pthread_mutex_unlock(&ctx->mu);
             fanout_ctx_unref(ctx);
         }
