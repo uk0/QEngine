@@ -269,7 +269,6 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
             fclose(col_fp); return TSDB_ERR_IO;
         }
     }
-    fflush(col_fp);
     fclose(col_fp);
 
     /* --- Rewrite .idx (always write v2). Read either v1 or v2 existing. */
@@ -352,7 +351,6 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
                            r->ts_min, r->ts_max);
     fwrite(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_w);
 
-    fflush(idx_w);
     fclose(idx_w);
     free(old_entries);
     return TSDB_OK;

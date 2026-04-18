@@ -87,6 +87,16 @@ struct tsdb_db {
     /* Default block_points for subsequently-created tables.  0 = library
      * default (TSDB_BLOCK_POINTS).  Tunable via tsdb_db_set_default_block_points. */
     int                  default_block_points;
+
+    /* When set, tsdb_batch_commit only syncs WAL and skips the immediate
+     * memtable→partition flush; the memtable flushes naturally when it fills
+     * via maybe_flush_b().  Enabled by env TSDB_WAL_ONLY_COMMIT=1.
+     *
+     * Trade-off: reduces flush count sharply (batches share a memtable), but
+     * defers replication (row-level and raw-block hooks fire inside
+     * flush_and_clear_ex).  Durability is preserved via WAL fsync; crash
+     * recovery replays WAL records back into memtables on open. */
+    int                  wal_only_commit;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -120,6 +130,10 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
 
     snprintf(db->data_dir, sizeof(db->data_dir), "%s", data_dir);
     pthread_mutex_init(&db->lock, NULL);
+
+    /* Opt-in: commit only syncs WAL, memtable flush deferred to is_full(). */
+    const char *wc = getenv("TSDB_WAL_ONLY_COMMIT");
+    db->wal_only_commit = (wc && wc[0] && wc[0] != '0') ? 1 : 0;
 
     /* Open catalog — non-fatal on failure so plain SELECT workloads
      * still work even if catalog dir creation fails. */
@@ -662,9 +676,15 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
     }
 
     /* Replicate (if cluster hook) + flush any remaining rows.
-     * flush_and_clear_ex skips hook when local_only=1 (replica received write). */
-    int rc = flush_and_clear_ex(t, b->local_only);
-    if (rc != TSDB_OK) return rc;
+     * flush_and_clear_ex skips hook when local_only=1 (replica received write).
+     *
+     * With TSDB_WAL_ONLY_COMMIT, skip the per-commit flush; the memtable
+     * drains when it fills via maybe_flush_b().  WAL is still fsynced below
+     * so durability is preserved (replay on crash). */
+    if (!t->db->wal_only_commit) {
+        int rc = flush_and_clear_ex(t, b->local_only);
+        if (rc != TSDB_OK) return rc;
+    }
 
     /* Sync WAL — direct fsync or via group-commit batcher. */
     if (t->wal) {

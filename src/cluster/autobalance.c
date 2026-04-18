@@ -264,13 +264,11 @@ static void do_rebalance(tsdb_autobalance_t *ab) {
         int cur_vn = tsdb_hashring_get_weight(ring, nid);
 
         if (cur_vn != target) {
-            /* Apply under the node_mgr ring lock is done inside set_weight.
-             * We call tsdb_hashring_set_weight directly; node_mgr lock
-             * protects the ring pointer but not the ring internals here.
-             * To be safe, take node_mgr's lock via a snapshot of the ring ptr. */
             tsdb_hashring_set_weight(ring, nid, target);
-            printf("[autobalance] node %llu: VN %d → %d  (score=%.3f)\n",
-                   (unsigned long long)nid, cur_vn, target, score);
+            if (getenv("TSDB_LOG_AUTOBALANCE")) {
+                fprintf(stderr, "[autobalance] node %llu: VN %d → %d  (score=%.3f)\n",
+                        (unsigned long long)nid, cur_vn, target, score);
+            }
         }
     }
 }

@@ -378,8 +378,8 @@ static void *tick_loop(void *arg) {
                     int64_t elapsed = now - snap[i].last_heartbeat_ns;
                     if (elapsed > DEAD_TIMEOUT_NS) {
                         tsdb_node_manager_dead(g->node_mgr, snap[i].id);
-                        printf("[gossip] node %llu declared DEAD (no heartbeat for 10s)\n",
-                               (unsigned long long)snap[i].id);
+                        fprintf(stderr, "[gossip] node %llu declared DEAD (no heartbeat for 10s)\n",
+                                (unsigned long long)snap[i].id);
                     }
                 }
             }

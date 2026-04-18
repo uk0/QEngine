@@ -41,6 +41,9 @@ services:
       # a hostname; resolves to the container's internal network IP.)
       TSDB_RPC_BIND:      qengine-cnode-1:28081
       TSDB_METRICS_BIND:  0.0.0.0:28094
+      # HDD-optimised I/O path (madvise SEQUENTIAL, larger stdio write
+      # buffer, posix_fadvise on .idx reads).  Host disk is a 512G HDD.
+      TSDB_IOPOLICY:      hdd
       # node1 is the seed — no TSDB_SEEDS.
     ports:
       - "29301:28090"
@@ -71,6 +74,9 @@ services:
       TSDB_BIND:          0.0.0.0:28090
       TSDB_RPC_BIND:      qengine-cnode-2:28081
       TSDB_METRICS_BIND:  0.0.0.0:28094
+      # HDD-optimised I/O path (madvise SEQUENTIAL, larger stdio write
+      # buffer, posix_fadvise on .idx reads).  Host disk is a 512G HDD.
+      TSDB_IOPOLICY:      hdd
       # Seeds are gossip addresses (= RPC port − 1).
       TSDB_SEEDS:         qengine-cnode-1:28080
     ports:
@@ -102,6 +108,9 @@ services:
       TSDB_BIND:          0.0.0.0:28090
       TSDB_RPC_BIND:      qengine-cnode-3:28081
       TSDB_METRICS_BIND:  0.0.0.0:28094
+      # HDD-optimised I/O path (madvise SEQUENTIAL, larger stdio write
+      # buffer, posix_fadvise on .idx reads).  Host disk is a 512G HDD.
+      TSDB_IOPOLICY:      hdd
       # Seeds are gossip addresses (= RPC port − 1).
       TSDB_SEEDS:         qengine-cnode-1:28080,qengine-cnode-2:28080
     ports:

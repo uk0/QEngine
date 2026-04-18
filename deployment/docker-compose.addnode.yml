@@ -29,6 +29,7 @@ services:
       TSDB_BIND:          0.0.0.0:28090
       TSDB_RPC_BIND:      qengine-cnode-4:28081
       TSDB_METRICS_BIND:  0.0.0.0:28094
+      TSDB_IOPOLICY:      hdd
       # Seed 指向 node1 的 gossip 地址（= RPC - 1）
       TSDB_SEEDS:         qengine-cnode-1:28080
     ports:

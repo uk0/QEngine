@@ -187,11 +187,12 @@ int main(int argc, char **argv) {
     }
     fflush(stdout);
 
-    /* Main loop: print stats every 5s until signal. */
+    /* Main loop: optionally print stats every 5s (gated by env). */
+    int verbose = getenv("TSDB_VERBOSE") != NULL;
     int tick = 0;
     while (g_running) {
         sleep(1);
-        if (++tick % 5 == 0) {
+        if (verbose && ++tick % 5 == 0) {
             tsdb_cluster_stats(db, stats_buf, sizeof(stats_buf));
             printf("[node] alive=%d  %s\n",
                    tsdb_cluster_alive_count(db), stats_buf);
