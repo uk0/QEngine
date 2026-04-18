@@ -36,6 +36,11 @@ tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
 struct tsdb_tmq;
 struct tsdb_tmq       *tsdb_db_tmq(tsdb_db_t *db);
 
+/* Access the RBAC/auth store embedded in the db. May be NULL if opening
+ * failed (non-fatal for plain workloads). */
+struct tsdb_auth;
+struct tsdb_auth      *tsdb_db_auth(tsdb_db_t *db);
+
 tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_dir(tsdb_table_internal_t *t);

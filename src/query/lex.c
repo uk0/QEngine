@@ -50,6 +50,15 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"export",       QTOK_EXPORT},
     {"to",           QTOK_TO},
     {"parquet",      QTOK_PARQUET},
+    /* RBAC keywords */
+    {"user",         QTOK_USER},
+    {"identified",   QTOK_IDENTIFIED},
+    {"role",         QTOK_ROLE},
+    {"admin",        QTOK_ADMIN},
+    {"normal",       QTOK_NORMAL},
+    {"grant",        QTOK_GRANT},
+    {"revoke",       QTOK_REVOKE},
+    {"password",     QTOK_PASSWORD},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -109,6 +118,14 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_EXPORT:       return "EXPORT";
     case QTOK_TO:           return "TO";
     case QTOK_PARQUET:      return "PARQUET";
+    case QTOK_USER:         return "USER";
+    case QTOK_IDENTIFIED:   return "IDENTIFIED";
+    case QTOK_ROLE:         return "ROLE";
+    case QTOK_ADMIN:        return "ADMIN";
+    case QTOK_NORMAL:       return "NORMAL";
+    case QTOK_GRANT:        return "GRANT";
+    case QTOK_REVOKE:       return "REVOKE";
+    case QTOK_PASSWORD:     return "PASSWORD";
     case QTOK_ERR: return "<error>";
     }
     return "?";

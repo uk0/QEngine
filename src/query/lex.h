@@ -68,6 +68,16 @@ typedef enum {
     QTOK_TO,
     QTOK_PARQUET,
 
+    /* RBAC keywords — see CREATE USER / GRANT / REVOKE / ALTER USER. */
+    QTOK_USER,            /* CREATE USER / DROP USER / ALTER USER     */
+    QTOK_IDENTIFIED,      /* IDENTIFIED BY '<password>'               */
+    QTOK_ROLE,            /* ROLE ADMIN | NORMAL                      */
+    QTOK_ADMIN,
+    QTOK_NORMAL,
+    QTOK_GRANT,           /* GRANT <priv> ON <resource> TO <user>     */
+    QTOK_REVOKE,
+    QTOK_PASSWORD,        /* ALTER USER ... SET PASSWORD '<pw>'       */
+
     QTOK_ERR
 } qtok_kind_t;
 

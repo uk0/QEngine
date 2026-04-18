@@ -15,7 +15,7 @@
  *     -group   <name>
  *     +member  <group> <consumer_id> <joined_at>
  *     -member  <group> <consumer_id>
- *     ~offset  <group> <consumer_id> <partition> <seq>
+ *     ~offset  <group> <partition> <seq>
  *
  *   On open, log is replayed top-to-bottom; tombstones remove entries.
  */
@@ -42,9 +42,6 @@ extern "C" {
 typedef struct {
     char        consumer_id[TSDB_TMQ_ID_MAX];
     tsdb_ts_t   joined_at;
-    /* committed_offsets[partition] — only meaningful for partitions owned
-     * by this member; others stay at 0 / last committed. */
-    int64_t     committed_offsets[TSDB_TMQ_NPARTITIONS];
 } tsdb_tmq_member_t;
 
 typedef struct {
@@ -58,6 +55,11 @@ typedef struct {
 
     /* partition_owner[p] = index into members[] (or -1 if unowned). */
     int                partition_owner[TSDB_TMQ_NPARTITIONS];
+
+    /* committed_offsets[p] — seq per partition (shared across members).
+     * Survives member handover so Kafka-like consumer-group semantics hold:
+     * the partition's committed position persists when ownership changes. */
+    int64_t            committed_offsets[TSDB_TMQ_NPARTITIONS];
 } tsdb_tmq_group_t;
 
 typedef struct tsdb_tmq tsdb_tmq_t;
@@ -101,18 +103,23 @@ int tsdb_tmq_leave(tsdb_tmq_t *t,
 
 /* ---- Offsets ----------------------------------------------------------- */
 
-/* Commit a seq for all partitions currently owned by <consumer_id> in
- * <group>. Rejects decreasing seq (returns TSDB_ERR_INVAL). */
+/* Commit a seq.
+ *   consumer_id == NULL → apply seq to every partition of the group
+ *                         (matches the spec's `COMMIT OFFSET <name> AT <seq>`).
+ *   consumer_id != NULL → apply seq only to partitions currently owned
+ *                         by that member.
+ * Rejects decreasing seq (returns TSDB_ERR_INVAL). */
 int tsdb_tmq_commit(tsdb_tmq_t *t,
                     const char *group,
-                    const char *consumer_id,
+                    const char *consumer_id,   /* may be NULL */
                     int64_t seq);
 
-/* Read the committed offset for a specific (group, consumer, partition).
- * Returns TSDB_ERR_NOTFOUND if group or consumer missing.               */
+/* Read the committed offset for a partition. Offsets live on the group,
+ * so consumer_id is accepted for convenience but ignored (pass NULL).
+ * Returns TSDB_ERR_NOTFOUND if group missing.                            */
 int tsdb_tmq_get_offset(tsdb_tmq_t *t,
                         const char *group,
-                        const char *consumer_id,
+                        const char *consumer_id,   /* may be NULL */
                         int partition,
                         int64_t *out_seq);
 

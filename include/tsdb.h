@@ -32,7 +32,8 @@ typedef enum {
     TSDB_ERR_UNSUPPORTED = -9,
     TSDB_ERR_PARSE       = -10,
     TSDB_ERR_SCHEMA      = -11,
-    TSDB_ERR_INTERNAL    = -12
+    TSDB_ERR_INTERNAL    = -12,
+    TSDB_ERR_PERMISSION  = -13
 } tsdb_err_t;
 
 /* Column types */
@@ -149,6 +150,54 @@ const char *tsdb_errstr(int err);
 const char *tsdb_version(void);
 tsdb_ts_t   tsdb_now_ns(void);
 tsdb_ts_t   tsdb_parse_ts(const char *s); /* ISO-8601 or "YYYY-MM-DD HH:MM:SS.nnn" */
+
+/* ---- RBAC (role-based access control) -----------------------------------
+ *
+ * User records are persisted in <data_dir>/catalog/users.log.  Passwords are
+ * stored as PBKDF2-HMAC-SHA256 hashes (10000 rounds) with per-user 16-byte
+ * random salts.
+ *
+ * Enforcement is opt-in.  The executor does NOT consult auth by default;
+ * callers invoke tsdb_auth_check (or tsdb_auth_enforce) explicitly to guard
+ * their own entrypoints.  Flip db->auth_enforce via tsdb_auth_set_enforce
+ * when auto-consulting via tsdb_auth_enforce is desired.
+ */
+
+#define TSDB_PRIV_SELECT 0x01
+#define TSDB_PRIV_INSERT 0x02
+#define TSDB_PRIV_DDL    0x04
+#define TSDB_PRIV_ALL    0x07
+
+/* Authenticate username/password; on success copy a 32-char hex token + NUL
+ * into out_token (token_cap must be >= 33).
+ *   Returns TSDB_OK or TSDB_ERR_PERMISSION (bad creds / unknown user),
+ *   TSDB_ERR_INVAL (bad args). */
+int tsdb_auth_authenticate(tsdb_db_t  *db,
+                            const char *username,
+                            const char *password,
+                            char       *out_token,
+                            size_t      token_cap);
+
+/* Check whether <token> carries <privilege> on <resource>.  <privilege> is a
+ * bitmask; a single call can check multiple bits (all must be granted).
+ * <resource> is a table name or "*" meaning any table.
+ *   Returns TSDB_OK if granted, TSDB_ERR_PERMISSION otherwise. */
+int tsdb_auth_check(tsdb_db_t  *db,
+                     const char *token,
+                     int         privilege,
+                     const char *resource);
+
+/* Toggle the db-level auto-enforce flag consumed by tsdb_auth_enforce.
+ * Enforcement into tsdb_query/TCP server is not yet wired — this flag
+ * is present so opt-in callers can short-circuit cheaply. */
+void tsdb_auth_set_enforce(tsdb_db_t *db, bool enforce);
+
+/* Opt-in enforcement stub: returns TSDB_OK when db->auth_enforce is false;
+ * otherwise delegates to tsdb_auth_check. */
+int tsdb_auth_enforce(tsdb_db_t  *db,
+                       const char *token,
+                       int         privilege,
+                       const char *resource);
 
 #ifdef __cplusplus
 }

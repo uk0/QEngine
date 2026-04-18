@@ -22,6 +22,7 @@
 #include "../catalog/device.h"
 #include "../catalog/stable.h"
 #include "../catalog/tmq.h"
+#include "../catalog/user.h"
 #include "../../include/tsdb.h"
 #include "../server/metrics.h"
 #include <stdio.h>
@@ -4622,6 +4623,36 @@ static int exec_list_devices(tsdb_catalog_t *cat, const char *group,
     return rc;
 }
 
+/* LIST USERS result columns: name, role, created_at. */
+static const char *LIST_USERS_COLS[]  = {"name", "role", "created_at"};
+static const tsdb_type_t LIST_USERS_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_TIMESTAMP
+};
+#define LIST_USERS_NCOLS 3
+
+static int exec_list_users(tsdb_auth_t *auth, tsdb_result_t *r) {
+    int rc = result_init_ddl(r, LIST_USERS_NCOLS,
+                              LIST_USERS_COLS, LIST_USERS_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_user_t *arr = NULL;
+    size_t n = 0;
+    rc = tsdb_auth_user_list(auth, &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_user_t *u = &arr[i];
+        const char *role_str = (u->role == TSDB_USER_ROLE_ADMIN) ? "ADMIN" : "NORMAL";
+        result_append_sym(r, 0, u->name);
+        result_append_sym(r, 1, role_str);
+        result_append_ts_val(r, 2, u->created_at);
+        result_ddl_end_row(r);
+    }
+    free(arr);
+    return rc;
+}
+
 /* Build a single-row, single-col STATUS result with a message string. */
 static int result_status(tsdb_result_t *r, const char *msg) {
     static const char *col_names[] = {"status"};
@@ -4827,9 +4858,10 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_COMMIT_OFFSET: {
         tsdb_tmq_t *tmq = tsdb_db_tmq(db);
         if (!tmq) { result_status(r, "ERR: tmq not available"); rc = TSDB_ERR_INTERNAL; break; }
+        const char *cid = stmt.u.commit_offset.consumer_id;
         rc = tsdb_tmq_commit(tmq,
                              stmt.u.commit_offset.name,
-                             stmt.u.commit_offset.consumer_id,
+                             (cid && *cid) ? cid : NULL,
                              stmt.u.commit_offset.seq);
         if (rc == TSDB_OK)                  rc = result_status(r, "OK: offset committed");
         else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group or consumer not found"); rc = TSDB_ERR_NOTFOUND; }
@@ -4895,6 +4927,68 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             snprintf(msg, sizeof(msg), "OK: exported %d partition(s)", nfiles);
             rc = result_status(r, msg);
         }
+        break;
+    }
+
+    /* ---- RBAC statements ---------------------------------------------- */
+    case QAST_STMT_CREATE_USER: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        tsdb_user_role_t role = stmt.u.create_user.role ? TSDB_USER_ROLE_ADMIN
+                                                         : TSDB_USER_ROLE_NORMAL;
+        rc = tsdb_auth_user_create(auth, stmt.u.create_user.name,
+                                    stmt.u.create_user.password, role);
+        if (rc == TSDB_OK)                 rc = result_status(r, "OK: user created");
+        else if (rc == TSDB_ERR_EXISTS)  { result_status(r, "ERR: user exists"); rc = TSDB_ERR_EXISTS; }
+        else if (rc == TSDB_ERR_FULL)    { result_status(r, "ERR: too many users"); rc = TSDB_ERR_FULL; }
+        else                               result_status(r, "ERR: create user failed");
+        break;
+    }
+    case QAST_STMT_DROP_USER: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_auth_user_drop(auth, stmt.u.drop_user.name);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: user dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: user not found"); rc = TSDB_ERR_NOTFOUND; }
+        else                                result_status(r, "ERR: drop user failed");
+        break;
+    }
+    case QAST_STMT_LIST_USERS: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = exec_list_users(auth, r);
+        break;
+    }
+    case QAST_STMT_GRANT: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_auth_grant(auth, stmt.u.grant.user,
+                              stmt.u.grant.priv, stmt.u.grant.resource);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: grant applied");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: user not found"); rc = TSDB_ERR_NOTFOUND; }
+        else if (rc == TSDB_ERR_FULL)     { result_status(r, "ERR: too many grants"); rc = TSDB_ERR_FULL; }
+        else                                result_status(r, "ERR: grant failed");
+        break;
+    }
+    case QAST_STMT_REVOKE: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_auth_revoke(auth, stmt.u.revoke_.user,
+                               stmt.u.revoke_.priv, stmt.u.revoke_.resource);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: revoke applied");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: user not found"); rc = TSDB_ERR_NOTFOUND; }
+        else                                result_status(r, "ERR: revoke failed");
+        break;
+    }
+    case QAST_STMT_ALTER_USER_PASSWORD: {
+        tsdb_auth_t *auth = tsdb_db_auth(db);
+        if (!auth) { result_status(r, "ERR: auth not available"); rc = TSDB_ERR_INTERNAL; break; }
+        rc = tsdb_auth_user_set_password(auth,
+                                          stmt.u.alter_user_password.name,
+                                          stmt.u.alter_user_password.password);
+        if (rc == TSDB_OK)                  rc = result_status(r, "OK: password updated");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: user not found"); rc = TSDB_ERR_NOTFOUND; }
+        else                                result_status(r, "ERR: alter user failed");
         break;
     }
 

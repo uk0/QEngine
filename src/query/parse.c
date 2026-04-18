@@ -903,14 +903,95 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP, DEVICE, STABLE, or TABLE after CREATE");
+        /* CREATE USER <name> IDENTIFIED BY '<password>' [ROLE admin|normal] */
+        if (accept(&p, QTOK_USER)) {
+            out->kind = QAST_STMT_CREATE_USER;
+            memset(&out->u.create_user, 0, sizeof(out->u.create_user));
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected user name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.create_user.name,
+                     sizeof(out->u.create_user.name));
+            advance(&p);
+            if (!accept(&p, QTOK_IDENTIFIED)) {
+                perr(&p, "expected IDENTIFIED BY '<password>'");
+                return TSDB_ERR_PARSE;
+            }
+            if (!accept(&p, QTOK_BY)) {
+                perr(&p, "expected BY after IDENTIFIED");
+                return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_STRING) {
+                perr(&p, "expected quoted password");
+                return TSDB_ERR_PARSE;
+            }
+            {
+                char *pw = str_literal(&p, &p.tok);
+                if (!pw) return TSDB_ERR_NOMEM;
+                size_t n = strlen(pw);
+                if (n >= sizeof(out->u.create_user.password))
+                    n = sizeof(out->u.create_user.password) - 1;
+                memcpy(out->u.create_user.password, pw, n);
+                out->u.create_user.password[n] = '\0';
+            }
+            advance(&p);
+            /* Default role: NORMAL. Optional ROLE keyword. */
+            out->u.create_user.role = 0;
+            if (accept(&p, QTOK_ROLE)) {
+                if (accept(&p, QTOK_ADMIN))       out->u.create_user.role = 1;
+                else if (accept(&p, QTOK_NORMAL)) out->u.create_user.role = 0;
+                else {
+                    perr(&p, "expected ADMIN or NORMAL after ROLE");
+                    return TSDB_ERR_PARSE;
+                }
+            }
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, STABLE, TABLE, or USER after CREATE");
         return TSDB_ERR_PARSE;
     }
 
-    /* ---- ALTER TABLE t ADD COLUMN c TYPE -------------------------------- */
+    /* ---- ALTER (TABLE ... ADD COLUMN | USER ... SET PASSWORD) ----------- */
     if (accept(&p, QTOK_ALTER)) {
+        /* ALTER USER <name> SET PASSWORD '<pw>' */
+        if (accept(&p, QTOK_USER)) {
+            out->kind = QAST_STMT_ALTER_USER_PASSWORD;
+            memset(&out->u.alter_user_password, 0, sizeof(out->u.alter_user_password));
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected user name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.alter_user_password.name,
+                     sizeof(out->u.alter_user_password.name));
+            advance(&p);
+            /* SET is lexed as QTOK_IDENT (not a reserved keyword) — accept by ident_ci */
+            if (!(p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "set"))) {
+                perr(&p, "expected SET after user name"); return TSDB_ERR_PARSE;
+            }
+            advance(&p);
+            if (!accept(&p, QTOK_PASSWORD)) {
+                perr(&p, "expected PASSWORD after SET"); return TSDB_ERR_PARSE;
+            }
+            if (p.tok.kind != QTOK_STRING) {
+                perr(&p, "expected quoted password"); return TSDB_ERR_PARSE;
+            }
+            {
+                char *pw = str_literal(&p, &p.tok);
+                if (!pw) return TSDB_ERR_NOMEM;
+                size_t n = strlen(pw);
+                if (n >= sizeof(out->u.alter_user_password.password))
+                    n = sizeof(out->u.alter_user_password.password) - 1;
+                memcpy(out->u.alter_user_password.password, pw, n);
+                out->u.alter_user_password.password[n] = '\0';
+            }
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
         if (!accept(&p, QTOK_TABLE)) {
-            perr(&p, "expected TABLE after ALTER"); return TSDB_ERR_PARSE;
+            perr(&p, "expected TABLE or USER after ALTER"); return TSDB_ERR_PARSE;
         }
         if (p.tok.kind != QTOK_IDENT) {
             perr(&p, "expected table name"); return TSDB_ERR_PARSE;
@@ -997,7 +1078,19 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP, DEVICE, or STABLE after DROP");
+        /* DROP USER <name> */
+        if (accept(&p, QTOK_USER)) {
+            out->kind = QAST_STMT_DROP_USER;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected user name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_user.name, sizeof(out->u.drop_user.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUP, DEVICE, STABLE, or USER after DROP");
         return TSDB_ERR_PARSE;
     }
 
@@ -1031,7 +1124,15 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUPS or DEVICES after LIST");
+        /* LIST USERS — "users" is an IDENT (plural of USER keyword). */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "users")) {
+            out->kind = QAST_STMT_LIST_USERS;
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        perr(&p, "expected GROUPS, DEVICES, or USERS after LIST");
         return TSDB_ERR_PARSE;
     }
 
@@ -1085,10 +1186,11 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
     }
 
-    /* ---- COMMIT OFFSET <name> AS <consumer_id> AT <seq> (TMQ) ---------
-     * Note: task spec says "COMMIT OFFSET <name> AT <seq>" but a consumer
-     * group has multiple members. We require AS <consumer_id> to identify
-     * which member is committing (its owned partitions get <seq>).     */
+    /* ---- COMMIT OFFSET <name> [AS <consumer_id>] AT <seq> (TMQ) -------
+     * Spec form: `COMMIT OFFSET <name> AT <seq>` applies <seq> to every
+     * partition of the group (offsets are per-group, per-partition).
+     * Extended form `AS <consumer_id>` scopes the commit to the partitions
+     * currently owned by that consumer. consumer_id == "" means group-wide. */
     if (accept(&p, QTOK_COMMIT)) {
         if (!accept(&p, QTOK_OFFSET)) {
             perr(&p, "expected OFFSET after COMMIT"); return TSDB_ERR_PARSE;
@@ -1100,15 +1202,15 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         tok_copy(&p.tok, out->u.commit_offset.name,
                  sizeof(out->u.commit_offset.name));
         advance(&p);
-        if (!accept(&p, QTOK_AS)) {
-            perr(&p, "expected AS <consumer_id>"); return TSDB_ERR_PARSE;
+        out->u.commit_offset.consumer_id[0] = '\0';   /* default: group-wide */
+        if (accept(&p, QTOK_AS)) {
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected consumer id after AS"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.commit_offset.consumer_id,
+                     sizeof(out->u.commit_offset.consumer_id));
+            advance(&p);
         }
-        if (p.tok.kind != QTOK_IDENT) {
-            perr(&p, "expected consumer id after AS"); return TSDB_ERR_PARSE;
-        }
-        tok_copy(&p.tok, out->u.commit_offset.consumer_id,
-                 sizeof(out->u.commit_offset.consumer_id));
-        advance(&p);
         if (!accept(&p, QTOK_AT)) {
             perr(&p, "expected AT <seq>"); return TSDB_ERR_PARSE;
         }
@@ -1157,7 +1259,74 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
     }
 
-    perr(&p, "expected SELECT, CREATE, DROP, LIST, JOIN, LEAVE, COMMIT, or EXPORT");
+    /* ---- GRANT <priv> ON (<table>|*) TO <user> ------------------------- */
+    /* ---- REVOKE <priv> ON (<table>|*) FROM <user> ---------------------- */
+    if (p.tok.kind == QTOK_GRANT || p.tok.kind == QTOK_REVOKE) {
+        int is_grant = (p.tok.kind == QTOK_GRANT);
+        advance(&p);
+
+        int priv = 0;
+        if (accept(&p, QTOK_SELECT)) {
+            priv = TSDB_PRIV_SELECT;
+        } else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "insert")) {
+            priv = TSDB_PRIV_INSERT;
+            advance(&p);
+        } else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "ddl")) {
+            priv = TSDB_PRIV_DDL;
+            advance(&p);
+        } else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "all")) {
+            priv = TSDB_PRIV_ALL;
+            advance(&p);
+        } else {
+            perr(&p, "expected SELECT, INSERT, DDL, or ALL"); return TSDB_ERR_PARSE;
+        }
+
+        if (!accept(&p, QTOK_ON)) {
+            perr(&p, "expected ON after privilege"); return TSDB_ERR_PARSE;
+        }
+
+        char resource[64];
+        if (accept(&p, QTOK_STAR)) {
+            snprintf(resource, sizeof(resource), "*");
+        } else if (p.tok.kind == QTOK_IDENT) {
+            tok_copy(&p.tok, resource, sizeof(resource));
+            advance(&p);
+        } else {
+            perr(&p, "expected table name or *"); return TSDB_ERR_PARSE;
+        }
+
+        if (is_grant) {
+            if (!accept(&p, QTOK_TO)) {
+                perr(&p, "expected TO after resource"); return TSDB_ERR_PARSE;
+            }
+        } else {
+            if (!accept(&p, QTOK_FROM)) {
+                perr(&p, "expected FROM after resource"); return TSDB_ERR_PARSE;
+            }
+        }
+
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected user name"); return TSDB_ERR_PARSE;
+        }
+        if (is_grant) {
+            out->kind = QAST_STMT_GRANT;
+            tok_copy(&p.tok, out->u.grant.user, sizeof(out->u.grant.user));
+            out->u.grant.priv = priv;
+            snprintf(out->u.grant.resource, sizeof(out->u.grant.resource),
+                     "%s", resource);
+        } else {
+            out->kind = QAST_STMT_REVOKE;
+            tok_copy(&p.tok, out->u.revoke_.user, sizeof(out->u.revoke_.user));
+            out->u.revoke_.priv = priv;
+            snprintf(out->u.revoke_.resource, sizeof(out->u.revoke_.resource),
+                     "%s", resource);
+        }
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    perr(&p, "expected SELECT, CREATE, DROP, LIST, JOIN, LEAVE, COMMIT, GRANT, REVOKE, or EXPORT");
     return TSDB_ERR_PARSE;
 }
 

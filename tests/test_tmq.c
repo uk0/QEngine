@@ -161,6 +161,10 @@ static void phase3_commit_and_reopen(const char *data_dir) {
     rc = tsdb_tmq_commit(tmq, "g1", "c1", 12345);
     CHECK(rc == TSDB_OK, "monotone: equal seq accepted");
 
+    /* Group-wide commit: NULL consumer_id covers every partition. */
+    rc = tsdb_tmq_commit(tmq, "g1", NULL, 20000);
+    CHECK(rc == TSDB_OK, "group-wide commit seq=20000");
+
     /* Close and reopen to verify offsets persist via the log. */
     tsdb_close(db);
     db = NULL;
@@ -171,25 +175,14 @@ static void phase3_commit_and_reopen(const char *data_dir) {
     rc = tsdb_tmq_group_get(tmq, "g1", &g);
     CHECK(rc == TSDB_OK, "group survived close+reopen");
 
-    /* Find c1's partitions and verify seq. */
-    int mi = -1;
-    for (int i = 0; i < g.nmembers; i++) {
-        if (strcmp(g.members[i].consumer_id, "c1") == 0) { mi = i; break; }
-    }
-    CHECK(mi >= 0, "c1 replayed");
-
-    int seq_matches = 0, partitions_checked = 0;
+    /* After the group-wide commit, every partition should read 20000. */
+    int all_match = 1;
     for (int p = 0; p < g.npart; p++) {
-        if (g.partition_owner[p] == mi) {
-            int64_t seq = 0;
-            int qrc = tsdb_tmq_get_offset(tmq, "g1", "c1", p, &seq);
-            if (qrc == TSDB_OK && seq == 12345) seq_matches++;
-            partitions_checked++;
-        }
+        int64_t seq = -1;
+        int qrc = tsdb_tmq_get_offset(tmq, "g1", NULL, p, &seq);
+        if (qrc != TSDB_OK || seq != 20000) { all_match = 0; break; }
     }
-    CHECK(partitions_checked > 0, "c1 owned at least one partition");
-    CHECK(seq_matches == partitions_checked,
-          "every c1-owned partition has seq=12345 after replay");
+    CHECK(all_match, "every partition has seq=20000 after replay");
 
     tsdb_close(db);
 }
@@ -203,6 +196,21 @@ static void phase4_leave(const char *data_dir) {
     CHECK(rc == TSDB_OK, "reopen for phase 4");
     tsdb_tmq_t *tmq = tsdb_db_tmq(db);
 
+    /* Before leaving, note the committed offset on a partition that c2
+     * currently owns. That offset must survive the handover to c1. */
+    tsdb_tmq_group_t before;
+    tsdb_tmq_group_get(tmq, "g1", &before);
+    int mi_c2 = -1;
+    for (int i = 0; i < before.nmembers; i++) {
+        if (strcmp(before.members[i].consumer_id, "c2") == 0) { mi_c2 = i; break; }
+    }
+    int c2_partition = -1;
+    for (int p = 0; p < before.npart; p++) {
+        if (before.partition_owner[p] == mi_c2) { c2_partition = p; break; }
+    }
+    int64_t pre_seq = before.committed_offsets[c2_partition];
+    CHECK(pre_seq == 20000, "c2-owned partition has seq=20000 pre-leave");
+
     rc = tsdb_tmq_leave(tmq, "g1", "c2");
     CHECK(rc == TSDB_OK, "leave c2 ok");
 
@@ -211,6 +219,13 @@ static void phase4_leave(const char *data_dir) {
     CHECK(g.nmembers == 1, "1 member after leave");
     CHECK(owned_count(&g, "c1") == TSDB_TMQ_NPARTITIONS,
           "c1 regains every partition after c2 leaves");
+
+    /* Offset survives the handover: the partition c2 used to own still
+     * shows seq=20000 under c1. */
+    int64_t post_seq = -1;
+    rc = tsdb_tmq_get_offset(tmq, "g1", "c1", c2_partition, &post_seq);
+    CHECK(rc == TSDB_OK && post_seq == 20000,
+          "offset survives handover across member leave");
 
     /* Duplicate leave fails. */
     rc = tsdb_tmq_leave(tmq, "g1", "c2");
@@ -256,13 +271,19 @@ static void qtl_smoke(const char *data_dir) {
     CHECK(rc == TSDB_OK, "QTL: JOIN second consumer");
     if (r) { tsdb_result_free(r); r = NULL; }
 
-    rc = tsdb_query(db, "COMMIT OFFSET gq AS ca AT 42", &r);
-    CHECK(rc == TSDB_OK, "QTL: COMMIT OFFSET dispatched");
+    /* Spec form: no AS — applies to every partition. */
+    rc = tsdb_query(db, "COMMIT OFFSET gq AT 42", &r);
+    CHECK(rc == TSDB_OK, "QTL: COMMIT OFFSET (spec form) dispatched");
     if (r) { result_first_symbol(r, status, sizeof(status));
              CHECK(strstr(status, "OK:") == status, "QTL commit OK"); tsdb_result_free(r); r = NULL; }
 
+    /* Extended form: AS <consumer> scopes to that consumer's partitions. */
+    rc = tsdb_query(db, "COMMIT OFFSET gq AS ca AT 100", &r);
+    CHECK(rc == TSDB_OK, "QTL: COMMIT OFFSET AS ca AT dispatched");
+    if (r) { tsdb_result_free(r); r = NULL; }
+
     /* Monotone: backwards commit returns non-OK. */
-    rc = tsdb_query(db, "COMMIT OFFSET gq AS ca AT 1", &r);
+    rc = tsdb_query(db, "COMMIT OFFSET gq AT 1", &r);
     CHECK(rc == TSDB_ERR_INVAL, "QTL: backwards commit rejected");
     if (r) { tsdb_result_free(r); r = NULL; }
 

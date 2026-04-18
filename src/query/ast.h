@@ -187,6 +187,13 @@ typedef enum {
     QAST_STMT_COMMIT_OFFSET,          /* COMMIT OFFSET n AT seq (needs AS)  */
     /* Parquet export */
     QAST_STMT_EXPORT_PARQUET,         /* EXPORT TABLE <name> TO PARQUET '<dir>' */
+    /* RBAC statements */
+    QAST_STMT_CREATE_USER,            /* CREATE USER n IDENTIFIED BY '...' [ROLE admin|normal] */
+    QAST_STMT_DROP_USER,              /* DROP USER n                                          */
+    QAST_STMT_LIST_USERS,             /* LIST USERS                                           */
+    QAST_STMT_GRANT,                  /* GRANT <priv> ON <table>|* TO <user>                  */
+    QAST_STMT_REVOKE,                 /* REVOKE <priv> ON <table>|* FROM <user>               */
+    QAST_STMT_ALTER_USER_PASSWORD,    /* ALTER USER n SET PASSWORD '<pw>'                      */
 } qast_stmt_kind_t;
 
 typedef struct {
@@ -216,6 +223,22 @@ typedef struct {
         struct { char name[64]; char consumer_id[64]; int64_t seq; } commit_offset;
         /* Parquet export: EXPORT TABLE <table> TO PARQUET '<dir>' */
         struct { char table[64]; char out_dir[1024]; } export_parquet;
+        /* RBAC */
+        struct {
+            char  name[64];
+            char  password[128];
+            int   role;   /* 0 = NORMAL, 1 = ADMIN */
+        } create_user;
+        struct { char name[64]; } drop_user;
+        struct {
+            char  user[64];
+            int   priv;           /* bitmask: TSDB_PRIV_{SELECT,INSERT,DDL,ALL} */
+            char  resource[64];   /* table name or "*" */
+        } grant, revoke_;
+        struct {
+            char name[64];
+            char password[128];
+        } alter_user_password;
     } u;
 } qast_stmt_t;
 

@@ -164,12 +164,11 @@ static int log_member_drop(tsdb_tmq_t *t, const char *group,
 }
 
 static int log_offset(tsdb_tmq_t *t, const char *group,
-                      const char *consumer_id, int partition, int64_t seq) {
-    char eg[128], ec[128];
+                      int partition, int64_t seq) {
+    char eg[128];
     pct_encode(group, eg, sizeof(eg));
-    pct_encode(consumer_id, ec, sizeof(ec));
-    int n = fprintf(t->log, "~offset\t%s\t%s\t%d\t%lld\n",
-                    eg, ec, partition, (long long)seq);
+    int n = fprintf(t->log, "~offset\t%s\t%d\t%lld\n",
+                    eg, partition, (long long)seq);
     if (n < 0 || fflush(t->log) != 0) return TSDB_ERR_IO;
     return TSDB_OK;
 }
@@ -230,14 +229,12 @@ static void apply_member_drop(tsdb_tmq_t *t, const char *group,
 }
 
 static void apply_offset(tsdb_tmq_t *t, const char *group,
-                         const char *consumer_id, int partition, int64_t seq) {
+                         int partition, int64_t seq) {
     int gi = find_group(t, group);
     if (gi < 0) return;
     tsdb_tmq_group_t *g = &t->groups[gi];
-    int mi = find_member(g, consumer_id);
-    if (mi < 0) return;
     if (partition < 0 || partition >= g->npart) return;
-    g->members[mi].committed_offsets[partition] = seq;
+    g->committed_offsets[partition] = seq;
 }
 
 static int replay_log(tsdb_tmq_t *t) {
@@ -281,13 +278,12 @@ static int replay_log(tsdb_tmq_t *t) {
             pct_decode(fields[2], c, sizeof(c));
             apply_member_drop(t, g, c);
 
-        } else if (strcmp(fields[0], "~offset") == 0 && nf >= 5) {
-            char g[TSDB_TMQ_NAME_MAX], c[TSDB_TMQ_ID_MAX];
+        } else if (strcmp(fields[0], "~offset") == 0 && nf >= 4) {
+            char g[TSDB_TMQ_NAME_MAX];
             pct_decode(fields[1], g, sizeof(g));
-            pct_decode(fields[2], c, sizeof(c));
-            int part = atoi(fields[3]);
-            int64_t seq = strtoll(fields[4], NULL, 10);
-            apply_offset(t, g, c, part, seq);
+            int part = atoi(fields[2]);
+            int64_t seq = strtoll(fields[3], NULL, 10);
+            apply_offset(t, g, part, seq);
         }
     }
     fclose(f);
@@ -491,10 +487,10 @@ int tsdb_tmq_leave(tsdb_tmq_t *t,
 
 int tsdb_tmq_commit(tsdb_tmq_t *t,
                     const char *group,
-                    const char *consumer_id,
+                    const char *consumer_id,   /* NULL = group-wide */
                     int64_t seq)
 {
-    if (!t || !group || !consumer_id) return TSDB_ERR_INVAL;
+    if (!t || !group) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&t->lock);
     int gi = find_group(t, group);
     if (gi < 0) {
@@ -502,25 +498,28 @@ int tsdb_tmq_commit(tsdb_tmq_t *t,
         return TSDB_ERR_NOTFOUND;
     }
     tsdb_tmq_group_t *g = &t->groups[gi];
-    int mi = find_member(g, consumer_id);
-    if (mi < 0) {
-        pthread_mutex_unlock(&t->lock);
-        return TSDB_ERR_NOTFOUND;
+
+    /* Compute which partitions the commit affects.
+     *   consumer_id == NULL → every partition of the group.
+     *   else                → only those owned by that member. */
+    int targets[TSDB_TMQ_NPARTITIONS];
+    int ntargets = 0;
+    if (consumer_id && *consumer_id) {
+        int mi = find_member(g, consumer_id);
+        if (mi < 0) {
+            pthread_mutex_unlock(&t->lock);
+            return TSDB_ERR_NOTFOUND;
+        }
+        for (int p = 0; p < g->npart; p++) {
+            if (g->partition_owner[p] == mi) targets[ntargets++] = p;
+        }
+    } else {
+        for (int p = 0; p < g->npart; p++) targets[ntargets++] = p;
     }
 
-    /* Collect owned partitions first so we reject early if ANY would go
-     * backwards (monotonic offset across the set). */
-    int owned[TSDB_TMQ_NPARTITIONS];
-    int nown = 0;
-    for (int p = 0; p < g->npart; p++) {
-        if (g->partition_owner[p] == mi) {
-            owned[nown++] = p;
-        }
-    }
-    /* Enforce monotone per owned partition. */
-    for (int i = 0; i < nown; i++) {
-        int64_t cur = g->members[mi].committed_offsets[owned[i]];
-        if (seq < cur) {
+    /* Enforce monotone for every affected partition before mutating. */
+    for (int i = 0; i < ntargets; i++) {
+        if (seq < g->committed_offsets[targets[i]]) {
             pthread_mutex_unlock(&t->lock);
             return TSDB_ERR_INVAL;
         }
@@ -528,10 +527,10 @@ int tsdb_tmq_commit(tsdb_tmq_t *t,
 
     /* Persist + apply. */
     int rc = TSDB_OK;
-    for (int i = 0; i < nown && rc == TSDB_OK; i++) {
-        rc = log_offset(t, group, consumer_id, owned[i], seq);
+    for (int i = 0; i < ntargets && rc == TSDB_OK; i++) {
+        rc = log_offset(t, group, targets[i], seq);
         if (rc == TSDB_OK) {
-            g->members[mi].committed_offsets[owned[i]] = seq;
+            g->committed_offsets[targets[i]] = seq;
         }
     }
     pthread_mutex_unlock(&t->lock);
@@ -544,18 +543,17 @@ int tsdb_tmq_get_offset(tsdb_tmq_t *t,
                         int partition,
                         int64_t *out_seq)
 {
-    if (!t || !group || !consumer_id || !out_seq) return TSDB_ERR_INVAL;
+    (void)consumer_id;  /* offsets are group-level; accepted for convenience */
+    if (!t || !group || !out_seq) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&t->lock);
     int gi = find_group(t, group);
     if (gi < 0) { pthread_mutex_unlock(&t->lock); return TSDB_ERR_NOTFOUND; }
     tsdb_tmq_group_t *g = &t->groups[gi];
-    int mi = find_member(g, consumer_id);
-    if (mi < 0) { pthread_mutex_unlock(&t->lock); return TSDB_ERR_NOTFOUND; }
     if (partition < 0 || partition >= g->npart) {
         pthread_mutex_unlock(&t->lock);
         return TSDB_ERR_INVAL;
     }
-    *out_seq = g->members[mi].committed_offsets[partition];
+    *out_seq = g->committed_offsets[partition];
     pthread_mutex_unlock(&t->lock);
     return TSDB_OK;
 }

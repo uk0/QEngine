@@ -9,6 +9,7 @@
 #include "../catalog/group.h"
 #include "../catalog/device.h"
 #include "../catalog/tmq.h"
+#include "../catalog/user.h"
 #include "../server/metrics.h"
 #include "retention.h"
 #include <stdio.h>
@@ -66,6 +67,13 @@ struct tsdb_db {
     /* TMQ consumer-group store. Opened in tsdb_open. */
     tsdb_tmq_t          *tmq;
 
+    /* RBAC auth store. Opened in tsdb_open. NULL if open failed. */
+    tsdb_auth_t         *auth;
+
+    /* Opt-in enforcement flag.  Default false: tsdb_auth_enforce is a no-op.
+     * Flip to true to auto-consult tsdb_auth_check via tsdb_auth_enforce. */
+    bool                 auth_enforce;
+
     /* Retention GC (NULL when not configured). Stopped in tsdb_close(). */
     struct tsdb_retention *retention;
 
@@ -116,6 +124,11 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         db->tmq = NULL;
     }
 
+    /* Open RBAC auth store. Non-fatal on failure. */
+    if (tsdb_auth_open(data_dir, &db->auth) != TSDB_OK) {
+        db->auth = NULL;
+    }
+
     *out = db;
     return TSDB_OK;
 }
@@ -155,6 +168,7 @@ void tsdb_close(tsdb_db_t *db) {
         free(t);
     }
 
+    if (db->auth)    tsdb_auth_close(db->auth);
     if (db->tmq)     tsdb_tmq_close(db->tmq);
     if (db->catalog) tsdb_catalog_close(db->catalog);
 
@@ -702,7 +716,48 @@ const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->s
 const char      *tsdb_tbl_name(tsdb_table_internal_t *t)     { return t ? t->name : NULL; }
 tsdb_catalog_t  *tsdb_db_catalog(tsdb_db_t *db)              { return db ? db->catalog : NULL; }
 tsdb_tmq_t      *tsdb_db_tmq(tsdb_db_t *db)                  { return db ? db->tmq : NULL; }
+tsdb_auth_t     *tsdb_db_auth(tsdb_db_t *db)                 { return db ? db->auth : NULL; }
 pthread_mutex_t *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t) { return t ? &t->compact_mtx : NULL; }
+
+/* ---- RBAC public API (in include/tsdb.h) ------------------------------- */
+
+int tsdb_auth_authenticate(tsdb_db_t *db, const char *username,
+                            const char *password, char *out_token,
+                            size_t token_cap)
+{
+    if (!db) return TSDB_ERR_INVAL;
+    tsdb_auth_t *a = db->auth;
+    if (!a) return TSDB_ERR_INTERNAL;
+    return tsdb_auth_login(a, username, password, out_token, token_cap);
+}
+
+int tsdb_auth_check(tsdb_db_t *db, const char *token,
+                     int privilege, const char *resource)
+{
+    if (!db) return TSDB_ERR_PERMISSION;
+    tsdb_auth_t *a = db->auth;
+    if (!a) return TSDB_ERR_PERMISSION;
+    return tsdb_auth_verify(a, token, privilege, resource);
+}
+
+void tsdb_auth_set_enforce(tsdb_db_t *db, bool enforce) {
+    if (!db) return;
+    pthread_mutex_lock(&db->lock);
+    db->auth_enforce = enforce;
+    pthread_mutex_unlock(&db->lock);
+}
+
+int tsdb_auth_enforce(tsdb_db_t *db, const char *token,
+                       int privilege, const char *resource)
+{
+    if (!db) return TSDB_ERR_PERMISSION;
+    pthread_mutex_lock(&db->lock);
+    bool enforce = db->auth_enforce;
+    pthread_mutex_unlock(&db->lock);
+    if (!enforce) return TSDB_OK;
+    return tsdb_auth_check(db, token, privilege, resource);
+}
+
 /* ---- Group-commit DB-level API ------------------------------------------ */
 
 /*
