@@ -40,6 +40,12 @@ typedef struct tsdb_table_internal {
     char                 name[TSDB_MAX_NAME + 1];
     tsdb_db_t           *db;          /* owning db (set at creation/open) */
     pthread_mutex_t      compact_mtx; /* serialises flush vs. compactor swap */
+    /* Serialises an entire batch (begin..commit) for this table.
+     * Without this, two concurrent replicate RPCs landing on different
+     * RPC-handler threads can interleave row_begin/row_ts/.../row_end
+     * on the same memtable, producing torn rows and (with pool>1 peer
+     * connections) heap corruption in the replay path. */
+    pthread_mutex_t      batch_mu;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -111,6 +117,18 @@ struct tsdb_batch {
     int                    in_row;
     int                    local_only; /* 1 = skip replication hook (replica recv) */
 };
+
+/* ---- Public per-table batch lock --------------------------------------- */
+
+void tsdb_table_lock_write(tsdb_table_t *tbl) {
+    if (!tbl) return;
+    pthread_mutex_lock(&((tsdb_table_internal_t *)tbl)->batch_mu);
+}
+
+void tsdb_table_unlock_write(tsdb_table_t *tbl) {
+    if (!tbl) return;
+    pthread_mutex_unlock(&((tsdb_table_internal_t *)tbl)->batch_mu);
+}
 
 /* ---- Path helpers ------------------------------------------------------- */
 
@@ -192,6 +210,7 @@ void tsdb_close(tsdb_db_t *db) {
             tsdb_schema_free(t->schema);
         }
         pthread_mutex_destroy(&t->compact_mtx);
+        pthread_mutex_destroy(&t->batch_mu);
         free(t);
     }
 
@@ -292,10 +311,12 @@ static int create_table_impl(tsdb_db_t *db,
     t->schema = schema;
     t->db     = db;
     pthread_mutex_init(&t->compact_mtx, NULL);
+    pthread_mutex_init(&t->batch_mu, NULL);
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
         pthread_mutex_destroy(&t->compact_mtx);
+        pthread_mutex_destroy(&t->batch_mu);
         tsdb_schema_free(schema);
         free(t);
         pthread_mutex_unlock(&db->lock);
@@ -422,10 +443,12 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     t->schema = schema;
     t->db     = db;
     pthread_mutex_init(&t->compact_mtx, NULL);
+    pthread_mutex_init(&t->batch_mu, NULL);
 
     rc = tsdb_memtable_new(schema, &t->memtable);
     if (rc != TSDB_OK) {
         pthread_mutex_destroy(&t->compact_mtx);
+        pthread_mutex_destroy(&t->batch_mu);
         tsdb_schema_free(schema);
         free(t);
         pthread_mutex_unlock(&db->lock);
@@ -501,6 +524,7 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         if (t->memtable) tsdb_memtable_free(t->memtable);
         if (t->schema)   tsdb_schema_free(t->schema);
         pthread_mutex_destroy(&t->compact_mtx);
+        pthread_mutex_destroy(&t->batch_mu);
         free(t);
 
         /* Compact table array. */

@@ -306,6 +306,9 @@ static void *connection_handler(void *arg) {
                 if (rc == 0 && nrows > 0) {
                     tsdb_table_t *tbl = NULL;
                     if (tsdb_open_table(db, table_name, &tbl) == TSDB_OK && tbl) {
+                        /* Serialize concurrent replicate RPCs on the
+                         * same table.  See tsdb_table_lock_write() doc. */
+                        tsdb_table_lock_write(tbl);
                         tsdb_batch_t *batch = NULL;
                         if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
                             /* Mark as local-only to prevent re-replication loop. */
@@ -372,6 +375,7 @@ static void *connection_handler(void *arg) {
                             }
                             tsdb_batch_commit(batch);
                         }
+                        tsdb_table_unlock_write(tbl);
                     }
                 }
                 send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);

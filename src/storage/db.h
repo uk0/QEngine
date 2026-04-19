@@ -27,6 +27,22 @@ typedef struct tsdb_table_internal tsdb_table_internal_t;
 const char            *tsdb_db_data_dir(tsdb_db_t *db);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 
+/* Acquire / release the per-table batch serialization lock.
+ *
+ * Required by any caller running a tsdb_batch_begin → row_*... →
+ * tsdb_batch_commit sequence from a context where concurrent writes to
+ * the same table are possible (in particular: the cluster RPC handler
+ * thread pool on the replica side).  Without this lock, two concurrent
+ * batches interleave memtable row_begin / row_ts / ... / row_end on a
+ * single table, tearing rows and (with replica pool >1) corrupting the
+ * heap on replay.
+ *
+ * Idempotent for the single-writer path but adds negligible overhead —
+ * one uncontended mutex acquire per batch.
+ */
+void tsdb_table_lock_write  (tsdb_table_t *tbl);
+void tsdb_table_unlock_write(tsdb_table_t *tbl);
+
 /* Access the catalog embedded in the db. May return NULL if catalog
  * failed to open (non-fatal for pure SELECT workloads). */
 tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
