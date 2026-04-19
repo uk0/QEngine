@@ -632,9 +632,9 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
      * For 4-byte SYMBOL columns we zero-extend into a scratch buffer.
      */
     {
-        fanout_col_t fcols[64];
+        fanout_col_t fcols[TSDB_MAX_COLS];
         /* Scratch buffers for 4→8 byte extension (one per SYMBOL column). */
-        uint8_t *sym_scratch[64];
+        uint8_t *sym_scratch[TSDB_MAX_COLS];
         memset(sym_scratch, 0, sizeof(sym_scratch));
         int fanout_ok = 1;
 

@@ -267,14 +267,17 @@ static void *connection_handler(void *arg) {
             if (db && msg.payload_len > 0) {
                 char table_name[64] = {0};
                 int ncols = 0, ts_col_idx = 0;
-                char col_names[64][64];
-                int col_types[64];
+                /* Sized for TSDB_MAX_COLS so 128-col IoT devices replicate
+                 * without trashing adjacent stack.  64 KiB (names) + 2 KiB
+                 * (types) is well under the default 8 MiB pthread stack. */
+                char col_names[TSDB_MAX_COLS][64];
+                int col_types[TSDB_MAX_COLS];
 
                 int rc = tsdb_rpc_decode_schema(msg.payload, msg.payload_len,
                                                 table_name, sizeof(table_name),
                                                 &ncols, col_names, col_types, &ts_col_idx);
-                if (rc == 0 && ncols > 0) {
-                    tsdb_col_t cols[64];
+                if (rc == 0 && ncols > 0 && ncols <= TSDB_MAX_COLS) {
+                    tsdb_col_t cols[TSDB_MAX_COLS];
                     for (int i = 0; i < ncols; i++) {
                         cols[i].name = col_names[i];
                         cols[i].type = (tsdb_type_t)col_types[i];
@@ -294,8 +297,8 @@ static void *connection_handler(void *arg) {
             if (db && msg.payload_len > 0) {
                 char table_name[64] = {0};
                 int ncols = 0, nrows = 0;
-                int col_types[64];
-                uint8_t *col_data[64] = {0};
+                int col_types[TSDB_MAX_COLS];
+                uint8_t *col_data[TSDB_MAX_COLS] = {0};
 
                 int rc = tsdb_rpc_decode_write_batch(
                     msg.payload, msg.payload_len,
@@ -315,7 +318,7 @@ static void *connection_handler(void *arg) {
                             tsdb_batch_set_local_only(batch);
                             for (int row = 0; row < nrows; row++) {
                                 /* Compute per-col offsets. */
-                                int col_off[64];
+                                int col_off[TSDB_MAX_COLS];
                                 int off = 0;
                                 for (int c = 0; c < ncols; c++) {
                                     col_off[c] = off;
@@ -337,7 +340,7 @@ static void *connection_handler(void *arg) {
                                 }
 
                                 /* Calculate offsets for each column. */
-                                int base[64];
+                                int base[TSDB_MAX_COLS];
                                 {
                                     int boff = 0;
                                     for (int c = 0; c < ncols; c++) {
