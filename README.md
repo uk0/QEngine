@@ -384,7 +384,7 @@ The cluster layer provides:
 
 | Env var | Default | What it changes |
 |---|---|---|
-| `TSDB_REPLICA_CONNS_PER_PEER` | `8` | TCP conns per peer for replication. Bump to 16 for write-heavy 4+ node clusters. |
+| `TSDB_REPLICA_CONNS_PER_PEER` | `8` | TCP conns per peer for replication. **Default is currently kept at `1` in the shipped compose files** — values >1 expose a known UAF under sustained RPC failure (slot eviction vs in-flight call). At `1`, the lvm1 4-node HDD cluster sustains 3.3 M rows/s with zero write errors; bump only after the pool-refcount refactor lands. |
 | `TSDB_WAL_ONLY_COMMIT` | `0` | When set, `tsdb_batch_commit` only fsyncs the WAL; memtable drains lazily when `is_full()`. Sharply reduces flush count on small-batch workloads. Trade-off: replication hooks fire at flush time, so replication is deferred to the next flush boundary. Durability is preserved via WAL replay on crash. |
 | `TSDB_IOPOLICY` | unset | Set to `hdd` for spinning-disk hosts: madvise SEQUENTIAL, 256 KiB stdio write buffer, `posix_fadvise` on index reads. No-op on SSD/NVMe. |
 | `TSDB_BALANCE_ALPHA` / `BETA` / `DAMPEN` / `INTERVAL_MS` | 0.6 / 0.4 / 0.5 / 30000 | Auto-balance weighting between write-rate load and storage-usage load. |

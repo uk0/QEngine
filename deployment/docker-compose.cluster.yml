@@ -72,7 +72,12 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-1:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
-      TSDB_REPLICA_CONNS_PER_PEER: "16"
+      # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
+      # UAF under sustained failure (slot eviction vs in-flight rpc_call
+      # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
+      # 4-node HDD cluster and 0 write errors over 60 s.  Bump only after
+      # the pool-refcount refactor lands.
+      TSDB_REPLICA_CONNS_PER_PEER: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"   # opt-in, see note above
       # node1 is the seed — no TSDB_SEEDS.
     ports:
@@ -105,7 +110,12 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-2:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
-      TSDB_REPLICA_CONNS_PER_PEER: "16"
+      # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
+      # UAF under sustained failure (slot eviction vs in-flight rpc_call
+      # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
+      # 4-node HDD cluster and 0 write errors over 60 s.  Bump only after
+      # the pool-refcount refactor lands.
+      TSDB_REPLICA_CONNS_PER_PEER: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"
       # Seeds are gossip addresses (= RPC port − 1).
       TSDB_SEEDS:                  qengine-cnode-1:28080
@@ -139,7 +149,12 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-3:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
-      TSDB_REPLICA_CONNS_PER_PEER: "16"
+      # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
+      # UAF under sustained failure (slot eviction vs in-flight rpc_call
+      # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
+      # 4-node HDD cluster and 0 write errors over 60 s.  Bump only after
+      # the pool-refcount refactor lands.
+      TSDB_REPLICA_CONNS_PER_PEER: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"
       TSDB_SEEDS:                  qengine-cnode-1:28080,qengine-cnode-2:28080
     ports:
