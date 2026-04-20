@@ -341,3 +341,78 @@ void tsdb_close_cluster(tsdb_db_t *db) {
         tsdb_cluster_free(c);
     }
 }
+
+/* ---- Broadcast helpers (called after local DELETE/TRUNCATE success) ---- */
+
+/* Collect ALIVE peer IDs (excluding self). */
+static int collect_alive_peers(tsdb_cluster_t *c,
+                                tsdb_node_id_t *out, int cap)
+{
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+
+    int k = 0;
+    for (int i = 0; i < n && k < cap; i++) {
+        if (snap[i].id == self) continue;
+        if (snap[i].state != TSDB_NODE_ALIVE) continue;
+        out[k++] = snap[i].id;
+    }
+    return k;
+}
+
+int tsdb_cluster_broadcast_truncate(tsdb_db_t *db,
+                                     const char *table_name,
+                                     int *out_acked_peers,
+                                     int *out_total_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (out_total_peers) *out_total_peers = 0;
+    if (!db || !table_name) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;  /* standalone — nothing to do */
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    if (out_total_peers) *out_total_peers = npeers;
+    if (npeers == 0) return TSDB_OK;
+
+    int acked = 0;
+    int rc = tsdb_replica_broadcast_truncate(tsdb_cluster_replica_mgr(c),
+                                             table_name,
+                                             peers, npeers,
+                                             &acked);
+    if (out_acked_peers) *out_acked_peers = acked;
+    return rc;
+}
+
+int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
+                                         const char *table_name,
+                                         int64_t cutoff_ns,
+                                         int op_lt, int inclusive,
+                                         int *out_acked_peers,
+                                         int *out_total_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (out_total_peers) *out_total_peers = 0;
+    if (!db || !table_name) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    if (out_total_peers) *out_total_peers = npeers;
+    if (npeers == 0) return TSDB_OK;
+
+    int acked = 0;
+    int rc = tsdb_replica_broadcast_delete_range(tsdb_cluster_replica_mgr(c),
+                                                  table_name,
+                                                  cutoff_ns, op_lt, inclusive,
+                                                  peers, npeers,
+                                                  &acked);
+    if (out_acked_peers) *out_acked_peers = acked;
+    return rc;
+}

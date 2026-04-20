@@ -279,11 +279,17 @@ static void *fanout_worker(void *arg) {
  * all workers finish.  On success, caller returns TSDB_OK without waiting
  * for slow replicas — they finish in background and drop their refs on the
  * shared context.
+ *
+ * When `out_acks` is non-NULL, the total ack count (including the local
+ * +1 baseline) is written out on return; only meaningful in the
+ * wait-for-all case (quorum > 1 + nreplicas forces the loop to wait until
+ * every worker finishes).
  */
-static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
-                              uint8_t *payload, uint32_t plen,
-                              const tsdb_node_id_t *replicas, int nreplicas,
-                              int quorum, int rpc_kind)
+static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
+                                 uint8_t *payload, uint32_t plen,
+                                 const tsdb_node_id_t *replicas, int nreplicas,
+                                 int quorum, int rpc_kind,
+                                 int *out_acks)
 {
     /* Caller's local write counts as 1 ack; if even launching every
      * replica can't reach quorum, fail fast. */
@@ -343,10 +349,23 @@ static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
         pthread_cond_wait(&ctx->cv, &ctx->mu);
     }
     int ok = (ctx->ack_count >= ctx->quorum);
+    int final_acks = ctx->ack_count;
     pthread_mutex_unlock(&ctx->mu);
+
+    if (out_acks) *out_acks = final_acks;
 
     fanout_ctx_unref(ctx);  /* drop caller's ref; workers may outlive us */
     return ok ? TSDB_OK : TSDB_ERR_IO;
+}
+
+/* Thin wrapper: legacy callers don't need ack counts. */
+static int fanout_wait_quorum(tsdb_replica_mgr_t *rmgr,
+                              uint8_t *payload, uint32_t plen,
+                              const tsdb_node_id_t *replicas, int nreplicas,
+                              int quorum, int rpc_kind)
+{
+    return fanout_wait_quorum_ex(rmgr, payload, plen, replicas, nreplicas,
+                                 quorum, rpc_kind, NULL);
 }
 
 int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
@@ -403,4 +422,76 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
     return fanout_wait_quorum(rmgr, payload, (uint32_t)plen,
                               nodes, nnodes,
                               quorum, TSDB_RPC_SCHEMA_SYNC);
+}
+
+/* ---- Broadcast: TRUNCATE / DELETE RANGE ---------------------------------
+ *
+ * Best-effort broadcast to all ALIVE peers.  Unlike write-path quorum,
+ * we wait for every worker to finish and report how many ACKed.  Callers
+ * (exec.c) surface the counts to the user as "X/Y peers ACKed".  The local
+ * apply already happened before this is called; peers that were never
+ * replicas simply reply with ACK (not-found is a no-op on the peer side).
+ */
+int tsdb_replica_broadcast_truncate(tsdb_replica_mgr_t *rmgr,
+                                     const char *table_name,
+                                     const tsdb_node_id_t *peers, int npeers,
+                                     int *out_acked_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (!rmgr || !table_name || npeers <= 0) return TSDB_OK;
+
+    uint8_t stack_buf[256];
+    int plen = tsdb_rpc_encode_truncate(stack_buf, sizeof(stack_buf), table_name);
+    if (plen < 0) return TSDB_ERR_INTERNAL;
+
+    uint8_t *payload = malloc((size_t)plen);
+    if (!payload) return TSDB_ERR_NOMEM;
+    memcpy(payload, stack_buf, (size_t)plen);
+
+    /* quorum = 1 + npeers is the maximum achievable count (local +1
+     * plus every peer ACK).  It passes fanout's fail-fast check (which
+     * rejects unreachable quorums) and still forces the loop to wait
+     * for every worker since done_count >= nreplicas exits the loop
+     * regardless of ack_count.  Best-effort result. */
+    int acks = 0;
+    (void)fanout_wait_quorum_ex(rmgr, payload, (uint32_t)plen,
+                                peers, npeers,
+                                1 + npeers, TSDB_RPC_APPLY_TRUNCATE,
+                                &acks);
+    /* fanout_wait_quorum_ex counts local as +1; subtract to get peer acks. */
+    int peer_acks = acks - 1;
+    if (peer_acks < 0) peer_acks = 0;
+    if (out_acked_peers) *out_acked_peers = peer_acks;
+    return TSDB_OK;
+}
+
+int tsdb_replica_broadcast_delete_range(tsdb_replica_mgr_t *rmgr,
+                                         const char *table_name,
+                                         int64_t cutoff_ns,
+                                         int op_lt, int inclusive,
+                                         const tsdb_node_id_t *peers, int npeers,
+                                         int *out_acked_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (!rmgr || !table_name || npeers <= 0) return TSDB_OK;
+
+    uint8_t stack_buf[256];
+    int plen = tsdb_rpc_encode_delete_range(stack_buf, sizeof(stack_buf),
+                                            table_name, cutoff_ns,
+                                            op_lt, inclusive);
+    if (plen < 0) return TSDB_ERR_INTERNAL;
+
+    uint8_t *payload = malloc((size_t)plen);
+    if (!payload) return TSDB_ERR_NOMEM;
+    memcpy(payload, stack_buf, (size_t)plen);
+
+    int acks = 0;
+    (void)fanout_wait_quorum_ex(rmgr, payload, (uint32_t)plen,
+                                peers, npeers,
+                                1 + npeers, TSDB_RPC_APPLY_DELETE_RANGE,
+                                &acks);
+    int peer_acks = acks - 1;
+    if (peer_acks < 0) peer_acks = 0;
+    if (out_acked_peers) *out_acked_peers = peer_acks;
+    return TSDB_OK;
 }

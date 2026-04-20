@@ -25,6 +25,7 @@
 #include "../catalog/udf.h"
 #include "../catalog/user.h"
 #include "../../include/tsdb.h"
+#include "../../include/tsdb_cluster.h"
 #include "../server/metrics.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -4931,7 +4932,20 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     }
     case QAST_STMT_TRUNCATE_TABLE: {
         rc = tsdb_truncate_table(db, stmt.u.truncate_table.name);
-        if (rc == TSDB_OK) rc = result_status(r, "OK: table truncated");
+        if (rc == TSDB_OK) {
+            /* Broadcast to all ALIVE peers.  No-op in standalone mode. */
+            int acked = 0, total = 0;
+            (void)tsdb_cluster_broadcast_truncate(db, stmt.u.truncate_table.name,
+                                                   &acked, &total);
+            char buf[96];
+            if (total > 0) {
+                snprintf(buf, sizeof(buf),
+                         "OK: table truncated (peers ACKed %d/%d)", acked, total);
+            } else {
+                snprintf(buf, sizeof(buf), "OK: table truncated");
+            }
+            rc = result_status(r, buf);
+        }
         else if (rc == TSDB_ERR_NOTFOUND) {
             result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND;
         } else {
@@ -4948,8 +4962,22 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                                stmt.u.delete_range.inclusive,
                                &removed);
         if (rc == TSDB_OK) {
-            char buf[80];
-            snprintf(buf, sizeof(buf), "OK: %d partition(s) deleted", removed);
+            int acked = 0, total = 0;
+            (void)tsdb_cluster_broadcast_delete_range(
+                    db, stmt.u.delete_range.table,
+                    stmt.u.delete_range.cutoff_ns,
+                    stmt.u.delete_range.op_lt,
+                    stmt.u.delete_range.inclusive,
+                    &acked, &total);
+            char buf[128];
+            if (total > 0) {
+                snprintf(buf, sizeof(buf),
+                         "OK: %d partition(s) deleted (peers ACKed %d/%d)",
+                         removed, acked, total);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "OK: %d partition(s) deleted", removed);
+            }
             rc = result_status(r, buf);
         } else if (rc == TSDB_ERR_NOTFOUND) {
             result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND;

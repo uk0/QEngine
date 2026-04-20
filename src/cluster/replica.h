@@ -73,6 +73,28 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                              int quorum);
 
 /*
+ * Broadcast a TRUNCATE-TABLE apply to the given peer list (best-effort).
+ * Local apply must already have happened.  Always returns TSDB_OK;
+ * *out_acked_peers gets the count of peers that ACKed (0 = all failed).
+ */
+int tsdb_replica_broadcast_truncate(tsdb_replica_mgr_t *rmgr,
+                                     const char *table_name,
+                                     const tsdb_node_id_t *peers, int npeers,
+                                     int *out_acked_peers);
+
+/*
+ * Broadcast a DELETE-RANGE apply (best-effort).  Same semantics as
+ * broadcast_truncate.  cutoff_ns / op_lt / inclusive match the
+ * tsdb_delete_range signature.
+ */
+int tsdb_replica_broadcast_delete_range(tsdb_replica_mgr_t *rmgr,
+                                         const char *table_name,
+                                         int64_t cutoff_ns,
+                                         int op_lt, int inclusive,
+                                         const tsdb_node_id_t *peers, int npeers,
+                                         int *out_acked_peers);
+
+/*
  * Get or create a persistent RPC connection to the given node.
  * Returns NULL if unable to connect.
  */

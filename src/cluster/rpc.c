@@ -454,6 +454,54 @@ static void *connection_handler(void *arg) {
             }
             break;
 
+        case TSDB_RPC_APPLY_TRUNCATE:
+            /* Peer-side: apply TRUNCATE locally.  Call the storage API
+             * directly (not QTL) so we never re-enter exec.c and can't loop. */
+            if (db && msg.payload_len > 0) {
+                char tbl[128] = {0};
+                int rc = tsdb_rpc_decode_truncate(msg.payload, msg.payload_len,
+                                                  tbl, sizeof(tbl));
+                if (rc == 0) {
+                    int trc = tsdb_truncate_table(db, tbl);
+                    /* Treat "table not found" as a successful no-op — this
+                     * peer simply wasn't a replica for that table.  Only
+                     * real I/O errors count as failure. */
+                    if (trc == TSDB_OK || trc == TSDB_ERR_NOTFOUND)
+                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                    else
+                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                } else {
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
+        case TSDB_RPC_APPLY_DELETE_RANGE:
+            if (db && msg.payload_len > 0) {
+                char tbl[128] = {0};
+                int64_t cutoff = 0;
+                int op_lt = 0, inclusive = 0;
+                int rc = tsdb_rpc_decode_delete_range(msg.payload, msg.payload_len,
+                                                      tbl, sizeof(tbl),
+                                                      &cutoff, &op_lt, &inclusive);
+                if (rc == 0) {
+                    int removed = 0;
+                    int trc = tsdb_delete_range(db, tbl, cutoff,
+                                                op_lt, inclusive, &removed);
+                    if (trc == TSDB_OK || trc == TSDB_ERR_NOTFOUND)
+                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                    else
+                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                } else {
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
         default:
             send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
@@ -871,5 +919,64 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
         out_col_types[c] = *p++;
     }
 #undef NEED
+    return 0;
+}
+
+/* ---- APPLY_TRUNCATE / APPLY_DELETE_RANGE encode & decode ----------------- */
+
+int tsdb_rpc_encode_truncate(uint8_t *buf, uint32_t cap, const char *table_name) {
+    if (!buf || !table_name) return -1;
+    uint8_t tnlen = (uint8_t)strlen(table_name);
+    if ((uint32_t)tnlen + 1 > cap) return -1;
+    buf[0] = tnlen;
+    memcpy(buf + 1, table_name, tnlen);
+    return 1 + tnlen;
+}
+
+int tsdb_rpc_decode_truncate(const uint8_t *buf, uint32_t len,
+                             char *out_table, int table_cap) {
+    if (!buf || len < 1 || !out_table || table_cap <= 0) return -1;
+    uint8_t tnlen = buf[0];
+    if ((uint32_t)tnlen + 1 > len) return -1;
+    int copy = tnlen < (uint8_t)(table_cap - 1) ? tnlen : table_cap - 1;
+    memcpy(out_table, buf + 1, copy);
+    out_table[copy] = '\0';
+    return 0;
+}
+
+int tsdb_rpc_encode_delete_range(uint8_t *buf, uint32_t cap,
+                                 const char *table_name,
+                                 int64_t cutoff_ns,
+                                 int op_lt, int inclusive)
+{
+    if (!buf || !table_name) return -1;
+    uint8_t tnlen = (uint8_t)strlen(table_name);
+    uint32_t need = 1u + tnlen + 8u + 1u + 1u;
+    if (need > cap) return -1;
+    buf[0] = tnlen;
+    memcpy(buf + 1, table_name, tnlen);
+    memcpy(buf + 1 + tnlen, &cutoff_ns, 8);
+    buf[1 + tnlen + 8] = (uint8_t)(op_lt ? 1 : 0);
+    buf[1 + tnlen + 9] = (uint8_t)(inclusive ? 1 : 0);
+    return (int)need;
+}
+
+int tsdb_rpc_decode_delete_range(const uint8_t *buf, uint32_t len,
+                                 char *out_table, int table_cap,
+                                 int64_t *out_cutoff_ns,
+                                 int *out_op_lt, int *out_inclusive)
+{
+    if (!buf || len < 1 || !out_table || table_cap <= 0) return -1;
+    uint8_t tnlen = buf[0];
+    uint32_t need = 1u + tnlen + 8u + 1u + 1u;
+    if (need > len) return -1;
+    int copy = tnlen < (uint8_t)(table_cap - 1) ? tnlen : table_cap - 1;
+    memcpy(out_table, buf + 1, copy);
+    out_table[copy] = '\0';
+    int64_t cutoff;
+    memcpy(&cutoff, buf + 1 + tnlen, 8);
+    if (out_cutoff_ns)  *out_cutoff_ns  = cutoff;
+    if (out_op_lt)      *out_op_lt      = buf[1 + tnlen + 8] ? 1 : 0;
+    if (out_inclusive)  *out_inclusive  = buf[1 + tnlen + 9] ? 1 : 0;
     return 0;
 }

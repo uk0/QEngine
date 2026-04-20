@@ -49,7 +49,9 @@ typedef enum {
     TSDB_RPC_ERR          = 7,
     TSDB_RPC_FED_QUERY       = 8,  /* federation query: QTL → encoded result */
     TSDB_RPC_RAW_BLOCK_PUSH  = 9,  /* raw compressed block replica sync */
-    TSDB_RPC_RAW_BLOCK_ACK   = 10  /* per-block ack */
+    TSDB_RPC_RAW_BLOCK_ACK   = 10, /* per-block ack */
+    TSDB_RPC_APPLY_TRUNCATE    = 11, /* cluster broadcast: apply TRUNCATE TABLE locally */
+    TSDB_RPC_APPLY_DELETE_RANGE = 12 /* cluster broadcast: apply partition-level DELETE locally */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
@@ -194,6 +196,33 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
                            char *out_table, int table_cap,
                            int *out_ncols, char out_col_names[][64],
                            int *out_col_types, int *out_ts_col_idx);
+
+/* ---- Apply-truncate / apply-delete-range payload helpers ----------------
+ *
+ * APPLY_TRUNCATE payload:
+ *   name_len u8
+ *   name     [name_len bytes]
+ *
+ * APPLY_DELETE_RANGE payload:
+ *   name_len  u8
+ *   name      [name_len bytes]
+ *   cutoff_ns i64 LE (8 bytes)
+ *   op_lt     u8  (1 = ts <, 0 = ts >)
+ *   inclusive u8  (1 = inclusive boundary)
+ */
+int tsdb_rpc_encode_truncate(uint8_t *buf, uint32_t cap,
+                             const char *table_name);
+int tsdb_rpc_decode_truncate(const uint8_t *buf, uint32_t len,
+                             char *out_table, int table_cap);
+
+int tsdb_rpc_encode_delete_range(uint8_t *buf, uint32_t cap,
+                                 const char *table_name,
+                                 int64_t cutoff_ns,
+                                 int op_lt, int inclusive);
+int tsdb_rpc_decode_delete_range(const uint8_t *buf, uint32_t len,
+                                 char *out_table, int table_cap,
+                                 int64_t *out_cutoff_ns,
+                                 int *out_op_lt, int *out_inclusive);
 
 #ifdef __cplusplus
 }

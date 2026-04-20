@@ -54,6 +54,33 @@ void tsdb_cluster_wait_ready(tsdb_db_t *db, int min_nodes, int timeout_ms);
  */
 void tsdb_close_cluster(tsdb_db_t *db);
 
+/*
+ * Cluster-wide broadcast of a TRUNCATE TABLE that has already been applied
+ * locally.  Sends TSDB_RPC_APPLY_TRUNCATE to every ALIVE peer except self,
+ * best-effort.  *out_total_peers gets the number of peers contacted;
+ * *out_acked_peers gets how many replied with ACK.  Both may be NULL.
+ *
+ * In standalone mode (no cluster) returns TSDB_OK with both counts = 0.
+ */
+int tsdb_cluster_broadcast_truncate(tsdb_db_t *db,
+                                     const char *table_name,
+                                     int *out_acked_peers,
+                                     int *out_total_peers);
+
+/*
+ * Cluster-wide broadcast of a partition-level DELETE that has already
+ * been applied locally.  Sends TSDB_RPC_APPLY_DELETE_RANGE to every
+ * ALIVE peer except self.
+ *
+ * op_lt / inclusive match the semantics of tsdb_delete_range.
+ */
+int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
+                                         const char *table_name,
+                                         int64_t cutoff_ns,
+                                         int op_lt, int inclusive,
+                                         int *out_acked_peers,
+                                         int *out_total_peers);
+
 #ifdef __cplusplus
 }
 #endif
