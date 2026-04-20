@@ -784,17 +784,33 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         p->col_metas[ci] = malloc((size_t)block_count * sizeof(tsdb_block_meta_t));
         if (!p->col_metas[ci]) { fclose(idx_f); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
 
+        /* Snapshot consistency: the mmap covered the col file at stat-time,
+         * but a writer might have appended + rewritten idx between our
+         * stat+mmap and this idx read.  The idx then references blocks
+         * whose data lives past our mmap.  Drop those entries here so the
+         * query layer never attempts to read past the snapshot — avoids
+         * TSDB_ERR_CORRUPT from the map-size guard in tsdb_part_col_read_block.
+         * The next query's part_open will see the full list. */
+        size_t map_sz_snap = p->col_maps[ci].map_size;
+
         for (uint32_t b = 0; b < block_count; b++) {
             uint8_t entry[TSDB_IDX_ENTRY_SIZE];
             if (fread(entry, 1, TSDB_IDX_ENTRY_SIZE, idx_f) != TSDB_IDX_ENTRY_SIZE) break;
-            p->col_metas[ci][b].offset = get_u64le(entry + 0);
-            p->col_metas[ci][b].size   = get_u32le(entry + 8);
-            p->col_metas[ci][b].count  = get_u32le(entry + 12);
-            p->col_metas[ci][b].ts_min = get_i64le(entry + 16);
-            p->col_metas[ci][b].ts_max = get_i64le(entry + 24);
-            p->col_metas[ci][b].bloom  = get_u64le(entry + 32);
-            p->col_metas[ci][b].codec  = TSDB_CODEC_NONE;
-            p->col_metas[ci][b].flags  = 0;
+            uint64_t offset = get_u64le(entry + 0);
+            uint32_t bsize  = get_u32le(entry + 8);
+            /* End-of-block byte within col file. */
+            uint64_t end = offset + TSDB_BLOCK_HEADER_SIZE + (uint64_t)bsize;
+            if (end > (uint64_t)map_sz_snap)
+                continue;  /* block lives past our snapshot — skip */
+            size_t slot = p->col_meta_n[ci];
+            p->col_metas[ci][slot].offset = offset;
+            p->col_metas[ci][slot].size   = bsize;
+            p->col_metas[ci][slot].count  = get_u32le(entry + 12);
+            p->col_metas[ci][slot].ts_min = get_i64le(entry + 16);
+            p->col_metas[ci][slot].ts_max = get_i64le(entry + 24);
+            p->col_metas[ci][slot].bloom  = get_u64le(entry + 32);
+            p->col_metas[ci][slot].codec  = TSDB_CODEC_NONE;
+            p->col_metas[ci][slot].flags  = 0;
             p->col_meta_n[ci]++;
         }
         fclose(idx_f);

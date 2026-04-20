@@ -89,13 +89,18 @@ static void *reader_thread(void *arg) {
         tsdb_result_t *r = NULL;
         int rc = tsdb_query(c->db, "SELECT count() FROM stress_t", &r);
         if (rc == TSDB_OK && r) {
-            /* Drain result — doesn't matter what count we got, just that
-             * the query path didn't crash. */
             while (tsdb_result_next(r)) { /* no-op */ }
             tsdb_result_free(r);
             atomic_fetch_add(&c->queries_ok, 1);
         } else {
             atomic_fetch_add(&c->queries_err, 1);
+            /* Log once to surface which rc fires first. */
+            static _Atomic int logged = 0;
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&logged, &expected, 1)) {
+                fprintf(stderr, "    (first err) rc=%d (%s)\n",
+                        rc, tsdb_errstr(rc));
+            }
             if (r) tsdb_result_free(r);
         }
     }
