@@ -24,6 +24,7 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"between",   QTOK_BETWEEN},  {"true",      QTOK_TRUE},      {"false",     QTOK_FALSE},
     /* DDL keywords */
     {"create",    QTOK_CREATE},   {"drop",      QTOK_DROP},      {"list",      QTOK_LIST},
+    {"truncate",  QTOK_TRUNCATE}, {"delete",    QTOK_DELETE},
     {"device",    QTOK_DEVICE},
     {"retention", QTOK_RETENTION},{"profile",   QTOK_PROFILE},   {"region",    QTOK_REGION},
     {"replica",   QTOK_REPLICA},  {"factor",    QTOK_FACTOR},
@@ -97,6 +98,7 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_TRUE: return "true"; case QTOK_FALSE: return "false";
     case QTOK_CREATE: return "CREATE"; case QTOK_DROP: return "DROP";
     case QTOK_LIST: return "LIST"; case QTOK_DEVICE: return "DEVICE";
+    case QTOK_TRUNCATE: return "TRUNCATE"; case QTOK_DELETE: return "DELETE";
     case QTOK_RETENTION: return "RETENTION"; case QTOK_PROFILE: return "PROFILE";
     case QTOK_REGION: return "REGION"; case QTOK_REPLICA: return "REPLICA";
     case QTOK_FACTOR: return "FACTOR";

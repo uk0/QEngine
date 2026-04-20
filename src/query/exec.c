@@ -4929,6 +4929,35 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         else result_status(r, "ERR: drop stable failed");
         break;
     }
+    case QAST_STMT_TRUNCATE_TABLE: {
+        rc = tsdb_truncate_table(db, stmt.u.truncate_table.name);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: table truncated");
+        else if (rc == TSDB_ERR_NOTFOUND) {
+            result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND;
+        } else {
+            result_status(r, "ERR: truncate failed");
+        }
+        break;
+    }
+    case QAST_STMT_DELETE_RANGE: {
+        int removed = 0;
+        rc = tsdb_delete_range(db,
+                               stmt.u.delete_range.table,
+                               stmt.u.delete_range.cutoff_ns,
+                               stmt.u.delete_range.op_lt,
+                               stmt.u.delete_range.inclusive,
+                               &removed);
+        if (rc == TSDB_OK) {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "OK: %d partition(s) deleted", removed);
+            rc = result_status(r, buf);
+        } else if (rc == TSDB_ERR_NOTFOUND) {
+            result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND;
+        } else {
+            result_status(r, "ERR: delete failed");
+        }
+        break;
+    }
     case QAST_STMT_CREATE_CHILD_TABLE: {
         const tsdb_child_table_t *ct = &stmt.u.create_child_table.spec;
         /* Fetch stable schema to build the physical table columns. */
@@ -5311,6 +5340,17 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     case QAST_STMT_ALTER_ADD_COLUMN:
         *out_priv     = TSDB_PRIV_DDL;
         *out_resource = stmt->u.alter_add_column.table;
+        break;
+
+    /* TRUNCATE / DELETE — data-mutating operations on a specific table.
+     * Treat them as DELETE privilege on that table. */
+    case QAST_STMT_TRUNCATE_TABLE:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.truncate_table.name;
+        break;
+    case QAST_STMT_DELETE_RANGE:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.delete_range.table;
         break;
 
     /* TMQ consumer-group statements — DDL */

@@ -1022,9 +1022,6 @@ static bool do_command(tsdb_conn_t *c, const char *cmd) {
         const char *p = line + 10;
         while (isspace((unsigned char)*p)) p++;
         do_drop_group(c, p);
-    } else if (strncasecmp(line, "DROP DEVICE", 11) == 0) {
-        /* TODO: parse group + device */
-        fprintf(stderr, "DROP DEVICE not implemented in this client version\n");
     } else if (strncasecmp(line, "WRITE", 5) == 0) {
         do_write(c, line);
     } else if (strncasecmp(line, "SUBSCRIBE", 9) == 0) {

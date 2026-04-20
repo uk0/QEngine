@@ -183,6 +183,12 @@ typedef enum {
     QAST_STMT_CREATE_TABLE,
     /* ALTER TABLE t ADD COLUMN c TYPE */
     QAST_STMT_ALTER_ADD_COLUMN,
+    /* TRUNCATE TABLE t — wipe all rows, keep schema. */
+    QAST_STMT_TRUNCATE_TABLE,
+    /* DELETE FROM t WHERE <ts_col> <OP> <literal_ts> — partition-level
+     * time-range delete.  Only whole partitions fully outside the kept
+     * range are removed; boundary partitions are preserved as-is. */
+    QAST_STMT_DELETE_RANGE,
     /* TMQ consumer-group statements */
     QAST_STMT_CREATE_CONSUMER_GROUP,  /* CREATE CONSUMER GROUP n ON topic   */
     QAST_STMT_JOIN_GROUP,             /* JOIN GROUP n AS consumer_id        */
@@ -233,6 +239,17 @@ typedef struct {
             char         col_name[64];
             tsdb_type_t  col_type;
         } alter_add_column;
+        /* TRUNCATE TABLE t */
+        struct { char name[64]; } truncate_table;
+        /* DELETE FROM t WHERE ts <op> cutoff
+         *   op_lt:  1 for '<' / '<=', 0 for '>' / '>=' (keep-side semantics).
+         *   inclusive: 1 if '<=' or '>='. */
+        struct {
+            char     table[64];
+            int64_t  cutoff_ns;   /* nanosecond timestamp literal */
+            int8_t   op_lt;       /* 1 = delete ts <(=) cutoff, 0 = ts >(=) cutoff */
+            int8_t   inclusive;   /* 1 = include boundary row (<=, >=) */
+        } delete_range;
         /* TMQ statements (all use short fixed-size names) */
         struct { char name[64]; char topic[64]; } create_consumer_group;
         struct { char name[64]; char consumer_id[64]; } join_group;

@@ -1314,6 +1314,88 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return TSDB_ERR_PARSE;
     }
 
+    /* ---- TRUNCATE TABLE <name> ------------------------------------------ */
+    if (accept(&p, QTOK_TRUNCATE)) {
+        if (!accept(&p, QTOK_TABLE)) {
+            perr(&p, "expected TABLE after TRUNCATE");
+            return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_TRUNCATE_TABLE;
+        tok_copy(&p.tok, out->u.truncate_table.name,
+                 sizeof(out->u.truncate_table.name));
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
+    /* ---- DELETE FROM <name> WHERE <col> <op> <literal> ------------------- */
+    if (accept(&p, QTOK_DELETE)) {
+        if (!accept(&p, QTOK_FROM)) {
+            perr(&p, "expected FROM after DELETE");
+            return TSDB_ERR_PARSE;
+        }
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_DELETE_RANGE;
+        tok_copy(&p.tok, out->u.delete_range.table,
+                 sizeof(out->u.delete_range.table));
+        advance(&p);
+
+        if (!accept(&p, QTOK_WHERE)) {
+            perr(&p, "DELETE requires WHERE <ts_col> <op> <cutoff>");
+            return TSDB_ERR_PARSE;
+        }
+        /* Column name — accepted but not used: we only support the table's
+         * timestamp column.  Keeping the identifier in the grammar makes
+         * predicates read naturally. */
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected ts column name in WHERE"); return TSDB_ERR_PARSE;
+        }
+        advance(&p);
+
+        /* Comparison operator. */
+        int op_lt = -1, inclusive = 0;
+        if      (accept(&p, QTOK_LT)) { op_lt = 1; inclusive = 0; }
+        else if (accept(&p, QTOK_LE)) { op_lt = 1; inclusive = 1; }
+        else if (accept(&p, QTOK_GT)) { op_lt = 0; inclusive = 0; }
+        else if (accept(&p, QTOK_GE)) { op_lt = 0; inclusive = 1; }
+        else {
+            perr(&p, "expected <, <=, >, or >=");
+            return TSDB_ERR_PARSE;
+        }
+
+        /* Cutoff literal: accept raw ns NUMBER, INTERVAL, or ISO string. */
+        int64_t cutoff_ns = 0;
+        if (p.tok.kind == QTOK_NUMBER || p.tok.kind == QTOK_INTERVAL) {
+            cutoff_ns = p.tok.i;
+            advance(&p);
+        } else if (p.tok.kind == QTOK_STRING) {
+            char buf[128] = {0};
+            size_t n = p.tok.len < sizeof(buf) - 1 ? p.tok.len : sizeof(buf) - 1;
+            memcpy(buf, p.tok.start, n);
+            buf[n] = '\0';
+            tsdb_ts_t ts = tsdb_parse_ts(buf);
+            if (ts == TSDB_TS_MIN) {
+                perr(&p, "cutoff string is not a valid timestamp");
+                return TSDB_ERR_PARSE;
+            }
+            cutoff_ns = (int64_t)ts;
+            advance(&p);
+        } else {
+            perr(&p, "expected timestamp literal after comparison");
+            return TSDB_ERR_PARSE;
+        }
+        out->u.delete_range.cutoff_ns = cutoff_ns;
+        out->u.delete_range.op_lt     = (int8_t)op_lt;
+        out->u.delete_range.inclusive = (int8_t)inclusive;
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
     /* ---- LIST ----------------------------------------------------------- */
     if (accept(&p, QTOK_LIST)) {
         /* LIST GROUPS  — "groups" lexes as QTOK_IDENT (plural not a keyword) */

@@ -27,6 +27,31 @@ typedef struct tsdb_table_internal tsdb_table_internal_t;
 const char            *tsdb_db_data_dir(tsdb_db_t *db);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 
+/* Wipe all row data for a table, keeping schema + symbol tables intact.
+ * Partition directories under <data_dir>/<name>/ are removed, the memtable
+ * is cleared, and the WAL is truncated to zero.  Idempotent — a concurrent
+ * writer's in-flight batch is NOT interrupted; callers should quiesce
+ * external traffic first for a strict truncation.  Returns TSDB_OK on
+ * success, TSDB_ERR_NOTFOUND if the table is unknown. */
+int tsdb_truncate_table(tsdb_db_t *db, const char *name);
+
+/* Partition-level time-range delete.
+ *
+ * cutoff_ns is the boundary in nanoseconds.  op_lt=1 deletes rows with
+ * ts < cutoff (or ts <= cutoff when inclusive=1); op_lt=0 deletes rows
+ * with ts > cutoff (or ts >= cutoff when inclusive=1).  Only partitions
+ * whose full time range satisfies the predicate are removed from disk;
+ * boundary partitions containing both kept and deleted rows are left
+ * untouched (documented limitation; use per-row DELETE for fine grain,
+ * not yet implemented).
+ *
+ * If out_removed is non-NULL, *out_removed is set to the number of
+ * partition directories deleted.  Returns TSDB_OK on success,
+ * TSDB_ERR_NOTFOUND if the table is unknown. */
+int tsdb_delete_range(tsdb_db_t *db, const char *name,
+                      int64_t cutoff_ns, int op_lt, int inclusive,
+                      int *out_removed);
+
 /* Acquire / release the per-table batch serialization lock.
  *
  * Required by any caller running a tsdb_batch_begin → row_*... →

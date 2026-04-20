@@ -547,6 +547,151 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     return TSDB_OK;
 }
 
+/* ---- TRUNCATE TABLE ---------------------------------------------------- */
+
+/* Return 1 if the entry name is metadata we must preserve across truncate:
+ * schema.bin (columnar layout) or *.sym (per-column symbol dictionaries). */
+static int truncate_keep_entry(const char *name) {
+    if (strcmp(name, "schema.bin") == 0) return 1;
+    size_t n = strlen(name);
+    if (n >= 4 && strcmp(name + n - 4, ".sym") == 0) return 1;
+    return 0;
+}
+
+int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = NULL;
+    for (int i = 0; i < db->ntables; i++) {
+        if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0) {
+            t = db->tables[i]; break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (!t) return TSDB_ERR_NOTFOUND;
+
+    /* Hold both locks: compact_mtx so no flush is mid-write, batch_mu so
+     * no row_begin is in flight.  Order matches flush_and_clear_ex. */
+    pthread_mutex_lock(&t->batch_mu);
+    pthread_mutex_lock(&t->compact_mtx);
+
+    if (t->memtable) tsdb_memtable_clear(t->memtable);
+    if (t->wal)     (void)tsdb_wal_truncate(t->wal);
+
+    /* Remove every entry under the table dir except schema.bin and *.sym.
+     * This kills all partition directories verbatim. */
+    char tbl_dir[4096];
+    table_dir(db->data_dir, name, tbl_dir, sizeof(tbl_dir));
+    DIR *d = opendir(tbl_dir);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (truncate_keep_entry(ent->d_name)) continue;
+            char sub[4096];
+            snprintf(sub, sizeof(sub), "%s/%s", tbl_dir, ent->d_name);
+            rm_rf(sub);
+        }
+        closedir(d);
+    }
+
+    pthread_mutex_unlock(&t->compact_mtx);
+    pthread_mutex_unlock(&t->batch_mu);
+    return TSDB_OK;
+}
+
+/* ---- DELETE (partition-level time range) ------------------------------- */
+
+/* Parse "YYYYMMDD" or "YYYYMMDDHH" into [start_ns, end_ns] inclusive.
+ * Returns 0 on success, -1 if the dirname isn't a partition. */
+static int part_dir_to_range(const char *dname, tsdb_partition_unit_t unit,
+                             int64_t *out_start, int64_t *out_end)
+{
+    int y, mo, dy, hh = 0;
+    size_t n = strlen(dname);
+    if (unit == TSDB_PARTITION_HOUR) {
+        if (n != 10) return -1;
+        if (sscanf(dname, "%4d%2d%2d%2d", &y, &mo, &dy, &hh) != 4) return -1;
+    } else {
+        if (n != 8) return -1;
+        if (sscanf(dname, "%4d%2d%2d", &y, &mo, &dy) != 3) return -1;
+    }
+    struct tm tm = {0};
+    tm.tm_year = y - 1900;
+    tm.tm_mon  = mo - 1;
+    tm.tm_mday = dy;
+    tm.tm_hour = hh;
+    time_t secs = timegm(&tm);
+    if (secs == (time_t)-1) return -1;
+    int64_t start = (int64_t)secs * 1000000000LL;
+    int64_t span  = (unit == TSDB_PARTITION_HOUR) ? 3600000000000LL
+                                                  : 86400000000000LL;
+    *out_start = start;
+    *out_end   = start + span - 1;
+    return 0;
+}
+
+int tsdb_delete_range(tsdb_db_t *db, const char *name,
+                      int64_t cutoff_ns, int op_lt, int inclusive,
+                      int *out_removed)
+{
+    if (!db || !name) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = NULL;
+    for (int i = 0; i < db->ntables; i++) {
+        if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0) {
+            t = db->tables[i]; break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (!t || !t->schema) return TSDB_ERR_NOTFOUND;
+
+    tsdb_partition_unit_t unit = t->schema->partition_unit;
+
+    pthread_mutex_lock(&t->compact_mtx);
+
+    char tbl_dir[4096];
+    table_dir(db->data_dir, name, tbl_dir, sizeof(tbl_dir));
+    DIR *d = opendir(tbl_dir);
+    int removed = 0;
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (truncate_keep_entry(ent->d_name)) continue;
+
+            int64_t pstart = 0, pend = 0;
+            if (part_dir_to_range(ent->d_name, unit, &pstart, &pend) != 0)
+                continue;  /* not a recognisable partition dir */
+
+            int drop = 0;
+            if (op_lt) {
+                /* Delete ts < cutoff (or ts <= cutoff when inclusive). */
+                drop = inclusive ? (pend <= cutoff_ns) : (pend <  cutoff_ns);
+            } else {
+                /* Delete ts > cutoff (or ts >= cutoff when inclusive). */
+                drop = inclusive ? (pstart >= cutoff_ns) : (pstart > cutoff_ns);
+            }
+            if (drop) {
+                char sub[4096];
+                snprintf(sub, sizeof(sub), "%s/%s", tbl_dir, ent->d_name);
+                rm_rf(sub);
+                removed++;
+            }
+        }
+        closedir(d);
+    }
+
+    pthread_mutex_unlock(&t->compact_mtx);
+
+    if (out_removed) *out_removed = removed;
+    return TSDB_OK;
+}
+
 /* ---- ALTER TABLE ADD COLUMN -------------------------------------------- */
 
 int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
