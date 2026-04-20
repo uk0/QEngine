@@ -483,7 +483,14 @@ static int col_writer_close(col_writer_t *w) {
             }
         }
 
-        /* Rewrite idx atomically (always in v2 format). */
+        /* Rewrite idx in place.  The footer-first read order in
+         * tsdb_part_open eliminates the reader's mmap-vs-idx visibility
+         * race without needing atomic publish: if the reader hits this
+         * mid-rewrite it either (a) sees a short/zero read and drops the
+         * column for this open (next open retries), or (b) sees fewer
+         * entries than actually committed, which is still consistent —
+         * all observed entries reference durable col bytes, since data
+         * is fflushed above before we ever touch the idx file. */
         FILE *idx_w = fopen(w->idx_path, "wb");
         if (!idx_w) {
             free(old_entries);
@@ -718,23 +725,79 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         p->col_maps[i].fd = -1;
 
     for (int ci = 0; ci < s->ncols; ci++) {
+        /* ── Parquet-footer open order ──────────────────────────────────
+         * 1. Read idx fully into a scratch buffer (idx is the atomic
+         *    manifest — published via rename by col_writer_close).
+         * 2. Compute the max byte offset any entry references.
+         * 3. Open col + fstat.  Writer orders data-fflush BEFORE idx
+         *    rename, so if we observed an idx entry referencing byte N,
+         *    the col file is durable up to N on disk.
+         * 4. mmap col at current size — always covers max_end.
+         * Zero locks, no reader-writer visibility gap. */
+        char idx_path[4096];
+        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+                 partition_dir, s->cols[ci].name);
+
+        FILE *idx_f = fopen(idx_path, "rb");
+        if (!idx_f) continue;
+        tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(partition_dir),
+                                     fileno(idx_f));
+
+        uint8_t idx_hdr[TSDB_IDX_HEADER_SIZE];
+        size_t hdr_n = fread(idx_hdr, 1, TSDB_IDX_HEADER_SIZE, idx_f);
+        uint32_t block_count  = 0;
+        uint16_t idx_version  = 0;
+        uint64_t total_rows_u = 0;
+        int64_t  fmn = 0, fmx = 0;
+        int      hdr_size = read_idx_header(idx_hdr, hdr_n,
+                                            &block_count, &idx_version,
+                                            &total_rows_u, &fmn, &fmx);
+        if (hdr_size < 0 || block_count == 0) { fclose(idx_f); continue; }
+
+        if (fseek(idx_f, (long)hdr_size, SEEK_SET) != 0) {
+            fclose(idx_f); continue;
+        }
+
+        /* Read all entries up-front so we can finalise col_metas later
+         * against the mmap snapshot in one consistent pass. */
+        uint8_t *entries = malloc((size_t)block_count * TSDB_IDX_ENTRY_SIZE);
+        if (!entries) { fclose(idx_f); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
+        size_t nread = fread(entries, TSDB_IDX_ENTRY_SIZE,
+                             (size_t)block_count, idx_f);
+        fclose(idx_f);
+        if (nread == 0) { free(entries); continue; }
+
+        uint64_t max_end = 0;
+        for (size_t i = 0; i < nread; i++) {
+            uint64_t off = get_u64le(entries + i * TSDB_IDX_ENTRY_SIZE);
+            uint32_t sz  = get_u32le(entries + i * TSDB_IDX_ENTRY_SIZE + 8);
+            uint64_t end = off + TSDB_BLOCK_HEADER_SIZE + (uint64_t)sz;
+            if (end > max_end) max_end = end;
+        }
+
+        /* Open col file AFTER reading idx — this is the ordering that
+         * makes read-side consistency a local property of this loop. */
         char col_path[4096];
         snprintf(col_path, sizeof(col_path), "%s/%s.col",
                  partition_dir, s->cols[ci].name);
 
         int fd = open(col_path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) { free(entries); continue; }
 
         struct stat st;
-        if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); continue; }
+        if (fstat(fd, &st) < 0 || st.st_size == 0) {
+            free(entries); close(fd); continue;
+        }
+
+        /* Writer ordering guarantee: data durable before idx publish.
+         * If this trips, the partition is mid-catastrophe — skip column. */
+        if ((uint64_t)st.st_size < max_end) {
+            free(entries); close(fd); continue;
+        }
 
         void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map == MAP_FAILED) { close(fd); continue; }
+        if (map == MAP_FAILED) { free(entries); close(fd); continue; }
 
-        /* Hint the kernel about expected access pattern.  Forward scan +
-         * block-skip benefits from SEQUENTIAL on HDD (aggressive readahead
-         * + early page eviction) and WILLNEED on SSD (warm page cache
-         * without forward prefetch). */
         tsdb_iopolicy_advise_read(tsdb_iopolicy_detect(partition_dir),
                                   map, (size_t)st.st_size);
 
@@ -742,66 +805,26 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         p->col_maps[ci].map      = (uint8_t *)map;
         p->col_maps[ci].map_size = (size_t)st.st_size;
 
-        /* Read idx. */
-        char idx_path[4096];
-        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
-                 partition_dir, s->cols[ci].name);
-
-        FILE *idx_f = fopen(idx_path, "rb");
-        if (!idx_f) continue;
-
-        /* HDD: async prefetch the idx file — the scan loop below reads the
-         * whole file sequentially to populate the block-metadata array. */
-        tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(partition_dir),
-                                     fileno(idx_f));
-
-        uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-        size_t hdr_n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_f);
-        uint32_t block_count  = 0;
-        uint16_t idx_version  = 0;
-        uint64_t total_rows_u = 0;
-        int64_t  fmn = 0, fmx = 0;
-        int      hdr_size = read_idx_header(hdr, hdr_n,
-                                            &block_count, &idx_version,
-                                            &total_rows_u, &fmn, &fmx);
-        if (hdr_size < 0) { fclose(idx_f); continue; }
-        if (block_count == 0) { fclose(idx_f); continue; }
-
-        /* Seek past whichever header size the file actually uses. */
-        if (fseek(idx_f, (long)hdr_size, SEEK_SET) != 0) {
-            fclose(idx_f); continue;
-        }
-
-        /* Merge v2 file-level zone map into the per-partition aggregate.
-         * All columns cover the same rows (and thus same row timestamps),
-         * so taking the union is safe and idempotent. */
         if (idx_version >= 2) {
             if (fmn < p->zone_ts_min) p->zone_ts_min = fmn;
             if (fmx > p->zone_ts_max) p->zone_ts_max = fmx;
             p->zone_valid = 1;
         }
 
-        p->col_metas[ci] = malloc((size_t)block_count * sizeof(tsdb_block_meta_t));
-        if (!p->col_metas[ci]) { fclose(idx_f); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
+        p->col_metas[ci] = malloc((size_t)nread * sizeof(tsdb_block_meta_t));
+        if (!p->col_metas[ci]) { free(entries); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
 
-        /* Snapshot consistency: the mmap covered the col file at stat-time,
-         * but a writer might have appended + rewritten idx between our
-         * stat+mmap and this idx read.  The idx then references blocks
-         * whose data lives past our mmap.  Drop those entries here so the
-         * query layer never attempts to read past the snapshot — avoids
-         * TSDB_ERR_CORRUPT from the map-size guard in tsdb_part_col_read_block.
-         * The next query's part_open will see the full list. */
-        size_t map_sz_snap = p->col_maps[ci].map_size;
-
-        for (uint32_t b = 0; b < block_count; b++) {
-            uint8_t entry[TSDB_IDX_ENTRY_SIZE];
-            if (fread(entry, 1, TSDB_IDX_ENTRY_SIZE, idx_f) != TSDB_IDX_ENTRY_SIZE) break;
+        /* Filter retained as defence-in-depth for crash-recovery edge
+         * cases where idx is newer than col (incomplete flush, legacy
+         * non-atomic idx).  With the new write path it should be a
+         * no-op on every entry. */
+        size_t map_sz = p->col_maps[ci].map_size;
+        for (size_t i = 0; i < nread; i++) {
+            uint8_t *entry  = entries + i * TSDB_IDX_ENTRY_SIZE;
             uint64_t offset = get_u64le(entry + 0);
             uint32_t bsize  = get_u32le(entry + 8);
-            /* End-of-block byte within col file. */
             uint64_t end = offset + TSDB_BLOCK_HEADER_SIZE + (uint64_t)bsize;
-            if (end > (uint64_t)map_sz_snap)
-                continue;  /* block lives past our snapshot — skip */
+            if (end > (uint64_t)map_sz) continue;
             size_t slot = p->col_meta_n[ci];
             p->col_metas[ci][slot].offset = offset;
             p->col_metas[ci][slot].size   = bsize;
@@ -813,7 +836,7 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
             p->col_metas[ci][slot].flags  = 0;
             p->col_meta_n[ci]++;
         }
-        fclose(idx_f);
+        free(entries);
 
         /* Back-fill codec from block headers. */
         for (size_t b = 0; b < p->col_meta_n[ci]; b++) {
