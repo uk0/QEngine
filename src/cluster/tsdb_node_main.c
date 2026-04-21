@@ -242,19 +242,83 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
             int first_db = 1;
             while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
                 const char *dn = NULL, *ddesc = NULL;
+                int prot = 0;
                 for (int c = 0; c < ncols; c++) {
                     const char *cn = tsdb_result_col_name(res, c);
                     if      (cn && strcmp(cn, "name") == 0)        dn    = tsdb_result_sym(res, c);
                     else if (cn && strcmp(cn, "description") == 0) ddesc = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "protected") == 0)   prot  = (int)tsdb_result_i64(res, c);
                 }
                 if (!dn) continue;
                 char ne[128], de[256];
                 j_escape_str(ne, sizeof(ne), dn);
                 j_escape_str(de, sizeof(de), ddesc ? ddesc : "");
                 w += snprintf(buf + w, cap - (size_t)w,
-                              "%s{\"name\":\"%s\",\"description\":\"%s\"}",
-                              first_db ? "" : ",", ne, de);
+                              "%s{\"name\":\"%s\",\"description\":\"%s\","
+                              "\"protected\":%d}",
+                              first_db ? "" : ",", ne, de, prot);
                 first_db = 0;
+            }
+            tsdb_result_free(res);
+        }
+    }
+
+    /* VTABLES section (super-tables). */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"vtables\":[");
+    {
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, "LIST VTABLES;", &res) == 0 && res) {
+            int ncols = tsdb_result_ncols(res);
+            int first_v = 1;
+            while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
+                const char *vn = NULL, *vdb = NULL;
+                int ncols_v = 0, ntags_v = 0;
+                for (int c = 0; c < ncols; c++) {
+                    const char *cn = tsdb_result_col_name(res, c);
+                    if      (cn && strcmp(cn, "name")       == 0) vn      = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "database")   == 0) vdb     = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "ncols")      == 0) ncols_v = (int)tsdb_result_i64(res, c);
+                    else if (cn && strcmp(cn, "ntag_cols")  == 0) ntags_v = (int)tsdb_result_i64(res, c);
+                }
+                if (!vn) continue;
+                char ne[128], dbe[128];
+                j_escape_str(ne,  sizeof(ne),  vn);
+                j_escape_str(dbe, sizeof(dbe), vdb ? vdb : "");
+                w += snprintf(buf + w, cap - (size_t)w,
+                              "%s{\"name\":\"%s\",\"database\":\"%s\","
+                              "\"ncols\":%d,\"ntags\":%d}",
+                              first_v ? "" : ",", ne, dbe, ncols_v, ntags_v);
+                first_v = 0;
+            }
+            tsdb_result_free(res);
+        }
+    }
+
+    /* PTABLES section (child tables). */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"ptables\":[");
+    {
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, "LIST PTABLES;", &res) == 0 && res) {
+            int ncols = tsdb_result_ncols(res);
+            int first_p = 1;
+            while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
+                const char *pn = NULL, *pv = NULL, *pdb = NULL;
+                for (int c = 0; c < ncols; c++) {
+                    const char *cn = tsdb_result_col_name(res, c);
+                    if      (cn && strcmp(cn, "name")     == 0) pn  = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "vtable")   == 0) pv  = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "database") == 0) pdb = tsdb_result_sym(res, c);
+                }
+                if (!pn) continue;
+                char ne[128], ve[128], dbe[128];
+                j_escape_str(ne,  sizeof(ne),  pn);
+                j_escape_str(ve,  sizeof(ve),  pv  ? pv  : "");
+                j_escape_str(dbe, sizeof(dbe), pdb ? pdb : "");
+                w += snprintf(buf + w, cap - (size_t)w,
+                              "%s{\"name\":\"%s\",\"vtable\":\"%s\","
+                              "\"database\":\"%s\"}",
+                              first_p ? "" : ",", ne, ve, dbe);
+                first_p = 0;
             }
             tsdb_result_free(res);
         }

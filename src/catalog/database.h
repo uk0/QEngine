@@ -32,7 +32,13 @@ typedef struct {
     char      description[192];
     int64_t   retention_ns;      /* default retention for groups under this db; 0 = none */
     tsdb_ts_t created_at;
+    uint8_t   protected_flag;    /* 1 → cannot be dropped (e.g. sysdb) */
 } tsdb_database_t;
+
+/* The one system database — auto-created on catalog open if absent.
+ * Holds no user tables of its own; surfaces cluster/user/RBAC state
+ * through virtual tree entries in the dashboard.  Cannot be dropped. */
+#define TSDB_SYSDB_NAME "sysdb"
 
 /* Forward decl — defined in catalog.c */
 typedef struct tsdb_catalog tsdb_catalog_t;

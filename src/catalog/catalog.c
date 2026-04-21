@@ -276,11 +276,15 @@ static int log_database(tsdb_catalog_t *c, char op, const tsdb_database_t *d) {
     char enc_name[128], enc_desc[512];
     pct_encode(d->name,        enc_name, sizeof(enc_name));
     pct_encode(d->description, enc_desc, sizeof(enc_desc));
+    /* V1 records had 5 fields (+ name desc retention created).  We now
+     * append a 6th — protected_flag.  Readers that only know V1 shape
+     * still parse the first 4; writers always emit V2. */
     int n = fprintf(c->databases_log,
-                    "%c\t%s\t%s\t%lld\t%lld\n",
+                    "%c\t%s\t%s\t%lld\t%lld\t%u\n",
                     op, enc_name, enc_desc,
                     (long long)d->retention_ns,
-                    (long long)d->created_at);
+                    (long long)d->created_at,
+                    (unsigned)d->protected_flag);
     if (n < 0) return TSDB_ERR_IO;
     if (fflush(c->databases_log) != 0) return TSDB_ERR_IO;
     return TSDB_OK;
@@ -321,10 +325,16 @@ static int replay_databases(tsdb_catalog_t *c, const char *path) {
             strncpy(d->description, desc, sizeof(d->description) - 1);
             d->retention_ns = (int64_t)strtoll(fields[3], NULL, 10);
             d->created_at   = (tsdb_ts_t)strtoll(fields[4], NULL, 10);
+            d->protected_flag = (nf >= 6) ? (uint8_t)strtoul(fields[5], NULL, 10)
+                                          : (uint8_t)0;
+            /* sysdb is always protected — defence in depth against hand-
+             * edited logs. */
+            if (strcmp(d->name, TSDB_SYSDB_NAME) == 0) d->protected_flag = 1;
             hmap_put(&c->databases, d->name, d);
         } else if (op == '-' && nf >= 2) {
             char name[64];
             pct_decode(fields[1], name, sizeof(name));
+            if (strcmp(name, TSDB_SYSDB_NAME) == 0) continue; /* ignore */
             hmap_del(&c->databases, name);
         }
     }
@@ -370,10 +380,15 @@ int tsdb_database_exists(tsdb_catalog_t *c, const char *name) {
 
 int tsdb_database_drop(tsdb_catalog_t *c, const char *name) {
     if (!c || !name) return TSDB_ERR_INVAL;
+    /* System database is forever — callers receive a dedicated rc so
+     * the executor can surface a distinct error message. */
+    if (strcmp(name, TSDB_SYSDB_NAME) == 0) return TSDB_ERR_PERMISSION;
     pthread_mutex_lock(&c->lock);
-    if (!hmap_get(&c->databases, name)) {
+    tsdb_database_t *d = (tsdb_database_t *)hmap_get(&c->databases, name);
+    if (!d) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
+    if (d->protected_flag) {
         pthread_mutex_unlock(&c->lock);
-        return TSDB_ERR_NOTFOUND;
+        return TSDB_ERR_PERMISSION;
     }
     int rc = log_database_drop(c, name);
     if (rc != TSDB_OK) { pthread_mutex_unlock(&c->lock); return rc; }
@@ -717,6 +732,28 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     if (!c->stables_log) { fclose(c->databases_log); fclose(c->groups_log); fclose(c->devices_log); free(c); return TSDB_ERR_IO; }
     c->children_log = fopen(children_path, "a");
     if (!c->children_log) { fclose(c->databases_log); fclose(c->groups_log); fclose(c->devices_log); fclose(c->stables_log); free(c); return TSDB_ERR_IO; }
+
+    /* Auto-bootstrap sysdb on first open.  It's always protected, so
+     * DROP DATABASE sysdb is rejected downstream. */
+    if (!hmap_get(&c->databases, TSDB_SYSDB_NAME)) {
+        tsdb_database_t sysdb;
+        memset(&sysdb, 0, sizeof(sysdb));
+        snprintf(sysdb.name, sizeof(sysdb.name), "%s", TSDB_SYSDB_NAME);
+        snprintf(sysdb.description, sizeof(sysdb.description),
+                 "system database — cluster state, users, RBAC, load "
+                 "(read-only; cannot be dropped)");
+        sysdb.created_at     = (tsdb_ts_t)tsdb_now_ns();
+        sysdb.protected_flag = 1;
+        tsdb_database_t *copy = malloc(sizeof(*copy));
+        if (copy) {
+            *copy = sysdb;
+            if (log_database(c, '+', copy) == TSDB_OK) {
+                hmap_put(&c->databases, copy->name, copy);
+            } else {
+                free(copy);
+            }
+        }
+    }
 
     *out = c;
     return TSDB_OK;

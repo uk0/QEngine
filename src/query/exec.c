@@ -4945,13 +4945,34 @@ static const tsdb_type_t LIST_GROUPS_TYPES[] = {
 
 /* LIST DATABASES result columns: name, description, retention_ns, created_at. */
 static const char *LIST_DBS_COLS[] = {
-    "name","description","retention_ns","created_at"
+    "name","description","retention_ns","created_at","protected"
 };
 static const tsdb_type_t LIST_DBS_TYPES[] = {
     TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL,
-    TSDB_TYPE_INT64,  TSDB_TYPE_TIMESTAMP
+    TSDB_TYPE_INT64,  TSDB_TYPE_TIMESTAMP,
+    TSDB_TYPE_INT64
 };
-#define LIST_DBS_NCOLS 4
+#define LIST_DBS_NCOLS 5
+
+/* LIST VTABLES result columns. */
+static const char *LIST_VTABS_COLS[] = {
+    "name","ncols","ntag_cols","created_at","database"
+};
+static const tsdb_type_t LIST_VTABS_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64, TSDB_TYPE_INT64,
+    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL
+};
+#define LIST_VTABS_NCOLS 5
+
+/* LIST PTABLES result columns. */
+static const char *LIST_PTABS_COLS[] = {
+    "name","vtable","ntags","created_at","database"
+};
+static const tsdb_type_t LIST_PTABS_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,
+    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL
+};
+#define LIST_PTABS_NCOLS 5
 
 static const char *LIST_DEVICES_COLS[] = {"group","id","type","location","tags","last_seen","status"};
 static const tsdb_type_t LIST_DEVICES_TYPES[] = {
@@ -5089,9 +5110,62 @@ static int exec_list_databases(tsdb_catalog_t *cat, tsdb_result_t *r) {
         result_append_sym(r, 1, d->description);
         result_append_i64_val(r, 2, d->retention_ns);
         result_append_ts_val(r, 3, d->created_at);
+        result_append_i64_val(r, 4, (int64_t)d->protected_flag);
         result_ddl_end_row(r);
     }
     tsdb_database_list_free(arr);
+    return rc;
+}
+
+static int exec_list_vtables(tsdb_catalog_t *cat, tsdb_result_t *r) {
+    int rc = result_init_ddl(r, LIST_VTABS_NCOLS,
+                              LIST_VTABS_COLS, LIST_VTABS_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_stable_t *arr = NULL;
+    size_t n = 0;
+    rc = tsdb_stable_list(cat, &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_stable_t *s = &arr[i];
+        result_append_sym(r, 0, s->name);
+        result_append_i64_val(r, 1, (int64_t)s->ncols);
+        result_append_i64_val(r, 2, (int64_t)s->ntag_cols);
+        result_append_ts_val(r, 3, s->created_at);
+        result_append_sym(r, 4, s->database);
+        result_ddl_end_row(r);
+    }
+    free(arr);
+    return rc;
+}
+
+static int exec_list_ptables(tsdb_catalog_t *cat, const char *vtable_filter,
+                              tsdb_result_t *r)
+{
+    int rc = result_init_ddl(r, LIST_PTABS_NCOLS,
+                              LIST_PTABS_COLS, LIST_PTABS_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_child_table_t *arr = NULL;
+    size_t n = 0;
+    rc = tsdb_child_table_list(cat,
+        (vtable_filter && vtable_filter[0]) ? vtable_filter : NULL,
+        &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_child_table_t *ct = &arr[i];
+        result_append_sym(r, 0, ct->name);
+        result_append_sym(r, 1, ct->stable_name);
+        result_append_i64_val(r, 2, (int64_t)ct->ntags);
+        result_append_ts_val(r, 3, ct->created_at);
+        result_append_sym(r, 4, ct->database);
+        result_ddl_end_row(r);
+    }
+    free(arr);
     return rc;
 }
 
@@ -5216,9 +5290,18 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     }
     case QAST_STMT_DROP_DATABASE: {
         rc = tsdb_database_drop(cat, stmt.u.drop_database.name);
-        if (rc == TSDB_OK) rc = result_status(r, "OK: database dropped");
-        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: database not found"); rc = TSDB_ERR_NOTFOUND; }
-        else result_status(r, "ERR: drop database failed");
+        if (rc == TSDB_OK)
+            rc = result_status(r, "OK: database dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) {
+            result_status(r, "ERR: database not found");
+            rc = TSDB_ERR_NOTFOUND;
+        } else if (rc == TSDB_ERR_PERMISSION) {
+            result_status(r,
+                "ERR: database is protected (e.g. sysdb) — drop refused");
+            rc = TSDB_ERR_PERMISSION;
+        } else {
+            result_status(r, "ERR: drop database failed");
+        }
         break;
     }
     case QAST_STMT_LIST_DATABASES:
@@ -5265,6 +5348,12 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     }
     case QAST_STMT_LIST_DEVICES:
         rc = exec_list_devices(cat, stmt.u.list_devices.group, r);
+        break;
+    case QAST_STMT_LIST_VTABLES:
+        rc = exec_list_vtables(cat, r);
+        break;
+    case QAST_STMT_LIST_PTABLES:
+        rc = exec_list_ptables(cat, stmt.u.list_ptables.vtable, r);
         break;
 
     /* ---- STable DDL ---------------------------------------------------- */
@@ -5352,10 +5441,10 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_CREATE_CHILD_TABLE: {
-        const tsdb_child_table_t *ct = &stmt.u.create_child_table.spec;
+        const tsdb_child_table_t *ct_in = &stmt.u.create_child_table.spec;
         /* Fetch stable schema to build the physical table columns. */
         tsdb_stable_t st;
-        int src = tsdb_stable_get(cat, ct->stable_name, &st);
+        int src = tsdb_stable_get(cat, ct_in->stable_name, &st);
         if (src != TSDB_OK) {
             result_status(r, "ERR: stable not found");
             rc = TSDB_ERR_NOTFOUND;
@@ -5368,7 +5457,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             cols[ci].type = st.cols[ci].type;
         }
         const char *ts_col = st.cols[st.ts_col_idx >= 0 ? st.ts_col_idx : 0].name;
-        rc = tsdb_create_table(db, ct->name, cols, (size_t)st.ncols, ts_col);
+        rc = tsdb_create_table(db, ct_in->name, cols, (size_t)st.ncols, ts_col);
         if (rc != TSDB_OK && rc != TSDB_ERR_EXISTS) {
             result_status(r, "ERR: create child table failed");
             break;
@@ -5377,8 +5466,15 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             result_status(r, "ERR: child table already exists");
             break;
         }
-        /* Register in catalog. */
-        rc = tsdb_child_table_create(cat, ct);
+        /* Inherit the parent stable's database when the AST didn't
+         * carry one — makes every PTable automatically nest under the
+         * same DB as its VTable. */
+        tsdb_child_table_t ct_registered = *ct_in;
+        if (!ct_registered.database[0] && st.database[0]) {
+            snprintf(ct_registered.database,
+                     sizeof(ct_registered.database), "%s", st.database);
+        }
+        rc = tsdb_child_table_create(cat, &ct_registered);
         if (rc == TSDB_OK) rc = result_status(r, "OK: child table created");
         else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: child table exists"); rc = TSDB_ERR_EXISTS; }
         else { result_status(r, "ERR: child table catalog failed"); }
@@ -5710,6 +5806,8 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     case QAST_STMT_LIST_DATABASES:
     case QAST_STMT_LIST_GROUPS:
     case QAST_STMT_LIST_DEVICES:
+    case QAST_STMT_LIST_VTABLES:
+    case QAST_STMT_LIST_PTABLES:
     case QAST_STMT_LIST_FUNCTIONS:
         *out_priv = TSDB_PRIV_SELECT;
         break;

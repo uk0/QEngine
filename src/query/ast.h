@@ -178,6 +178,11 @@ typedef enum {
     QAST_STMT_CREATE_DEVICE,
     QAST_STMT_DROP_DEVICE,
     QAST_STMT_LIST_DEVICES,
+    /* VTable = STable (super-table); PTable = child-table.  Aliases exist
+     * in the grammar; these two list kinds are new, exposing the 3-level
+     * hierarchy through QTL. */
+    QAST_STMT_LIST_VTABLES,
+    QAST_STMT_LIST_PTABLES,     /* optional arg: vtable filter */
     /* STable DDL */
     QAST_STMT_CREATE_STABLE,
     QAST_STMT_DROP_STABLE,
@@ -228,6 +233,8 @@ typedef struct {
         struct { tsdb_device_t spec; } create_device;    /* QAST_STMT_CREATE_DEVICE */
         struct { char group[64]; char id[128]; } drop_device;  /* QAST_STMT_DROP_DEVICE */
         struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
+        /* LIST PTABLES [USING <vtable>] — empty vtable = all */
+        struct { char vtable[64]; }    list_ptables;
         /* STable DDL */
         struct { tsdb_stable_t spec; }       create_stable;       /* QAST_STMT_CREATE_STABLE */
         struct { char name[64]; }            drop_stable;          /* QAST_STMT_DROP_STABLE */

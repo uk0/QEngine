@@ -770,8 +770,13 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        /* CREATE STABLE name (col type, ...) TAGS (tag_col type, ...) */
-        if (accept(&p, QTOK_STABLE)) {
+        /* CREATE {STABLE|VTABLE} name (col type, ...) TAGS (tag_col type, ...)
+         * VTABLE is the industrial-digital-twin alias for STABLE under the
+         * 3-level model (Database → VTable → PTable).  Both forms produce
+         * the same AST; downstream code is unchanged. */
+        if (accept(&p, QTOK_STABLE) ||
+            (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "vtable")
+             && (advance(&p), 1))) {
             out->kind = QAST_STMT_CREATE_STABLE;
             tsdb_stable_t *st = &out->u.create_stable.spec;
             memset(st, 0, sizeof(*st));
@@ -782,6 +787,22 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             }
             tok_copy(&p.tok, st->name, sizeof(st->name));
             advance(&p);
+
+            /* Optional "IN DATABASE <name>" — binds the VTable to a DB
+             * so the dashboard hierarchy nests it under the DB node. */
+            if (accept(&p, QTOK_IN)) {
+                if (p.tok.kind != QTOK_IDENT ||
+                    !(ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    perr(&p, "expected DATABASE after IN");
+                    return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, st->database, sizeof(st->database));
+                advance(&p);
+            }
 
             /* Parse column list: (col_name type, ...) */
             if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
@@ -1319,11 +1340,13 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        /* DROP STABLE name */
-        if (accept(&p, QTOK_STABLE)) {
+        /* DROP {STABLE|VTABLE} name */
+        if (accept(&p, QTOK_STABLE) ||
+            (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "vtable")
+             && (advance(&p), 1))) {
             out->kind = QAST_STMT_DROP_STABLE;
             if (p.tok.kind != QTOK_IDENT) {
-                perr(&p, "expected stable name"); return TSDB_ERR_PARSE;
+                perr(&p, "expected vtable name"); return TSDB_ERR_PARSE;
             }
             tok_copy(&p.tok, out->u.drop_stable.name, sizeof(out->u.drop_stable.name));
             advance(&p);
@@ -1457,6 +1480,35 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             advance(&p);
             accept(&p, QTOK_SEMI);
             return TSDB_OK;
+        }
+
+        /* LIST VTABLES  (alias: LIST STABLES) */
+        if (p.tok.kind == QTOK_IDENT &&
+            (ident_ci(&p.tok, "vtables") || ident_ci(&p.tok, "stables"))) {
+            out->kind = QAST_STMT_LIST_VTABLES;
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return TSDB_OK;
+        }
+
+        /* LIST PTABLES [USING <vtable>]  (alias: LIST TABLES) */
+        if (p.tok.kind == QTOK_IDENT &&
+            (ident_ci(&p.tok, "ptables") || ident_ci(&p.tok, "tables"))) {
+            out->kind = QAST_STMT_LIST_PTABLES;
+            out->u.list_ptables.vtable[0] = '\0';
+            advance(&p);
+            if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "using")) {
+                advance(&p);
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected vtable name after USING");
+                    return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, out->u.list_ptables.vtable,
+                         sizeof(out->u.list_ptables.vtable));
+                advance(&p);
+            }
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
         /* LIST DEVICES [IN GROUP <group>] */
