@@ -81,6 +81,20 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
                                          int *out_acked_peers,
                                          int *out_total_peers);
 
+/*
+ * Cluster-wide broadcast of a catalog-mutating QTL (CREATE DATABASE,
+ * CREATE VTABLE, CREATE TABLE, CREATE GROUP, DROP *).  The primary has
+ * already applied locally; this fans out to every ALIVE peer so each
+ * maintains an identical catalog snapshot.  Standalone → no-op.
+ *
+ * A thread-local flag (`tsdb_g_suppress_catalog_broadcast`) keeps the
+ * peer's re-entered tsdb_query from broadcasting again.
+ */
+int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
+                                        const char *qtl,
+                                        int *out_acked_peers,
+                                        int *out_total_peers);
+
 #ifdef __cplusplus
 }
 #endif

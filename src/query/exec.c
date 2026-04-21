@@ -5242,6 +5242,19 @@ static int result_status(tsdb_result_t *r, const char *msg) {
 
 /* ---- Public API implementations --------------------------------------- */
 
+/* Defined in storage/db_cluster.c.  The peer-side RPC handler flips
+ * this to 1 before re-entering tsdb_query with a replayed catalog
+ * statement — prevents a broadcast ping-pong between nodes. */
+extern __thread int tsdb_g_suppress_catalog_broadcast;
+
+static inline void try_broadcast_catalog_qtl(tsdb_db_t *db,
+                                             const char *qtl, int rc_local)
+{
+    if (rc_local != TSDB_OK) return;
+    if (tsdb_g_suppress_catalog_broadcast) return;
+    (void)tsdb_cluster_broadcast_catalog_qtl(db, qtl, NULL, NULL);
+}
+
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     if (!db || !qtl || !out) return TSDB_ERR_INVAL;
 
@@ -5464,13 +5477,13 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             result_status(r, "ERR: create child table failed");
             break;
         }
-        if (rc == TSDB_ERR_EXISTS) {
-            result_status(r, "ERR: child table already exists");
-            break;
-        }
-        /* Inherit the parent VTable's ancestry (database + group) when
-         * the AST didn't carry one.  Keeps every PTable nested under
-         * the same 4-level path (Database → Group → VTable → PTable). */
+        /* rc may be EXISTS here if a background schema-sync hook from a
+         * peer already provisioned the physical table.  That's fine —
+         * the catalog row is what makes it visible to LIST PTABLES, so
+         * we fall through and always try to register the catalog entry.
+         * The catalog layer itself returns EXISTS if the row is also
+         * already there (idempotent peer-side replay). */
+        int physical_preexisted = (rc == TSDB_ERR_EXISTS);
         tsdb_child_table_t ct_registered = *ct_in;
         if (!ct_registered.database[0] && st.database[0]) {
             snprintf(ct_registered.database,
@@ -5481,9 +5494,16 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                      sizeof(ct_registered.group), "%s", st.group);
         }
         rc = tsdb_child_table_create(cat, &ct_registered);
-        if (rc == TSDB_OK) rc = result_status(r, "OK: child table created");
-        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: child table exists"); rc = TSDB_ERR_EXISTS; }
-        else { result_status(r, "ERR: child table catalog failed"); }
+        if (rc == TSDB_OK) {
+            rc = result_status(r, physical_preexisted
+                ? "OK: child table catalog entry created (physical already present)"
+                : "OK: child table created");
+        } else if (rc == TSDB_ERR_EXISTS) {
+            result_status(r, "ERR: child table exists");
+            rc = TSDB_ERR_EXISTS;
+        } else {
+            result_status(r, "ERR: child table catalog failed");
+        }
         break;
     }
     case QAST_STMT_CREATE_TABLE: {
@@ -5772,6 +5792,27 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     default:
         result_status(r, "ERR: unknown statement");
         rc = TSDB_ERR_UNSUPPORTED;
+        break;
+    }
+
+    /* Catalog-mutating statements get fanned out to every ALIVE peer
+     * so every node's catalog stays in lockstep.  The peer-side RPC
+     * handler flips tsdb_g_suppress_catalog_broadcast before replaying
+     * the statement, which keeps the rebroadcast from looping.
+     * DROP STABLE cascades to child tables on both the primary and
+     * each peer, so DROP_CHILD doesn't need its own case. */
+    switch (stmt.kind) {
+    case QAST_STMT_CREATE_DATABASE:
+    case QAST_STMT_DROP_DATABASE:
+    case QAST_STMT_CREATE_GROUP:
+    case QAST_STMT_DROP_GROUP:
+    case QAST_STMT_CREATE_STABLE:
+    case QAST_STMT_DROP_STABLE:
+    case QAST_STMT_CREATE_CHILD_TABLE:
+    case QAST_STMT_CREATE_TABLE:
+        try_broadcast_catalog_qtl(db, qtl, rc);
+        break;
+    default:
         break;
     }
 

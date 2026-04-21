@@ -51,7 +51,8 @@ typedef enum {
     TSDB_RPC_RAW_BLOCK_PUSH  = 9,  /* raw compressed block replica sync */
     TSDB_RPC_RAW_BLOCK_ACK   = 10, /* per-block ack */
     TSDB_RPC_APPLY_TRUNCATE    = 11, /* cluster broadcast: apply TRUNCATE TABLE locally */
-    TSDB_RPC_APPLY_DELETE_RANGE = 12 /* cluster broadcast: apply partition-level DELETE locally */
+    TSDB_RPC_APPLY_DELETE_RANGE = 12, /* cluster broadcast: apply partition-level DELETE locally */
+    TSDB_RPC_APPLY_CATALOG_QTL  = 13  /* cluster broadcast: run a catalog QTL statement locally */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
@@ -223,6 +224,14 @@ int tsdb_rpc_decode_delete_range(const uint8_t *buf, uint32_t len,
                                  char *out_table, int table_cap,
                                  int64_t *out_cutoff_ns,
                                  int *out_op_lt, int *out_inclusive);
+
+/* APPLY_CATALOG_QTL payload:
+ *   qtl_len u32 LE
+ *   qtl     [qtl_len bytes]  UTF-8 (no NUL)
+ */
+int tsdb_rpc_encode_catalog_qtl(uint8_t *buf, uint32_t cap, const char *qtl);
+int tsdb_rpc_decode_catalog_qtl(const uint8_t *buf, uint32_t len,
+                                char *out_qtl, int qtl_cap);
 
 #ifdef __cplusplus
 }

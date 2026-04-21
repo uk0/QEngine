@@ -502,6 +502,38 @@ static void *connection_handler(void *arg) {
             }
             break;
 
+        case TSDB_RPC_APPLY_CATALOG_QTL:
+            /* Peer side: catalog mutation broadcast from a primary.
+             * We re-run the QTL locally so DB / Group / VTable / PTable
+             * registrations land in this peer's catalog.  The thread-
+             * local guard prevents the nested tsdb_query from
+             * re-broadcasting and ping-ponging forever. */
+            if (db && msg.payload_len > 0) {
+                char qtl[4096] = {0};
+                int rc = tsdb_rpc_decode_catalog_qtl(msg.payload,
+                                                     msg.payload_len,
+                                                     qtl, sizeof(qtl));
+                if (rc == 0) {
+                    extern __thread int tsdb_g_suppress_catalog_broadcast;
+                    tsdb_g_suppress_catalog_broadcast = 1;
+                    tsdb_result_t *qr = NULL;
+                    int qrc = tsdb_query(db, qtl, &qr);
+                    tsdb_g_suppress_catalog_broadcast = 0;
+                    if (qr) tsdb_result_free(qr);
+                    /* EXISTS is a common idempotent case on re-broadcast
+                     * or stale peer catch-up — treat as success. */
+                    if (qrc == TSDB_OK || qrc == TSDB_ERR_EXISTS)
+                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                    else
+                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                } else {
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
         default:
             send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
@@ -978,5 +1010,34 @@ int tsdb_rpc_decode_delete_range(const uint8_t *buf, uint32_t len,
     if (out_cutoff_ns)  *out_cutoff_ns  = cutoff;
     if (out_op_lt)      *out_op_lt      = buf[1 + tnlen + 8] ? 1 : 0;
     if (out_inclusive)  *out_inclusive  = buf[1 + tnlen + 9] ? 1 : 0;
+    return 0;
+}
+
+/* APPLY_CATALOG_QTL — carries a whole QTL statement so the peer can
+ * replay it into its own catalog (e.g. CREATE DATABASE, CREATE VTABLE).
+ * Payload layout: qtl_len u32 LE + raw UTF-8 bytes, no trailing NUL.
+ */
+int tsdb_rpc_encode_catalog_qtl(uint8_t *buf, uint32_t cap, const char *qtl) {
+    if (!buf || !qtl) return -1;
+    size_t qlen = strlen(qtl);
+    if (qlen > 0xFFFFFFFFu) return -1;
+    uint32_t need = 4u + (uint32_t)qlen;
+    if (need > cap) return -1;
+    uint32_t q32 = (uint32_t)qlen;
+    memcpy(buf, &q32, 4);
+    memcpy(buf + 4, qtl, qlen);
+    return (int)need;
+}
+
+int tsdb_rpc_decode_catalog_qtl(const uint8_t *buf, uint32_t len,
+                                char *out_qtl, int qtl_cap)
+{
+    if (!buf || len < 4 || !out_qtl || qtl_cap <= 0) return -1;
+    uint32_t qlen;
+    memcpy(&qlen, buf, 4);
+    if (4u + qlen > len) return -1;
+    int copy = (int)qlen < (qtl_cap - 1) ? (int)qlen : (qtl_cap - 1);
+    memcpy(out_qtl, buf + 4, (size_t)copy);
+    out_qtl[copy] = '\0';
     return 0;
 }

@@ -465,6 +465,35 @@ int tsdb_replica_broadcast_truncate(tsdb_replica_mgr_t *rmgr,
     return TSDB_OK;
 }
 
+int tsdb_replica_broadcast_catalog_qtl(tsdb_replica_mgr_t *rmgr,
+                                        const char *qtl,
+                                        const tsdb_node_id_t *peers, int npeers,
+                                        int *out_acked_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (!rmgr || !qtl || npeers <= 0) return TSDB_OK;
+
+    size_t qlen = strlen(qtl);
+    /* 4 B length prefix + statement body.  Catalog statements are short
+     * (CREATE VTABLE ... cols ... tags) so 8 KB is ample even with a
+     * generous margin. */
+    size_t cap = 16u + qlen;
+    uint8_t *payload = malloc(cap);
+    if (!payload) return TSDB_ERR_NOMEM;
+    int plen = tsdb_rpc_encode_catalog_qtl(payload, (uint32_t)cap, qtl);
+    if (plen < 0) { free(payload); return TSDB_ERR_INTERNAL; }
+
+    int acks = 0;
+    (void)fanout_wait_quorum_ex(rmgr, payload, (uint32_t)plen,
+                                peers, npeers,
+                                1 + npeers, TSDB_RPC_APPLY_CATALOG_QTL,
+                                &acks);
+    int peer_acks = acks - 1;
+    if (peer_acks < 0) peer_acks = 0;
+    if (out_acked_peers) *out_acked_peers = peer_acks;
+    return TSDB_OK;
+}
+
 int tsdb_replica_broadcast_delete_range(tsdb_replica_mgr_t *rmgr,
                                          const char *table_name,
                                          int64_t cutoff_ns,

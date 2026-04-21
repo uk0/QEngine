@@ -95,6 +95,17 @@ int tsdb_replica_broadcast_delete_range(tsdb_replica_mgr_t *rmgr,
                                          int *out_acked_peers);
 
 /*
+ * Broadcast a catalog-mutating QTL statement to every ALIVE peer.
+ * Best-effort; every peer runs the statement locally via tsdb_query.
+ * out_acked_peers gets the count that successfully applied (EXISTS is
+ * treated as success — idempotent on peer catch-up).
+ */
+int tsdb_replica_broadcast_catalog_qtl(tsdb_replica_mgr_t *rmgr,
+                                        const char *qtl,
+                                        const tsdb_node_id_t *peers, int npeers,
+                                        int *out_acked_peers);
+
+/*
  * Get or create a persistent RPC connection to the given node.
  * Returns NULL if unable to connect.
  */

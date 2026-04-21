@@ -416,3 +416,32 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
     if (out_acked_peers) *out_acked_peers = acked;
     return rc;
 }
+
+/* Thread-local re-entry guard.  Set on the peer side (RPC handler)
+ * before nested tsdb_query so the resulting catalog writes don't
+ * re-broadcast and ping-pong forever. */
+__thread int tsdb_g_suppress_catalog_broadcast = 0;
+
+int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
+                                        const char *qtl,
+                                        int *out_acked_peers,
+                                        int *out_total_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (out_total_peers) *out_total_peers = 0;
+    if (!db || !qtl) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    if (out_total_peers) *out_total_peers = npeers;
+    if (npeers == 0) return TSDB_OK;
+
+    int acked = 0;
+    int rc = tsdb_replica_broadcast_catalog_qtl(tsdb_cluster_replica_mgr(c),
+                                                 qtl, peers, npeers, &acked);
+    if (out_acked_peers) *out_acked_peers = acked;
+    return rc;
+}
