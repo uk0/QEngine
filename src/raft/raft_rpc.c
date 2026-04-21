@@ -188,22 +188,111 @@ int tsdb_raft_decode_resp_append(const uint8_t *buf, size_t len,
     return 0;
 }
 
+/* ---- InstallSnapshot codecs --------------------------------------------
+ *
+ * Wire layout (all LE, no padding):
+ *   req  (hdr 36 B + data):
+ *     term u64 | leader_id u64 | last_idx u64 | last_term u64 |
+ *     data_len u32 | data[data_len]
+ *   resp (8 B): term u64
+ */
+
+#define INSTALL_HDR_SIZE (8u + 8u + 8u + 8u + 4u) /* 36 */
+#define RESP_INSTALL_SIZE 8u
+
+int tsdb_raft_encode_req_install(uint8_t *buf, size_t cap,
+                                  const tsdb_raft_req_install_t *in)
+{
+    if (!buf || !in) return -1;
+    size_t need = INSTALL_HDR_SIZE + (size_t)in->data_len;
+    if (need > cap) return -1;
+    put_u64(buf +  0, in->term);
+    put_u64(buf +  8, in->leader_id);
+    put_u64(buf + 16, in->last_included_index);
+    put_u64(buf + 24, in->last_included_term);
+    put_u32(buf + 32, in->data_len);
+    if (in->data_len > 0) {
+        if (!in->data) return -1;
+        memcpy(buf + INSTALL_HDR_SIZE, in->data, in->data_len);
+    }
+    return (int)need;
+}
+
+int tsdb_raft_decode_req_install(const uint8_t *buf, size_t len,
+                                  tsdb_raft_req_install_t *out)
+{
+    if (!buf || !out || len < INSTALL_HDR_SIZE) return -1;
+    out->term                = get_u64(buf +  0);
+    out->leader_id           = get_u64(buf +  8);
+    out->last_included_index = get_u64(buf + 16);
+    out->last_included_term  = get_u64(buf + 24);
+    out->data_len            = get_u32(buf + 32);
+    if ((size_t)INSTALL_HDR_SIZE + out->data_len > len) return -1;
+    /* Data points into the caller's RPC buffer — caller must copy if
+     * needed past the request lifetime. */
+    out->data = out->data_len > 0 ? (buf + INSTALL_HDR_SIZE) : NULL;
+    return 0;
+}
+
+int tsdb_raft_encode_resp_install(uint8_t *buf, size_t cap,
+                                   const tsdb_raft_resp_install_t *in)
+{
+    if (!buf || !in || cap < RESP_INSTALL_SIZE) return -1;
+    put_u64(buf, in->term);
+    return (int)RESP_INSTALL_SIZE;
+}
+
+int tsdb_raft_decode_resp_install(const uint8_t *buf, size_t len,
+                                   tsdb_raft_resp_install_t *out)
+{
+    if (!buf || !out || len < RESP_INSTALL_SIZE) return -1;
+    out->term = get_u64(buf);
+    return 0;
+}
+
 /* ---- Handler registration + dispatch ------------------------------------ */
 
-static pthread_mutex_t            g_h_lock = PTHREAD_MUTEX_INITIALIZER;
-static tsdb_raft_on_req_vote_fn   g_vote_fn   = NULL;
-static tsdb_raft_on_req_append_fn g_append_fn = NULL;
-static void                      *g_h_ud      = NULL;
+static pthread_mutex_t             g_h_lock = PTHREAD_MUTEX_INITIALIZER;
+static tsdb_raft_on_req_vote_fn    g_vote_fn    = NULL;
+static tsdb_raft_on_req_append_fn  g_append_fn  = NULL;
+static tsdb_raft_on_req_install_fn g_install_fn = NULL;
+static void                       *g_h_ud       = NULL;
 
-void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn   vote_fn,
-                                 tsdb_raft_on_req_append_fn append_fn,
+void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn    vote_fn,
+                                 tsdb_raft_on_req_append_fn  append_fn,
+                                 tsdb_raft_on_req_install_fn install_fn,
                                  void *ud)
 {
     pthread_mutex_lock(&g_h_lock);
-    g_vote_fn   = vote_fn;
-    g_append_fn = append_fn;
-    g_h_ud      = ud;
+    g_vote_fn    = vote_fn;
+    g_append_fn  = append_fn;
+    g_install_fn = install_fn;
+    g_h_ud       = ud;
     pthread_mutex_unlock(&g_h_lock);
+}
+
+int tsdb_raft_rpc_handle_install(const uint8_t *req_payload, uint32_t req_len,
+                                  uint8_t *resp_buf, uint32_t resp_cap,
+                                  uint32_t *resp_len)
+{
+    if (!resp_len) return -1;
+    *resp_len = 0;
+
+    tsdb_raft_req_install_t req = {0};
+    if (tsdb_raft_decode_req_install(req_payload, req_len, &req) != 0) return -1;
+
+    pthread_mutex_lock(&g_h_lock);
+    tsdb_raft_on_req_install_fn fn = g_install_fn;
+    void *ud = g_h_ud;
+    pthread_mutex_unlock(&g_h_lock);
+    if (!fn) return -1;
+
+    tsdb_raft_resp_install_t resp = {0};
+    if (fn(ud, &req, &resp) != 0) return -1;
+    int n = tsdb_raft_encode_resp_install(resp_buf, resp_cap, &resp);
+    if (n < 0) return -1;
+    *resp_len = (uint32_t)n;
+    return 0;
 }
 
 int tsdb_raft_rpc_handle_vote(const uint8_t *req_payload, uint32_t req_len,

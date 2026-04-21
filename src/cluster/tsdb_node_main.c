@@ -29,6 +29,9 @@
 static volatile int g_running = 1;
 static time_t       g_node_start_epoch = 0;   /* set in main() */
 static char         g_local_role[16] = "master"; /* TSDB_NODE_ROLE, set in main() */
+char                g_local_data_dir[4096] = {0};  /* defined here (non-static)
+                                                      so snapshot callbacks
+                                                      can extern-declare it. */
 
 /* Forward decl for the /raft JSON callback — full body lives next to
  * the other *_json_cb helpers further down. */
@@ -39,6 +42,163 @@ static int raft_json_cb(void *ud, char *buf, size_t cap);
  * on the apply thread before replaying the QTL. */
 extern __thread int tsdb_g_suppress_catalog_broadcast;
 extern __thread int tsdb_g_inside_raft_apply;
+
+/* Forward decl: g_local_data_dir is defined further down but used by
+ * the snapshot callbacks that live up here (they need to be visible
+ * before raft_apply_cb). */
+extern char g_local_data_dir[];
+static int  tsdb_mkdir_p_noerr(const char *path);
+
+/* ---- Catalog snapshot callbacks ----------------------------------------
+ *
+ * raft_snapshot_write_cb serialises every .log file under
+ * <data_dir>/catalog/ into a contiguous byte stream.  The body shape:
+ *   u32 num_files
+ *   for each file:
+ *     u32 name_len       (bytes including NUL, max 255)
+ *     name[name_len]
+ *     u64 content_len
+ *     content[content_len]
+ *
+ * raft_snapshot_restore_cb parses the same format and atomically
+ * swaps the catalog/.log files on disk.  It does NOT hot-reopen the
+ * in-memory catalog — that requires db.c surgery and is tracked as a
+ * follow-up.  A restart applies the snapshot contents; until then the
+ * node's state machine sits on the prior catalog (but at least the
+ * raft log+markers are now in sync with the leader, so it stops
+ * spinning on AE mismatches). */
+
+static int raft_snapshot_write_cb(void *ud, uint8_t **out, uint32_t *out_len) {
+    (void)ud;
+    *out = NULL; *out_len = 0;
+    if (!g_local_data_dir[0]) return -1;
+
+    char cat_dir[4200];
+    snprintf(cat_dir, sizeof(cat_dir), "%s/catalog", g_local_data_dir);
+    DIR *d = opendir(cat_dir);
+    if (!d) return -1;
+
+    /* First pass: collect file names + sizes. */
+    struct { char name[128]; size_t sz; } files[32];
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && n < 32) {
+        const char *ext = strrchr(de->d_name, '.');
+        if (!ext || strcmp(ext, ".log") != 0) continue;
+        if (strlen(de->d_name) >= sizeof(files[0].name)) continue;
+        char path[4400];
+        snprintf(path, sizeof(path), "%s/%s", cat_dir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        snprintf(files[n].name, sizeof(files[n].name), "%s", de->d_name);
+        files[n].sz = (size_t)st.st_size;
+        n++;
+    }
+    closedir(d);
+    if (n == 0) return -1;
+
+    /* Second pass: allocate buffer + copy. */
+    size_t total = 4; /* num_files */
+    for (int i = 0; i < n; i++) {
+        size_t nm = strlen(files[i].name) + 1;
+        total += 4 + nm + 8 + files[i].sz;
+    }
+    uint8_t *buf = malloc(total);
+    if (!buf) return -1;
+
+    size_t off = 0;
+    uint32_t nf = (uint32_t)n;
+    memcpy(buf + off, &nf, 4); off += 4;
+    for (int i = 0; i < n; i++) {
+        uint32_t nm = (uint32_t)(strlen(files[i].name) + 1);
+        memcpy(buf + off, &nm, 4); off += 4;
+        memcpy(buf + off, files[i].name, nm); off += nm;
+        uint64_t sz = files[i].sz;
+        memcpy(buf + off, &sz, 8); off += 8;
+        if (sz == 0) continue;
+        char path[4400];
+        snprintf(path, sizeof(path), "%s/%s", cat_dir, files[i].name);
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { free(buf); return -1; }
+        size_t got = fread(buf + off, 1, sz, fp);
+        fclose(fp);
+        if (got != sz) { free(buf); return -1; }
+        off += sz;
+    }
+
+    *out = buf;
+    *out_len = (uint32_t)off;
+    return 0;
+}
+
+static int raft_snapshot_restore_cb(void *ud,
+                                     const uint8_t *data, uint32_t data_len)
+{
+    (void)ud;
+    if (!data || data_len < 4 || !g_local_data_dir[0]) return -1;
+
+    char cat_dir[4200];
+    snprintf(cat_dir, sizeof(cat_dir), "%s/catalog", g_local_data_dir);
+
+    /* Parse and write into a staging dir so we don't clobber the live
+     * catalog mid-restore.  Then atomic-rename each file over. */
+    char stage[4232];
+    snprintf(stage, sizeof(stage), "%s/snapshot-stage", cat_dir);
+    (void)tsdb_mkdir_p_noerr(stage);  /* helper below */
+
+    size_t off = 0;
+    uint32_t nf = 0;
+    memcpy(&nf, data + off, 4); off += 4;
+    if (nf > 32) return -1;
+
+    for (uint32_t i = 0; i < nf; i++) {
+        if (off + 4 > data_len) return -1;
+        uint32_t nm = 0;
+        memcpy(&nm, data + off, 4); off += 4;
+        if (nm == 0 || nm > 128 || off + nm + 8 > data_len) return -1;
+        char name[128];
+        memcpy(name, data + off, nm);
+        name[nm - 1] = '\0';   /* incoming carries its own NUL but
+                                  be defensive in case the sender was
+                                  off by one */
+        off += nm;
+        uint64_t sz = 0;
+        memcpy(&sz, data + off, 8); off += 8;
+        if (sz > data_len || off + sz > data_len) return -1;
+        char spath[4360];
+        snprintf(spath, sizeof(spath), "%s/%s", stage, name);
+        FILE *fp = fopen(spath, "wb");
+        if (!fp) return -1;
+        if (sz > 0 && fwrite(data + off, 1, sz, fp) != sz) {
+            fclose(fp); return -1;
+        }
+        fflush(fp);
+        fsync(fileno(fp));
+        fclose(fp);
+        off += sz;
+
+        /* Atomic swap over the live file. */
+        char dpath[4232];
+        snprintf(dpath, sizeof(dpath), "%s/%s", cat_dir, name);
+        if (rename(spath, dpath) != 0) return -1;
+    }
+    fprintf(stderr,
+            "[raft-snap] restored %u catalog file(s) from leader "
+            "(%u bytes).  Node restart required for in-memory catalog "
+            "to reflect the snapshot.\n", nf, data_len);
+    return 0;
+}
+
+/* Helper: mkdir -p, ignore EEXIST.  db.c has tsdb_mkdir_p but it's
+ * not on the public surface — duplicate here to avoid coupling. */
+static int tsdb_mkdir_p_noerr(const char *path) {
+    char tmp[4232]; snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
+    return 0;
+}
 
 /* raft_apply_cb — invoked on every committed log entry.  Replays the
  * QTL locally (with both suppression flags on) so every master ends
@@ -142,7 +302,8 @@ static int raft_json_cb(void *ud, char *buf, size_t cap) {
  * shown as "-" until the gossip protocol grows the field (separate
  * change, involves on-wire schema bump).
  */
-static char g_local_data_dir[4096] = {0};
+/* g_local_data_dir is now defined above (non-static) so the
+ * snapshot callbacks and cluster_json_cb share the same storage. */
 
 static int cluster_json_cb(void *ud, char *buf, size_t cap) {
     tsdb_db_t *db = (tsdb_db_t *)ud;
@@ -735,6 +896,10 @@ int main(int argc, char **argv) {
                                          raft_apply_cb, db);
                 if (raft_h) {
                     tsdb_db_bind_raft(db, raft_h);
+                    tsdb_raft_set_snapshot_handlers(raft_h,
+                                                     raft_snapshot_write_cb,
+                                                     raft_snapshot_restore_cb,
+                                                     NULL);
                     tsdb_metrics_server_set_raft_provider(raft_json_cb,
                                                            raft_h);
                     printf("[node] raft consensus ENABLED (data=%s/raft)\n",

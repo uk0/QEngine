@@ -568,6 +568,22 @@ static void *connection_handler(void *arg) {
             break;
         }
 
+        case TSDB_RPC_RAFT_INSTALL_SNAPSHOT: {
+            /* Far-behind follower receiving a full snapshot body.
+             * Response is tiny (8 B) — just an ACK with the current term. */
+            uint8_t rb[32];
+            uint32_t rn = 0;
+            extern int tsdb_raft_rpc_handle_install(const uint8_t *, uint32_t,
+                                                    uint8_t *, uint32_t,
+                                                    uint32_t *);
+            if (tsdb_raft_rpc_handle_install(msg.payload, msg.payload_len,
+                                             rb, sizeof(rb), &rn) == 0)
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+            else
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            break;
+        }
+
         default:
             send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;

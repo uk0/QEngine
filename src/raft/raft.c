@@ -93,6 +93,11 @@ struct tsdb_raft {
     tsdb_raft_apply_fn apply_fn;
     void              *apply_ud;
 
+    /* Snapshot callbacks (optional). */
+    tsdb_raft_snapshot_write_fn   snap_write_fn;
+    tsdb_raft_snapshot_restore_fn snap_restore_fn;
+    void                         *snap_ud;
+
     /* Tick thread control. */
     pthread_t          tick_thread;
     pthread_t          apply_thread;
@@ -368,6 +373,71 @@ static int on_append_entries(void *ud,
     return 0;
 }
 
+/* --- InstallSnapshot handler (follower side) ------------------------- */
+
+static int on_install_snapshot(void *ud,
+                                const tsdb_raft_req_install_t *req,
+                                tsdb_raft_resp_install_t *resp)
+{
+    tsdb_raft_t *r = (tsdb_raft_t *)ud;
+    if (!r || !req || !resp) return -1;
+    pthread_mutex_lock(&r->lock);
+
+    uint64_t cur_term = tsdb_raft_log_current_term(r->log);
+
+    /* Stale leader? ignore. */
+    if (req->term < cur_term) {
+        resp->term = cur_term;
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+    if (req->term > cur_term) {
+        become_follower_locked(r, req->term, req->leader_id);
+        cur_term = req->term;
+    } else {
+        /* Same term — sender is the legit leader; reset election timer. */
+        if (r->state == TSDB_RAFT_CANDIDATE) r->state = TSDB_RAFT_FOLLOWER;
+        r->leader_id = req->leader_id;
+        reset_election_timer(r);
+    }
+
+    /* If we've already applied past this snapshot index there's
+     * nothing to do — ack with our term. */
+    if (req->last_included_index <= tsdb_raft_log_snapshot_index(r->log)) {
+        resp->term = cur_term;
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+
+    /* Hand the body off to the state machine's restore hook (if any).
+     * We release the lock across the restore call because it may do
+     * filesystem I/O; re-acquire to update raft state. */
+    tsdb_raft_snapshot_restore_fn fn = r->snap_restore_fn;
+    void *sud = r->snap_ud;
+    pthread_mutex_unlock(&r->lock);
+
+    int rc = 0;
+    if (fn) {
+        rc = fn(sud, req->data, req->data_len);
+    }
+
+    pthread_mutex_lock(&r->lock);
+    if (rc == 0) {
+        /* Advance log markers so future AEs with prev_log_index ==
+         * last_included_index pass the consistency check. */
+        (void)tsdb_raft_log_compact(r->log,
+                                    req->last_included_index,
+                                    req->last_included_term);
+        if (r->last_applied < req->last_included_index)
+            r->last_applied = req->last_included_index;
+        if (r->commit_index < req->last_included_index)
+            r->commit_index = req->last_included_index;
+    }
+    resp->term = tsdb_raft_log_current_term(r->log);
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
+
 /* --- Outgoing election: send RequestVote to every peer -------------- */
 
 /* Send RequestVote to peer_id and merge the response.  May cause us
@@ -500,13 +570,77 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
     uint64_t snap_idx   = tsdb_raft_log_snapshot_index(r->log);
     uint64_t next_idx   = r->peers[peer_idx].next_index;
 
-    /* If the peer is so far behind that it needs entries the leader
-     * has already discarded, we have no choice but to skip this
-     * round — they'd need a snapshot transfer, which is a follow-up.
-     * Bumping next_index forward so the peer at least hears our
-     * heartbeats (AE with prev_log_index = snap_idx, prev_log_term =
-     * snap_term) and won't loop into elections. */
+    /* Peer is far enough behind that it needs entries we already
+     * compacted away.  If we have a snapshot-write hook, ship the
+     * body via InstallSnapshot.  Otherwise fall back to the old
+     * behaviour: bump next_index forward and let the peer coast on
+     * heartbeats (stale catalog, but at least not election storm). */
     if (next_idx <= snap_idx) {
+        if (r->snap_write_fn) {
+            /* Drop the lock across the (potentially slow) write hook
+             * and the wire RPC. */
+            uint64_t snap_term = tsdb_raft_log_snapshot_term(r->log);
+            tsdb_raft_snapshot_write_fn wfn = r->snap_write_fn;
+            void *sud = r->snap_ud;
+            uint64_t self_id = r->self_id;
+            pthread_mutex_unlock(&r->lock);
+
+            uint8_t *body = NULL;
+            uint32_t body_len = 0;
+            if (wfn(sud, &body, &body_len) != 0 || !body) {
+                goto skip_snap;
+            }
+
+            tsdb_raft_req_install_t sreq = {
+                .term = term,
+                .leader_id = self_id,
+                .last_included_index = snap_idx,
+                .last_included_term  = snap_term,
+                .data_len = body_len,
+                .data = body
+            };
+            size_t bcap = 64 + body_len;
+            uint8_t *sbuf = malloc(bcap);
+            if (!sbuf) { free(body); goto skip_snap; }
+            int sn = tsdb_raft_encode_req_install(sbuf, bcap, &sreq);
+            if (sn <= 0) { free(sbuf); free(body); goto skip_snap; }
+
+            tsdb_rpc_conn_t *conn2 = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+            if (!conn2) { free(sbuf); free(body); goto skip_snap; }
+
+            uint8_t sresp_buf[32];
+            uint32_t sresp_len = 0;
+            int rc2 = tsdb_rpc_call_recv(conn2, TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
+                                          sbuf, (uint32_t)sn,
+                                          sresp_buf, sizeof(sresp_buf),
+                                          &sresp_len);
+            free(sbuf);
+            free(body);
+            if (rc2 == TSDB_OK) {
+                tsdb_raft_resp_install_t sresp = {0};
+                if (tsdb_raft_decode_resp_install(sresp_buf, sresp_len, &sresp) == 0) {
+                    pthread_mutex_lock(&r->lock);
+                    if (sresp.term > tsdb_raft_log_current_term(r->log)) {
+                        become_follower_locked(r, sresp.term, 0);
+                    }
+                    /* Peer now has last_included_index covered. */
+                    for (int i = 0; i < r->npeers; i++) {
+                        if (r->peers[i].id == peer_id) {
+                            r->peers[i].next_index = snap_idx + 1;
+                            if (r->peers[i].match_index < snap_idx)
+                                r->peers[i].match_index = snap_idx;
+                            break;
+                        }
+                    }
+                    pthread_mutex_unlock(&r->lock);
+                }
+            }
+            return;
+
+skip_snap:
+            pthread_mutex_lock(&r->lock);
+            /* fall through to the heartbeat-only path below */
+        }
         r->peers[peer_idx].next_index = snap_idx + 1;
         next_idx = snap_idx + 1;
     }
@@ -708,7 +842,8 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
 
     /* Register RPC handlers before we start ticking, so a peer's
      * RequestVote on a cold cluster always lands in our state machine. */
-    tsdb_raft_rpc_set_handlers(on_request_vote, on_append_entries, r);
+    tsdb_raft_rpc_set_handlers(on_request_vote, on_append_entries,
+                               on_install_snapshot, r);
 
     r->tick_running = 1;
     if (pthread_create(&r->tick_thread, NULL, tick_thread_main, r) != 0) {
@@ -734,7 +869,7 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
     pthread_join(r->tick_thread, NULL);
     pthread_join(r->apply_thread, NULL);
-    tsdb_raft_rpc_set_handlers(NULL, NULL, NULL);
+    tsdb_raft_rpc_set_handlers(NULL, NULL, NULL, NULL);
     tsdb_raft_log_close(r->log);
     pthread_cond_destroy(&r->commit_cv);
     pthread_mutex_destroy(&r->lock);
@@ -780,6 +915,19 @@ uint64_t tsdb_raft_last_index(tsdb_raft_t *r) {
 }
 uint64_t tsdb_raft_snapshot_index(tsdb_raft_t *r) {
     return r ? tsdb_raft_log_snapshot_index(r->log) : 0;
+}
+
+void tsdb_raft_set_snapshot_handlers(tsdb_raft_t *r,
+                                      tsdb_raft_snapshot_write_fn   write_fn,
+                                      tsdb_raft_snapshot_restore_fn restore_fn,
+                                      void *ud)
+{
+    if (!r) return;
+    pthread_mutex_lock(&r->lock);
+    r->snap_write_fn   = write_fn;
+    r->snap_restore_fn = restore_fn;
+    r->snap_ud         = ud;
+    pthread_mutex_unlock(&r->lock);
 }
 
 /* --- Apply thread -----------------------------------------------------

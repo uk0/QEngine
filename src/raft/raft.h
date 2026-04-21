@@ -40,6 +40,23 @@ typedef struct tsdb_raft tsdb_raft_t;
  * applied regardless (consistent with Raft's state-machine contract). */
 typedef int (*tsdb_raft_apply_fn)(void *ud, const tsdb_raft_entry_t *entry);
 
+/* Called when a peer must SNAPSHOT its state machine for shipment to
+ * a far-behind follower.  Returns 0 on success, with *out pointing at
+ * a malloc'd buffer the caller will free(); *out_len is the byte
+ * count.  Returning -1 or leaving out=NULL tells the raft module
+ * "can't snapshot right now, stay with AppendEntries". */
+typedef int (*tsdb_raft_snapshot_write_fn)(void *ud,
+                                            uint8_t **out,
+                                            uint32_t *out_len);
+
+/* Called when this node is a follower that just received a full
+ * snapshot body from the leader.  The implementation is responsible
+ * for replacing its local state machine state with the snapshot
+ * contents.  Returns 0 on success, -1 to reject (leader will retry). */
+typedef int (*tsdb_raft_snapshot_restore_fn)(void *ud,
+                                              const uint8_t *data,
+                                              uint32_t data_len);
+
 /* Create a raft instance rooted at <data_dir>/raft/ for this node.
  *
  *  local_id    — this node's 64-bit id
@@ -56,6 +73,14 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
                              tsdb_replica_mgr_t  *replica_mgr,
                              tsdb_raft_apply_fn   apply_fn,
                              void                *apply_ud);
+
+/* Attach optional snapshot callbacks.  Without these the log-only
+ * compaction from task #41 still works; with them, InstallSnapshot
+ * RPC can ship a catalog body to a far-behind follower. */
+void tsdb_raft_set_snapshot_handlers(tsdb_raft_t *r,
+                                      tsdb_raft_snapshot_write_fn   write_fn,
+                                      tsdb_raft_snapshot_restore_fn restore_fn,
+                                      void *ud);
 
 void tsdb_raft_close(tsdb_raft_t *r);
 

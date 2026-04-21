@@ -99,6 +99,36 @@ int tsdb_raft_encode_resp_append(uint8_t *buf, size_t cap,
 int tsdb_raft_decode_resp_append(const uint8_t *buf, size_t len,
                                   tsdb_raft_resp_append_t *out);
 
+/* ---- InstallSnapshot -----------------------------------------------------
+ *
+ * Sent when a follower's next_index is already below the leader's
+ * snap_index — i.e. the entries the follower needs were compacted
+ * away.  The leader ships the full snapshot body in one shot.
+ * Chunking (§7 of the thesis) is a follow-up; for catalog snapshots
+ * the body stays well under a few MB in practice.
+ */
+typedef struct {
+    uint64_t term;
+    uint64_t leader_id;
+    uint64_t last_included_index;
+    uint64_t last_included_term;
+    uint32_t data_len;
+    const uint8_t *data;          /* borrowed from caller buffer */
+} tsdb_raft_req_install_t;
+
+typedef struct {
+    uint64_t term;
+} tsdb_raft_resp_install_t;
+
+int tsdb_raft_encode_req_install(uint8_t *buf, size_t cap,
+                                  const tsdb_raft_req_install_t *in);
+int tsdb_raft_decode_req_install(const uint8_t *buf, size_t len,
+                                  tsdb_raft_req_install_t *out);
+int tsdb_raft_encode_resp_install(uint8_t *buf, size_t cap,
+                                   const tsdb_raft_resp_install_t *in);
+int tsdb_raft_decode_resp_install(const uint8_t *buf, size_t len,
+                                   tsdb_raft_resp_install_t *out);
+
 /* ---- Server-side dispatcher ---------------------------------------------
  *
  * The RPC server, upon receiving REQUEST_VOTE / APPEND_ENTRIES, calls
@@ -114,9 +144,13 @@ typedef int (*tsdb_raft_on_req_vote_fn)(void *ud,
 typedef int (*tsdb_raft_on_req_append_fn)(void *ud,
                                           const tsdb_raft_req_append_t *req,
                                           tsdb_raft_resp_append_t *resp);
+typedef int (*tsdb_raft_on_req_install_fn)(void *ud,
+                                           const tsdb_raft_req_install_t *req,
+                                           tsdb_raft_resp_install_t *resp);
 
-void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn   vote_fn,
-                                 tsdb_raft_on_req_append_fn append_fn,
+void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn    vote_fn,
+                                 tsdb_raft_on_req_append_fn  append_fn,
+                                 tsdb_raft_on_req_install_fn install_fn,
                                  void *ud);
 
 /* Called by rpc.c when a RAFT_* frame arrives.  Returns 0 if the
@@ -128,6 +162,9 @@ int tsdb_raft_rpc_handle_vote  (const uint8_t *req_payload, uint32_t req_len,
 int tsdb_raft_rpc_handle_append(const uint8_t *req_payload, uint32_t req_len,
                                 uint8_t *resp_buf, uint32_t resp_cap,
                                 uint32_t *resp_len);
+int tsdb_raft_rpc_handle_install(const uint8_t *req_payload, uint32_t req_len,
+                                  uint8_t *resp_buf, uint32_t resp_cap,
+                                  uint32_t *resp_len);
 
 #ifdef __cplusplus
 }
