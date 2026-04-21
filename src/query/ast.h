@@ -216,6 +216,12 @@ typedef enum {
     QAST_STMT_CREATE_FUNCTION,        /* CREATE FUNCTION f(T,T) RETURNS T FROM '...' SYMBOL '...' */
     QAST_STMT_DROP_FUNCTION,          /* DROP FUNCTION f                                       */
     QAST_STMT_LIST_FUNCTIONS,         /* LIST FUNCTIONS                                        */
+    /* Raft membership (master set).  MVP scope: light wrapper around
+     * a persisted config file + propose a CONFIG log entry.  See
+     * src/raft/ for the real machinery. */
+    QAST_STMT_LIST_MASTERS,           /* LIST MASTERS                                          */
+    QAST_STMT_ADD_MASTER,             /* ADD MASTER 'host:port'                                */
+    QAST_STMT_REMOVE_MASTER,          /* REMOVE MASTER '<node_id_or_addr>'                     */
 } qast_stmt_kind_t;
 
 typedef struct {
@@ -235,6 +241,9 @@ typedef struct {
         struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
         /* LIST PTABLES [USING <vtable>] — empty vtable = all */
         struct { char vtable[64]; }    list_ptables;
+        /* Raft membership */
+        struct { char target[96]; }    add_master;      /* "host:port" */
+        struct { char target[96]; }    remove_master;   /* node_id or addr */
         /* STable DDL */
         struct { tsdb_stable_t spec; }       create_stable;       /* QAST_STMT_CREATE_STABLE */
         struct { char name[64]; }            drop_stable;          /* QAST_STMT_DROP_STABLE */

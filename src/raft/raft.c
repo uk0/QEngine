@@ -69,6 +69,7 @@ struct tsdb_raft {
     tsdb_node_manager_t *node_mgr;
     tsdb_replica_mgr_t  *replica_mgr;
     tsdb_raft_log_t     *log;
+    tsdb_raft_config_t  *config;      /* persistent master set */
 
     /* Volatile Raft state. */
     tsdb_raft_state_t  state;
@@ -156,7 +157,12 @@ static void bump_heartbeat_deadline(tsdb_raft_t *r) {
 /* --- Peer table ------------------------------------------------------- */
 
 /* Rebuild peer[] from node_mgr: every ALIVE or SUSPECT master except
- * self.  Called under r->lock. */
+ * self.  This MVP keeps using gossip for both peer discovery AND
+ * quorum — the persisted r->config is advisory only (populated by
+ * ADD MASTER / REMOVE MASTER log entries for audit + LIST MASTERS).
+ * Swapping to a config-gated quorum is the "real" Raft membership
+ * change and is tracked as a follow-up; it needs PreVote +
+ * stepdown-on-self-removal + joint consensus handling. */
 static void rebuild_peers_locked(tsdb_raft_t *r) {
     tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
     int n = tsdb_node_manager_snapshot(r->node_mgr, snap, TSDB_CLUSTER_MAX_NODES);
@@ -165,7 +171,6 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
         if (snap[i].id == r->self_id) continue;
         if (snap[i].role != TSDB_ROLE_MASTER) continue;
         if (snap[i].state == TSDB_NODE_DEAD) continue;
-        /* Already in table? keep next_index / match_index. */
         int found = -1;
         for (int j = 0; j < r->npeers; j++) {
             if (r->peers[j].id == snap[i].id) { found = j; break; }
@@ -182,9 +187,8 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
     r->npeers = k;
 }
 
-/* Quorum across (peers + self).  Simple majority. */
 static int quorum_needed(const tsdb_raft_t *r) {
-    int total = r->npeers + 1; /* include self */
+    int total = r->npeers + 1;
     return total / 2 + 1;
 }
 
@@ -764,6 +768,29 @@ static void *tick_thread_main(void *arg) {
         pthread_mutex_unlock(&r->lock);
 
         int64_t now = now_ns();
+
+        /* Post-grace config auto-seed for the LIST MASTERS read-out
+         * (advisory only; quorum still uses gossip).  Writes once.  */
+        pthread_mutex_lock(&r->lock);
+        if (r->config && !tsdb_raft_config_is_initialised(r->config) &&
+            now >= r->startup_grace_until_ns && r->npeers >= 1) {
+            tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+            int n2 = tsdb_node_manager_snapshot(r->node_mgr, snap,
+                                                 TSDB_CLUSTER_MAX_NODES);
+            tsdb_raft_cfg_member_t seed[TSDB_RAFT_CFG_MAX_MASTERS];
+            int nm = 0;
+            for (int i = 0; i < n2 && nm < TSDB_RAFT_CFG_MAX_MASTERS; i++) {
+                if (snap[i].role != TSDB_ROLE_MASTER) continue;
+                if (snap[i].state == TSDB_NODE_DEAD) continue;
+                seed[nm].id = snap[i].id;
+                snprintf(seed[nm].addr, sizeof(seed[nm].addr), "%s",
+                         snap[i].addr);
+                nm++;
+            }
+            if (nm >= 1) (void)tsdb_raft_config_set(r->config, seed, nm);
+        }
+        pthread_mutex_unlock(&r->lock);
+
         if (st == TSDB_RAFT_LEADER) {
             if (now >= hb) {
                 /* One AppendEntries sweep per peer — carries entries
@@ -830,6 +857,9 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
 
     r->log = tsdb_raft_log_open(data_dir);
     if (!r->log) { free(r); return NULL; }
+    r->config = tsdb_raft_config_open(data_dir);
+    /* config==NULL is OK; the module falls back to gossip-derived
+     * quorum counts so existing clusters keep functioning. */
 
     r->startup_grace_until_ns = now_ns() + ms_to_ns(RAFT_STARTUP_GRACE_MS);
     reset_election_timer(r);
@@ -870,6 +900,7 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     pthread_join(r->tick_thread, NULL);
     pthread_join(r->apply_thread, NULL);
     tsdb_raft_rpc_set_handlers(NULL, NULL, NULL, NULL);
+    tsdb_raft_config_close(r->config);
     tsdb_raft_log_close(r->log);
     pthread_cond_destroy(&r->commit_cv);
     pthread_mutex_destroy(&r->lock);
@@ -917,6 +948,49 @@ uint64_t tsdb_raft_snapshot_index(tsdb_raft_t *r) {
     return r ? tsdb_raft_log_snapshot_index(r->log) : 0;
 }
 
+int tsdb_raft_config_members(tsdb_raft_t *r,
+                              tsdb_raft_cfg_member_t *out, int cap)
+{
+    if (!r || !out || cap <= 0) return 0;
+    return r->config ? tsdb_raft_config_snapshot(r->config, out, cap) : 0;
+}
+
+/* Build a CONFIG-entry payload: op | id | addr_len | addr. */
+static uint32_t encode_cfg_payload(uint8_t op, uint64_t id, const char *addr,
+                                    uint8_t *buf, uint32_t cap)
+{
+    uint8_t al = addr ? (uint8_t)strlen(addr) : 0;
+    if (al > 79) al = 79;
+    if ((uint32_t)(10u + al) > cap) return 0;
+    buf[0] = op;
+    memcpy(buf + 1, &id, 8);
+    buf[9] = al;
+    if (al > 0) memcpy(buf + 10, addr, al);
+    return 10u + al;
+}
+
+int tsdb_raft_add_master(tsdb_raft_t *r,
+                          uint64_t id, const char *addr, int timeout_ms)
+{
+    if (!r) return TSDB_ERR_INVAL;
+    uint8_t payload[128];
+    uint32_t plen = encode_cfg_payload(TSDB_RAFT_CFG_OP_ADD, id, addr,
+                                        payload, sizeof(payload));
+    if (plen == 0) return TSDB_ERR_INVAL;
+    return tsdb_raft_propose(r, TSDB_RAFT_ENTRY_CONFIG,
+                              payload, plen, timeout_ms);
+}
+
+int tsdb_raft_remove_master(tsdb_raft_t *r, uint64_t id, int timeout_ms) {
+    if (!r) return TSDB_ERR_INVAL;
+    uint8_t payload[16];
+    uint32_t plen = encode_cfg_payload(TSDB_RAFT_CFG_OP_REMOVE, id, NULL,
+                                        payload, sizeof(payload));
+    if (plen == 0) return TSDB_ERR_INVAL;
+    return tsdb_raft_propose(r, TSDB_RAFT_ENTRY_CONFIG,
+                              payload, plen, timeout_ms);
+}
+
 void tsdb_raft_set_snapshot_handlers(tsdb_raft_t *r,
                                       tsdb_raft_snapshot_write_fn   write_fn,
                                       tsdb_raft_snapshot_restore_fn restore_fn,
@@ -954,7 +1028,28 @@ static void *apply_thread_main(void *arg) {
         for (uint64_t idx = to_apply; idx <= commit; idx++) {
             tsdb_raft_entry_t e = {0};
             if (tsdb_raft_log_read(r->log, idx, &e) != 0) break;
-            if (r->apply_fn) {
+            if (e.type == TSDB_RAFT_ENTRY_CONFIG) {
+                /* Raft owns CONFIG entries — apply directly to the
+                 * persistent config file.  Payload:
+                 *   u8 op | u64 id | u8 addr_len | char addr[addr_len] */
+                if (e.payload_len >= 10 && r->config) {
+                    uint8_t *p = (uint8_t *)e.payload;
+                    uint8_t op = p[0];
+                    uint64_t id;
+                    memcpy(&id, p + 1, 8);
+                    uint8_t al = p[9];
+                    char addr[80] = {0};
+                    if ((uint32_t)(10 + al) <= e.payload_len && al < sizeof(addr)) {
+                        memcpy(addr, p + 10, al);
+                        addr[al] = '\0';
+                    }
+                    if (op == TSDB_RAFT_CFG_OP_ADD) {
+                        (void)tsdb_raft_config_add(r->config, id, addr);
+                    } else if (op == TSDB_RAFT_CFG_OP_REMOVE) {
+                        (void)tsdb_raft_config_remove(r->config, id);
+                    }
+                }
+            } else if (r->apply_fn) {
                 (void)r->apply_fn(r->apply_ud, &e);
             }
             uint64_t entry_term = e.term;

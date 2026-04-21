@@ -24,6 +24,7 @@
 #include <stddef.h>
 
 #include "raft_log.h"
+#include "raft_config.h"
 #include "../cluster/node.h"
 #include "../cluster/replica.h"
 
@@ -100,6 +101,23 @@ uint64_t          tsdb_raft_commit_index (tsdb_raft_t *r);
 uint64_t          tsdb_raft_last_applied (tsdb_raft_t *r);
 uint64_t          tsdb_raft_last_index   (tsdb_raft_t *r);
 uint64_t          tsdb_raft_snapshot_index(tsdb_raft_t *r);
+
+/* Snapshot of the current master set.  `out` must have room for at
+ * least TSDB_RAFT_CFG_MAX_MASTERS entries; returns the count
+ * actually written. */
+int               tsdb_raft_config_members(tsdb_raft_t *r,
+                                            tsdb_raft_cfg_member_t *out,
+                                            int cap);
+
+/* Leader-only: propose an ADD / REMOVE MASTER.  Appends a config
+ * entry to the Raft log; caller waits for commit via the normal
+ * propose/apply path.  Returns TSDB_OK when applied cluster-wide. */
+int               tsdb_raft_add_master(tsdb_raft_t *r,
+                                        uint64_t id, const char *addr,
+                                        int timeout_ms);
+int               tsdb_raft_remove_master(tsdb_raft_t *r,
+                                           uint64_t id,
+                                           int timeout_ms);
 
 /* ---- Public client API -------------------------------------------------- */
 

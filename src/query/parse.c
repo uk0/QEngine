@@ -664,6 +664,49 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return qparse(src, a, &out->u.query, err, errcap);
     }
 
+    /* ---- ADD MASTER / REMOVE MASTER -----------------------------------
+     *
+     * ADD is an existing keyword (QTOK_ADD, used by ALTER TABLE ADD
+     * COLUMN); REMOVE is a plain identifier.  We accept both here and
+     * disambiguate ADD via "ADD MASTER" — since ALTER TABLE is
+     * triggered by QTOK_ALTER earlier, a bare ADD at statement start
+     * can only be membership change. */
+    if (p.tok.kind == QTOK_ADD ||
+        (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "remove"))) {
+        int is_add = (p.tok.kind == QTOK_ADD);
+        advance(&p);
+        if (p.tok.kind != QTOK_IDENT || !ident_ci(&p.tok, "master")) {
+            perr(&p, "expected MASTER after ADD/REMOVE");
+            return TSDB_ERR_PARSE;
+        }
+        advance(&p);
+        /* Target can be:
+         *   - quoted string          'host:port' or '12345'
+         *   - bare ident (hostname)
+         *   - decimal number         (node_id)
+         *   - ip-style literal split by lexer — allow fall-through. */
+        char target[96] = {0};
+        if (p.tok.kind == QTOK_STRING || p.tok.kind == QTOK_IDENT ||
+            p.tok.kind == QTOK_NUMBER) {
+            tok_copy(&p.tok, target, sizeof(target));
+        } else {
+            perr(&p, "expected target after MASTER");
+            return TSDB_ERR_PARSE;
+        }
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        if (is_add) {
+            out->kind = QAST_STMT_ADD_MASTER;
+            snprintf(out->u.add_master.target,
+                     sizeof(out->u.add_master.target), "%s", target);
+        } else {
+            out->kind = QAST_STMT_REMOVE_MASTER;
+            snprintf(out->u.remove_master.target,
+                     sizeof(out->u.remove_master.target), "%s", target);
+        }
+        return TSDB_OK;
+    }
+
     /* ---- CREATE --------------------------------------------------------- */
     if (accept(&p, QTOK_CREATE)) {
         /* CREATE CONSUMER GROUP <name> ON <topic>  (TMQ) — matched first
@@ -1552,6 +1595,14 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         /* LIST FUNCTIONS — "functions" is an IDENT (plural of FUNCTION keyword). */
         if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "functions")) {
             out->kind = QAST_STMT_LIST_FUNCTIONS;
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* LIST MASTERS — Raft master set from the persisted config. */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "masters")) {
+            out->kind = QAST_STMT_LIST_MASTERS;
             advance(&p);
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;

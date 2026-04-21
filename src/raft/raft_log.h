@@ -36,9 +36,18 @@ typedef struct tsdb_raft_log tsdb_raft_log_t;
  * after winning an election so followers commit everything from the
  * previous term (Raft §5.4.2). */
 typedef enum {
-    TSDB_RAFT_ENTRY_NOOP        = 0,
-    TSDB_RAFT_ENTRY_CATALOG_QTL = 1
+    TSDB_RAFT_ENTRY_NOOP         = 0,
+    TSDB_RAFT_ENTRY_CATALOG_QTL  = 1,
+    /* Membership change.  Payload layout:
+     *   u8  op       — 1 = ADD, 2 = REMOVE
+     *   u64 id
+     *   u8  addr_len
+     *   char addr[addr_len]  (ignored for REMOVE) */
+    TSDB_RAFT_ENTRY_CONFIG       = 2
 } tsdb_raft_entry_type_t;
+
+#define TSDB_RAFT_CFG_OP_ADD    1u
+#define TSDB_RAFT_CFG_OP_REMOVE 2u
 
 typedef struct {
     uint64_t index;        /* 1-based Raft log index */

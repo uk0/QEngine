@@ -5865,6 +5865,92 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
 
+    case QAST_STMT_LIST_MASTERS: {
+        tsdb_raft_t *raft_h = tsdb_db_raft_for_db(db);
+        static const char *cols_m[]  = { "id", "addr" };
+        static const tsdb_type_t tys_m[] = { TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL };
+        rc = result_init_ddl(r, 2, cols_m, tys_m);
+        if (rc == TSDB_OK && raft_h) {
+            tsdb_raft_cfg_member_t mems[TSDB_RAFT_CFG_MAX_MASTERS];
+            int nm = tsdb_raft_config_members(raft_h, mems,
+                                               TSDB_RAFT_CFG_MAX_MASTERS);
+            for (int i = 0; i < nm; i++) {
+                char idbuf[32];
+                snprintf(idbuf, sizeof(idbuf), "%llu",
+                         (unsigned long long)mems[i].id);
+                result_append_sym(r, 0, idbuf);
+                result_append_sym(r, 1, mems[i].addr);
+                result_ddl_end_row(r);
+            }
+        }
+        break;
+    }
+    case QAST_STMT_ADD_MASTER:
+    case QAST_STMT_REMOVE_MASTER: {
+        tsdb_raft_t *raft_h = tsdb_db_raft_for_db(db);
+        if (!raft_h) {
+            result_status(r,
+                "ERR: raft not enabled on this node (set "
+                "TSDB_CONSENSUS=raft to use membership change)");
+            break;
+        }
+        const char *target = (stmt.kind == QAST_STMT_ADD_MASTER)
+                             ? stmt.u.add_master.target
+                             : stmt.u.remove_master.target;
+
+        /* Resolve target → (id, addr).  Strategy:
+         *   1. If target parses as a decimal u64, use it as id directly.
+         *   2. Otherwise treat as "host:port" and look up the id from
+         *      the gossip node manager.
+         * ADD requires addr; REMOVE can accept either. */
+        uint64_t target_id = 0;
+        char     target_addr[80] = {0};
+        char *endp = NULL;
+        unsigned long long parsed = strtoull(target, &endp, 10);
+        if (endp && *endp == '\0' && parsed > 0) {
+            target_id = (uint64_t)parsed;
+        } else {
+            snprintf(target_addr, sizeof(target_addr), "%s", target);
+            /* Scan node_mgr for matching addr. */
+            tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr_for_db(db);
+            if (mgr) {
+                tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+                int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+                for (int i = 0; i < n; i++) {
+                    if (strcmp(snap[i].addr, target) == 0) {
+                        target_id = snap[i].id;
+                        break;
+                    }
+                }
+            }
+        }
+        if (target_id == 0) {
+            result_status(r, "ERR: could not resolve target to a node id "
+                             "(check TSDB_NODE_ROLE=master seed is alive)");
+            break;
+        }
+
+        int prc;
+        if (stmt.kind == QAST_STMT_ADD_MASTER) {
+            prc = tsdb_raft_add_master(raft_h, target_id, target_addr, 5000);
+        } else {
+            prc = tsdb_raft_remove_master(raft_h, target_id, 5000);
+        }
+        if (prc == TSDB_ERR_PERMISSION) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "ERR: not raft leader (leader=%llu) — retry there",
+                     (unsigned long long)tsdb_raft_leader_id(raft_h));
+            result_status(r, msg);
+        } else if (prc == TSDB_OK) {
+            result_status(r, stmt.kind == QAST_STMT_ADD_MASTER
+                             ? "OK: master added (raft committed)"
+                             : "OK: master removed (raft committed)");
+        } else {
+            result_status(r, "ERR: raft propose failed (timeout or IO)");
+        }
+        break;
+    }
     default:
         result_status(r, "ERR: unknown statement");
         rc = TSDB_ERR_UNSUPPORTED;
@@ -5932,7 +6018,14 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     case QAST_STMT_LIST_VTABLES:
     case QAST_STMT_LIST_PTABLES:
     case QAST_STMT_LIST_FUNCTIONS:
+    case QAST_STMT_LIST_MASTERS:
         *out_priv = TSDB_PRIV_SELECT;
+        break;
+
+    /* Raft membership change — admin-only cluster op. */
+    case QAST_STMT_ADD_MASTER:
+    case QAST_STMT_REMOVE_MASTER:
+        *out_admin_only = 1;
         break;
 
     /* Schema DDL */
