@@ -107,6 +107,17 @@ tsdb_node_manager_t *tsdb_cluster_node_mgr_for_db   (tsdb_db_t *db);
 tsdb_replica_mgr_t  *tsdb_cluster_replica_mgr_for_db(tsdb_db_t *db);
 uint64_t             tsdb_cluster_local_id_for_db   (tsdb_db_t *db);
 
+/* Attach/lookup a raft instance for a given db.  The node main hands
+ * its raft_h to the db once the state machine is open; exec.c then
+ * consults it on every catalog-mutating QTL to decide between the
+ * Raft consensus path and the legacy fanout path.  Pass NULL to
+ * detach (during shutdown). */
+struct tsdb_raft;
+typedef struct tsdb_raft tsdb_raft_t;
+
+void           tsdb_db_bind_raft (tsdb_db_t *db, tsdb_raft_t *raft);
+tsdb_raft_t   *tsdb_db_raft_for_db(tsdb_db_t *db);
+
 #ifdef __cplusplus
 }
 #endif

@@ -430,10 +430,20 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
     return rc;
 }
 
-/* Thread-local re-entry guard.  Set on the peer side (RPC handler)
- * before nested tsdb_query so the resulting catalog writes don't
- * re-broadcast and ping-pong forever. */
+/* Thread-local re-entry guards.
+ *
+ * tsdb_g_suppress_catalog_broadcast
+ *   Set on the peer side of the legacy fanout RPC handler before
+ *   nested tsdb_query.  Prevents ping-pong in fanout mode.
+ *
+ * tsdb_g_inside_raft_apply
+ *   Set on the Raft apply thread before replaying a committed QTL.
+ *   Tells exec.c "you're already on the consensus-blessed path,
+ *   skip the propose-and-wait and just execute locally."  Both
+ *   flags are set together during apply — Raft's serialization is
+ *   the only fan-out that happens, the local execution is quiet. */
 __thread int tsdb_g_suppress_catalog_broadcast = 0;
+__thread int tsdb_g_inside_raft_apply          = 0;
 
 /* ---- Bridges for modules that live above the cluster layer ----------
  * raft.c wants node_mgr + replica_mgr + local_id but has no reason to
@@ -451,6 +461,50 @@ tsdb_replica_mgr_t *tsdb_cluster_replica_mgr_for_db(tsdb_db_t *db) {
 uint64_t tsdb_cluster_local_id_for_db(tsdb_db_t *db) {
     tsdb_cluster_t *c = cluster_get(db);
     return c ? (uint64_t)tsdb_cluster_local_id(c) : 0;
+}
+
+/* ---- Raft binding -----------------------------------------------------
+ * Map tsdb_db_t* → tsdb_raft_t* so exec.c can reach the state machine
+ * without pulling raft.h into every call site.  Parallels cluster_get
+ * but in a small private map because raft is optional. */
+
+#define RAFT_MAP_CAP 32
+typedef struct {
+    tsdb_db_t  *db;
+    tsdb_raft_t *raft;
+} raft_entry_t;
+
+static raft_entry_t   g_raft_map[RAFT_MAP_CAP];
+static int            g_raft_nentries = 0;
+static pthread_mutex_t g_raft_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void tsdb_db_bind_raft(tsdb_db_t *db, tsdb_raft_t *raft) {
+    if (!db) return;
+    pthread_mutex_lock(&g_raft_lock);
+    for (int i = 0; i < g_raft_nentries; i++) {
+        if (g_raft_map[i].db == db) {
+            g_raft_map[i].raft = raft;
+            pthread_mutex_unlock(&g_raft_lock);
+            return;
+        }
+    }
+    if (g_raft_nentries < RAFT_MAP_CAP) {
+        g_raft_map[g_raft_nentries].db   = db;
+        g_raft_map[g_raft_nentries].raft = raft;
+        g_raft_nentries++;
+    }
+    pthread_mutex_unlock(&g_raft_lock);
+}
+
+tsdb_raft_t *tsdb_db_raft_for_db(tsdb_db_t *db) {
+    if (!db) return NULL;
+    pthread_mutex_lock(&g_raft_lock);
+    tsdb_raft_t *r = NULL;
+    for (int i = 0; i < g_raft_nentries; i++) {
+        if (g_raft_map[i].db == db) { r = g_raft_map[i].raft; break; }
+    }
+    pthread_mutex_unlock(&g_raft_lock);
+    return r;
 }
 
 int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,

@@ -27,6 +27,7 @@
 #include "../catalog/user.h"
 #include "../../include/tsdb.h"
 #include "../../include/tsdb_cluster.h"
+#include "../raft/raft.h"
 #include "../server/metrics.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -5242,17 +5243,41 @@ static int result_status(tsdb_result_t *r, const char *msg) {
 
 /* ---- Public API implementations --------------------------------------- */
 
-/* Defined in storage/db_cluster.c.  The peer-side RPC handler flips
- * this to 1 before re-entering tsdb_query with a replayed catalog
- * statement — prevents a broadcast ping-pong between nodes. */
+/* Defined in storage/db_cluster.c.  Peer-side RPC and apply paths
+ * flip these to 1 before re-entering tsdb_query with a replayed
+ * catalog statement — prevents ping-pong in fanout mode and
+ * re-entry-into-Raft in consensus mode. */
 extern __thread int tsdb_g_suppress_catalog_broadcast;
+extern __thread int tsdb_g_inside_raft_apply;
 
 static inline void try_broadcast_catalog_qtl(tsdb_db_t *db,
                                              const char *qtl, int rc_local)
 {
     if (rc_local != TSDB_OK) return;
     if (tsdb_g_suppress_catalog_broadcast) return;
+    /* When Raft is live, consensus replication already made this
+     * statement durable across the master set — skip the fanout. */
+    if (tsdb_db_raft_for_db(db)) return;
     (void)tsdb_cluster_broadcast_catalog_qtl(db, qtl, NULL, NULL);
+}
+
+/* Check whether a parsed statement is a catalog mutation that must
+ * go through Raft when raft is bound.  Keep this in sync with the
+ * broadcast switch near the end of tsdb_query. */
+static int is_catalog_ddl(qast_stmt_kind_t k) {
+    switch (k) {
+    case QAST_STMT_CREATE_DATABASE:
+    case QAST_STMT_DROP_DATABASE:
+    case QAST_STMT_CREATE_GROUP:
+    case QAST_STMT_DROP_GROUP:
+    case QAST_STMT_CREATE_STABLE:
+    case QAST_STMT_DROP_STABLE:
+    case QAST_STMT_CREATE_CHILD_TABLE:
+    case QAST_STMT_CREATE_TABLE:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
@@ -5275,6 +5300,57 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
+        *out = r;
+        return TSDB_OK;
+    }
+
+    /* ---- Raft consensus fast-path for catalog DDL --------------------
+     *
+     * When this db has a raft state machine bound (TSDB_CONSENSUS=raft,
+     * role=master) AND we're NOT already running inside the apply
+     * thread, route catalog mutations through Raft.  The apply callback
+     * (raft_apply_cb in tsdb_node_main.c) is responsible for re-entering
+     * tsdb_query on every master with both suppress flags on; that
+     * re-entry lands below this block and executes the statement via
+     * the normal DDL switch. */
+    tsdb_raft_t *raft = tsdb_db_raft_for_db(db);
+    if (raft && is_catalog_ddl(stmt.kind) && !tsdb_g_inside_raft_apply) {
+        tsdb_arena_free(&a);
+        tsdb_raft_state_t s = tsdb_raft_state(raft);
+        if (s != TSDB_RAFT_LEADER) {
+            /* Not leader — surface leader hint as a status row.  Return
+             * TSDB_OK (not PERMISSION) so the HTTP layer renders the
+             * hint in `rows` instead of flattening to a generic
+             * "permission denied" error body; clients that want to
+             * auto-retry can detect the "ERR: not raft leader" prefix. */
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "ERR: not raft leader (self=%llu, leader=%llu) — "
+                     "retry against the leader",
+                     (unsigned long long)tsdb_raft_self_id(raft),
+                     (unsigned long long)tsdb_raft_leader_id(raft));
+            result_status(r, msg);
+            *out = r;
+            return TSDB_OK;
+        }
+        int prc = tsdb_raft_propose(raft, TSDB_RAFT_ENTRY_CATALOG_QTL,
+                                     qtl, (uint32_t)strlen(qtl), 5000);
+        if (prc == TSDB_ERR_PERMISSION) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "ERR: stepped down mid-propose, retry (leader=%llu)",
+                     (unsigned long long)tsdb_raft_leader_id(raft));
+            result_status(r, msg);
+            *out = r;
+            return TSDB_OK;
+        }
+        if (prc != TSDB_OK) {
+            result_status(r, "ERR: raft propose failed (timeout or IO)");
+            *out = r;
+            return TSDB_OK;
+        }
+        /* Applied on us via raft_apply_cb.  Return success marker. */
+        result_status(r, "OK: committed via raft");
         *out = r;
         return TSDB_OK;
     }

@@ -34,6 +34,52 @@ static char         g_local_role[16] = "master"; /* TSDB_NODE_ROLE, set in main(
  * the other *_json_cb helpers further down. */
 static int raft_json_cb(void *ud, char *buf, size_t cap);
 
+/* Thread-local flags re-used by exec.c to keep the Raft apply path
+ * from re-entering itself.  Declared extern here so we can flip them
+ * on the apply thread before replaying the QTL. */
+extern __thread int tsdb_g_suppress_catalog_broadcast;
+extern __thread int tsdb_g_inside_raft_apply;
+
+/* raft_apply_cb — invoked on every committed log entry.  Replays the
+ * QTL locally (with both suppression flags on) so every master ends
+ * up with the same catalog state.  Failures are logged but never
+ * roll back — Raft guarantees apply is idempotent across nodes. */
+static int raft_apply_cb(void *ud, const tsdb_raft_entry_t *e) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db || !e) return 0;
+    if (e->type != TSDB_RAFT_ENTRY_CATALOG_QTL) return 0;
+    if (e->payload_len == 0 || !e->payload) return 0;
+
+    /* Copy payload to a NUL-terminated buffer for tsdb_query.  Cap to
+     * 16 KB; catalog statements are tiny in practice. */
+    if (e->payload_len > 16 * 1024) {
+        fprintf(stderr, "[raft-apply] oversized QTL (%u bytes), skipping\n",
+                e->payload_len);
+        return 0;
+    }
+    char *qtl = malloc(e->payload_len + 1);
+    if (!qtl) return 0;
+    memcpy(qtl, e->payload, e->payload_len);
+    qtl[e->payload_len] = '\0';
+
+    tsdb_g_suppress_catalog_broadcast = 1;
+    tsdb_g_inside_raft_apply          = 1;
+    tsdb_result_t *res = NULL;
+    int qrc = tsdb_query(db, qtl, &res);
+    tsdb_g_inside_raft_apply          = 0;
+    tsdb_g_suppress_catalog_broadcast = 0;
+
+    if (res) tsdb_result_free(res);
+    if (qrc != TSDB_OK && qrc != TSDB_ERR_EXISTS) {
+        /* Log, don't fail — Raft can't roll back apply.  An EXISTS
+         * here is normal on peer catch-up where the DB already has
+         * the catalog row from a prior broadcast. */
+        fprintf(stderr, "[raft-apply] tsdb_query rc=%d qtl=%s\n", qrc, qtl);
+    }
+    free(qtl);
+    return 0;
+}
+
 static void sig_handler(int sig) {
     (void)sig;
     g_running = 0;
@@ -684,9 +730,9 @@ int main(int argc, char **argv) {
             uint64_t self_id          = tsdb_cluster_local_id_for_db(db);
             if (mgr && rmgr && self_id) {
                 raft_h = tsdb_raft_open(data_dir, self_id, mgr, rmgr,
-                                         NULL /* apply_fn wired in #39 */,
-                                         NULL);
+                                         raft_apply_cb, db);
                 if (raft_h) {
+                    tsdb_db_bind_raft(db, raft_h);
                     tsdb_metrics_server_set_raft_provider(raft_json_cb,
                                                            raft_h);
                     printf("[node] raft consensus ENABLED (data=%s/raft)\n",
