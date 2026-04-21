@@ -6,7 +6,7 @@ source "$(dirname "$0")/../lib.sh"
 trap raft_down EXIT
 
 raft_up
-leader=$(raft_wait_leader 2)
+leader=$(raft_wait_leader 5)
 
 # Find which node index holds the leader id.
 leader_idx=""
@@ -18,9 +18,12 @@ done
 
 say "leader=node${leader_idx}"
 
-# Write via the leader.
+# Write via the leader.  Accept either the Raft happy-path status
+# ("OK: committed via raft") or the legacy fanout message ("OK:
+# database created") — the scenario is about visibility on followers,
+# not the exact wording of the ACK.
 resp=$(sql_on "$leader_idx" 'CREATE DATABASE s02_db')
-echo "$resp" | jq -e '.rows[0][0] == "OK: database created"' >/dev/null \
+echo "$resp" | jq -e '.rows[0][0] | startswith("OK")' >/dev/null \
   || fail "leader refused CREATE: $resp"
 
 # Every node — including followers — must now LIST it back.

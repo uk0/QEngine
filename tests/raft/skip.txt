@@ -1,13 +1,4 @@
-# Scenarios currently skipped while Raft is being implemented.  When a
-# scenario passes locally, remove its name from this file so CI catches
-# regressions.
+# Scenarios currently skipped while Raft is being implemented.  Entries
+# get removed as scenarios become stable in the docker harness.
 #
-# Status as of commit c586226:
-#   s01 — in-process smoke passes (3 nodes elect a leader within ~1 s).
-#   s02 — in-process smoke passes (CREATE on leader replicates to all).
-#   s03 — in-process smoke passes (new leader within 5 s + accepts DDL).
-# The bash harness runner still needs a docker image with the latest
-# raft code, so keep them skipped in CI until the deploy lands.
-s01_elect_leader
-s02_ddl_replicates
-s03_kill_leader
+# Empty → all live scenarios are expected to pass on every run.

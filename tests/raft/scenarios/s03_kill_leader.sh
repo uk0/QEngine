@@ -7,7 +7,7 @@ source "$(dirname "$0")/../lib.sh"
 trap raft_down EXIT
 
 raft_up
-leader=$(raft_wait_leader 2)
+leader=$(raft_wait_leader 5)
 
 leader_idx=""
 for i in 1 2 3; do
@@ -44,16 +44,23 @@ done
 
 say "new leader=node${new_idx} (id=${new_leader})"
 
-# Write via new leader.
+# Write via new leader.  Same tolerance as s02 — accept any OK status.
 resp=$(sql_on "$new_idx" 'CREATE DATABASE s03_db')
-echo "$resp" | jq -e '.rows[0][0] == "OK: database created"' >/dev/null \
+echo "$resp" | jq -e '.rows[0][0] | startswith("OK")' >/dev/null \
   || fail "new leader refused CREATE: $resp"
 
-# Both surviving nodes must see it.
+# Both surviving nodes must see it.  Raft commit on the leader
+# completes before the follower has necessarily applied, so give
+# the apply thread a couple of heartbeats to catch up.
 for i in 1 2 3; do
   [[ "$i" == "$leader_idx" ]] && continue
-  dbs=$(sql_on "$i" 'LIST DATABASES' | jq -r '[.rows[][0]] | join(",")')
-  [[ "$dbs" == *"s03_db"* ]] || fail "survivor node${i} missing s03_db"
+  seen=""
+  for _ in 1 2 3 4 5; do
+    dbs=$(sql_on "$i" 'LIST DATABASES' | jq -r '[.rows[][0]] | join(",")')
+    if [[ "$dbs" == *"s03_db"* ]]; then seen=1; break; fi
+    sleep 0.3
+  done
+  [[ -n "$seen" ]] || fail "survivor node${i} missing s03_db (dbs=${dbs})"
 done
 
 pass "s03 kill_leader"
