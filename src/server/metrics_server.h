@@ -83,6 +83,20 @@ typedef int (*tsdb_sql_exec_fn)(void *userdata,
 void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata);
 
+/* ---- /raft provider hook ------------------------------------------------- *
+ * Returns a JSON snapshot of the local Raft state machine for the
+ * acceptance harness and the topology dashboard.  Expected shape:
+ *   { "self_id":"…", "role":"follower|candidate|leader",
+ *     "current_term":N, "leader_id":"…",
+ *     "commit_index":N, "last_applied":N, "last_index":N }
+ *
+ * Returns bytes written; 0 → server serves an empty {} for nodes that
+ * don't run raft (role=data, or TSDB_CONSENSUS=fanout).
+ */
+typedef int (*tsdb_raft_json_fn)(void *userdata, char *buf, size_t cap);
+void tsdb_metrics_server_set_raft_provider(tsdb_raft_json_fn fn,
+                                            void *userdata);
+
 #ifdef __cplusplus
 }
 #endif

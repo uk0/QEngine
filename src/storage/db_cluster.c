@@ -435,6 +435,24 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
  * re-broadcast and ping-pong forever. */
 __thread int tsdb_g_suppress_catalog_broadcast = 0;
 
+/* ---- Bridges for modules that live above the cluster layer ----------
+ * raft.c wants node_mgr + replica_mgr + local_id but has no reason to
+ * pull in the full cluster.h (which would pull gossip / autobalance).
+ * These thin helpers live here because db_cluster.c already owns the
+ * db->cluster mapping. */
+tsdb_node_manager_t *tsdb_cluster_node_mgr_for_db(tsdb_db_t *db) {
+    tsdb_cluster_t *c = cluster_get(db);
+    return c ? tsdb_cluster_node_mgr(c) : NULL;
+}
+tsdb_replica_mgr_t *tsdb_cluster_replica_mgr_for_db(tsdb_db_t *db) {
+    tsdb_cluster_t *c = cluster_get(db);
+    return c ? tsdb_cluster_replica_mgr(c) : NULL;
+}
+uint64_t tsdb_cluster_local_id_for_db(tsdb_db_t *db) {
+    tsdb_cluster_t *c = cluster_get(db);
+    return c ? (uint64_t)tsdb_cluster_local_id(c) : 0;
+}
+
 int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
                                         const char *qtl,
                                         int *out_acked_peers,

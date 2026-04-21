@@ -95,6 +95,18 @@ int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
                                         int *out_acked_peers,
                                         int *out_total_peers);
 
+/* Bridges into the cluster layer for modules that live above it
+ * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each
+ * returns NULL / 0 if the db is in standalone mode. */
+struct tsdb_node_manager;
+typedef struct tsdb_node_manager tsdb_node_manager_t;
+struct tsdb_replica_mgr;
+typedef struct tsdb_replica_mgr  tsdb_replica_mgr_t;
+
+tsdb_node_manager_t *tsdb_cluster_node_mgr_for_db   (tsdb_db_t *db);
+tsdb_replica_mgr_t  *tsdb_cluster_replica_mgr_for_db(tsdb_db_t *db);
+uint64_t             tsdb_cluster_local_id_for_db   (tsdb_db_t *db);
+
 #ifdef __cplusplus
 }
 #endif

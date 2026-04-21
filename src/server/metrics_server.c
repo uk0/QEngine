@@ -47,6 +47,8 @@ static tsdb_tree_json_fn    g_tree_fn     = NULL;
 static void                *g_tree_ud     = NULL;
 static tsdb_sql_exec_fn     g_sql_fn      = NULL;
 static void                *g_sql_ud      = NULL;
+static tsdb_raft_json_fn    g_raft_fn     = NULL;
+static void                *g_raft_ud     = NULL;
 static char                 g_data_dir[4096] = {0};
 
 void tsdb_metrics_server_set_cluster_provider(tsdb_cluster_json_fn fn,
@@ -65,6 +67,12 @@ void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata) {
     g_sql_ud = userdata;
     g_sql_fn = fn;
+}
+
+void tsdb_metrics_server_set_raft_provider(tsdb_raft_json_fn fn,
+                                            void *userdata) {
+    g_raft_ud = userdata;
+    g_raft_fn = fn;
 }
 
 void tsdb_metrics_server_set_data_dir(const char *path) {
@@ -221,10 +229,12 @@ static void *handle_connection(void *arg) {
     int route_cluster = 0;
     int route_tree    = 0;
     int route_sql     = 0;
+    int route_raft    = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /health", 11) == 0)       route_health  = 1;
     else if (strncmp(req, "GET /cluster", 12) == 0)      route_cluster = 1;
     else if (strncmp(req, "GET /tree", 9) == 0)          route_tree    = 1;
+    else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
     else if (strncmp(req, "POST /sql", 9) == 0 ||
              strncmp(req, "GET /sql",  8) == 0)          route_sql     = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
@@ -251,6 +261,24 @@ static void *handle_connection(void *arg) {
             write_all(fd, body, body_len);
             free(body);
         }
+    } else if (route_raft) {
+        /* Small, stable JSON — fine on the stack. */
+        char body_r[1024] = "{}";
+        int blen = 2;
+        if (g_raft_fn) {
+            int n = g_raft_fn(g_raft_ud, body_r, sizeof(body_r));
+            if (n > 0) blen = n;
+        }
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body_r, (size_t)blen);
     } else if (route_cluster) {
         /* Cluster topology.  If the cluster module has registered a
          * provider we defer to it (full member list + autobalance);

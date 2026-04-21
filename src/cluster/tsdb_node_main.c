@@ -13,6 +13,7 @@
 #include "../server/server.h"
 #include "../server/metrics_server.h"
 #include "../server/metrics.h"
+#include "../raft/raft.h"
 #include "disk_weight.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,10 @@
 static volatile int g_running = 1;
 static time_t       g_node_start_epoch = 0;   /* set in main() */
 static char         g_local_role[16] = "master"; /* TSDB_NODE_ROLE, set in main() */
+
+/* Forward decl for the /raft JSON callback — full body lives next to
+ * the other *_json_cb helpers further down. */
+static int raft_json_cb(void *ud, char *buf, size_t cap);
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -50,6 +55,33 @@ static void usage(const char *prog) {
         "\n"
         "Gossip UDP port = RPC port - 1.\n",
         prog);
+}
+
+/* raft_json_cb — serialise the local Raft state machine for /raft.
+ * Small, stable JSON consumed by tests/raft/lib.sh + the dashboard.
+ * NULL `ud` → {} (raft not running on this node). */
+static int raft_json_cb(void *ud, char *buf, size_t cap) {
+    tsdb_raft_t *r = (tsdb_raft_t *)ud;
+    if (!r || cap < 8) return 0;
+    static const char *state_names[] = { "follower", "candidate", "leader" };
+    tsdb_raft_state_t st = tsdb_raft_state(r);
+    const char *sname = (st <= 2) ? state_names[st] : "?";
+    int n = snprintf(buf, cap,
+                     "{\"self_id\":\"%llu\","
+                     "\"role\":\"%s\","
+                     "\"current_term\":%llu,"
+                     "\"leader_id\":\"%llu\","
+                     "\"commit_index\":%llu,"
+                     "\"last_applied\":%llu,"
+                     "\"last_index\":%llu}",
+                     (unsigned long long)tsdb_raft_self_id(r),
+                     sname,
+                     (unsigned long long)tsdb_raft_current_term(r),
+                     (unsigned long long)tsdb_raft_leader_id(r),
+                     (unsigned long long)tsdb_raft_commit_index(r),
+                     (unsigned long long)tsdb_raft_last_applied(r),
+                     (unsigned long long)tsdb_raft_last_index(r));
+    return (n > 0 && (size_t)n < cap) ? n : 0;
 }
 
 /* cluster_json_cb — provide /cluster HTTP payload.
@@ -636,6 +668,37 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_set_cluster_provider(cluster_json_cb, db);
     tsdb_metrics_server_set_tree_provider(tree_json_cb, db);
     tsdb_metrics_server_set_sql_provider(sql_exec_cb, db);
+
+    /* Optional Raft consensus for the master set.  Gate:
+     *   TSDB_NODE_ROLE == master (default)   AND
+     *   TSDB_CONSENSUS == raft   (explicit opt-in; fanout stays the
+     *                             default until the implementation is
+     *                             exercised under the acceptance suite). */
+    tsdb_raft_t *raft_h = NULL;
+    {
+        const char *cons = getenv("TSDB_CONSENSUS");
+        int want_raft = cons && !strcasecmp(cons, "raft");
+        if (want_raft && !strcmp(g_local_role, "master")) {
+            tsdb_node_manager_t *mgr  = tsdb_cluster_node_mgr_for_db(db);
+            tsdb_replica_mgr_t  *rmgr = tsdb_cluster_replica_mgr_for_db(db);
+            uint64_t self_id          = tsdb_cluster_local_id_for_db(db);
+            if (mgr && rmgr && self_id) {
+                raft_h = tsdb_raft_open(data_dir, self_id, mgr, rmgr,
+                                         NULL /* apply_fn wired in #39 */,
+                                         NULL);
+                if (raft_h) {
+                    tsdb_metrics_server_set_raft_provider(raft_json_cb,
+                                                           raft_h);
+                    printf("[node] raft consensus ENABLED (data=%s/raft)\n",
+                           data_dir);
+                } else {
+                    fprintf(stderr,
+                            "[node] raft open failed — falling back to fanout\n");
+                }
+            }
+        }
+    }
+
     rc = tsdb_metrics_server_start(metrics_bind, &ms);
     if (rc == 0 && ms) {
         printf("[node] metrics  bind=%s\n", metrics_bind);
