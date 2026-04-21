@@ -13,6 +13,7 @@
 #include "../server/server.h"
 #include "../server/metrics_server.h"
 #include "../server/metrics.h"
+#include "../server/influx_line.h"
 #include "../raft/raft.h"
 #include "disk_weight.h"
 #include <stdio.h>
@@ -1088,6 +1089,20 @@ int main(int argc, char **argv) {
         printf("[node] metrics  bind=%s\n", metrics_bind);
     } else {
         fprintf(stderr, "[node] metrics server start(%s) failed\n", metrics_bind);
+    }
+
+    /* Influx Line Protocol ingest on a separate port — turning this on
+     * for cluster nodes lets benchmarks & perf tests push rows over a
+     * widely-supported HTTP endpoint instead of the bespoke wire
+     * protocol.  Convention: TSDB_INFLUX_BIND, default 0.0.0.0:28092. */
+    {
+        const char *influx_bind = getenv("TSDB_INFLUX_BIND");
+        if (!influx_bind || !*influx_bind) influx_bind = "0.0.0.0:28092";
+        if (tsdb_influx_http_start(influx_bind, db) == 0) {
+            printf("[node] influx  bind=%s\n", influx_bind);
+        } else {
+            fprintf(stderr, "[node] influx start(%s) failed\n", influx_bind);
+        }
     }
     fflush(stdout);
 
