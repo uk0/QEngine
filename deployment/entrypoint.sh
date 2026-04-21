@@ -25,12 +25,17 @@ set -e
 mkdir -p "$TSDB_DATA_DIR"
 chown -R tsdb:tsdb "$TSDB_DATA_DIR"
 
+# runuser + PAM reset soft nofile to 1024 even when the container
+# advertises a higher limit.  Raise it here AND inside the drop-user
+# shell so tsdb-{node,server} sees the container's real cap — needed
+# for thousands of PTables in industrial workloads.
+ulimit -n 1048576 2>/dev/null || true
+
 case "$TSDB_ROLE" in
   server)
     echo "[entrypoint] mode=server  data=$TSDB_DATA_DIR  bind=$TSDB_BIND"
-    exec runuser -u tsdb -- tsdb-server \
-         --data-dir "$TSDB_DATA_DIR" \
-         --bind     "$TSDB_BIND"
+    exec runuser -u tsdb -- sh -c 'ulimit -n 1048576; exec tsdb-server --data-dir "$1" --bind "$2"' _ \
+         "$TSDB_DATA_DIR" "$TSDB_BIND"
     ;;
 
   cluster-node)
@@ -40,7 +45,7 @@ case "$TSDB_ROLE" in
     if [ -n "$TSDB_SEEDS" ]; then
       ARGS="$ARGS --seeds $TSDB_SEEDS"
     fi
-    exec runuser -u tsdb -- tsdb-node $ARGS
+    exec runuser -u tsdb -- sh -c "ulimit -n 1048576; exec tsdb-node $ARGS"
     ;;
 
   cli)
