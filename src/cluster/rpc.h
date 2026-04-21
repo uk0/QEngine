@@ -52,7 +52,9 @@ typedef enum {
     TSDB_RPC_RAW_BLOCK_ACK   = 10, /* per-block ack */
     TSDB_RPC_APPLY_TRUNCATE    = 11, /* cluster broadcast: apply TRUNCATE TABLE locally */
     TSDB_RPC_APPLY_DELETE_RANGE = 12, /* cluster broadcast: apply partition-level DELETE locally */
-    TSDB_RPC_APPLY_CATALOG_QTL  = 13  /* cluster broadcast: run a catalog QTL statement locally */
+    TSDB_RPC_APPLY_CATALOG_QTL  = 13, /* cluster broadcast: run a catalog QTL statement locally */
+    TSDB_RPC_RAFT_REQUEST_VOTE  = 14, /* candidate asks peer for a vote   */
+    TSDB_RPC_RAFT_APPEND_ENTRIES = 15 /* leader replicates log to follower */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */

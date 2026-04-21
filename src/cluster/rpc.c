@@ -534,6 +534,40 @@ static void *connection_handler(void *arg) {
             }
             break;
 
+        case TSDB_RPC_RAFT_REQUEST_VOTE: {
+            /* Raft candidate requesting a vote — hand off to the raft
+             * state machine via the registered handler.  If no raft is
+             * running on this node (role=data or feature off) we reply
+             * ERR so the candidate treats this peer as absent. */
+            uint8_t rb[64];
+            uint32_t rn = 0;
+            extern int tsdb_raft_rpc_handle_vote(const uint8_t *, uint32_t,
+                                                 uint8_t *, uint32_t, uint32_t *);
+            if (tsdb_raft_rpc_handle_vote(msg.payload, msg.payload_len,
+                                          rb, sizeof(rb), &rn) == 0)
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+            else
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            break;
+        }
+
+        case TSDB_RPC_RAFT_APPEND_ENTRIES: {
+            /* Leader heartbeat or log replication — same plumbing as
+             * REQUEST_VOTE above.  Response buffer sized for the 17-byte
+             * resp struct; no further growth since responses never carry
+             * entries. */
+            uint8_t rb[64];
+            uint32_t rn = 0;
+            extern int tsdb_raft_rpc_handle_append(const uint8_t *, uint32_t,
+                                                   uint8_t *, uint32_t, uint32_t *);
+            if (tsdb_raft_rpc_handle_append(msg.payload, msg.payload_len,
+                                            rb, sizeof(rb), &rn) == 0)
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+            else
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            break;
+        }
+
         default:
             send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
