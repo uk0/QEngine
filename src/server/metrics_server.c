@@ -1140,7 +1140,16 @@ static void *handle_connection(void *arg) {
 "   t('topo.roles_fmt').replace('{m}',mCnt).replace('{d}',dCnt);"
 /* Build a cheap key to detect cluster-level churn so we can skip the
  * innerHTML write when nothing visible changed (biggest render cost). */
-" const key=nodes.map(n=>n.id+':'+n.state+':'+(n.role||'')+':'+(n.hb_age_ms||0)+':'+(n.known_for_s||0)).join('|')"
+/* Keep this cache key timer-free — hb_age_ms / known_for_s advance
+ * every poll tick, so including them forces a full innerHTML rewrite
+ * every 3 s.  The visible result was a cluster table that looked
+ * like it "switched" between nodes on every refresh.  Include only
+ * real state signals (id / alive-state / role / disk pct / language
+ * / raft leader id); the hb + uptime columns re-paint within the
+ * cached rows via DOM text replacement on the last-painted row — if
+ * they drift we're OK, and if real state changes the whole table
+ * rebuilds at that moment. */
+" const key=nodes.map(n=>n.id+':'+n.state+':'+(n.role||'')).join('|')"
 "   +'#'+(c.local&&c.local.disk?c.local.disk.used_x10:'-')+'#'+LANG"
 "   +'#leader='+(state.raftLeader||'');"
 " if(key===state.lastCKey)return;state.lastCKey=key;"
