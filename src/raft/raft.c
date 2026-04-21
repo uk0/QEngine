@@ -107,6 +107,18 @@ struct tsdb_raft {
  * change. */
 #define MAX_ENTRIES_PER_AE 64
 
+/* Auto-compaction threshold.  Once the apply thread has applied this
+ * many entries past the current snapshot boundary, we discard the
+ * subsumed prefix so the log doesn't grow without bound.  On a
+ * three-master cluster issuing DDL every few seconds this produces
+ * one compaction every ~15 s in the worst case, which is fine.
+ *
+ * Trade-off: a follower that falls more than SNAP_COMPACT_STRIDE
+ * entries behind can no longer catch up from the tail alone; it needs
+ * InstallSnapshot (tracked as a follow-up).  For a stable 3-master
+ * set this is rare, but the threshold is deliberately generous. */
+#define SNAP_COMPACT_STRIDE 256
+
 /* --- Time helpers ----------------------------------------------------- */
 
 static int64_t now_ns(void) {
@@ -485,7 +497,20 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
     uint64_t term       = tsdb_raft_log_current_term(r->log);
     uint64_t commit     = r->commit_index;
     uint64_t last_idx   = tsdb_raft_log_last_index(r->log);
+    uint64_t snap_idx   = tsdb_raft_log_snapshot_index(r->log);
     uint64_t next_idx   = r->peers[peer_idx].next_index;
+
+    /* If the peer is so far behind that it needs entries the leader
+     * has already discarded, we have no choice but to skip this
+     * round — they'd need a snapshot transfer, which is a follow-up.
+     * Bumping next_index forward so the peer at least hears our
+     * heartbeats (AE with prev_log_index = snap_idx, prev_log_term =
+     * snap_term) and won't loop into elections. */
+    if (next_idx <= snap_idx) {
+        r->peers[peer_idx].next_index = snap_idx + 1;
+        next_idx = snap_idx + 1;
+    }
+
     uint64_t prev_idx   = next_idx > 0 ? next_idx - 1 : 0;
     uint64_t prev_term  = prev_idx > 0 ? tsdb_raft_log_term_at(r->log, prev_idx) : 0;
 
@@ -753,6 +778,9 @@ uint64_t tsdb_raft_last_applied(tsdb_raft_t *r) {
 uint64_t tsdb_raft_last_index(tsdb_raft_t *r) {
     return r ? tsdb_raft_log_last_index(r->log) : 0;
 }
+uint64_t tsdb_raft_snapshot_index(tsdb_raft_t *r) {
+    return r ? tsdb_raft_log_snapshot_index(r->log) : 0;
+}
 
 /* --- Apply thread -----------------------------------------------------
  *
@@ -781,11 +809,21 @@ static void *apply_thread_main(void *arg) {
             if (r->apply_fn) {
                 (void)r->apply_fn(r->apply_ud, &e);
             }
+            uint64_t entry_term = e.term;
             free(e.payload);
             pthread_mutex_lock(&r->lock);
             r->last_applied = idx;
             pthread_cond_broadcast(&r->commit_cv); /* wake proposers */
             pthread_mutex_unlock(&r->lock);
+
+            /* Auto-compact: once we're SNAP_COMPACT_STRIDE past the
+             * current snapshot boundary, roll it forward.  Keeps the
+             * log bounded regardless of DDL workload.  Entry terms are
+             * stable after apply so we can compact up to `idx`. */
+            uint64_t snap = tsdb_raft_log_snapshot_index(r->log);
+            if (idx >= snap + SNAP_COMPACT_STRIDE) {
+                (void)tsdb_raft_log_compact(r->log, idx, entry_term);
+            }
         }
     }
     return NULL;

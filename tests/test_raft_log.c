@@ -199,6 +199,58 @@ static void t_torn_tail(const char *dir) {
     PASS("crash mid-append → rollback to last complete entry");
 }
 
+/* Scenario 6: snapshot compact drops the prefix, preserves the tail,
+ * answers term_at(snap_index) from the marker, and survives reopen. */
+static void t_snapshot_compact(const char *dir) {
+    printf("\n[6] snapshot compact + reopen\n");
+    rm_rf(dir);
+    tsdb_raft_log_t *rl = tsdb_raft_log_open(dir);
+
+    /* Append 10 entries. */
+    for (int i = 0; i < 10; i++) {
+        char body[16] = "payload";
+        tsdb_raft_entry_t e = { .term = (uint64_t)(i / 3 + 1),
+                                 .type = 1, .payload_len = 7, .payload = body };
+        assert(tsdb_raft_log_append(rl, &e) == 0);
+    }
+    assert(tsdb_raft_log_last_index(rl) == 10);
+    assert(tsdb_raft_log_snapshot_index(rl) == 0);
+
+    /* Compact through index 6.  Loop wrote term = i/3+1 for i=0..9
+     * which maps to Raft index = i+1, so term_at(6) = (5/3)+1 = 2. */
+    uint64_t term_at_6 = tsdb_raft_log_term_at(rl, 6);
+    assert(term_at_6 == 2);
+    assert(tsdb_raft_log_compact(rl, 6, term_at_6) == 0);
+
+    assert(tsdb_raft_log_snapshot_index(rl) == 6);
+    assert(tsdb_raft_log_snapshot_term(rl)  == 2);
+    assert(tsdb_raft_log_last_index(rl) == 10);
+    /* term_at() answers the snapshot boundary from the marker. */
+    assert(tsdb_raft_log_term_at(rl, 6) == 2);
+    /* Entries 7..10 still readable. */
+    tsdb_raft_entry_t r = {0};
+    assert(tsdb_raft_log_read(rl, 7, &r) == 0);
+    free(r.payload);
+    /* Entries <=6 are physically gone and must report "not found". */
+    tsdb_raft_entry_t r2 = {0};
+    assert(tsdb_raft_log_read(rl, 5, &r2) == -1);
+
+    /* Idempotency: re-compacting at lower or equal index is a no-op. */
+    assert(tsdb_raft_log_compact(rl, 3, 1) == 0);
+    assert(tsdb_raft_log_snapshot_index(rl) == 6);
+
+    tsdb_raft_log_close(rl);
+    /* Reopen — snapshot marker + remaining log survive. */
+    rl = tsdb_raft_log_open(dir);
+    assert(tsdb_raft_log_snapshot_index(rl) == 6);
+    assert(tsdb_raft_log_snapshot_term(rl)  == 2);
+    assert(tsdb_raft_log_last_index(rl) == 10);
+    assert(tsdb_raft_log_term_at(rl, 6) == 2);
+    tsdb_raft_log_close(rl);
+
+    PASS("compact drops prefix, marker answers term_at, survives reopen");
+}
+
 int main(void) {
     const char *dir = "/tmp/tsdb-raft-log-test";
     rm_rf(dir);
@@ -208,6 +260,7 @@ int main(void) {
     t_append_and_read(dir);
     t_truncate(dir);
     t_torn_tail(dir);
+    t_snapshot_compact(dir);
 
     rm_rf(dir);
     printf("\n=== all raft_log tests passed ===\n");

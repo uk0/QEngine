@@ -39,6 +39,7 @@
 
 #define META_MAGIC     0x4D544652u /* 'RFTM' in LE */
 #define VOTE_MAGIC     0x56544652u /* 'RFTV' */
+#define SNAP_MAGIC     0x53544652u /* 'RFTS' — snapshot marker file */
 #define LOG_ENTRY_MAGIC 0x45544652u /* 'RFTE' */
 #define LOG_VERSION     1u
 
@@ -51,18 +52,26 @@ struct tsdb_raft_log {
     char            base_dir[4096];   /* <data_dir>/raft */
     char            meta_path[4128];  /* base_dir/meta.bin */
     char            vote_path[4128];  /* base_dir/vote.bin */
+    char            snap_meta_path[4128]; /* base_dir/snap_meta.bin */
     char            log_path[4128];   /* base_dir/log/seg.bin */
     char            idx_path[4128];   /* base_dir/log/index.bin */
 
     uint64_t        current_term;
     uint64_t        voted_for;
 
+    /* Snapshot cover.  When snap_index > 0, every entry with Raft
+     * index <= snap_index has been subsumed by the snapshot body
+     * (managed by the raft.c layer).  term_at(snap_index) can still
+     * be answered from snap_term even after the entry is gone. */
+    uint64_t        snap_index;
+    uint64_t        snap_term;
+
     FILE           *log_fp;
     FILE           *idx_fp;
 
     /* In-memory offset index: offsets[i] = byte offset in log_fp of the
-     * entry whose Raft index is (first_index + i).  first_index is 1
-     * while snapshotting hasn't landed. */
+     * entry whose Raft index is (first_index + i).  After a compact
+     * first_index is snap_index + 1. */
     uint64_t        first_index;
     uint64_t        last_index;
     uint64_t        last_term;
@@ -116,6 +125,34 @@ static int vote_write(tsdb_raft_log_t *rl) {
              (fsync_file(fp) == 0);
     fclose(fp);
     return ok ? 0 : -1;
+}
+
+static int snap_meta_write(tsdb_raft_log_t *rl) {
+    FILE *fp = fopen(rl->snap_meta_path, "wb");
+    if (!fp) return -1;
+    uint32_t m = SNAP_MAGIC, v = LOG_VERSION;
+    uint64_t idx = rl->snap_index, term = rl->snap_term;
+    int ok = (fwrite(&m,    4, 1, fp) == 1) &&
+             (fwrite(&v,    4, 1, fp) == 1) &&
+             (fwrite(&idx,  8, 1, fp) == 1) &&
+             (fwrite(&term, 8, 1, fp) == 1) &&
+             (fsync_file(fp) == 0);
+    fclose(fp);
+    return ok ? 0 : -1;
+}
+
+static void snap_meta_load(tsdb_raft_log_t *rl) {
+    FILE *fp = fopen(rl->snap_meta_path, "rb");
+    if (!fp) return;
+    uint32_t m = 0, v = 0;
+    uint64_t idx = 0, term = 0;
+    if (fread(&m, 4, 1, fp) == 1 && fread(&v, 4, 1, fp) == 1 &&
+        fread(&idx, 8, 1, fp) == 1 && fread(&term, 8, 1, fp) == 1 &&
+        m == SNAP_MAGIC) {
+        rl->snap_index = idx;
+        rl->snap_term  = term;
+    }
+    fclose(fp);
 }
 
 static void meta_load(tsdb_raft_log_t *rl) {
@@ -225,6 +262,8 @@ tsdb_raft_log_t *tsdb_raft_log_open(const char *data_dir) {
     snprintf(rl->base_dir, sizeof(rl->base_dir), "%s/raft",          data_dir);
     snprintf(rl->meta_path,sizeof(rl->meta_path),"%s/meta.bin",     rl->base_dir);
     snprintf(rl->vote_path,sizeof(rl->vote_path),"%s/vote.bin",     rl->base_dir);
+    snprintf(rl->snap_meta_path, sizeof(rl->snap_meta_path),
+             "%s/snap_meta.bin", rl->base_dir);
     snprintf(rl->log_path, sizeof(rl->log_path), "%s/log/seg.bin",  rl->base_dir);
     snprintf(rl->idx_path, sizeof(rl->idx_path), "%s/log/index.bin",rl->base_dir);
 
@@ -237,6 +276,7 @@ tsdb_raft_log_t *tsdb_raft_log_open(const char *data_dir) {
 
     meta_load(rl);
     vote_load(rl);
+    snap_meta_load(rl);
 
     rl->log_fp = fopen(rl->log_path, "a+b");
     if (!rl->log_fp) { tsdb_raft_log_close(rl); return NULL; }
@@ -315,6 +355,15 @@ uint64_t tsdb_raft_log_last_term(tsdb_raft_log_t *rl) {
 uint64_t tsdb_raft_log_term_at(tsdb_raft_log_t *rl, uint64_t index) {
     if (!rl || index == 0) return 0;
     pthread_mutex_lock(&rl->lock);
+    /* If the query lands exactly on the snapshot boundary, the entry
+     * itself is gone but the marker remembers its term.  Needed so a
+     * leader's AE with prev_log_index == snap_index passes the peer's
+     * consistency check. */
+    if (index == rl->snap_index) {
+        uint64_t term = rl->snap_term;
+        pthread_mutex_unlock(&rl->lock);
+        return term;
+    }
     uint64_t term = 0;
     if (index >= rl->first_index && index <= rl->last_index) {
         long off = (long)rl->offsets[index - rl->first_index];
@@ -442,6 +491,139 @@ int tsdb_raft_log_read(tsdb_raft_log_t *rl, uint64_t index,
 
     pthread_mutex_unlock(&rl->lock);
     return 0;
+}
+
+/* ---- Snapshot ------------------------------------------------------------ */
+
+uint64_t tsdb_raft_log_snapshot_index(tsdb_raft_log_t *rl) {
+    if (!rl) return 0;
+    pthread_mutex_lock(&rl->lock);
+    uint64_t v = rl->snap_index;
+    pthread_mutex_unlock(&rl->lock);
+    return v;
+}
+
+uint64_t tsdb_raft_log_snapshot_term(tsdb_raft_log_t *rl) {
+    if (!rl) return 0;
+    pthread_mutex_lock(&rl->lock);
+    uint64_t v = rl->snap_term;
+    pthread_mutex_unlock(&rl->lock);
+    return v;
+}
+
+/* Compact: mark (idx, term) as covered by a snapshot, rewrite seg.bin
+ * to drop entries <= idx, rebuild the offset table.  The tail-preserving
+ * rewrite is straightforward: read entries for indices > idx into a
+ * temp file, fsync + rename. */
+int tsdb_raft_log_compact(tsdb_raft_log_t *rl,
+                           uint64_t snap_idx, uint64_t snap_term)
+{
+    if (!rl) return -1;
+    pthread_mutex_lock(&rl->lock);
+    if (snap_idx <= rl->snap_index) {
+        pthread_mutex_unlock(&rl->lock);
+        return 0; /* idempotent */
+    }
+
+    /* Walk surviving entries (> snap_idx) into a temp segment. */
+    char tmp_path[4128];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/log/seg.bin.tmp", rl->base_dir);
+    FILE *nfp = fopen(tmp_path, "wb+");
+    if (!nfp) { pthread_mutex_unlock(&rl->lock); return -1; }
+    setvbuf(nfp, NULL, _IONBF, 0);
+
+    /* New offset table, assuming worst case every surviving entry is kept. */
+    size_t need = (rl->last_index > snap_idx)
+                     ? (size_t)(rl->last_index - snap_idx) : 0;
+    uint64_t *new_off = NULL;
+    if (need > 0) {
+        new_off = calloc(need, sizeof(uint64_t));
+        if (!new_off) { fclose(nfp); unlink(tmp_path);
+                        pthread_mutex_unlock(&rl->lock); return -1; }
+    }
+    size_t nkept = 0;
+    uint64_t new_last_term = 0;
+
+    for (uint64_t idx = snap_idx + 1; idx <= rl->last_index; idx++) {
+        if (idx < rl->first_index) continue; /* already gone */
+        long off_in = (long)rl->offsets[idx - rl->first_index];
+        if (fseek(rl->log_fp, off_in, SEEK_SET) != 0) goto bad;
+
+        uint32_t magic = 0, type = 0, plen = 0;
+        uint64_t idx64 = 0, term64 = 0;
+        if (fread(&magic, 4, 1, rl->log_fp) != 1 || magic != LOG_ENTRY_MAGIC ||
+            fread(&idx64, 8, 1, rl->log_fp) != 1 ||
+            fread(&term64,8, 1, rl->log_fp) != 1 ||
+            fread(&type,  4, 1, rl->log_fp) != 1 ||
+            fread(&plen,  4, 1, rl->log_fp) != 1) goto bad;
+
+        /* Payload + trailer, copy verbatim. */
+        void *buf = plen > 0 ? malloc(plen) : NULL;
+        if (plen > 0 && (!buf || fread(buf, plen, 1, rl->log_fp) != 1)) {
+            free(buf); goto bad;
+        }
+        uint32_t trailer = 0;
+        if (fread(&trailer, 4, 1, rl->log_fp) != 1 || trailer != plen) {
+            free(buf); goto bad;
+        }
+
+        long off_out = ftell(nfp);
+        if (off_out < 0 ||
+            fwrite(&magic,  4, 1, nfp) != 1 ||
+            fwrite(&idx64,  8, 1, nfp) != 1 ||
+            fwrite(&term64, 8, 1, nfp) != 1 ||
+            fwrite(&type,   4, 1, nfp) != 1 ||
+            fwrite(&plen,   4, 1, nfp) != 1 ||
+            (plen > 0 && fwrite(buf, plen, 1, nfp) != 1) ||
+            fwrite(&plen,   4, 1, nfp) != 1)
+        {
+            free(buf); goto bad;
+        }
+        free(buf);
+        new_off[nkept++] = (uint64_t)off_out;
+        new_last_term = term64;
+    }
+
+    if (fsync_file(nfp) != 0) goto bad;
+    fclose(nfp); nfp = NULL;
+
+    /* Swap files: close old, rename tmp onto seg.bin, reopen. */
+    if (rl->log_fp) { fclose(rl->log_fp); rl->log_fp = NULL; }
+    if (rename(tmp_path, rl->log_path) != 0) goto bad;
+    rl->log_fp = fopen(rl->log_path, "a+b");
+    if (!rl->log_fp) goto bad;
+    setvbuf(rl->log_fp, NULL, _IONBF, 0);
+
+    /* Install new state + persist snapshot marker. */
+    free(rl->offsets);
+    rl->offsets      = new_off; new_off = NULL;
+    rl->offsets_cap  = nkept;
+    rl->first_index  = snap_idx + 1;
+    if (nkept == 0) {
+        rl->last_index = 0;  /* entire log subsumed */
+        rl->last_term  = 0;
+    } else {
+        rl->last_index = snap_idx + nkept;
+        rl->last_term  = new_last_term;
+    }
+    rl->snap_index = snap_idx;
+    rl->snap_term  = snap_term;
+    int rc = snap_meta_write(rl);
+
+    pthread_mutex_unlock(&rl->lock);
+    return rc;
+
+bad:
+    if (nfp) { fclose(nfp); unlink(tmp_path); }
+    free(new_off);
+    /* Reopen log if we closed it.  On failure we leave snapshot state
+     * un-advanced; caller can retry. */
+    if (!rl->log_fp) {
+        rl->log_fp = fopen(rl->log_path, "a+b");
+        if (rl->log_fp) setvbuf(rl->log_fp, NULL, _IONBF, 0);
+    }
+    pthread_mutex_unlock(&rl->lock);
+    return -1;
 }
 
 int tsdb_raft_log_truncate(tsdb_raft_log_t *rl, uint64_t index) {

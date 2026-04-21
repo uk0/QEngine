@@ -103,6 +103,27 @@ int tsdb_raft_log_read(tsdb_raft_log_t *rl, uint64_t index,
  * on success, -1 on I/O failure. */
 int tsdb_raft_log_truncate(tsdb_raft_log_t *rl, uint64_t index);
 
+/* ---- Snapshot support ---------------------------------------------------
+ *
+ * A snapshot captures state up through (last_snapshot_index,
+ * last_snapshot_term).  The log can physically discard entries with
+ * index <= last_snapshot_index because they're subsumed.  The
+ * snapshot BODY (the catalog tarball) lives in a separate file
+ * managed by the higher-level raft module; the log only records the
+ * marker so AE consistency checks can still answer "term at
+ * snapshot_index" after the entries themselves are gone.
+ */
+
+uint64_t tsdb_raft_log_snapshot_index(tsdb_raft_log_t *rl);
+uint64_t tsdb_raft_log_snapshot_term (tsdb_raft_log_t *rl);
+
+/* Mark (index, term) as covered by a snapshot, then drop every log
+ * entry whose index is <= `index`.  Idempotent for indices that
+ * don't advance the marker.  Returns 0 on success, -1 on I/O
+ * failure. */
+int tsdb_raft_log_compact(tsdb_raft_log_t *rl,
+                           uint64_t index, uint64_t term);
+
 #ifdef __cplusplus
 }
 #endif

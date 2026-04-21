@@ -119,14 +119,16 @@ static int raft_json_cb(void *ud, char *buf, size_t cap) {
                      "\"leader_id\":\"%llu\","
                      "\"commit_index\":%llu,"
                      "\"last_applied\":%llu,"
-                     "\"last_index\":%llu}",
+                     "\"last_index\":%llu,"
+                     "\"snapshot_index\":%llu}",
                      (unsigned long long)tsdb_raft_self_id(r),
                      sname,
                      (unsigned long long)tsdb_raft_current_term(r),
                      (unsigned long long)tsdb_raft_leader_id(r),
                      (unsigned long long)tsdb_raft_commit_index(r),
                      (unsigned long long)tsdb_raft_last_applied(r),
-                     (unsigned long long)tsdb_raft_last_index(r));
+                     (unsigned long long)tsdb_raft_last_index(r),
+                     (unsigned long long)tsdb_raft_snapshot_index(r));
     return (n > 0 && (size_t)n < cap) ? n : 0;
 }
 

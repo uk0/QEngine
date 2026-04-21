@@ -74,6 +74,7 @@ uint64_t          tsdb_raft_leader_id    (tsdb_raft_t *r);
 uint64_t          tsdb_raft_commit_index (tsdb_raft_t *r);
 uint64_t          tsdb_raft_last_applied (tsdb_raft_t *r);
 uint64_t          tsdb_raft_last_index   (tsdb_raft_t *r);
+uint64_t          tsdb_raft_snapshot_index(tsdb_raft_t *r);
 
 /* ---- Public client API -------------------------------------------------- */
 
