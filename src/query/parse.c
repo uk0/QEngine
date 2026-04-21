@@ -693,7 +693,25 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        /* CREATE GROUP <name> [(props)] */
+        /* CREATE DATABASE <name> — top-of-hierarchy entity.
+         * Accepts either the DATABASE keyword (QTOK_DATABASE if tokenised)
+         * or the IDENT "database" / "db" — lex doesn't reserve them. */
+        if ((p.tok.kind == QTOK_IDENT &&
+             (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db")))) {
+            advance(&p);
+            out->kind = QAST_STMT_CREATE_DATABASE;
+            memset(&out->u.create_database, 0, sizeof(out->u.create_database));
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.create_database.name,
+                     sizeof(out->u.create_database.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* CREATE GROUP <name> [IN DATABASE <db>] [(props)] */
         if (accept(&p, QTOK_GROUP)) {
             out->kind = QAST_STMT_CREATE_GROUP;
             tsdb_group_t *g = &out->u.create_group.spec;
@@ -704,6 +722,20 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             }
             tok_copy(&p.tok, g->name, sizeof(g->name));
             advance(&p);
+            /* Optional "IN DATABASE <name>" clause. */
+            if (accept(&p, QTOK_IN)) {
+                if (p.tok.kind != QTOK_IDENT ||
+                    !(ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    perr(&p, "expected DATABASE after IN");
+                    return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, g->database, sizeof(g->database));
+                advance(&p);
+            }
             if (parse_props_group(&p, g) != TSDB_OK) return TSDB_ERR_PARSE;
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
@@ -1238,6 +1270,20 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
 
     /* ---- DROP ----------------------------------------------------------- */
     if (accept(&p, QTOK_DROP)) {
+        /* DROP DATABASE <name> */
+        if (p.tok.kind == QTOK_IDENT &&
+            (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+            advance(&p);
+            out->kind = QAST_STMT_DROP_DATABASE;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_database.name,
+                     sizeof(out->u.drop_database.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
         /* DROP GROUP <name> */
         if (accept(&p, QTOK_GROUP)) {
             out->kind = QAST_STMT_DROP_GROUP;
@@ -1398,6 +1444,13 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
 
     /* ---- LIST ----------------------------------------------------------- */
     if (accept(&p, QTOK_LIST)) {
+        /* LIST DATABASES */
+        if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "databases")) {
+            out->kind = QAST_STMT_LIST_DATABASES;
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return TSDB_OK;
+        }
         /* LIST GROUPS  — "groups" lexes as QTOK_IDENT (plural not a keyword) */
         if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "groups")) {
             out->kind = QAST_STMT_LIST_GROUPS;

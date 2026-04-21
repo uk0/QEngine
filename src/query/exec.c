@@ -19,6 +19,7 @@
 #include "../exec/bucket.h"
 #include "../exec/pool.h"
 #include "../catalog/group.h"
+#include "../catalog/database.h"
 #include "../catalog/device.h"
 #include "../catalog/stable.h"
 #include "../catalog/tmq.h"
@@ -4931,13 +4932,26 @@ done:
  * Columns: name, region, retention_ns(i64), codec_profile, replica_factor(i64),
  *          tags, created_at(ts)
  */
-static const char *LIST_GROUPS_COLS[]  = {"name","region","retention_ns","codec_profile","replica_factor","tags","created_at"};
+static const char *LIST_GROUPS_COLS[]  = {
+    "name","region","retention_ns","codec_profile",
+    "replica_factor","tags","created_at","database"
+};
 static const tsdb_type_t LIST_GROUPS_TYPES[] = {
     TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,
     TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,  TSDB_TYPE_SYMBOL,
-    TSDB_TYPE_TIMESTAMP
+    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL
 };
-#define LIST_GROUPS_NCOLS 7
+#define LIST_GROUPS_NCOLS 8
+
+/* LIST DATABASES result columns: name, description, retention_ns, created_at. */
+static const char *LIST_DBS_COLS[] = {
+    "name","description","retention_ns","created_at"
+};
+static const tsdb_type_t LIST_DBS_TYPES[] = {
+    TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL,
+    TSDB_TYPE_INT64,  TSDB_TYPE_TIMESTAMP
+};
+#define LIST_DBS_NCOLS 4
 
 static const char *LIST_DEVICES_COLS[] = {"group","id","type","location","tags","last_seen","status"};
 static const tsdb_type_t LIST_DEVICES_TYPES[] = {
@@ -5049,9 +5063,35 @@ static int exec_list_groups(tsdb_catalog_t *cat, tsdb_result_t *r) {
         result_append_i64_val(r, 4, (int64_t)g->replica_factor);
         result_append_sym(r, 5, g->tags);
         result_append_ts_val(r, 6, g->created_at);
+        /* Empty string → implicit "default" database; keep the on-wire
+         * value empty so the UI can decide how to render it. */
+        result_append_sym(r, 7, g->database);
         result_ddl_end_row(r);
     }
     tsdb_group_list_free(arr);
+    return rc;
+}
+
+static int exec_list_databases(tsdb_catalog_t *cat, tsdb_result_t *r) {
+    int rc = result_init_ddl(r, LIST_DBS_NCOLS,
+                              LIST_DBS_COLS, LIST_DBS_TYPES);
+    if (rc != TSDB_OK) return rc;
+
+    tsdb_database_t *arr = NULL;
+    size_t n = 0;
+    rc = tsdb_database_list(cat, &arr, &n);
+    if (rc != TSDB_OK) return rc;
+
+    for (size_t i = 0; i < n; i++) {
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+        tsdb_database_t *d = &arr[i];
+        result_append_sym(r, 0, d->name);
+        result_append_sym(r, 1, d->description);
+        result_append_i64_val(r, 2, d->retention_ns);
+        result_append_ts_val(r, 3, d->created_at);
+        result_ddl_end_row(r);
+    }
+    tsdb_database_list_free(arr);
     return rc;
 }
 
@@ -5161,7 +5201,37 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     }
 
     switch (stmt.kind) {
+    case QAST_STMT_CREATE_DATABASE: {
+        tsdb_database_t d;
+        memset(&d, 0, sizeof(d));
+        snprintf(d.name, sizeof(d.name), "%s", stmt.u.create_database.name);
+        snprintf(d.description, sizeof(d.description), "%s",
+                 stmt.u.create_database.description);
+        d.retention_ns = stmt.u.create_database.retention_ns;
+        rc = tsdb_database_create(cat, &d);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: database created");
+        else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: database exists"); rc = TSDB_ERR_EXISTS; }
+        else result_status(r, "ERR: create database failed");
+        break;
+    }
+    case QAST_STMT_DROP_DATABASE: {
+        rc = tsdb_database_drop(cat, stmt.u.drop_database.name);
+        if (rc == TSDB_OK) rc = result_status(r, "OK: database dropped");
+        else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: database not found"); rc = TSDB_ERR_NOTFOUND; }
+        else result_status(r, "ERR: drop database failed");
+        break;
+    }
+    case QAST_STMT_LIST_DATABASES:
+        rc = exec_list_databases(cat, r);
+        break;
     case QAST_STMT_CREATE_GROUP: {
+        /* If IN DATABASE was specified, ensure the parent exists. */
+        const tsdb_group_t *g = &stmt.u.create_group.spec;
+        if (g->database[0] && !tsdb_database_exists(cat, g->database)) {
+            result_status(r, "ERR: database not found");
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
         rc = tsdb_group_create(cat, &stmt.u.create_group.spec);
         if (rc == TSDB_OK) rc = result_status(r, "OK: group created");
         else if (rc == TSDB_ERR_EXISTS) { result_status(r, "ERR: group exists"); rc = TSDB_ERR_EXISTS; }
@@ -5637,6 +5707,7 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
         break;
 
     /* Catalog reads — SELECT privilege on "*" */
+    case QAST_STMT_LIST_DATABASES:
     case QAST_STMT_LIST_GROUPS:
     case QAST_STMT_LIST_DEVICES:
     case QAST_STMT_LIST_FUNCTIONS:
@@ -5644,6 +5715,8 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
         break;
 
     /* Schema DDL */
+    case QAST_STMT_CREATE_DATABASE:
+    case QAST_STMT_DROP_DATABASE:
     case QAST_STMT_CREATE_GROUP:
     case QAST_STMT_DROP_GROUP:
     case QAST_STMT_CREATE_DEVICE:

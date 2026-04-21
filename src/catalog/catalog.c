@@ -18,6 +18,7 @@
 #include "group.h"
 #include "device.h"
 #include "stable.h"
+#include "database.h"
 #include "../../include/tsdb.h"
 #include "../core/types.h"
 
@@ -234,6 +235,9 @@ struct tsdb_catalog {
 
     pthread_mutex_t lock;
 
+    /* databases: name -> tsdb_database_t* (owned) */
+    hmap_t         databases;
+
     /* groups: name -> tsdb_group_t* (owned) */
     hmap_t         groups;
 
@@ -246,6 +250,7 @@ struct tsdb_catalog {
     /* child_tables: child_name -> tsdb_child_table_t* (owned) */
     hmap_t         child_tables;
 
+    FILE          *databases_log;
     FILE          *groups_log;
     FILE          *devices_log;
     FILE          *stables_log;
@@ -254,23 +259,179 @@ struct tsdb_catalog {
 
 /* ---- Log helpers --------------------------------------------------------- */
 
-/* Write a group record to groups.log. '+' for create, '-' for drop. */
+/* Forward decls — definitions live further down in this file. */
+static int  split_tab(char *line, char **fields, int max_fields);
+
+/* ---- Database log + replay + CRUD ---------------------------------- *
+ *
+ * databases.log record format (tab-separated, percent-encoded):
+ *   +db  <name>  <description>  <retention_ns>  <created_at>
+ *   -db  <name>
+ *
+ * Mirrors groups.log's shape so future versions that add columns can
+ * append them without breaking older readers.
+ */
+
+static int log_database(tsdb_catalog_t *c, char op, const tsdb_database_t *d) {
+    char enc_name[128], enc_desc[512];
+    pct_encode(d->name,        enc_name, sizeof(enc_name));
+    pct_encode(d->description, enc_desc, sizeof(enc_desc));
+    int n = fprintf(c->databases_log,
+                    "%c\t%s\t%s\t%lld\t%lld\n",
+                    op, enc_name, enc_desc,
+                    (long long)d->retention_ns,
+                    (long long)d->created_at);
+    if (n < 0) return TSDB_ERR_IO;
+    if (fflush(c->databases_log) != 0) return TSDB_ERR_IO;
+    return TSDB_OK;
+}
+
+static int log_database_drop(tsdb_catalog_t *c, const char *name) {
+    char enc_name[128];
+    pct_encode(name, enc_name, sizeof(enc_name));
+    int n = fprintf(c->databases_log, "-\t%s\n", enc_name);
+    if (n < 0) return TSDB_ERR_IO;
+    if (fflush(c->databases_log) != 0) return TSDB_ERR_IO;
+    return TSDB_OK;
+}
+
+static int replay_databases(tsdb_catalog_t *c, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return TSDB_OK;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        size_t ln = strlen(line);
+        while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'))
+            line[--ln] = '\0';
+        if (!line[0]) continue;
+        char *fields[8];
+        char cp[4096];
+        strncpy(cp, line, sizeof(cp) - 1);
+        cp[sizeof(cp) - 1] = '\0';
+        int nf = split_tab(cp, fields, 8);
+        if (nf < 1) continue;
+        char op = fields[0][0];
+        if (op == '+' && nf >= 5) {
+            tsdb_database_t *d = calloc(1, sizeof(*d));
+            if (!d) { fclose(f); return TSDB_ERR_NOMEM; }
+            char name[64], desc[192];
+            pct_decode(fields[1], name, sizeof(name));
+            pct_decode(fields[2], desc, sizeof(desc));
+            strncpy(d->name, name, sizeof(d->name) - 1);
+            strncpy(d->description, desc, sizeof(d->description) - 1);
+            d->retention_ns = (int64_t)strtoll(fields[3], NULL, 10);
+            d->created_at   = (tsdb_ts_t)strtoll(fields[4], NULL, 10);
+            hmap_put(&c->databases, d->name, d);
+        } else if (op == '-' && nf >= 2) {
+            char name[64];
+            pct_decode(fields[1], name, sizeof(name));
+            hmap_del(&c->databases, name);
+        }
+    }
+    fclose(f);
+    return TSDB_OK;
+}
+
+int tsdb_database_create(tsdb_catalog_t *c, const tsdb_database_t *db) {
+    if (!c || !db || !db->name[0]) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    if (hmap_get(&c->databases, db->name)) {
+        pthread_mutex_unlock(&c->lock);
+        return TSDB_ERR_EXISTS;
+    }
+    tsdb_database_t *copy = malloc(sizeof(*copy));
+    if (!copy) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOMEM; }
+    *copy = *db;
+    if (copy->created_at == 0) copy->created_at = (tsdb_ts_t)tsdb_now_ns();
+    int rc = log_database(c, '+', copy);
+    if (rc != TSDB_OK) { free(copy); pthread_mutex_unlock(&c->lock); return rc; }
+    hmap_put(&c->databases, copy->name, copy);
+    pthread_mutex_unlock(&c->lock);
+    return TSDB_OK;
+}
+
+int tsdb_database_get(tsdb_catalog_t *c, const char *name, tsdb_database_t *out) {
+    if (!c || !name || !out) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    tsdb_database_t *d = (tsdb_database_t *)hmap_get(&c->databases, name);
+    if (!d) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
+    *out = *d;
+    pthread_mutex_unlock(&c->lock);
+    return TSDB_OK;
+}
+
+int tsdb_database_exists(tsdb_catalog_t *c, const char *name) {
+    if (!c || !name) return 0;
+    pthread_mutex_lock(&c->lock);
+    int yes = (hmap_get(&c->databases, name) != NULL);
+    pthread_mutex_unlock(&c->lock);
+    return yes;
+}
+
+int tsdb_database_drop(tsdb_catalog_t *c, const char *name) {
+    if (!c || !name) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    if (!hmap_get(&c->databases, name)) {
+        pthread_mutex_unlock(&c->lock);
+        return TSDB_ERR_NOTFOUND;
+    }
+    int rc = log_database_drop(c, name);
+    if (rc != TSDB_OK) { pthread_mutex_unlock(&c->lock); return rc; }
+    hmap_del(&c->databases, name);
+    pthread_mutex_unlock(&c->lock);
+    return TSDB_OK;
+}
+
+int tsdb_database_list(tsdb_catalog_t *c,
+                        tsdb_database_t **out_arr, size_t *out_n)
+{
+    if (!c || !out_arr || !out_n) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    size_t n = c->databases.size;
+    tsdb_database_t *arr = n ? malloc(n * sizeof(*arr)) : NULL;
+    if (n && !arr) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOMEM; }
+    size_t k = 0;
+    for (size_t i = 0; i < c->databases.cap; i++) {
+        if (c->databases.buckets[i].key) {
+            arr[k++] = *(tsdb_database_t *)c->databases.buckets[i].val;
+        }
+    }
+    *out_arr = arr;
+    *out_n = k;
+    pthread_mutex_unlock(&c->lock);
+    return TSDB_OK;
+}
+
+void tsdb_database_list_free(tsdb_database_t *arr) { free(arr); }
+
+/* ---- Group log (continues) ---------------------------------------- */
+
+/* Write a group record to groups.log. '+' for create, '-' for drop.
+ *
+ * V1 shape:  + name region retention codec replica tags created_at
+ * V2 shape:  + name region retention codec replica tags created_at database
+ *
+ * We always write V2; readers that see 8 fields assume empty database.
+ */
 static int log_group(tsdb_catalog_t *c, char op, const tsdb_group_t *g) {
     char enc_name[128], enc_region[96], enc_profile[96], enc_tags[1600];
+    char enc_db[128];
     pct_encode(g->name, enc_name, sizeof(enc_name));
     pct_encode(g->region, enc_region, sizeof(enc_region));
     pct_encode(g->codec_profile, enc_profile, sizeof(enc_profile));
     pct_encode(g->tags, enc_tags, sizeof(enc_tags));
+    pct_encode(g->database, enc_db, sizeof(enc_db));
 
     int n = fprintf(c->groups_log,
-        "%c\t%s\t%s\t%lld\t%s\t%d\t%s\t%lld\n",
+        "%c\t%s\t%s\t%lld\t%s\t%d\t%s\t%lld\t%s\n",
         op,
         enc_name, enc_region,
         (long long)g->retention_ns,
         enc_profile,
         g->replica_factor,
         enc_tags,
-        (long long)g->created_at);
+        (long long)g->created_at,
+        enc_db);
     if (n < 0) return TSDB_ERR_IO;
     if (fflush(c->groups_log) != 0) return TSDB_ERR_IO;
     return TSDB_OK;
@@ -390,11 +551,13 @@ static int replay_groups(tsdb_catalog_t *c, const char *path) {
             if (!g) { fclose(f); return TSDB_ERR_NOMEM; }
 
             /* Decode each field */
-            char name[64], region[32], profile[32], tags[512];
+            char name[64], region[32], profile[32], tags[512], dbn[64];
             pct_decode(fields[1], name, sizeof(name));
             pct_decode(fields[2], region, sizeof(region));
             pct_decode(fields[4], profile, sizeof(profile));
             pct_decode(fields[6], tags, sizeof(tags));
+            if (nf >= 9) pct_decode(fields[8], dbn, sizeof(dbn));
+            else         dbn[0] = '\0';
 
             strncpy(g->name, name, sizeof(g->name) - 1);
             strncpy(g->region, region, sizeof(g->region) - 1);
@@ -403,6 +566,7 @@ static int replay_groups(tsdb_catalog_t *c, const char *path) {
             g->replica_factor = atoi(fields[5]);
             strncpy(g->tags, tags, sizeof(g->tags) - 1);
             g->created_at = (tsdb_ts_t)strtoll(fields[7], NULL, 10);
+            strncpy(g->database, dbn, sizeof(g->database) - 1);
 
             hmap_put(&c->groups, g->name, g);
             /* ensure device index entry */
@@ -512,20 +676,25 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
 
     pthread_mutex_init(&c->lock, NULL);
 
-    if (hmap_init(&c->groups) != 0 || hmap_init(&c->device_index) != 0
+    if (hmap_init(&c->databases) != 0
+        || hmap_init(&c->groups) != 0 || hmap_init(&c->device_index) != 0
         || hmap_init(&c->stables) != 0 || hmap_init(&c->child_tables) != 0) {
         free(c);
         return TSDB_ERR_NOMEM;
     }
 
     /* Replay existing logs. */
-    char groups_path[4096], devices_path[4096], stables_path[4096], children_path[4096];
+    char databases_path[4096], groups_path[4096], devices_path[4096];
+    char stables_path[4096], children_path[4096];
+    snprintf(databases_path,sizeof(databases_path),"%s/databases.log",    c->cat_dir);
     snprintf(groups_path,   sizeof(groups_path),   "%s/groups.log",       c->cat_dir);
     snprintf(devices_path,  sizeof(devices_path),  "%s/devices.log",      c->cat_dir);
     snprintf(stables_path,  sizeof(stables_path),  "%s/stables.log",      c->cat_dir);
     snprintf(children_path, sizeof(children_path), "%s/child_tables.log", c->cat_dir);
 
-    int rc = replay_groups(c, groups_path);
+    int rc = replay_databases(c, databases_path);
+    if (rc != TSDB_OK) { free(c); return rc; }
+    rc = replay_groups(c, groups_path);
     if (rc != TSDB_OK) { free(c); return rc; }
     rc = replay_devices(c, devices_path);
     if (rc != TSDB_OK) { free(c); return rc; }
@@ -538,14 +707,16 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     if (rc != TSDB_OK) { free(c); return rc; }
 
     /* Open logs for appending. */
+    c->databases_log = fopen(databases_path, "a");
+    if (!c->databases_log) { free(c); return TSDB_ERR_IO; }
     c->groups_log   = fopen(groups_path,   "a");
-    if (!c->groups_log) { free(c); return TSDB_ERR_IO; }
+    if (!c->groups_log) { fclose(c->databases_log); free(c); return TSDB_ERR_IO; }
     c->devices_log  = fopen(devices_path,  "a");
-    if (!c->devices_log) { fclose(c->groups_log); free(c); return TSDB_ERR_IO; }
+    if (!c->devices_log) { fclose(c->databases_log); fclose(c->groups_log); free(c); return TSDB_ERR_IO; }
     c->stables_log  = fopen(stables_path,  "a");
-    if (!c->stables_log) { fclose(c->groups_log); fclose(c->devices_log); free(c); return TSDB_ERR_IO; }
+    if (!c->stables_log) { fclose(c->databases_log); fclose(c->groups_log); fclose(c->devices_log); free(c); return TSDB_ERR_IO; }
     c->children_log = fopen(children_path, "a");
-    if (!c->children_log) { fclose(c->groups_log); fclose(c->devices_log); fclose(c->stables_log); free(c); return TSDB_ERR_IO; }
+    if (!c->children_log) { fclose(c->databases_log); fclose(c->groups_log); fclose(c->devices_log); fclose(c->stables_log); free(c); return TSDB_ERR_IO; }
 
     *out = c;
     return TSDB_OK;
@@ -556,10 +727,11 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
 
     pthread_mutex_lock(&c->lock);
 
-    if (c->groups_log)   fclose(c->groups_log);
-    if (c->devices_log)  fclose(c->devices_log);
-    if (c->stables_log)  fclose(c->stables_log);
-    if (c->children_log) fclose(c->children_log);
+    if (c->databases_log) fclose(c->databases_log);
+    if (c->groups_log)    fclose(c->groups_log);
+    if (c->devices_log)   fclose(c->devices_log);
+    if (c->stables_log)   fclose(c->stables_log);
+    if (c->children_log)  fclose(c->children_log);
 
     /* Free stables + child_tables hmaps (values are malloc'd). */
     hmap_free_values(&c->stables);      free(c->stables.buckets);
@@ -585,6 +757,10 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
     /* Free groups map. */
     hmap_free_values(&c->groups);
     free(c->groups.buckets);
+
+    /* Free databases map. */
+    hmap_free_values(&c->databases);
+    free(c->databases.buckets);
 
     pthread_mutex_unlock(&c->lock);
     pthread_mutex_destroy(&c->lock);

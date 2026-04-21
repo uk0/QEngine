@@ -149,6 +149,27 @@ static int is_table_dir(const char *name) {
     return 1;
 }
 
+/* Recursively sum file sizes under a directory.  Used to surface the
+ * data_dir's disk footprint in the dashboard's Database header. */
+static uint64_t dir_bytes_recursive(const char *path, int depth) {
+    if (depth > 6) return 0;          /* guard against pathological layouts */
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    uint64_t total = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISREG(st.st_mode))      total += (uint64_t)st.st_size;
+        else if (S_ISDIR(st.st_mode)) total += dir_bytes_recursive(full, depth + 1);
+    }
+    closedir(d);
+    return total;
+}
+
 static int tree_json_cb(void *ud, char *buf, size_t cap) {
     tsdb_db_t *db = (tsdb_db_t *)ud;
     if (!db || !g_local_data_dir[0]) return 0;
@@ -156,11 +177,33 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
     DIR *d = opendir(g_local_data_dir);
     if (!d) return 0;
 
+    /* Derive db name = basename(data_dir).  Fallback to full path. */
+    const char *db_name = strrchr(g_local_data_dir, '/');
+    db_name = (db_name && db_name[1]) ? db_name + 1 : g_local_data_dir;
+
+    char host[128] = "self";
+    gethostname(host, sizeof(host) - 1);
+    host[sizeof(host) - 1] = '\0';
+
+    long uptime_s = 0;
+    if (g_node_start_epoch > 0) {
+        time_t nowt = time(NULL);
+        if (nowt > g_node_start_epoch) uptime_s = (long)(nowt - g_node_start_epoch);
+    }
+
+    uint64_t disk_bytes = dir_bytes_recursive(g_local_data_dir, 0);
+
     int w = 0;
-    w += snprintf(buf + w, cap - (size_t)w, "{\"db\":\"");
     char esc[1024];
+    char name_esc[256];
     j_escape_str(esc, sizeof(esc), g_local_data_dir);
-    w += snprintf(buf + w, cap - (size_t)w, "%s\",\"tables\":[", esc);
+    j_escape_str(name_esc, sizeof(name_esc), db_name);
+    w += snprintf(buf + w, cap - (size_t)w,
+                  "{\"db\":{\"name\":\"%s\",\"path\":\"%s\","
+                   "\"host\":\"%s\",\"uptime_s\":%ld,"
+                   "\"disk_bytes\":%llu},\"tables\":[",
+                   name_esc, esc, host, uptime_s,
+                   (unsigned long long)disk_bytes);
 
     int first = 1;
     struct dirent *de;
@@ -173,27 +216,51 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
         if (stat(path, &st) != 0) continue;
         if (!S_ISDIR(st.st_mode)) continue;
 
-        /* Try to open the table to read its schema.  Opening here is
-         * potentially expensive for very large catalogs, but realistic
-         * catalogs have O(10–100) tables; if it becomes a bottleneck we
-         * can add a lighter-weight schema-read path to the public API. */
         tsdb_table_t *tbl = NULL;
         int rc = tsdb_open_table(db, de->d_name, &tbl);
         if (rc != 0) continue;
 
-        char name_esc[256];
-        j_escape_str(name_esc, sizeof(name_esc), de->d_name);
+        char tbl_name_esc[256];
+        j_escape_str(tbl_name_esc, sizeof(tbl_name_esc), de->d_name);
+        uint64_t tbl_bytes = dir_bytes_recursive(path, 0);
         w += snprintf(buf + w, cap - (size_t)w,
-                      "%s{\"name\":\"%s\",\"kind\":\"table\"}",
-                      first ? "" : ",", name_esc);
+                      "%s{\"name\":\"%s\",\"kind\":\"table\","
+                       "\"bytes\":%llu}",
+                      first ? "" : ",", tbl_name_esc,
+                      (unsigned long long)tbl_bytes);
         first = 0;
-        /* tsdb_open_table caches handles in db — no close required. */
         (void)tbl;
     }
     closedir(d);
 
-    /* Append a GROUPS section pulled via LIST GROUPS QTL.  If the
-     * statement errors (e.g. RBAC not set up), the array is empty. */
+    /* DATABASES section — top-level logical namespace. */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"databases\":[");
+    {
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, "LIST DATABASES;", &res) == 0 && res) {
+            int ncols = tsdb_result_ncols(res);
+            int first_db = 1;
+            while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
+                const char *dn = NULL, *ddesc = NULL;
+                for (int c = 0; c < ncols; c++) {
+                    const char *cn = tsdb_result_col_name(res, c);
+                    if      (cn && strcmp(cn, "name") == 0)        dn    = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "description") == 0) ddesc = tsdb_result_sym(res, c);
+                }
+                if (!dn) continue;
+                char ne[128], de[256];
+                j_escape_str(ne, sizeof(ne), dn);
+                j_escape_str(de, sizeof(de), ddesc ? ddesc : "");
+                w += snprintf(buf + w, cap - (size_t)w,
+                              "%s{\"name\":\"%s\",\"description\":\"%s\"}",
+                              first_db ? "" : ",", ne, de);
+                first_db = 0;
+            }
+            tsdb_result_free(res);
+        }
+    }
+
+    /* GROUPS section — each carries the parent `database`. */
     w += snprintf(buf + w, cap - (size_t)w, "],\"groups\":[");
     {
         tsdb_result_t *res = NULL;
@@ -201,22 +268,47 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
             int ncols = tsdb_result_ncols(res);
             int gfirst = 1;
             while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
-                /* Expect at least a "name" column. */
-                const char *gname = NULL;
+                const char *gname = NULL, *gdb = NULL;
                 for (int c = 0; c < ncols; c++) {
                     const char *cn = tsdb_result_col_name(res, c);
-                    if (cn && (strcmp(cn, "name") == 0 || strcmp(cn, "group") == 0)) {
-                        gname = tsdb_result_sym(res, c);
-                        break;
-                    }
+                    if      (cn && strcmp(cn, "name") == 0)     gname = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "database") == 0) gdb   = tsdb_result_sym(res, c);
                 }
-                if (!gname && ncols > 0) gname = tsdb_result_sym(res, 0);
                 if (!gname) continue;
-                char ge[256]; j_escape_str(ge, sizeof(ge), gname);
+                char ge[256], dbe[128];
+                j_escape_str(ge,  sizeof(ge),  gname);
+                j_escape_str(dbe, sizeof(dbe), gdb ? gdb : "");
                 w += snprintf(buf + w, cap - (size_t)w,
-                              "%s{\"name\":\"%s\"}",
-                              gfirst ? "" : ",", ge);
+                              "%s{\"name\":\"%s\",\"database\":\"%s\"}",
+                              gfirst ? "" : ",", ge, dbe);
                 gfirst = 0;
+            }
+            tsdb_result_free(res);
+        }
+    }
+
+    /* DEVICES section — each carries the parent `group`. */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"devices\":[");
+    {
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, "LIST DEVICES;", &res) == 0 && res) {
+            int ncols = tsdb_result_ncols(res);
+            int first = 1;
+            while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
+                const char *dgroup = NULL, *did = NULL;
+                for (int c = 0; c < ncols; c++) {
+                    const char *cn = tsdb_result_col_name(res, c);
+                    if      (cn && strcmp(cn, "group") == 0) dgroup = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "id")    == 0) did    = tsdb_result_sym(res, c);
+                }
+                if (!did) continue;
+                char gee[128], idee[128];
+                j_escape_str(gee,  sizeof(gee),  dgroup ? dgroup : "");
+                j_escape_str(idee, sizeof(idee), did);
+                w += snprintf(buf + w, cap - (size_t)w,
+                              "%s{\"name\":\"%s\",\"group\":\"%s\"}",
+                              first ? "" : ",", idee, gee);
+                first = 0;
             }
             tsdb_result_free(res);
         }

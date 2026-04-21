@@ -16,13 +16,15 @@ extern "C" {
 #endif
 
 typedef struct {
-    char      name[64];            /* unique across DB */
+    char      name[64];            /* unique across the parent database */
     char      region[32];          /* "us-east-1", "cn-beijing", ... */
     int64_t   retention_ns;        /* 0 = infinite */
     char      codec_profile[32];   /* "default", "chimp128+lz", "raw", ... */
     int       replica_factor;      /* 3 default */
     char      tags[512];           /* flat key=value pairs, comma-separated */
     tsdb_ts_t created_at;
+    /* Parent database.  Empty → implicit "default" database. */
+    char      database[64];
 } tsdb_group_t;
 
 /* Forward declaration — defined in catalog.c */

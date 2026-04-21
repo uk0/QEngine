@@ -50,10 +50,14 @@ struct tsdb_catalog {
     char          data_dir[4096];
     char          cat_dir[4096];
     pthread_mutex_t lock;
+    /* Mirror of catalog.c struct layout — must stay byte-identical.
+     * databases/databases_log added 2026-04 for the 3-level DB model. */
+    hmap_t         databases;
     hmap_t         groups;
     hmap_t         device_index;
     hmap_t         stables;
     hmap_t         child_tables;
+    FILE          *databases_log;
     FILE          *groups_log;
     FILE          *devices_log;
     FILE          *stables_log;

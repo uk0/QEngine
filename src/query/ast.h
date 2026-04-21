@@ -168,6 +168,10 @@ qast_expr_t *qast_mk_call(tsdb_arena_t *a, const char *name, qast_expr_t **args,
 
 typedef enum {
     QAST_STMT_SELECT,          /* existing query */
+    /* Database DDL — top of the 3-level hierarchy (DB → Group → Table). */
+    QAST_STMT_CREATE_DATABASE,
+    QAST_STMT_DROP_DATABASE,
+    QAST_STMT_LIST_DATABASES,
     QAST_STMT_CREATE_GROUP,
     QAST_STMT_DROP_GROUP,
     QAST_STMT_LIST_GROUPS,
@@ -213,6 +217,11 @@ typedef struct {
     qast_stmt_kind_t kind;
     union {
         qast_query_t query;                              /* QAST_STMT_SELECT */
+        /* Database DDL */
+        struct { char name[64]; char description[192]; int64_t retention_ns; }
+               create_database;                          /* QAST_STMT_CREATE_DATABASE */
+        struct { char name[64]; }      drop_database;    /* QAST_STMT_DROP_DATABASE */
+        /* LIST_DATABASES has no extra data */
         struct { tsdb_group_t spec; }  create_group;     /* QAST_STMT_CREATE_GROUP */
         struct { char name[64]; }      drop_group;       /* QAST_STMT_DROP_GROUP */
         /* LIST_GROUPS has no extra data */
