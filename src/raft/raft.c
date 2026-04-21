@@ -27,11 +27,15 @@
 #include "raft_rpc.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../cluster/rpc.h"
 #include "../../include/tsdb.h"
@@ -65,6 +69,8 @@ struct tsdb_raft {
     pthread_mutex_t   lock;
     pthread_cond_t    commit_cv;   /* wake proposer on commit advance */
 
+    char              data_dir[4096]; /* retained for chunked snapshot
+                                          staging under raft/snapshot/ */
     uint64_t          self_id;
     tsdb_node_manager_t *node_mgr;
     tsdb_replica_mgr_t  *replica_mgr;
@@ -106,12 +112,30 @@ struct tsdb_raft {
 
     /* RNG for election timeout randomisation. */
     unsigned int       rng_seed;
+
+    /* Membership-bootstrap plumbing.  When we win leadership on a
+     * cluster whose config.bin hasn't been initialised yet, we set
+     * `pending_seed = 1` under the lock.  The tick thread picks it up,
+     * drops the lock, and proposes a single TSDB_RAFT_CFG_OP_SEED log
+     * entry containing the current ALIVE-master snapshot.  That entry
+     * replicates to every peer via normal log replay; on commit the
+     * apply thread calls tsdb_raft_config_set() everywhere, so LIST
+     * MASTERS converges cluster-wide.  pending_seed is cleared once
+     * a propose call completes (success OR stale-leader failure) so
+     * we don't spin proposing the same entry. */
+    int                pending_seed;
 };
 
 /* Max entries packed into one AppendEntries call.  Keeps the RPC
  * bounded while leaving room for burst replication after a leader
  * change. */
 #define MAX_ENTRIES_PER_AE 64
+
+/* Upper bound on the InstallSnapshot request header.  Matches the
+ * codec layout in raft_rpc.c (INSTALL_HDR_SIZE = 41) with a small
+ * safety margin so the send buffer never truncates an encoded chunk
+ * header even if a future field is bolted on. */
+#define INSTALL_HDR_MAX 128u
 
 /* Auto-compaction threshold.  Once the apply thread has applied this
  * many entries past the current snapshot boundary, we discard the
@@ -203,6 +227,8 @@ static void become_follower_locked(tsdb_raft_t *r, uint64_t new_term,
     }
     r->state     = TSDB_RAFT_FOLLOWER;
     r->leader_id = leader_id;
+    r->pending_seed = 0;   /* follower doesn't seed; if we win again later
+                              and config is still uninit, we'll set it again. */
     reset_election_timer(r);
 }
 
@@ -226,6 +252,15 @@ static void become_leader_locked(tsdb_raft_t *r) {
         r->peers[i].match_index = 0;
     }
     bump_heartbeat_deadline(r);
+
+    /* If the config hasn't been initialised yet (fresh cluster, no
+     * prior SEED entry in any peer's log), mark that we need to emit
+     * one.  The tick thread owns the actual propose call because it
+     * needs to drop r->lock before calling tsdb_raft_propose (which
+     * re-acquires the lock internally).  See tick_thread_main. */
+    if (r->config && !tsdb_raft_config_is_initialised(r->config)) {
+        r->pending_seed = 1;
+    }
 }
 
 /* --- RPC handlers (called from rpc.c via the dispatcher) ------------- */
@@ -377,7 +412,70 @@ static int on_append_entries(void *ud,
     return 0;
 }
 
-/* --- InstallSnapshot handler (follower side) ------------------------- */
+/* --- InstallSnapshot handler (follower side) -------------------------
+ *
+ * The leader streams the body in 64 KB chunks.  We buffer partials to
+ *   <data_dir>/raft/snapshot/incoming.bin.tmp
+ * and only hand the fully-reassembled buffer to snap_restore_fn when
+ * the `done` flag arrives.  Each chunk carries its own byte offset so
+ * duplicates (benign retries on RPC timeout) overwrite in place.
+ *
+ * A mid-transfer crash leaves the tmp file on disk; we nuke it on
+ * raft_open so the next transfer re-starts at offset=0 without us
+ * having to teach the wire to resume.
+ */
+
+/* Build <data_dir>/raft/snapshot/; return 0 on success. */
+static int snap_stage_dir(const tsdb_raft_t *r, char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/raft/snapshot", r->data_dir);
+    if (n <= 0 || (size_t)n >= cap) return -1;
+    /* mkdir -p without pulling in shell utilities.  Ignore EEXIST. */
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s", out);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = 0; (void)mkdir(tmp, 0755); *p = '/'; }
+    }
+    (void)mkdir(tmp, 0755);
+    return 0;
+}
+
+/* Path of the in-progress chunk buffer. */
+static int snap_stage_path(const tsdb_raft_t *r, char *out, size_t cap) {
+    int n = snprintf(out, cap, "%s/raft/snapshot/incoming.bin.tmp",
+                     r->data_dir);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* Append `data_len` bytes at byte position `offset` in the stage file.
+ * Opens with O_CREAT | O_WRONLY; trusts the caller to do seek+write
+ * atomically.  Returns 0 on success. */
+static int snap_stage_write(const char *path, uint32_t offset,
+                             const uint8_t *data, uint32_t data_len)
+{
+    int flags = O_WRONLY;
+    struct stat st;
+    if (offset == 0) {
+        /* Fresh transfer — truncate so a prior aborted one doesn't
+         * leave stale tail bytes past our final `done` offset. */
+        flags |= O_CREAT | O_TRUNC;
+    } else {
+        flags |= O_CREAT;
+    }
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -1;
+    if (data_len > 0) {
+        if (lseek(fd, offset, SEEK_SET) != (off_t)offset) {
+            close(fd); return -1;
+        }
+        ssize_t w = write(fd, data, data_len);
+        if (w < 0 || (uint32_t)w != data_len) { close(fd); return -1; }
+    }
+    /* Keep the file around until done=1; fsync is deferred to the
+     * restore handler which does its own atomic-rename on the body. */
+    (void)st;
+    close(fd);
+    return 0;
+}
 
 static int on_install_snapshot(void *ud,
                                 const tsdb_raft_req_install_t *req,
@@ -413,20 +511,77 @@ static int on_install_snapshot(void *ud,
         return 0;
     }
 
-    /* Hand the body off to the state machine's restore hook (if any).
-     * We release the lock across the restore call because it may do
-     * filesystem I/O; re-acquire to update raft state. */
+    /* Drop the lock across any filesystem I/O (stage write or final
+     * restore hook).  Re-acquire to mutate log markers at the end. */
     tsdb_raft_snapshot_restore_fn fn = r->snap_restore_fn;
     void *sud = r->snap_ud;
     pthread_mutex_unlock(&r->lock);
 
-    int rc = 0;
-    if (fn) {
-        rc = fn(sud, req->data, req->data_len);
+    char stage_dir[4300];
+    char stage_path[4400];
+    if (snap_stage_dir(r, stage_dir, sizeof(stage_dir)) != 0) {
+        pthread_mutex_lock(&r->lock);
+        resp->term = tsdb_raft_log_current_term(r->log);
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+    (void)snap_stage_path(r, stage_path, sizeof(stage_path));
+
+    /* Stage this chunk to disk.  Single-threaded per follower (the RPC
+     * server handler fires these in order from one leader connection),
+     * so we don't need a lock here. */
+    if (snap_stage_write(stage_path, req->offset,
+                          req->data, req->data_len) != 0) {
+        pthread_mutex_lock(&r->lock);
+        resp->term = tsdb_raft_log_current_term(r->log);
+        pthread_mutex_unlock(&r->lock);
+        return 0;
     }
 
+    if (!req->done) {
+        /* More chunks coming.  Ack with our term so the leader keeps
+         * going; do NOT advance log markers yet. */
+        pthread_mutex_lock(&r->lock);
+        resp->term = tsdb_raft_log_current_term(r->log);
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+
+    /* Final chunk arrived — slurp the whole file in and hand it to the
+     * restore hook.  Size = req->offset + req->data_len (computed from
+     * the actual chunk headers rather than stat() so a stale tail can't
+     * leak into the body). */
+    uint32_t body_len = req->offset + req->data_len;
+    uint8_t *body = NULL;
+    int rrc = 0;
+    if (body_len > 0) {
+        body = malloc(body_len);
+        if (!body) rrc = -1;
+        else {
+            int bfd = open(stage_path, O_RDONLY);
+            if (bfd < 0) { rrc = -1; }
+            else {
+                uint32_t got = 0;
+                while (got < body_len) {
+                    ssize_t n = read(bfd, body + got, body_len - got);
+                    if (n <= 0) { rrc = -1; break; }
+                    got += (uint32_t)n;
+                }
+                close(bfd);
+            }
+        }
+    }
+
+    if (rrc == 0 && fn) {
+        rrc = fn(sud, body, body_len);
+    }
+    free(body);
+    /* Stage file is no longer needed — unlink opportunistically.
+     * On failure the leader will retry at offset=0 which truncates. */
+    (void)unlink(stage_path);
+
     pthread_mutex_lock(&r->lock);
-    if (rc == 0) {
+    if (rrc == 0) {
         /* Advance log markers so future AEs with prev_log_index ==
          * last_included_index pass the consistency check. */
         (void)tsdb_raft_log_compact(r->log,
@@ -575,10 +730,11 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
     uint64_t next_idx   = r->peers[peer_idx].next_index;
 
     /* Peer is far enough behind that it needs entries we already
-     * compacted away.  If we have a snapshot-write hook, ship the
-     * body via InstallSnapshot.  Otherwise fall back to the old
-     * behaviour: bump next_index forward and let the peer coast on
-     * heartbeats (stale catalog, but at least not election storm). */
+     * compacted away.  If we have a snapshot-write hook, stream the
+     * body via InstallSnapshot in 64 KB chunks.  Otherwise fall back
+     * to the old behaviour: bump next_index forward and let the peer
+     * coast on heartbeats (stale catalog, but at least not election
+     * storm). */
     if (next_idx <= snap_idx) {
         if (r->snap_write_fn) {
             /* Drop the lock across the (potentially slow) write hook
@@ -595,50 +751,87 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
                 goto skip_snap;
             }
 
-            tsdb_raft_req_install_t sreq = {
-                .term = term,
-                .leader_id = self_id,
-                .last_included_index = snap_idx,
-                .last_included_term  = snap_term,
-                .data_len = body_len,
-                .data = body
-            };
-            size_t bcap = 64 + body_len;
-            uint8_t *sbuf = malloc(bcap);
+            /* Chunked transfer.  64 KB balances per-RPC overhead
+             * against peer-side heartbeat starvation (each chunk
+             * monopolises the peer's RPC slot until ACK).  An empty
+             * body is legitimate on a fresh cluster with a snapshot
+             * marker but no catalog content — send a single done=1
+             * chunk so the follower still advances its log markers. */
+            const uint32_t CHUNK_MAX = 64u * 1024u;
+            uint8_t *sbuf = malloc(INSTALL_HDR_MAX + CHUNK_MAX);
             if (!sbuf) { free(body); goto skip_snap; }
-            int sn = tsdb_raft_encode_req_install(sbuf, bcap, &sreq);
-            if (sn <= 0) { free(sbuf); free(body); goto skip_snap; }
 
-            tsdb_rpc_conn_t *conn2 = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
-            if (!conn2) { free(sbuf); free(body); goto skip_snap; }
+            int aborted = 0;
+            uint32_t off = 0;
+            do {
+                uint32_t remain = body_len - off;
+                uint32_t take   = remain > CHUNK_MAX ? CHUNK_MAX : remain;
+                uint8_t done    = (take == remain);
 
-            uint8_t sresp_buf[32];
-            uint32_t sresp_len = 0;
-            int rc2 = tsdb_rpc_call_recv(conn2, TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
-                                          sbuf, (uint32_t)sn,
-                                          sresp_buf, sizeof(sresp_buf),
-                                          &sresp_len);
+                tsdb_raft_req_install_t sreq = {
+                    .term = term,
+                    .leader_id = self_id,
+                    .last_included_index = snap_idx,
+                    .last_included_term  = snap_term,
+                    .offset              = off,
+                    .done                = done,
+                    .data_len            = take,
+                    .data                = (take > 0) ? (body + off) : NULL
+                };
+                int sn = tsdb_raft_encode_req_install(
+                             sbuf, INSTALL_HDR_MAX + take, &sreq);
+                if (sn <= 0) { aborted = 1; break; }
+
+                tsdb_rpc_conn_t *conn2 =
+                    tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+                if (!conn2) { aborted = 1; break; }
+
+                uint8_t sresp_buf[32];
+                uint32_t sresp_len = 0;
+                int rc2 = tsdb_rpc_call_recv(conn2,
+                                              TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
+                                              sbuf, (uint32_t)sn,
+                                              sresp_buf, sizeof(sresp_buf),
+                                              &sresp_len);
+                if (rc2 != TSDB_OK) { aborted = 1; break; }
+
+                tsdb_raft_resp_install_t sresp = {0};
+                if (tsdb_raft_decode_resp_install(sresp_buf, sresp_len,
+                                                   &sresp) != 0) {
+                    aborted = 1; break;
+                }
+                /* Stale-leader: abort the whole transfer. */
+                pthread_mutex_lock(&r->lock);
+                if (sresp.term > tsdb_raft_log_current_term(r->log)) {
+                    become_follower_locked(r, sresp.term, 0);
+                    pthread_mutex_unlock(&r->lock);
+                    aborted = 1; break;
+                }
+                pthread_mutex_unlock(&r->lock);
+
+                off += take;
+                if (take == 0) break; /* defensive, empty-body 1-shot */
+            } while (off < body_len);
+
             free(sbuf);
             free(body);
-            if (rc2 == TSDB_OK) {
-                tsdb_raft_resp_install_t sresp = {0};
-                if (tsdb_raft_decode_resp_install(sresp_buf, sresp_len, &sresp) == 0) {
-                    pthread_mutex_lock(&r->lock);
-                    if (sresp.term > tsdb_raft_log_current_term(r->log)) {
-                        become_follower_locked(r, sresp.term, 0);
+
+            if (!aborted) {
+                /* All chunks ack'd.  Peer is now caught up through
+                 * snap_idx; AEs from snap_idx+1 will drain the tail. */
+                pthread_mutex_lock(&r->lock);
+                for (int i = 0; i < r->npeers; i++) {
+                    if (r->peers[i].id == peer_id) {
+                        r->peers[i].next_index = snap_idx + 1;
+                        if (r->peers[i].match_index < snap_idx)
+                            r->peers[i].match_index = snap_idx;
+                        break;
                     }
-                    /* Peer now has last_included_index covered. */
-                    for (int i = 0; i < r->npeers; i++) {
-                        if (r->peers[i].id == peer_id) {
-                            r->peers[i].next_index = snap_idx + 1;
-                            if (r->peers[i].match_index < snap_idx)
-                                r->peers[i].match_index = snap_idx;
-                            break;
-                        }
-                    }
-                    pthread_mutex_unlock(&r->lock);
                 }
+                pthread_mutex_unlock(&r->lock);
             }
+            /* Either way, next heartbeat retries; abort on transient
+             * failure is cheaper than an infinite re-try storm here. */
             return;
 
 skip_snap:
@@ -752,6 +945,119 @@ static void replicate_all(tsdb_raft_t *r) {
     for (int i = 0; i < np; i++) replicate_to(r, peers[i]);
 }
 
+/* Forward decl — propose is defined later; the tick thread needs it
+ * to drive the leader-seeded config bootstrap. */
+int tsdb_raft_propose(tsdb_raft_t *r,
+                       tsdb_raft_entry_type_t type,
+                       const void *payload, uint32_t payload_len,
+                       int timeout_ms);
+
+/* Encode a TSDB_RAFT_CFG_OP_SEED payload:
+ *   u8  op = TSDB_RAFT_CFG_OP_SEED
+ *   u8  count
+ *   [ u64 id | u8 addr_len | char addr[addr_len] ] * count
+ *
+ * Returns encoded bytes on success, 0 on cap overflow. */
+static uint32_t encode_cfg_seed(const tsdb_raft_cfg_member_t *members,
+                                 int n,
+                                 uint8_t *buf, uint32_t cap)
+{
+    if (n < 0 || n > 255) return 0;
+    if (cap < 2) return 0;
+    uint32_t off = 0;
+    buf[off++] = TSDB_RAFT_CFG_OP_SEED;
+    buf[off++] = (uint8_t)n;
+    for (int i = 0; i < n; i++) {
+        uint8_t al = (uint8_t)strnlen(members[i].addr,
+                                       sizeof(members[i].addr));
+        if (al > 79) al = 79;
+        if ((uint32_t)(off + 8 + 1 + al) > cap) return 0;
+        memcpy(buf + off, &members[i].id, 8);
+        off += 8;
+        buf[off++] = al;
+        if (al > 0) {
+            memcpy(buf + off, members[i].addr, al);
+            off += al;
+        }
+    }
+    return off;
+}
+
+/* Called by the tick thread OUTSIDE r->lock when the leader won
+ * election on a fresh cluster (pending_seed set).  Builds a SEED
+ * payload from ALIVE master peers + self and proposes it.  On success
+ * or on "not leader any more" outcome, pending_seed is cleared so we
+ * don't re-propose.  Temporary failures (timeout, no quorum yet)
+ * leave the flag set so the next tick retries. */
+static void drive_pending_seed(tsdb_raft_t *r) {
+    /* Snapshot everything we need to build the payload under the
+     * lock; release it before calling propose (which acquires). */
+    pthread_mutex_lock(&r->lock);
+    if (r->state != TSDB_RAFT_LEADER || !r->pending_seed) {
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+    /* If config somehow got populated while we weren't looking
+     * (e.g. apply thread replayed a SEED from the log on a quick
+     * reboot), clear the flag and bail — no need to propose. */
+    if (r->config && tsdb_raft_config_is_initialised(r->config)) {
+        r->pending_seed = 0;
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+
+    /* Snapshot gossip-ALIVE masters (including self). */
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int ns = tsdb_node_manager_snapshot(r->node_mgr, snap,
+                                          TSDB_CLUSTER_MAX_NODES);
+    tsdb_raft_cfg_member_t members[TSDB_RAFT_CFG_MAX_MASTERS];
+    int nm = 0;
+    for (int i = 0; i < ns && nm < TSDB_RAFT_CFG_MAX_MASTERS; i++) {
+        if (snap[i].role != TSDB_ROLE_MASTER) continue;
+        if (snap[i].state == TSDB_NODE_DEAD) continue;
+        members[nm].id = snap[i].id;
+        snprintf(members[nm].addr, sizeof(members[nm].addr), "%s",
+                 snap[i].addr);
+        nm++;
+    }
+    /* Ensure self is in the seed (gossip may not list self depending
+     * on the impl; defensive). */
+    int have_self = 0;
+    for (int i = 0; i < nm; i++) {
+        if (members[i].id == r->self_id) { have_self = 1; break; }
+    }
+    if (!have_self && nm < TSDB_RAFT_CFG_MAX_MASTERS) {
+        const char *addr = tsdb_node_manager_local_addr(r->node_mgr);
+        members[nm].id = r->self_id;
+        snprintf(members[nm].addr, sizeof(members[nm].addr), "%s",
+                 addr ? addr : "");
+        nm++;
+    }
+    pthread_mutex_unlock(&r->lock);
+
+    if (nm < 1) return; /* retry next tick */
+
+    uint8_t payload[2 + TSDB_RAFT_CFG_MAX_MASTERS * (8 + 1 + 80)];
+    uint32_t plen = encode_cfg_seed(members, nm, payload, sizeof(payload));
+    if (plen == 0) return;
+
+    /* Short timeout — keeps the tick thread responsive.  If the
+     * propose doesn't commit within 500 ms the next tick retries.
+     * That also covers the "cluster lost quorum mid-propose" case. */
+    int prc = tsdb_raft_propose(r, TSDB_RAFT_ENTRY_CONFIG, payload, plen, 500);
+
+    pthread_mutex_lock(&r->lock);
+    if (prc == TSDB_OK) {
+        r->pending_seed = 0;
+    } else if (prc == TSDB_ERR_PERMISSION) {
+        /* Lost leadership mid-propose.  become_follower_locked already
+         * cleared pending_seed; belt-and-suspenders. */
+        r->pending_seed = 0;
+    }
+    /* Any other error (IO / timeout): leave flag set, next tick retries. */
+    pthread_mutex_unlock(&r->lock);
+}
+
 /* --- Tick thread ----------------------------------------------------- */
 
 static void *tick_thread_main(void *arg) {
@@ -769,29 +1075,18 @@ static void *tick_thread_main(void *arg) {
 
         int64_t now = now_ns();
 
-        /* Post-grace config auto-seed for the LIST MASTERS read-out
-         * (advisory only; quorum still uses gossip).  Writes once.  */
-        pthread_mutex_lock(&r->lock);
-        if (r->config && !tsdb_raft_config_is_initialised(r->config) &&
-            now >= r->startup_grace_until_ns && r->npeers >= 1) {
-            tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
-            int n2 = tsdb_node_manager_snapshot(r->node_mgr, snap,
-                                                 TSDB_CLUSTER_MAX_NODES);
-            tsdb_raft_cfg_member_t seed[TSDB_RAFT_CFG_MAX_MASTERS];
-            int nm = 0;
-            for (int i = 0; i < n2 && nm < TSDB_RAFT_CFG_MAX_MASTERS; i++) {
-                if (snap[i].role != TSDB_ROLE_MASTER) continue;
-                if (snap[i].state == TSDB_NODE_DEAD) continue;
-                seed[nm].id = snap[i].id;
-                snprintf(seed[nm].addr, sizeof(seed[nm].addr), "%s",
-                         snap[i].addr);
-                nm++;
-            }
-            if (nm >= 1) (void)tsdb_raft_config_set(r->config, seed, nm);
-        }
-        pthread_mutex_unlock(&r->lock);
-
+        /* Leader-seeded config bootstrap.  Every node used to seed
+         * config.bin independently right after the startup grace
+         * window — but that's a race: early starters saw fewer
+         * masters than late starters, so LIST MASTERS diverged
+         * across the cluster on a fresh boot.  Now only the LEADER
+         * proposes a SEED log entry (TSDB_RAFT_CFG_OP_SEED) with the
+         * master snapshot it sees; followers pick it up through
+         * normal replication.  See become_leader_locked() for the
+         * flag that kicks this off. */
         if (st == TSDB_RAFT_LEADER) {
+            drive_pending_seed(r);
+
             if (now >= hb) {
                 /* One AppendEntries sweep per peer — carries entries
                  * when the peer is behind, empty payload otherwise
@@ -854,6 +1149,17 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
     r->apply_ud    = apply_ud;
     r->state       = TSDB_RAFT_FOLLOWER;
     r->rng_seed    = (unsigned)(local_id ^ (uint64_t)now_ns());
+    snprintf(r->data_dir, sizeof(r->data_dir), "%s", data_dir);
+
+    /* Wipe any stale snapshot-chunk staging file left by a mid-
+     * transfer crash.  Leader always re-starts at offset=0 so there's
+     * nothing worth resuming. */
+    {
+        char stale[4200];
+        int n = snprintf(stale, sizeof(stale),
+                         "%s/raft/snapshot/incoming.bin.tmp", data_dir);
+        if (n > 0 && (size_t)n < sizeof(stale)) (void)unlink(stale);
+    }
 
     r->log = tsdb_raft_log_open(data_dir);
     if (!r->log) { free(r); return NULL; }
@@ -1030,23 +1336,67 @@ static void *apply_thread_main(void *arg) {
             if (tsdb_raft_log_read(r->log, idx, &e) != 0) break;
             if (e.type == TSDB_RAFT_ENTRY_CONFIG) {
                 /* Raft owns CONFIG entries — apply directly to the
-                 * persistent config file.  Payload:
-                 *   u8 op | u64 id | u8 addr_len | char addr[addr_len] */
-                if (e.payload_len >= 10 && r->config) {
+                 * persistent config file.  Three op codes:
+                 *   ADD    → u8 op | u64 id | u8 addr_len | char addr[]
+                 *   REMOVE → u8 op | u64 id | u8 addr_len | char addr[]
+                 *                                 (addr ignored)
+                 *   SEED   → u8 op | u8 count | [u64 id | u8 addr_len |
+                 *                                 char addr[]] * count
+                 *
+                 * SEED is emitted exactly once per cluster life by the
+                 * first elected leader against a pristine config.bin;
+                 * we replay it with tsdb_raft_config_set() so every
+                 * node converges on the same LIST MASTERS view. */
+                if (e.payload_len >= 1 && r->config) {
                     uint8_t *p = (uint8_t *)e.payload;
                     uint8_t op = p[0];
-                    uint64_t id;
-                    memcpy(&id, p + 1, 8);
-                    uint8_t al = p[9];
-                    char addr[80] = {0};
-                    if ((uint32_t)(10 + al) <= e.payload_len && al < sizeof(addr)) {
-                        memcpy(addr, p + 10, al);
-                        addr[al] = '\0';
-                    }
-                    if (op == TSDB_RAFT_CFG_OP_ADD) {
-                        (void)tsdb_raft_config_add(r->config, id, addr);
-                    } else if (op == TSDB_RAFT_CFG_OP_REMOVE) {
-                        (void)tsdb_raft_config_remove(r->config, id);
+                    if (op == TSDB_RAFT_CFG_OP_ADD ||
+                        op == TSDB_RAFT_CFG_OP_REMOVE) {
+                        if (e.payload_len >= 10) {
+                            uint64_t id;
+                            memcpy(&id, p + 1, 8);
+                            uint8_t al = p[9];
+                            char addr[80] = {0};
+                            if ((uint32_t)(10 + al) <= e.payload_len &&
+                                al < sizeof(addr)) {
+                                memcpy(addr, p + 10, al);
+                                addr[al] = '\0';
+                            }
+                            if (op == TSDB_RAFT_CFG_OP_ADD)
+                                (void)tsdb_raft_config_add(r->config, id, addr);
+                            else
+                                (void)tsdb_raft_config_remove(r->config, id);
+                        }
+                    } else if (op == TSDB_RAFT_CFG_OP_SEED) {
+                        if (e.payload_len >= 2) {
+                            uint8_t count = p[1];
+                            uint32_t off = 2;
+                            tsdb_raft_cfg_member_t members[TSDB_RAFT_CFG_MAX_MASTERS];
+                            int nm = 0;
+                            int valid = 1;
+                            for (int m = 0; m < count &&
+                                 nm < TSDB_RAFT_CFG_MAX_MASTERS; m++) {
+                                if (off + 9 > e.payload_len) { valid = 0; break; }
+                                uint64_t id;
+                                memcpy(&id, p + off, 8);
+                                off += 8;
+                                uint8_t al = p[off++];
+                                if (off + al > e.payload_len) { valid = 0; break; }
+                                char addr[80] = {0};
+                                uint8_t use_al = al < 79 ? al : 79;
+                                if (use_al > 0) memcpy(addr, p + off, use_al);
+                                addr[use_al] = '\0';
+                                off += al;
+                                members[nm].id = id;
+                                snprintf(members[nm].addr,
+                                          sizeof(members[nm].addr), "%s", addr);
+                                nm++;
+                            }
+                            if (valid && nm >= 1) {
+                                (void)tsdb_raft_config_set(r->config,
+                                                            members, nm);
+                            }
+                        }
                     }
                 }
             } else if (r->apply_fn) {

@@ -191,13 +191,19 @@ int tsdb_raft_decode_resp_append(const uint8_t *buf, size_t len,
 /* ---- InstallSnapshot codecs --------------------------------------------
  *
  * Wire layout (all LE, no padding):
- *   req  (hdr 36 B + data):
+ *   req  (hdr 41 B + chunk data):
  *     term u64 | leader_id u64 | last_idx u64 | last_term u64 |
- *     data_len u32 | data[data_len]
+ *     offset u32 | done u8 | data_len u32 | data[data_len]
+ *
+ *   The split lets the leader stream the body in 64 KB chunks; the
+ *   follower buffers partials to disk and only apply-restores when
+ *   done=1.  The on-disk BODY produced by snap_write_fn (num_files |
+ *   ...) is unchanged — chunking is purely a transport concern.
+ *
  *   resp (8 B): term u64
  */
 
-#define INSTALL_HDR_SIZE (8u + 8u + 8u + 8u + 4u) /* 36 */
+#define INSTALL_HDR_SIZE (8u + 8u + 8u + 8u + 4u + 1u + 4u) /* 41 */
 #define RESP_INSTALL_SIZE 8u
 
 int tsdb_raft_encode_req_install(uint8_t *buf, size_t cap,
@@ -210,7 +216,9 @@ int tsdb_raft_encode_req_install(uint8_t *buf, size_t cap,
     put_u64(buf +  8, in->leader_id);
     put_u64(buf + 16, in->last_included_index);
     put_u64(buf + 24, in->last_included_term);
-    put_u32(buf + 32, in->data_len);
+    put_u32(buf + 32, in->offset);
+    buf[36]         = in->done ? 1 : 0;
+    put_u32(buf + 37, in->data_len);
     if (in->data_len > 0) {
         if (!in->data) return -1;
         memcpy(buf + INSTALL_HDR_SIZE, in->data, in->data_len);
@@ -226,7 +234,9 @@ int tsdb_raft_decode_req_install(const uint8_t *buf, size_t len,
     out->leader_id           = get_u64(buf +  8);
     out->last_included_index = get_u64(buf + 16);
     out->last_included_term  = get_u64(buf + 24);
-    out->data_len            = get_u32(buf + 32);
+    out->offset              = get_u32(buf + 32);
+    out->done                = buf[36] ? 1 : 0;
+    out->data_len            = get_u32(buf + 37);
     if ((size_t)INSTALL_HDR_SIZE + out->data_len > len) return -1;
     /* Data points into the caller's RPC buffer — caller must copy if
      * needed past the request lifetime. */

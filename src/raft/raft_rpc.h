@@ -103,16 +103,22 @@ int tsdb_raft_decode_resp_append(const uint8_t *buf, size_t len,
  *
  * Sent when a follower's next_index is already below the leader's
  * snap_index — i.e. the entries the follower needs were compacted
- * away.  The leader ships the full snapshot body in one shot.
- * Chunking (§7 of the thesis) is a follow-up; for catalog snapshots
- * the body stays well under a few MB in practice.
+ * away.  The leader streams the snapshot body in 64 KB chunks (§7 of
+ * the thesis); `offset` names the starting byte of the current chunk
+ * within the full body, and `done==1` on the final chunk.  Chunks are
+ * sent sequentially with wait-for-ack so the follower can buffer
+ * partials in one receive file; the on-disk BODY format produced by
+ * the snapshot-write callback (num_files | name | content_len |
+ * content) is intentionally unchanged.
  */
 typedef struct {
     uint64_t term;
     uint64_t leader_id;
     uint64_t last_included_index;
     uint64_t last_included_term;
-    uint32_t data_len;
+    uint32_t offset;              /* byte offset of this chunk in body */
+    uint8_t  done;                /* 1 = final chunk, 0 = more coming */
+    uint32_t data_len;            /* bytes of data in THIS chunk */
     const uint8_t *data;          /* borrowed from caller buffer */
 } tsdb_raft_req_install_t;
 

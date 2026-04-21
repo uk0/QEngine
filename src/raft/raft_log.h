@@ -48,6 +48,17 @@ typedef enum {
 
 #define TSDB_RAFT_CFG_OP_ADD    1u
 #define TSDB_RAFT_CFG_OP_REMOVE 2u
+/* SEED: leader-only bootstrap of the master set.  Payload layout is
+ * distinct from ADD/REMOVE:
+ *   u8  op = TSDB_RAFT_CFG_OP_SEED
+ *   u8  count
+ *   [ u64 id | u8 addr_len | char addr[addr_len] ] * count
+ *
+ * Replayed via tsdb_raft_config_set() — i.e. it replaces the member
+ * list wholesale.  Applied by every peer on committed log entry,
+ * guaranteeing a fresh cluster converges on the same LIST MASTERS
+ * view regardless of gossip race order. */
+#define TSDB_RAFT_CFG_OP_SEED   3u
 
 typedef struct {
     uint64_t index;        /* 1-based Raft log index */

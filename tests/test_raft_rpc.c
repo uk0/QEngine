@@ -126,11 +126,77 @@ static void t_resp_append(void) {
     PASS("append response round-trip");
 }
 
+/* Chunked InstallSnapshot: the header grew from 36 B to 41 B in order
+ * to carry (offset u32, done u8) — verify both fields survive the
+ * encode/decode, and that an intermediate chunk (done=0) with a
+ * non-trivial offset round-trips byte-for-byte. */
+static void t_install_snapshot_chunk(void) {
+    printf("\n[5] InstallSnapshot request round-trip (chunked)\n");
+    uint8_t payload[256];
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = (uint8_t)(i * 31);
+
+    /* Intermediate chunk: offset=64 KB, done=0. */
+    tsdb_raft_req_install_t mid = {
+        .term = 5, .leader_id = 0x1122334455667788ULL,
+        .last_included_index = 777, .last_included_term = 4,
+        .offset   = 65536,
+        .done     = 0,
+        .data_len = sizeof(payload),
+        .data     = payload
+    };
+    uint8_t buf[512];
+    int n = tsdb_raft_encode_req_install(buf, sizeof(buf), &mid);
+    assert(n == 41 + (int)sizeof(payload));
+
+    tsdb_raft_req_install_t got = {0};
+    assert(tsdb_raft_decode_req_install(buf, (size_t)n, &got) == 0);
+    assert(got.term == mid.term);
+    assert(got.leader_id == mid.leader_id);
+    assert(got.last_included_index == mid.last_included_index);
+    assert(got.last_included_term  == mid.last_included_term);
+    assert(got.offset   == 65536);
+    assert(got.done     == 0);
+    assert(got.data_len == sizeof(payload));
+    assert(memcmp(got.data, payload, sizeof(payload)) == 0);
+    PASS("intermediate chunk encodes offset + done=0");
+
+    /* Final chunk: done=1, empty body (legal — the final chunk may just
+     * carry the terminator flag when the stream ends on a chunk
+     * boundary). */
+    tsdb_raft_req_install_t final_ch = {
+        .term = 5, .leader_id = 99,
+        .last_included_index = 777, .last_included_term = 4,
+        .offset = 131072, .done = 1, .data_len = 0, .data = NULL
+    };
+    n = tsdb_raft_encode_req_install(buf, sizeof(buf), &final_ch);
+    assert(n == 41);
+    tsdb_raft_req_install_t got2 = {0};
+    assert(tsdb_raft_decode_req_install(buf, (size_t)n, &got2) == 0);
+    assert(got2.done == 1 && got2.offset == 131072 && got2.data_len == 0);
+    assert(got2.data == NULL);
+    PASS("final empty chunk with done=1");
+
+    /* Truncated header (39 of 41 bytes) must fail cleanly. */
+    tsdb_raft_req_install_t bad = {0};
+    assert(tsdb_raft_decode_req_install(buf, 39, &bad) == -1);
+    PASS("truncated header surfaces -1");
+
+    /* Response round-trip. */
+    tsdb_raft_resp_install_t rin = { .term = 99 };
+    n = tsdb_raft_encode_resp_install(buf, sizeof(buf), &rin);
+    assert(n == 8);
+    tsdb_raft_resp_install_t rout;
+    assert(tsdb_raft_decode_resp_install(buf, (size_t)n, &rout) == 0);
+    assert(rout.term == 99);
+    PASS("install response round-trip");
+}
+
 int main(void) {
     t_vote();
     t_append_heartbeat();
     t_append_with_entries();
     t_resp_append();
+    t_install_snapshot_chunk();
     printf("\n=== all raft_rpc codec tests passed ===\n");
     return 0;
 }
