@@ -205,9 +205,19 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
                    name_esc, esc, host, uptime_s,
                    (unsigned long long)disk_bytes);
 
+    /* Legacy "tables" section — a flat on-disk dir scan.  In an
+     * industrial catalog (thousands of PTables) this duplicates what
+     * `ptables:[]` below already exposes via the catalog, and walking
+     * each dir with dir_bytes_recursive() is expensive.  Cap the list
+     * at a handful so the dashboard still shows something on blank
+     * deployments, but punt large catalogs through the cleaner
+     * databases/vtables/ptables sections. */
     int first = 1;
+    int tables_emitted = 0;
+    const int TABLES_SECTION_CAP = 32;
     struct dirent *de;
-    while ((de = readdir(d)) != NULL && (size_t)w < cap - 256) {
+    while ((de = readdir(d)) != NULL && (size_t)w < cap - 256
+           && tables_emitted < TABLES_SECTION_CAP) {
         if (!is_table_dir(de->d_name)) continue;
         /* Must be a directory. */
         char path[4096];
@@ -229,6 +239,7 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
                       first ? "" : ",", tbl_name_esc,
                       (unsigned long long)tbl_bytes);
         first = 0;
+        tables_emitted++;
         (void)tbl;
     }
     closedir(d);

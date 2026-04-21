@@ -271,15 +271,24 @@ static void *handle_connection(void *arg) {
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body_c, (size_t)blen);
     } else if (route_tree) {
-        /* Catalog tree for the dashboard left-hand navigator. */
-        char body_t[64 * 1024];
+        /* Catalog tree for the dashboard left-hand navigator.
+         *
+         * Size: 8 MB on the heap (not stack).  A 4-level industrial
+         * catalog (1 DB × 8 Groups × 64 VTables × 5000 PTables) emits
+         * ~400 KB already; reserve enough headroom that future fleets
+         * with 50 K+ tables still render instead of getting truncated
+         * right before the `databases:[]` / `vtables:[]` sections. */
+        size_t cap = 8u * 1024u * 1024u;
+        char *body_t = malloc(cap);
         int blen = 0;
-        if (g_tree_fn) blen = g_tree_fn(g_tree_ud, body_t, sizeof(body_t));
-        if (blen <= 0) {
-            blen = snprintf(body_t, sizeof(body_t),
-                            "{\"db\":\"%s\",\"tables\":[],"
-                            "\"note\":\"tree provider not installed\"}\n",
-                            g_data_dir);
+        if (body_t) {
+            if (g_tree_fn) blen = g_tree_fn(g_tree_ud, body_t, cap);
+            if (blen <= 0) {
+                blen = snprintf(body_t, cap,
+                                "{\"db\":\"%s\",\"tables\":[],"
+                                "\"note\":\"tree provider not installed\"}\n",
+                                g_data_dir);
+            }
         }
         char hdr[256];
         int hlen = snprintf(hdr, sizeof(hdr),
@@ -290,7 +299,10 @@ static void *handle_connection(void *arg) {
             "Connection: close\r\n\r\n",
             blen);
         write_all(fd, hdr, (size_t)hlen);
-        write_all(fd, body_t, (size_t)blen);
+        if (body_t) {
+            write_all(fd, body_t, (size_t)blen);
+            free(body_t);
+        }
     } else if (route_sql) {
         /* Execute a SQL / QTL statement.
          *
