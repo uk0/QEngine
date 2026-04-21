@@ -5355,6 +5355,25 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         return TSDB_OK;
     }
 
+    /* Data-node guard: on any cluster node that didn't bind a raft
+     * handle (TSDB_NODE_ROLE=data, or raft disabled on a master that's
+     * still bootstrapping) catalog DDL must not run locally — the
+     * catalog is raft-owned and any local write will diverge from the
+     * committed view.  Fresh catalog-DDL from a client should be sent
+     * to a master instead.  The cluster-node-mgr check excludes the
+     * legacy single-process server where db has no cluster binding —
+     * there, local DDL is still the right behaviour. */
+    if (!raft && is_catalog_ddl(stmt.kind) && !tsdb_g_inside_raft_apply &&
+        tsdb_cluster_node_mgr_for_db(db) != NULL)
+    {
+        tsdb_arena_free(&a);
+        result_status(r,
+            "ERR: catalog DDL is not accepted on a data node — send "
+            "to any master (TSDB_NODE_ROLE=master, see LIST MASTERS)");
+        *out = r;
+        return TSDB_OK;
+    }
+
     tsdb_arena_free(&a);
 
     /* DDL statements require the catalog. */
@@ -5881,6 +5900,28 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 result_append_sym(r, 0, idbuf);
                 result_append_sym(r, 1, mems[i].addr);
                 result_ddl_end_row(r);
+            }
+        } else if (rc == TSDB_OK) {
+            /* Data-node fallback: no raft handle, so we can't read the
+             * committed config.  Fall back to the gossip node manager —
+             * every master advertises role=master, so filtering ALIVE
+             * nodes by role gives the same answer the leader would
+             * return, modulo gossip freshness. */
+            tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr_for_db(db);
+            if (mgr) {
+                tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+                int n = tsdb_node_manager_snapshot(mgr, snap,
+                                                    TSDB_CLUSTER_MAX_NODES);
+                for (int i = 0; i < n; i++) {
+                    if (snap[i].role != TSDB_ROLE_MASTER) continue;
+                    if (snap[i].state == TSDB_NODE_DEAD) continue;
+                    char idbuf[32];
+                    snprintf(idbuf, sizeof(idbuf), "%llu",
+                             (unsigned long long)snap[i].id);
+                    result_append_sym(r, 0, idbuf);
+                    result_append_sym(r, 1, snap[i].addr);
+                    result_ddl_end_row(r);
+                }
             }
         }
         break;

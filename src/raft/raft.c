@@ -1098,11 +1098,14 @@ static void *tick_thread_main(void *arg) {
             }
         } else {
             /* Don't race into an election during the startup grace
-             * period, and don't elect ourselves when no peer is known
-             * yet — doing so gives us a 1-node quorum and every node
-             * trivially wins its own term.  In both cases just reset
-             * the timer and hope the next tick sees peers. */
-            if (now < grace_until || np == 0) {
+             * period: on a fresh multi-master cluster, gossip needs a
+             * moment to deliver peer addresses and without the grace
+             * every master would elect itself (1-node quorum) and we'd
+             * split-brain.  After grace, np==0 is legitimate — it
+             * means the gossip view really has no other masters, which
+             * is the normal shape of a 1-master topology — and the
+             * lone master must elect itself to make progress. */
+            if (now < grace_until) {
                 pthread_mutex_lock(&r->lock);
                 reset_election_timer(r);
                 pthread_mutex_unlock(&r->lock);
@@ -1454,6 +1457,14 @@ int tsdb_raft_propose(tsdb_raft_t *r,
         return TSDB_ERR_IO;
     }
     uint64_t my_index = entry.index;
+    /* On a single-master cluster (npeers==0) no AppendEntries response
+     * ever comes back, so the usual path through replicate_to →
+     * maybe_advance_commit_locked never fires — the leader would hang
+     * forever waiting for its own entry to commit.  The leader's own
+     * last_index counts toward the quorum; kick the advance here so a
+     * lone leader makes immediate progress.  For multi-node clusters
+     * this is a cheap no-op: quorum isn't satisfied until peers ack. */
+    maybe_advance_commit_locked(r);
     pthread_mutex_unlock(&r->lock);
 
     /* Kick the replicate sweep right away so we don't wait a full

@@ -713,10 +713,150 @@ static const char *type_name(tsdb_type_t t) {
     return "UNKNOWN";
 }
 
+/* Minimal TCP-HTTP client just good enough to forward POST /sql from
+ * a data node to a master dashboard.  No keepalive, no pipelining,
+ * one request per connection; blocking I/O with a generous overall
+ * timeout.  Every cluster node exposes the dashboard API on the same
+ * conventional port (28094), so we swap the port in the master's
+ * gossip-advertised host:RPC address. */
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/time.h>
+#include <errno.h>
+
+#define TSDB_METRICS_DEFAULT_PORT 28094
+
+static int http_post_sql(const char *host, int port,
+                          const char *q, size_t qlen,
+                          char *body_buf, size_t body_cap)
+{
+    struct addrinfo hints = {0}, *ai = NULL;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &ai) != 0) return -1;
+
+    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0) { freeaddrinfo(ai); return -1; }
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+        close(fd); freeaddrinfo(ai); return -1;
+    }
+    freeaddrinfo(ai);
+
+    /* Build body {"q":"…"} with minimal escaping for quote + backslash. */
+    size_t esc_cap = qlen * 2 + 16;
+    char *esc = malloc(esc_cap);
+    if (!esc) { close(fd); return -1; }
+    size_t ew = 0;
+    esc[ew++] = '{'; esc[ew++] = '"'; esc[ew++] = 'q'; esc[ew++] = '"';
+    esc[ew++] = ':'; esc[ew++] = '"';
+    for (size_t i = 0; i < qlen && ew + 2 < esc_cap; i++) {
+        char c = q[i];
+        if (c == '"' || c == '\\') esc[ew++] = '\\';
+        esc[ew++] = c;
+    }
+    if (ew + 2 >= esc_cap) { free(esc); close(fd); return -1; }
+    esc[ew++] = '"'; esc[ew++] = '}';
+
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "POST /sql HTTP/1.1\r\nHost: %s\r\n"
+        "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n", host, ew);
+    if (hlen <= 0 || send(fd, hdr, (size_t)hlen, 0) != hlen ||
+        send(fd, esc, ew, 0) != (ssize_t)ew) {
+        free(esc); close(fd); return -1;
+    }
+    free(esc);
+
+    /* Read full HTTP response into a local buffer, then slice body. */
+    size_t rcap = 64 * 1024, rlen = 0;
+    char *raw = malloc(rcap);
+    if (!raw) { close(fd); return -1; }
+    for (;;) {
+        if (rlen + 4096 > rcap) {
+            size_t nc = rcap * 2;
+            if (nc > 4 * 1024 * 1024) break;
+            char *nr = realloc(raw, nc);
+            if (!nr) break;
+            raw = nr; rcap = nc;
+        }
+        ssize_t n = recv(fd, raw + rlen, rcap - rlen - 1, 0);
+        if (n <= 0) break;
+        rlen += (size_t)n;
+    }
+    close(fd);
+    raw[rlen] = '\0';
+
+    /* Locate body after "\r\n\r\n". */
+    char *body = strstr(raw, "\r\n\r\n");
+    if (!body) { free(raw); return -1; }
+    body += 4;
+    size_t blen = rlen - (size_t)(body - raw);
+    if (blen >= body_cap) blen = body_cap - 1;
+    memcpy(body_buf, body, blen);
+    body_buf[blen] = '\0';
+    free(raw);
+    return (int)blen;
+}
+
+static int proxy_sql_to_master(tsdb_db_t *db,
+                                const char *q, size_t qlen,
+                                char *buf, size_t cap)
+{
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr_for_db(db);
+    if (!mgr) return -1;
+
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    for (int i = 0; i < n; i++) {
+        if (snap[i].role != TSDB_ROLE_MASTER) continue;
+        if (snap[i].state == TSDB_NODE_DEAD) continue;
+
+        /* addr is "host:RPC_PORT"; split on ':'. */
+        char host[128];
+        snprintf(host, sizeof(host), "%s", snap[i].addr);
+        char *colon = strchr(host, ':');
+        if (!colon) continue;
+        *colon = '\0';
+
+        int rc = http_post_sql(host, TSDB_METRICS_DEFAULT_PORT,
+                                q, qlen, buf, cap);
+        if (rc > 0) return rc;
+    }
+    return -1;
+}
+
 static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Peek the first keyword (ASCII, case-insensitive) to decide whether a
+ * query is a catalog DDL the data-node must forward to a master.  We
+ * intentionally stay keyword-based — the full parse happens on the
+ * master; the data node doesn't need a second parser. */
+static int query_is_catalog_ddl(const char *q, size_t qlen) {
+    size_t i = 0;
+    while (i < qlen && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' ||
+                        q[i] == '\r')) i++;
+    const char *p = q + i;
+    size_t left = qlen - i;
+    static const char *kw[] = {
+        "CREATE", "DROP", "ALTER", "ADD ", "REMOVE ", NULL
+    };
+    for (int k = 0; kw[k]; k++) {
+        size_t kl = strlen(kw[k]);
+        if (left >= kl && strncasecmp(p, kw[k], kl) == 0) return 1;
+    }
+    return 0;
 }
 
 static int sql_exec_cb(void *ud, const char *q, size_t qlen,
@@ -724,6 +864,17 @@ static int sql_exec_cb(void *ud, const char *q, size_t qlen,
 {
     tsdb_db_t *db = (tsdb_db_t *)ud;
     if (!db) return snprintf(buf, cap, "{\"error\":\"db not ready\"}");
+
+    /* Data-node UX fix: when the dashboard lands on a node without a
+     * Raft handle AND the statement is a catalog DDL, transparently
+     * forward to a master so CREATE DB / GROUP / TABLE just work.
+     * Clients still get the same JSON shape they would see if they
+     * had hit the master directly. */
+    if (!tsdb_db_raft_for_db(db) && query_is_catalog_ddl(q, qlen)) {
+        int prc = proxy_sql_to_master(db, q, qlen, buf, cap);
+        if (prc > 0) return prc;
+        /* else fall through — local exec will surface the guard msg */
+    }
 
     /* Ensure q is NUL-terminated; we copy because the HTTP parser
      * already left it NUL-terminated but belt-and-suspenders. */
