@@ -95,11 +95,17 @@ struct tsdb_raft {
 
     /* Tick thread control. */
     pthread_t          tick_thread;
+    pthread_t          apply_thread;
     int                tick_running;
 
     /* RNG for election timeout randomisation. */
     unsigned int       rng_seed;
 };
+
+/* Max entries packed into one AppendEntries call.  Keeps the RPC
+ * bounded while leaving room for burst replication after a leader
+ * change. */
+#define MAX_ENTRIES_PER_AE 64
 
 /* --- Time helpers ----------------------------------------------------- */
 
@@ -423,57 +429,164 @@ static void run_election_unlocked(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
 }
 
-/* --- Heartbeat (leader only) --------------------------------------- */
+/* --- Commit advance (leader only) ------------------------------------
+ *
+ * After any matchIndex update, sweep the range [commit_index+1,
+ * last_index] to see whether a majority of matchIndex[i] has caught
+ * up.  Raft §5.4.2: only commit entries whose term == currentTerm.
+ * Called under r->lock. */
+static void maybe_advance_commit_locked(tsdb_raft_t *r) {
+    if (r->state != TSDB_RAFT_LEADER) return;
+    uint64_t last    = tsdb_raft_log_last_index(r->log);
+    uint64_t current = tsdb_raft_log_current_term(r->log);
+    int quorum = quorum_needed(r);
 
-static void send_heartbeat_to(tsdb_raft_t *r, uint64_t peer_id) {
+    for (uint64_t N = last; N > r->commit_index; N--) {
+        if (tsdb_raft_log_term_at(r->log, N) != current) continue;
+        int count = 1; /* self */
+        for (int i = 0; i < r->npeers; i++) {
+            if (r->peers[i].match_index >= N) count++;
+        }
+        if (count >= quorum) {
+            r->commit_index = N;
+            pthread_cond_broadcast(&r->commit_cv);
+            return;
+        }
+    }
+}
+
+/* --- Replication (leader only) ---------------------------------------
+ *
+ * One AppendEntries sweep to peer_id.  Packs up to MAX_ENTRIES_PER_AE
+ * entries starting at the peer's next_index.  An empty call (peer is
+ * fully caught up) doubles as a heartbeat.
+ *
+ * Success → bumps peer.match_index and kicks the commit-advance check.
+ * Term-conflict failure → rewinds peer.next_index using the peer's
+ * match_index hint so the next AE re-tries from a safer point. */
+static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
+    /* Snapshot the state we need while holding the lock, then drop
+     * it for the blocking RPC.  Entries are copied into a local
+     * buffer so the peer's log can race freely. */
     pthread_mutex_lock(&r->lock);
     if (r->state != TSDB_RAFT_LEADER) {
         pthread_mutex_unlock(&r->lock);
         return;
     }
-    uint64_t term           = tsdb_raft_log_current_term(r->log);
-    uint64_t prev_log_index = tsdb_raft_log_last_index(r->log);
-    uint64_t prev_log_term  = tsdb_raft_log_last_term(r->log);
-    uint64_t commit         = r->commit_index;
+    int peer_idx = -1;
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].id == peer_id) { peer_idx = i; break; }
+    }
+    if (peer_idx < 0) {
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+
+    uint64_t term       = tsdb_raft_log_current_term(r->log);
+    uint64_t commit     = r->commit_index;
+    uint64_t last_idx   = tsdb_raft_log_last_index(r->log);
+    uint64_t next_idx   = r->peers[peer_idx].next_index;
+    uint64_t prev_idx   = next_idx > 0 ? next_idx - 1 : 0;
+    uint64_t prev_term  = prev_idx > 0 ? tsdb_raft_log_term_at(r->log, prev_idx) : 0;
+
+    /* How many entries to pack? */
+    uint32_t n_send = 0;
+    if (last_idx >= next_idx) {
+        uint64_t span = last_idx - next_idx + 1;
+        n_send = span > MAX_ENTRIES_PER_AE ? MAX_ENTRIES_PER_AE : (uint32_t)span;
+    }
+
+    tsdb_raft_entry_t *entries = NULL;
+    if (n_send > 0) {
+        entries = calloc(n_send, sizeof(tsdb_raft_entry_t));
+        if (!entries) { pthread_mutex_unlock(&r->lock); return; }
+        for (uint32_t i = 0; i < n_send; i++) {
+            uint64_t idx = next_idx + i;
+            tsdb_raft_entry_t tmp = {0};
+            if (tsdb_raft_log_read(r->log, idx, &tmp) != 0) {
+                for (uint32_t j = 0; j < i; j++) free(entries[j].payload);
+                free(entries);
+                pthread_mutex_unlock(&r->lock);
+                return;
+            }
+            entries[i] = tmp; /* payload malloc'd by log_read */
+        }
+    }
     pthread_mutex_unlock(&r->lock);
 
     tsdb_raft_req_append_t req = {
         .term = term, .leader_id = r->self_id,
-        .prev_log_index = prev_log_index, .prev_log_term = prev_log_term,
+        .prev_log_index = prev_idx, .prev_log_term = prev_term,
         .leader_commit  = commit,
-        .n_entries = 0, .entries = NULL
+        .n_entries = n_send, .entries = entries
     };
-    uint8_t req_buf[128];
-    int rn = tsdb_raft_encode_req_append(req_buf, sizeof(req_buf), &req);
-    if (rn <= 0) return;
+
+    /* Size the RPC buffer generously: header + entries + 1 KB slack. */
+    size_t bcap = tsdb_raft_append_buf_cap(n_send, 4096) + 1024;
+    uint8_t *req_buf = malloc(bcap);
+    if (!req_buf) goto done;
+    int rn = tsdb_raft_encode_req_append(req_buf, bcap, &req);
+    if (rn <= 0) { free(req_buf); goto done; }
 
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
-    if (!conn) return;
+    if (!conn) { free(req_buf); goto done; }
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
     int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_APPEND_ENTRIES,
                                  req_buf, (uint32_t)rn,
                                  resp_buf, sizeof(resp_buf), &resp_len);
-    if (rc != TSDB_OK) return;
+    free(req_buf);
+    if (rc != TSDB_OK) goto done;
 
     tsdb_raft_resp_append_t resp = {0};
-    if (tsdb_raft_decode_resp_append(resp_buf, resp_len, &resp) != 0) return;
+    if (tsdb_raft_decode_resp_append(resp_buf, resp_len, &resp) != 0) goto done;
 
     pthread_mutex_lock(&r->lock);
     if (resp.term > tsdb_raft_log_current_term(r->log)) {
         become_follower_locked(r, resp.term, 0);
+        pthread_mutex_unlock(&r->lock);
+        goto done;
+    }
+    /* Re-find the peer in case rebuild_peers shuffled the table. */
+    int new_idx = -1;
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].id == peer_id) { new_idx = i; break; }
+    }
+    if (new_idx < 0 || r->state != TSDB_RAFT_LEADER) {
+        pthread_mutex_unlock(&r->lock);
+        goto done;
+    }
+    if (resp.success) {
+        uint64_t new_match = prev_idx + n_send;
+        if (new_match > r->peers[new_idx].match_index)
+            r->peers[new_idx].match_index = new_match;
+        r->peers[new_idx].next_index = new_match + 1;
+        maybe_advance_commit_locked(r);
+    } else {
+        /* Roll back: follower's hint is its last matching index. */
+        uint64_t hint = resp.match_index;
+        if (hint + 1 < r->peers[new_idx].next_index)
+            r->peers[new_idx].next_index = hint + 1;
+        else if (r->peers[new_idx].next_index > 1)
+            r->peers[new_idx].next_index--;
     }
     pthread_mutex_unlock(&r->lock);
+
+done:
+    if (entries) {
+        for (uint32_t i = 0; i < n_send; i++) free(entries[i].payload);
+        free(entries);
+    }
 }
 
-static void send_heartbeats(tsdb_raft_t *r) {
+static void replicate_all(tsdb_raft_t *r) {
     pthread_mutex_lock(&r->lock);
     uint64_t peers[MAX_PEERS];
     int np = r->npeers;
     for (int i = 0; i < np; i++) peers[i] = r->peers[i].id;
     pthread_mutex_unlock(&r->lock);
-    for (int i = 0; i < np; i++) send_heartbeat_to(r, peers[i]);
+    for (int i = 0; i < np; i++) replicate_to(r, peers[i]);
 }
 
 /* --- Tick thread ----------------------------------------------------- */
@@ -494,7 +607,10 @@ static void *tick_thread_main(void *arg) {
         int64_t now = now_ns();
         if (st == TSDB_RAFT_LEADER) {
             if (now >= hb) {
-                send_heartbeats(r);
+                /* One AppendEntries sweep per peer — carries entries
+                 * when the peer is behind, empty payload otherwise
+                 * (so it also serves as a heartbeat). */
+                replicate_all(r);
                 pthread_mutex_lock(&r->lock);
                 bump_heartbeat_deadline(r);
                 pthread_mutex_unlock(&r->lock);
@@ -524,6 +640,11 @@ static void *tick_thread_main(void *arg) {
     }
     return NULL;
 }
+
+/* Forward decl — apply thread body is defined below tsdb_raft_propose
+ * because it's conceptually part of the propose/apply pipeline.  We
+ * only need the symbol up here for pthread_create. */
+static void *apply_thread_main(void *arg);
 
 /* --- Public API ----------------------------------------------------- */
 
@@ -570,13 +691,24 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
         free(r);
         return NULL;
     }
+    if (pthread_create(&r->apply_thread, NULL, apply_thread_main, r) != 0) {
+        r->tick_running = 0;
+        pthread_join(r->tick_thread, NULL);
+        tsdb_raft_log_close(r->log);
+        free(r);
+        return NULL;
+    }
     return r;
 }
 
 void tsdb_raft_close(tsdb_raft_t *r) {
     if (!r) return;
+    pthread_mutex_lock(&r->lock);
     r->tick_running = 0;
+    pthread_cond_broadcast(&r->commit_cv); /* unstick apply thread */
+    pthread_mutex_unlock(&r->lock);
     pthread_join(r->tick_thread, NULL);
+    pthread_join(r->apply_thread, NULL);
     tsdb_raft_rpc_set_handlers(NULL, NULL, NULL);
     tsdb_raft_log_close(r->log);
     pthread_cond_destroy(&r->commit_cv);
@@ -622,20 +754,100 @@ uint64_t tsdb_raft_last_index(tsdb_raft_t *r) {
     return r ? tsdb_raft_log_last_index(r->log) : 0;
 }
 
-/* Propose: stub for now (pre-#37 replication).  Returns PERMISSION if
- * not leader so the caller can redirect; otherwise IO because
- * replication isn't wired yet.  Real implementation lands in the next
- * commit together with AppendEntries log-replication. */
+/* --- Apply thread -----------------------------------------------------
+ *
+ * Drains committed-but-unapplied entries into the state machine via
+ * apply_fn.  Decoupled from the RPC path so a slow apply (e.g. a big
+ * catalog log replay) can't stall heartbeats. */
+static void *apply_thread_main(void *arg) {
+    tsdb_raft_t *r = (tsdb_raft_t *)arg;
+    while (r->tick_running) {
+        pthread_mutex_lock(&r->lock);
+        while (r->tick_running && r->last_applied >= r->commit_index) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;  /* wake up at least every second to check
+                                tick_running during shutdown */
+            pthread_cond_timedwait(&r->commit_cv, &r->lock, &ts);
+        }
+        if (!r->tick_running) { pthread_mutex_unlock(&r->lock); break; }
+        uint64_t to_apply = r->last_applied + 1;
+        uint64_t commit   = r->commit_index;
+        pthread_mutex_unlock(&r->lock);
+
+        for (uint64_t idx = to_apply; idx <= commit; idx++) {
+            tsdb_raft_entry_t e = {0};
+            if (tsdb_raft_log_read(r->log, idx, &e) != 0) break;
+            if (r->apply_fn) {
+                (void)r->apply_fn(r->apply_ud, &e);
+            }
+            free(e.payload);
+            pthread_mutex_lock(&r->lock);
+            r->last_applied = idx;
+            pthread_cond_broadcast(&r->commit_cv); /* wake proposers */
+            pthread_mutex_unlock(&r->lock);
+        }
+    }
+    return NULL;
+}
+
+/* --- Propose --------------------------------------------------------
+ *
+ * Append locally, then wait for commit_index to catch up.  We reuse
+ * the tick thread's replicate_all() sweep to push the entry to peers
+ * (fires every HEARTBEAT_MS ≈ 50 ms).  For a tighter RTT the caller
+ * could kick a condvar that speeds up the next sweep — left as a
+ * future optimisation; current latency is bounded by heartbeat_ms. */
 int tsdb_raft_propose(tsdb_raft_t *r,
                        tsdb_raft_entry_type_t type,
                        const void *payload, uint32_t payload_len,
                        int timeout_ms)
 {
-    (void)type; (void)payload; (void)payload_len; (void)timeout_ms;
     if (!r) return TSDB_ERR_INVAL;
+
     pthread_mutex_lock(&r->lock);
-    tsdb_raft_state_t s = r->state;
+    if (r->state != TSDB_RAFT_LEADER) {
+        pthread_mutex_unlock(&r->lock);
+        return TSDB_ERR_PERMISSION;
+    }
+
+    /* Append entry at (last_index + 1) in the current term. */
+    tsdb_raft_entry_t entry = {
+        .term        = tsdb_raft_log_current_term(r->log),
+        .type        = (uint32_t)type,
+        .payload_len = payload_len,
+        .payload     = (void *)payload, /* log.append copies */
+    };
+    if (tsdb_raft_log_append(r->log, &entry) != 0) {
+        pthread_mutex_unlock(&r->lock);
+        return TSDB_ERR_IO;
+    }
+    uint64_t my_index = entry.index;
     pthread_mutex_unlock(&r->lock);
-    if (s != TSDB_RAFT_LEADER) return TSDB_ERR_PERMISSION;
-    return TSDB_ERR_IO; /* replication not yet wired */
+
+    /* Kick the replicate sweep right away so we don't wait a full
+     * heartbeat_ms for propagation. */
+    replicate_all(r);
+
+    /* Wait until commit_index catches up (and apply too, so the caller
+     * sees the state machine effect of their write). */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    int tmo = timeout_ms > 0 ? timeout_ms : 5000;
+    deadline.tv_sec  += tmo / 1000;
+    deadline.tv_nsec += (long)(tmo % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec  += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&r->lock);
+    int rc = TSDB_OK;
+    while (r->last_applied < my_index) {
+        if (r->state != TSDB_RAFT_LEADER) { rc = TSDB_ERR_PERMISSION; break; }
+        int w = pthread_cond_timedwait(&r->commit_cv, &r->lock, &deadline);
+        if (w == ETIMEDOUT) { rc = TSDB_ERR_IO; break; }
+    }
+    pthread_mutex_unlock(&r->lock);
+    return rc;
 }
