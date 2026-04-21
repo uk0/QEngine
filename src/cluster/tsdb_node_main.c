@@ -263,7 +263,7 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
         }
     }
 
-    /* VTABLES section (super-tables). */
+    /* VTABLES section (super-tables).  4-level path: DB → Group → VTable. */
     w += snprintf(buf + w, cap - (size_t)w, "],\"vtables\":[");
     {
         tsdb_result_t *res = NULL;
@@ -271,30 +271,32 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
             int ncols = tsdb_result_ncols(res);
             int first_v = 1;
             while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
-                const char *vn = NULL, *vdb = NULL;
+                const char *vn = NULL, *vdb = NULL, *vgrp = NULL;
                 int ncols_v = 0, ntags_v = 0;
                 for (int c = 0; c < ncols; c++) {
                     const char *cn = tsdb_result_col_name(res, c);
                     if      (cn && strcmp(cn, "name")       == 0) vn      = tsdb_result_sym(res, c);
                     else if (cn && strcmp(cn, "database")   == 0) vdb     = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "group")      == 0) vgrp    = tsdb_result_sym(res, c);
                     else if (cn && strcmp(cn, "ncols")      == 0) ncols_v = (int)tsdb_result_i64(res, c);
                     else if (cn && strcmp(cn, "ntag_cols")  == 0) ntags_v = (int)tsdb_result_i64(res, c);
                 }
                 if (!vn) continue;
-                char ne[128], dbe[128];
+                char ne[128], dbe[128], gre[128];
                 j_escape_str(ne,  sizeof(ne),  vn);
-                j_escape_str(dbe, sizeof(dbe), vdb ? vdb : "");
+                j_escape_str(dbe, sizeof(dbe), vdb  ? vdb  : "");
+                j_escape_str(gre, sizeof(gre), vgrp ? vgrp : "");
                 w += snprintf(buf + w, cap - (size_t)w,
                               "%s{\"name\":\"%s\",\"database\":\"%s\","
-                              "\"ncols\":%d,\"ntags\":%d}",
-                              first_v ? "" : ",", ne, dbe, ncols_v, ntags_v);
+                              "\"group\":\"%s\",\"ncols\":%d,\"ntags\":%d}",
+                              first_v ? "" : ",", ne, dbe, gre, ncols_v, ntags_v);
                 first_v = 0;
             }
             tsdb_result_free(res);
         }
     }
 
-    /* PTABLES section (child tables). */
+    /* PTABLES section (child tables).  Inherits ancestry from parent VT. */
     w += snprintf(buf + w, cap - (size_t)w, "],\"ptables\":[");
     {
         tsdb_result_t *res = NULL;
@@ -302,22 +304,24 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
             int ncols = tsdb_result_ncols(res);
             int first_p = 1;
             while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
-                const char *pn = NULL, *pv = NULL, *pdb = NULL;
+                const char *pn = NULL, *pv = NULL, *pdb = NULL, *pgrp = NULL;
                 for (int c = 0; c < ncols; c++) {
                     const char *cn = tsdb_result_col_name(res, c);
-                    if      (cn && strcmp(cn, "name")     == 0) pn  = tsdb_result_sym(res, c);
-                    else if (cn && strcmp(cn, "vtable")   == 0) pv  = tsdb_result_sym(res, c);
-                    else if (cn && strcmp(cn, "database") == 0) pdb = tsdb_result_sym(res, c);
+                    if      (cn && strcmp(cn, "name")     == 0) pn   = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "vtable")   == 0) pv   = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "database") == 0) pdb  = tsdb_result_sym(res, c);
+                    else if (cn && strcmp(cn, "group")    == 0) pgrp = tsdb_result_sym(res, c);
                 }
                 if (!pn) continue;
-                char ne[128], ve[128], dbe[128];
+                char ne[128], ve[128], dbe[128], gre[128];
                 j_escape_str(ne,  sizeof(ne),  pn);
-                j_escape_str(ve,  sizeof(ve),  pv  ? pv  : "");
-                j_escape_str(dbe, sizeof(dbe), pdb ? pdb : "");
+                j_escape_str(ve,  sizeof(ve),  pv   ? pv   : "");
+                j_escape_str(dbe, sizeof(dbe), pdb  ? pdb  : "");
+                j_escape_str(gre, sizeof(gre), pgrp ? pgrp : "");
                 w += snprintf(buf + w, cap - (size_t)w,
                               "%s{\"name\":\"%s\",\"vtable\":\"%s\","
-                              "\"database\":\"%s\"}",
-                              first_p ? "" : ",", ne, ve, dbe);
+                              "\"database\":\"%s\",\"group\":\"%s\"}",
+                              first_p ? "" : ",", ne, ve, dbe, gre);
                 first_p = 0;
             }
             tsdb_result_free(res);

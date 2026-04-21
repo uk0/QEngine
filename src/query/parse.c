@@ -788,20 +788,38 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             tok_copy(&p.tok, st->name, sizeof(st->name));
             advance(&p);
 
-            /* Optional "IN DATABASE <name>" — binds the VTable to a DB
-             * so the dashboard hierarchy nests it under the DB node. */
-            if (accept(&p, QTOK_IN)) {
-                if (p.tok.kind != QTOK_IDENT ||
-                    !(ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
-                    perr(&p, "expected DATABASE after IN");
+            /* Optional "IN DATABASE <name>" and/or "IN GROUP <name>"
+             * clauses — industrial 4-level hierarchy
+             * (Database → Group → VTable → PTable).  Either clause may
+             * appear in either order; both are optional. */
+            for (int clause = 0; clause < 2 && accept(&p, QTOK_IN); clause++) {
+                if (p.tok.kind == QTOK_IDENT &&
+                    (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->database, sizeof(st->database));
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_IDENT &&
+                           ident_ci(&p.tok, "group")) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->group, sizeof(st->group));
+                    advance(&p);
+                } else if (accept(&p, QTOK_GROUP)) {
+                    /* GROUP is a keyword — handle lexer path. */
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->group, sizeof(st->group));
+                    advance(&p);
+                } else {
+                    perr(&p, "expected DATABASE or GROUP after IN");
                     return TSDB_ERR_PARSE;
                 }
-                advance(&p);
-                if (p.tok.kind != QTOK_IDENT) {
-                    perr(&p, "expected database name"); return TSDB_ERR_PARSE;
-                }
-                tok_copy(&p.tok, st->database, sizeof(st->database));
-                advance(&p);
             }
 
             /* Parse column list: (col_name type, ...) */

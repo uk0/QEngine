@@ -45,9 +45,10 @@ typedef struct {
     tsdb_stable_col_t  tag_cols[TSDB_STABLE_MAX_TAG_COLS];
     int                ntag_cols;
     tsdb_ts_t          created_at;
-    /* Parent database (3-level model: DB → VTable → PTable).
-     * Empty = unassigned / implicit root. */
+    /* 4-level hierarchy: Database → Group → VTable (this) → PTable.
+     * Either field empty → attaches to the implicit root of its parent. */
     char               database[64];
+    char               group[64];
 } tsdb_stable_t;
 
 /* Tag value slot: one per tag column, union of supported types. */
@@ -66,8 +67,9 @@ typedef struct {
     tsdb_tag_val_t   tags[TSDB_STABLE_MAX_TAG_COLS];
     int              ntags;
     tsdb_ts_t        created_at;
-    /* Parent database — inherits from the stable when blank. */
+    /* Ancestry — inherits from the parent VTable when blank. */
     char             database[64];
+    char             group[64];
 } tsdb_child_table_t;
 
 /* ── catalog-level APIs (defined in stable_catalog.c) ────────────────── */

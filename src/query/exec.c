@@ -4956,23 +4956,23 @@ static const tsdb_type_t LIST_DBS_TYPES[] = {
 
 /* LIST VTABLES result columns. */
 static const char *LIST_VTABS_COLS[] = {
-    "name","ncols","ntag_cols","created_at","database"
+    "name","ncols","ntag_cols","created_at","database","group"
 };
 static const tsdb_type_t LIST_VTABS_TYPES[] = {
     TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64, TSDB_TYPE_INT64,
-    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL
+    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL
 };
-#define LIST_VTABS_NCOLS 5
+#define LIST_VTABS_NCOLS 6
 
 /* LIST PTABLES result columns. */
 static const char *LIST_PTABS_COLS[] = {
-    "name","vtable","ntags","created_at","database"
+    "name","vtable","ntags","created_at","database","group"
 };
 static const tsdb_type_t LIST_PTABS_TYPES[] = {
     TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64,
-    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL
+    TSDB_TYPE_TIMESTAMP, TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL
 };
-#define LIST_PTABS_NCOLS 5
+#define LIST_PTABS_NCOLS 6
 
 static const char *LIST_DEVICES_COLS[] = {"group","id","type","location","tags","last_seen","status"};
 static const tsdb_type_t LIST_DEVICES_TYPES[] = {
@@ -5135,6 +5135,7 @@ static int exec_list_vtables(tsdb_catalog_t *cat, tsdb_result_t *r) {
         result_append_i64_val(r, 2, (int64_t)s->ntag_cols);
         result_append_ts_val(r, 3, s->created_at);
         result_append_sym(r, 4, s->database);
+        result_append_sym(r, 5, s->group);
         result_ddl_end_row(r);
     }
     free(arr);
@@ -5163,6 +5164,7 @@ static int exec_list_ptables(tsdb_catalog_t *cat, const char *vtable_filter,
         result_append_i64_val(r, 2, (int64_t)ct->ntags);
         result_append_ts_val(r, 3, ct->created_at);
         result_append_sym(r, 4, ct->database);
+        result_append_sym(r, 5, ct->group);
         result_ddl_end_row(r);
     }
     free(arr);
@@ -5466,13 +5468,17 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             result_status(r, "ERR: child table already exists");
             break;
         }
-        /* Inherit the parent stable's database when the AST didn't
-         * carry one — makes every PTable automatically nest under the
-         * same DB as its VTable. */
+        /* Inherit the parent VTable's ancestry (database + group) when
+         * the AST didn't carry one.  Keeps every PTable nested under
+         * the same 4-level path (Database → Group → VTable → PTable). */
         tsdb_child_table_t ct_registered = *ct_in;
         if (!ct_registered.database[0] && st.database[0]) {
             snprintf(ct_registered.database,
                      sizeof(ct_registered.database), "%s", st.database);
+        }
+        if (!ct_registered.group[0] && st.group[0]) {
+            snprintf(ct_registered.group,
+                     sizeof(ct_registered.group), "%s", st.group);
         }
         rc = tsdb_child_table_create(cat, &ct_registered);
         if (rc == TSDB_OK) rc = result_status(r, "OK: child table created");

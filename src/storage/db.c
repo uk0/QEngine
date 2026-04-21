@@ -50,7 +50,13 @@ typedef struct tsdb_table_internal {
 
 /* ---- DB handle ---------------------------------------------------------- */
 
-#define TSDB_DB_MAX_TABLES 128
+/* Raised from 128 (a dev-scale cap) to 16384 so a single node can hold
+ * the thousands of child tables an industrial time-series workload
+ * expects — a mid-size factory with 64 super-tables × 100 devices
+ * already blows through the old limit after one commissioning run.
+ * The array lives in the struct, so the only cost is ~128 KB of
+ * pointer space per open db. */
+#define TSDB_DB_MAX_TABLES 16384
 
 struct tsdb_db {
     char             data_dir[4096];

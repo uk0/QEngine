@@ -174,6 +174,12 @@ static int stable_log_write(tsdb_catalog_t *c, char op, const tsdb_stable_t *s) 
             fprintf(c->stables_log, "\t%s:%d", s->cols[i].name, (int)s->cols[i].type);
         for (int i = 0; i < s->ntag_cols; i++)
             fprintf(c->stables_log, "\t%s:%d", s->tag_cols[i].name, (int)s->tag_cols[i].type);
+        /* Ancestry tail — key=value tokens, skipped by older replayers
+         * that only read ncols+ntag_cols cols from this record.  This
+         * keeps the on-disk format backward-compatible while persisting
+         * the 4-level hierarchy (Database → Group → VTable → PTable). */
+        if (s->database[0]) fprintf(c->stables_log, "\tDB=%s",  s->database);
+        if (s->group[0])    fprintf(c->stables_log, "\tGRP=%s", s->group);
         fprintf(c->stables_log, "\n");
     }
     fflush(c->stables_log);
@@ -207,6 +213,9 @@ static int child_log_write(tsdb_catalog_t *c, char op, const tsdb_child_table_t 
                 fprintf(c->children_log, "\t0:");
             }
         }
+        /* Ancestry tail — see stable_log_write comment. */
+        if (ct->database[0]) fprintf(c->children_log, "\tDB=%s",  ct->database);
+        if (ct->group[0])    fprintf(c->children_log, "\tGRP=%s", ct->group);
         fprintf(c->children_log, "\n");
     }
     fflush(c->children_log);
@@ -250,6 +259,13 @@ int tsdb_catalog_replay_stables(tsdb_catalog_t *c, const char *path) {
                 *colon = 0;
                 snprintf(s->tag_cols[i].name, sizeof(s->tag_cols[i].name), "%s", fields[fi]);
                 s->tag_cols[i].type = (tsdb_type_t)atoi(colon + 1);
+            }
+            /* Optional DB=<name> / GRP=<name> tail — forward-compat. */
+            for (; fi < nf; fi++) {
+                if (!strncmp(fields[fi], "DB=", 3))
+                    snprintf(s->database, sizeof(s->database), "%s", fields[fi] + 3);
+                else if (!strncmp(fields[fi], "GRP=", 4))
+                    snprintf(s->group, sizeof(s->group), "%s", fields[fi] + 4);
             }
             sc_hmap_put(&c->stables, s->name, s);
         } else if (!strcmp(fields[0], "-stable") && nf >= 2) {
@@ -296,6 +312,13 @@ int tsdb_catalog_replay_children(tsdb_catalog_t *c, const char *path) {
                     break;
                 default: break;
                 }
+            }
+            /* Optional DB=<name> / GRP=<name> tail — forward-compat. */
+            for (; fi < nf; fi++) {
+                if (!strncmp(fields[fi], "DB=", 3))
+                    snprintf(ct->database, sizeof(ct->database), "%s", fields[fi] + 3);
+                else if (!strncmp(fields[fi], "GRP=", 4))
+                    snprintf(ct->group, sizeof(ct->group), "%s", fields[fi] + 4);
             }
             sc_hmap_put(&c->child_tables, ct->name, ct);
         } else if (!strcmp(fields[0], "-child") && nf >= 2) {
