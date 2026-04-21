@@ -201,7 +201,16 @@ func writerLoop(cfg cfg, pts []ptableSpec, done chan struct{},
 		_, err := c.WriteBatch(pt.name, cols, rows)
 		if err != nil {
 			atomic.AddInt64(&s.errs, 1)
-			// Back off briefly on error.
+			// The server has a per-connection resource budget (e.g.
+			// the RPC layer may slot-evict, or a peer replica RPC
+			// timed out and poisoned our socket).  A dead TCP socket
+			// leaks the writer forever — reopen so the next batch
+			// lands on a fresh session.
+			_ = c.Close()
+			nc, nerr := tsdb.Open(cfg.Addr, 15*time.Second)
+			if nerr == nil {
+				c = nc
+			}
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
