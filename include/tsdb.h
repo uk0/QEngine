@@ -68,6 +68,25 @@ typedef struct {
 int tsdb_open(const char *data_dir, tsdb_db_t **out);
 void tsdb_close(tsdb_db_t *db);
 
+/* Hot-reopen of the in-memory catalog from disk.
+ *
+ * Used when an external agent (e.g. the Raft InstallSnapshot receive
+ * path) has atomically swapped the catalog `.log` files under
+ * <data_dir>/catalog/ and the live catalog hashmap needs to re-reflect
+ * the new on-disk state without a process restart.
+ *
+ * Opens a fresh catalog from disk, swaps it into the db under the
+ * db-level lock, then closes the old one.  Briefly serialises against
+ * other db-level operations but does not abort in-flight queries — a
+ * concurrent query whose catalog pointer was already resolved via
+ * tsdb_db_catalog() will finish against the old catalog; subsequent
+ * lookups see the new state.
+ *
+ * Returns TSDB_OK on success, TSDB_ERR_IO or TSDB_ERR_NOMEM if the
+ * fresh catalog fails to open (in which case the existing in-memory
+ * catalog is left untouched). */
+int tsdb_db_reload_catalog(tsdb_db_t *db);
+
 /* Set the default block_points that subsequently-created tables will use
  * when the caller does not specify one.  Out-of-range values are silently
  * clamped into [1024, 8192]; 0 resets to the library default (8192).

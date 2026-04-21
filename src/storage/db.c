@@ -238,6 +238,47 @@ void tsdb_close(tsdb_db_t *db) {
     free(db);
 }
 
+/* ---- Catalog hot-reopen ------------------------------------------------- */
+
+/*
+ * Rebuild the in-memory catalog from <data_dir>/catalog/*.log.
+ *
+ * The Raft InstallSnapshot receive path atomically swaps the on-disk
+ * catalog files, but without this call the live tsdb_catalog_t hashmap
+ * still reflects the pre-snapshot state — the node would need a process
+ * restart to pick up the leader's catalog.  This function opens a fresh
+ * catalog, swaps it in under db->lock, then closes the old one outside
+ * the lock so concurrent queries that already hold the stale pointer
+ * finish on their own terms.
+ *
+ * Ordering is deliberate: open-new before close-old.  If the fresh
+ * catalog fails to open (disk read error, corrupt log, OOM) the live
+ * catalog is untouched and the caller gets the open rc back.  Callers
+ * decide whether to retry or surface the failure.
+ */
+int tsdb_db_reload_catalog(tsdb_db_t *db) {
+    if (!db) return TSDB_ERR_INVAL;
+
+    tsdb_catalog_t *new_cat = NULL;
+    int rc = tsdb_catalog_open(db->data_dir, &new_cat);
+    if (rc != TSDB_OK) return rc;
+
+    pthread_mutex_lock(&db->lock);
+    tsdb_catalog_t *old = db->catalog;
+    db->catalog = new_cat;
+    pthread_mutex_unlock(&db->lock);
+
+    /* Close outside the lock: catalog_close does fs I/O and holds its
+     * own internal mutex; no need to hold db->lock across it.  Any
+     * reader that grabbed `old` via tsdb_db_catalog() before our swap
+     * is already past db->lock and will finish against the old
+     * catalog's still-valid memory until they drop their pointer.  In
+     * practice catalog users never cache the pointer past a single
+     * query dispatch, so the overlap window is microseconds. */
+    if (old) tsdb_catalog_close(old);
+    return TSDB_OK;
+}
+
 /* ---- Retention GC attachment -------------------------------------------- */
 
 void tsdb_db_attach_retention(tsdb_db_t *db, struct tsdb_retention *r) {

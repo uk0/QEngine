@@ -134,7 +134,7 @@ static int raft_snapshot_write_cb(void *ud, uint8_t **out, uint32_t *out_len) {
 static int raft_snapshot_restore_cb(void *ud,
                                      const uint8_t *data, uint32_t data_len)
 {
-    (void)ud;
+    tsdb_db_t *db = (tsdb_db_t *)ud;   /* may be NULL on a minimal setup */
     if (!data || data_len < 4 || !g_local_data_dir[0]) return -1;
 
     char cat_dir[4200];
@@ -182,10 +182,30 @@ static int raft_snapshot_restore_cb(void *ud,
         snprintf(dpath, sizeof(dpath), "%s/%s", cat_dir, name);
         if (rename(spath, dpath) != 0) return -1;
     }
-    fprintf(stderr,
-            "[raft-snap] restored %u catalog file(s) from leader "
-            "(%u bytes).  Node restart required for in-memory catalog "
-            "to reflect the snapshot.\n", nf, data_len);
+
+    /* Hot-reopen the in-memory catalog so subsequent LIST / query /
+     * apply paths see the leader's state without a process restart.
+     * When db is NULL (legacy callers that didn't plumb it) we fall
+     * back to the old "restart required" behaviour — disk state is
+     * correct, only the live hashmap is stale. */
+    if (db) {
+        int rrc = tsdb_db_reload_catalog(db);
+        if (rrc != TSDB_OK) {
+            fprintf(stderr,
+                    "[raft-snap] restored %u file(s) (%u B) but catalog "
+                    "reload failed rc=%d — node may serve stale data "
+                    "until restart\n", nf, data_len, rrc);
+            return 0;
+        }
+        fprintf(stderr,
+                "[raft-snap] restored %u catalog file(s) from leader "
+                "(%u bytes); in-memory catalog reloaded\n", nf, data_len);
+    } else {
+        fprintf(stderr,
+                "[raft-snap] restored %u catalog file(s) from leader "
+                "(%u bytes); node restart required for in-memory "
+                "catalog to reflect the snapshot\n", nf, data_len);
+    }
     return 0;
 }
 
@@ -899,7 +919,7 @@ int main(int argc, char **argv) {
                     tsdb_raft_set_snapshot_handlers(raft_h,
                                                      raft_snapshot_write_cb,
                                                      raft_snapshot_restore_cb,
-                                                     NULL);
+                                                     db);
                     tsdb_metrics_server_set_raft_provider(raft_json_cb,
                                                            raft_h);
                     printf("[node] raft consensus ENABLED (data=%s/raft)\n",

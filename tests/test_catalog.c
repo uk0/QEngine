@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* ---- Tiny test harness -------------------------------------------------- */
 
@@ -441,6 +442,162 @@ static void test_cascade_drop_via_qtl(void) {
     rmrf(TEST_DIR);
 }
 
+/* Forward decl for the db accessor; db.h isn't on the public surface. */
+tsdb_catalog_t *tsdb_db_catalog(tsdb_db_t *db);
+
+/* ---- Hot-reopen of in-memory catalog (tsdb_db_reload_catalog) ---------- */
+/*
+ * Simulates what the Raft InstallSnapshot receive path does:
+ *   - a remote agent atomically rewrites the on-disk catalog .log files
+ *   - the live db handle must re-read them without a restart
+ *
+ * The concurrency wrinkle: another thread may be repeatedly hitting the
+ * catalog via the stable tsdb_db_catalog() accessor while the reload is
+ * in flight.  The reload must not blow the process up — the overlap is
+ * a microsecond window where the racer may still be reading the old
+ * catalog right after we've swapped, but before we close it.  We use
+ * db->lock to serialise the swap itself and rely on the racer having
+ * dropped its pointer by the time close runs (racer only touches the
+ * pointer inside tsdb_db_catalog() itself, which is a plain atomic read).
+ *
+ * What we actually verify post-reload is the visible-state contract:
+ *   before reload: catalog reports state from dir's first log snapshot
+ *   after  reload: catalog reports the overwritten log contents
+ */
+
+static volatile int g_reload_reader_stop = 0;
+
+static void *reload_reader_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    /* Pound on tsdb_db_catalog() while the main thread swaps in a fresh
+     * catalog.  Purely a "doesn't crash" check — we don't assert on the
+     * pointer contents because they legitimately change mid-loop. */
+    int loops = 0;
+    while (!g_reload_reader_stop) {
+        tsdb_catalog_t *c = tsdb_db_catalog(db);
+        (void)c;
+        loops++;
+        /* Brief pause so we actually race vs. spin the CPU into a wedge. */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000 };
+        nanosleep(&ts, NULL);
+    }
+    (void)loops;
+    return NULL;
+}
+
+/* Count DB rows in the on-disk catalog via LIST DATABASES — deliberately
+ * exercises the same code path that Raft apply + scenarios hit, rather
+ * than peeking at the internal hashmap. */
+static int count_databases(tsdb_db_t *db) {
+    tsdb_result_t *r = NULL;
+    if (tsdb_query(db, "LIST DATABASES;", &r) != TSDB_OK || !r) return -1;
+    int n = 0;
+    while (tsdb_result_next(r) == 1) n++;
+    tsdb_result_free(r);
+    return n;
+}
+
+static void test_reload_catalog(void) {
+    printf("test_reload_catalog\n");
+    setup();
+
+    tsdb_db_t *db = NULL;
+    CHECK_OK(tsdb_open(TEST_DIR, &db), "db_open");
+
+    /* Seed the live catalog with one user DB.  sysdb is always there
+     * (auto-bootstrapped), so baseline = sysdb + our new one = 2. */
+    tsdb_result_t *r = NULL;
+    CHECK_OK(tsdb_query(db, "CREATE DATABASE pre_snap", &r), "create pre_snap");
+    if (r) { tsdb_result_free(r); r = NULL; }
+    CHECK(count_databases(db) == 2, "pre-reload shows sysdb + pre_snap");
+
+    /* Prepare a "snapshot body" in a staging dir — a fresh DB set — and
+     * spawn a reader thread that pounds tsdb_db_catalog() concurrently. */
+    g_reload_reader_stop = 0;
+    pthread_t racer;
+    pthread_create(&racer, NULL, reload_reader_thread, db);
+
+    /* Fabricate the on-disk state a fresh catalog would produce by
+     * closing db, opening a second db on a side dir, running the DDL we
+     * want, closing it, then copy the side catalog log files over the
+     * live TEST_DIR catalog ones.  This mirrors the raft_snapshot
+     * restore_cb atomic-rename path.  Finally hand control back to the
+     * main db and call tsdb_db_reload_catalog. */
+    char side_dir[256];
+    snprintf(side_dir, sizeof(side_dir), "%s_side", TEST_DIR);
+    rmrf(side_dir);
+    mkdir(side_dir, 0755);
+
+    {
+        tsdb_db_t *side_db = NULL;
+        CHECK_OK(tsdb_open(side_dir, &side_db), "side_open");
+        CHECK_OK(tsdb_query(side_db, "CREATE DATABASE post_snap_a", &r),
+                 "side create post_snap_a");
+        if (r) { tsdb_result_free(r); r = NULL; }
+        CHECK_OK(tsdb_query(side_db, "CREATE DATABASE post_snap_b", &r),
+                 "side create post_snap_b");
+        if (r) { tsdb_result_free(r); r = NULL; }
+        CHECK_OK(tsdb_query(side_db, "CREATE DATABASE post_snap_c", &r),
+                 "side create post_snap_c");
+        if (r) { tsdb_result_free(r); r = NULL; }
+        tsdb_close(side_db);
+    }
+
+    /* Overlay the side catalog files onto the live test dir.  Simulates
+     * the atomic-rename loop in raft_snapshot_restore_cb. */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "cp %s/catalog/*.log %s/catalog/", side_dir, TEST_DIR);
+    (void)system(cmd);
+
+    /* Reload — this is the whole point of the test. */
+    CHECK_OK(tsdb_db_reload_catalog(db), "reload_catalog");
+
+    g_reload_reader_stop = 1;
+    pthread_join(racer, NULL);
+
+    /* Post-reload, the databases must match what's on disk under
+     * side_dir: sysdb + post_snap_a + _b + _c = 4 rows.  Previous
+     * pre_snap entry is still present because side_db saw sysdb from
+     * auto-bootstrap and we appended a/b/c — the original pre_snap
+     * record lives in the .log that was overwritten.  So final count
+     * depends on whether side_db's log overlay totally replaced the
+     * original: it does (cp -f).  Expected set: sysdb + a + b + c. */
+    r = NULL;
+    CHECK_OK(tsdb_query(db, "LIST DATABASES;", &r), "LIST after reload");
+    int saw_sysdb = 0, saw_a = 0, saw_b = 0, saw_c = 0, saw_pre = 0;
+    if (r) {
+        int ncols = tsdb_result_ncols(r);
+        while (tsdb_result_next(r) == 1) {
+            const char *nm = NULL;
+            for (int c = 0; c < ncols; c++) {
+                const char *cn = tsdb_result_col_name(r, c);
+                if (cn && strcmp(cn, "name") == 0) nm = tsdb_result_sym(r, c);
+            }
+            if (!nm) continue;
+            if (!strcmp(nm, "sysdb"))        saw_sysdb = 1;
+            else if (!strcmp(nm, "post_snap_a")) saw_a = 1;
+            else if (!strcmp(nm, "post_snap_b")) saw_b = 1;
+            else if (!strcmp(nm, "post_snap_c")) saw_c = 1;
+            else if (!strcmp(nm, "pre_snap"))    saw_pre = 1;
+        }
+        tsdb_result_free(r);
+    }
+    CHECK(saw_sysdb, "sysdb survives reload");
+    CHECK(saw_a, "post_snap_a visible after reload");
+    CHECK(saw_b, "post_snap_b visible after reload");
+    CHECK(saw_c, "post_snap_c visible after reload");
+    CHECK(!saw_pre, "pre_snap no longer present (overwritten)");
+
+    /* Reload is idempotent: a second call should leave state intact. */
+    CHECK_OK(tsdb_db_reload_catalog(db), "reload_catalog (idempotent)");
+    CHECK(count_databases(db) == 4, "post-reload count stable on repeat");
+
+    tsdb_close(db);
+    rmrf(side_dir);
+    rmrf(TEST_DIR);
+}
+
 /* ---- Main --------------------------------------------------------------- */
 
 int main(void) {
@@ -454,6 +611,7 @@ int main(void) {
     test_update_last_seen();
     test_qtl_ddl();
     test_cascade_drop_via_qtl();
+    test_reload_catalog();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
