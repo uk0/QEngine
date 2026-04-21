@@ -124,7 +124,7 @@ static void test_lifecycle(void) {
     SECTION("autobalance: create / destroy");
 
     tsdb_node_manager_t *mgr = tsdb_node_manager_new(1ULL, "127.0.0.1:19000",
-                                                      "127.0.0.1:19001");
+                                                      "127.0.0.1:19001", TSDB_ROLE_MASTER);
     CHECK(mgr != NULL, "node_mgr alloc");
 
     tsdb_autobalance_t *ab = tsdb_autobalance_new(mgr, 1ULL, NULL);
@@ -142,7 +142,7 @@ static void test_record_write(void) {
     SECTION("autobalance: record_write + rebalance_now");
 
     tsdb_node_manager_t *mgr = tsdb_node_manager_new(1ULL, "127.0.0.1:19010",
-                                                      "127.0.0.1:19011");
+                                                      "127.0.0.1:19011", TSDB_ROLE_MASTER);
     tsdb_autobalance_t *ab = tsdb_autobalance_new(mgr, 1ULL, NULL);
     CHECK(ab != NULL, "alloc");
 
@@ -163,7 +163,7 @@ static void test_load_roundtrip(void) {
     SECTION("autobalance: encode_load / merge_load round-trip");
 
     tsdb_node_manager_t *mgr = tsdb_node_manager_new(42ULL, "127.0.0.1:19020",
-                                                      "127.0.0.1:19021");
+                                                      "127.0.0.1:19021", TSDB_ROLE_MASTER);
     tsdb_autobalance_t *ab = tsdb_autobalance_new(mgr, 42ULL, NULL);
 
     /* Record some writes so EMA is non-zero after a cycle. */
@@ -194,7 +194,7 @@ static void test_load_roundtrip(void) {
 
     /* Now merge into a second balancer to verify merge_load. */
     tsdb_node_manager_t *mgr2 = tsdb_node_manager_new(99ULL, "127.0.0.1:19030",
-                                                       "127.0.0.1:19031");
+                                                       "127.0.0.1:19031", TSDB_ROLE_MASTER);
     tsdb_autobalance_t *ab2 = tsdb_autobalance_new(mgr2, 99ULL, NULL);
     tsdb_autobalance_merge_load(ab2, buf, n);
 
@@ -217,7 +217,7 @@ static void test_stats_str(void) {
     SECTION("autobalance: stats_str");
 
     tsdb_node_manager_t *mgr = tsdb_node_manager_new(7ULL, "127.0.0.1:19040",
-                                                      "127.0.0.1:19041");
+                                                      "127.0.0.1:19041", TSDB_ROLE_MASTER);
     tsdb_autobalance_t *ab = tsdb_autobalance_new(mgr, 7ULL, NULL);
 
     char buf[4096];
@@ -243,7 +243,7 @@ static void test_rebalance_adjusts_weights(void) {
      * load payload, then trigger a rebalance and verify node 2 gets fewer VNs. */
 
     tsdb_node_manager_t *mgr = tsdb_node_manager_new(1ULL, "127.0.0.1:19050",
-                                                      "127.0.0.1:19051");
+                                                      "127.0.0.1:19051", TSDB_ROLE_MASTER);
 
     /* Add a peer node to the manager so it appears in ring. */
     tsdb_node_info_t peer = {0};

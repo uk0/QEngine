@@ -48,11 +48,14 @@ static void parse_seeds(tsdb_cluster_t *c, tsdb_gossip_t *gossip, const char *se
 
 /* ---- Public API ---------------------------------------------------------- */
 
+/* Signature must stay in sync with cluster.h — adds local_role for
+ * master/data split introduced alongside the Raft consensus layer. */
 tsdb_cluster_t *tsdb_cluster_new(tsdb_db_t *db,
                                   tsdb_node_id_t local_id,
                                   const char *rpc_addr,
                                   const char *gossip_addr,
-                                  const char *seeds)
+                                  const char *seeds,
+                                  tsdb_node_role_t local_role)
 {
     tsdb_cluster_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
@@ -60,7 +63,7 @@ tsdb_cluster_t *tsdb_cluster_new(tsdb_db_t *db,
     c->local_id = local_id;
 
     /* Node manager. */
-    c->node_mgr = tsdb_node_manager_new(local_id, rpc_addr, gossip_addr);
+    c->node_mgr = tsdb_node_manager_new(local_id, rpc_addr, gossip_addr, local_role);
     if (!c->node_mgr) { free(c); return NULL; }
 
     /* RPC server (must start before gossip so port is ready). */
@@ -221,6 +224,7 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
     int n = tsdb_node_manager_snapshot(c->node_mgr, snap, TSDB_CLUSTER_MAX_NODES);
 
     static const char *state_names[] = { "JOINING", "ALIVE", "SUSPECT", "DEAD" };
+    static const char *role_names[]  = { "master", "data" };
 
     /* Snapshot monotonic clock once so per-node ages agree. */
     struct timespec ts;
@@ -252,13 +256,15 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
         if (snap[i].first_seen_ns > 0 && now > snap[i].first_seen_ns)
             known_for_s = (now - snap[i].first_seen_ns) / 1000000000LL;
 
+        const char *rname = (snap[i].role <= 1) ? role_names[snap[i].role] : "?";
         written += snprintf(buf + written, cap - written,
                             "%s{\"id\":\"%llu\",\"addr\":\"%s\",\"state\":\"%s\","
+                            "\"role\":\"%s\","
                             "\"ver\":%llu,\"hb_age_ms\":%lld,\"known_for_s\":%lld,"
                             "\"suspect_count\":%d}",
                             (i > 0 ? "," : ""),
                             (unsigned long long)snap[i].id,
-                            snap[i].addr, sname,
+                            snap[i].addr, sname, rname,
                             (unsigned long long)snap[i].version,
                             (long long)hb_age_ms,
                             (long long)known_for_s,

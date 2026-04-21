@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
@@ -26,6 +27,7 @@
 
 static volatile int g_running = 1;
 static time_t       g_node_start_epoch = 0;   /* set in main() */
+static char         g_local_role[16] = "master"; /* TSDB_NODE_ROLE, set in main() */
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -201,9 +203,9 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
     w += snprintf(buf + w, cap - (size_t)w,
                   "{\"db\":{\"name\":\"%s\",\"path\":\"%s\","
                    "\"host\":\"%s\",\"uptime_s\":%ld,"
-                   "\"disk_bytes\":%llu},\"tables\":[",
+                   "\"disk_bytes\":%llu,\"role\":\"%s\"},\"tables\":[",
                    name_esc, esc, host, uptime_s,
-                   (unsigned long long)disk_bytes);
+                   (unsigned long long)disk_bytes, g_local_role);
 
     /* Legacy "tables" section — a flat on-disk dir scan.  In an
      * industrial catalog (thousands of PTables) this duplicates what
@@ -621,6 +623,16 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_t *ms = NULL;
     tsdb_metrics_server_set_data_dir(data_dir);
     snprintf(g_local_data_dir, sizeof(g_local_data_dir), "%s", data_dir);
+    /* TSDB_NODE_ROLE — mirror the same env var db_cluster.c reads, so
+     * /tree can advertise this node's role without reaching into the
+     * cluster struct.  Accept "data" / "dnode" as aliases. */
+    {
+        const char *r = getenv("TSDB_NODE_ROLE");
+        if (r && (!strcasecmp(r, "data") || !strcasecmp(r, "dnode")))
+            snprintf(g_local_role, sizeof(g_local_role), "data");
+        else
+            snprintf(g_local_role, sizeof(g_local_role), "master");
+    }
     tsdb_metrics_server_set_cluster_provider(cluster_json_cb, db);
     tsdb_metrics_server_set_tree_provider(tree_json_cb, db);
     tsdb_metrics_server_set_sql_provider(sql_exec_cb, db);

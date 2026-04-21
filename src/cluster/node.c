@@ -32,6 +32,7 @@ struct tsdb_node_manager {
     tsdb_node_id_t    local_id;
     char              local_addr[TSDB_ADDR_MAX];
     char              local_gossip_addr[TSDB_ADDR_MAX];
+    tsdb_node_role_t  local_role;
 
     tsdb_node_info_t  nodes[TSDB_CLUSTER_MAX_NODES];
     int               nnodes;
@@ -45,13 +46,15 @@ struct tsdb_node_manager {
 
 tsdb_node_manager_t *tsdb_node_manager_new(tsdb_node_id_t local_id,
                                            const char *local_addr,
-                                           const char *gossip_addr)
+                                           const char *gossip_addr,
+                                           tsdb_node_role_t local_role)
 {
     tsdb_node_manager_t *mgr = calloc(1, sizeof(*mgr));
     if (!mgr) return NULL;
 
     pthread_mutex_init(&mgr->lock, NULL);
-    mgr->local_id = local_id;
+    mgr->local_id   = local_id;
+    mgr->local_role = local_role;
     snprintf(mgr->local_addr,        sizeof(mgr->local_addr),        "%s", local_addr   ? local_addr   : "");
     snprintf(mgr->local_gossip_addr, sizeof(mgr->local_gossip_addr), "%s", gossip_addr  ? gossip_addr  : "");
 
@@ -66,6 +69,7 @@ tsdb_node_manager_t *tsdb_node_manager_new(tsdb_node_id_t local_id,
     snprintf(self.addr,         sizeof(self.addr),        "%s", local_addr  ? local_addr  : "");
     snprintf(self.gossip_addr,  sizeof(self.gossip_addr), "%s", gossip_addr ? gossip_addr : "");
     self.state   = TSDB_NODE_ALIVE;
+    self.role    = local_role;
     self.version = 1;
     self.last_heartbeat_ns = now_ns();
     self.first_seen_ns     = self.last_heartbeat_ns;
@@ -74,6 +78,10 @@ tsdb_node_manager_t *tsdb_node_manager_new(tsdb_node_id_t local_id,
     tsdb_hashring_add(mgr->ring, local_id);
 
     return mgr;
+}
+
+tsdb_node_role_t tsdb_node_manager_local_role(tsdb_node_manager_t *mgr) {
+    return mgr ? mgr->local_role : TSDB_ROLE_MASTER;
 }
 
 void tsdb_node_manager_free(tsdb_node_manager_t *mgr) {
@@ -331,11 +339,19 @@ int tsdb_node_manager_alive_count(tsdb_node_manager_t *mgr) {
 
 /*
  * On-wire node record (fixed 80 bytes LE):
- *   id            u64
- *   addr          48 bytes (null-padded)
- *   gossip_addr   48 bytes (null-padded) -- reuse addr field space
- *   -- packed in 80: id(8)+addr(48)+state(1)+_pad(3)+version(8)+hb_ns(8)+suspct(4)
- * Wait, 8+48+1+3+8+8+4 = 80. Perfect.
+ *   id           u64
+ *   addr         24 bytes (null-padded)
+ *   gossip_addr  24 bytes (null-padded)
+ *   state        u8   (TSDB_NODE_*)
+ *   role         u8   (TSDB_ROLE_*)  — added 2026-04; older peers write 0 (MASTER)
+ *   _pad         2 bytes
+ *   version      u64
+ *   last_hb_ns   i64
+ *   suspct_cnt   i32
+ *
+ * Layout: 8 + 24 + 24 + 1 + 1 + 2 + 8 + 8 + 4 = 80 bytes.  Pre-role
+ * peers zeroed the whole pad region, so they decode as MASTER — the
+ * default — without a format version bump.
  */
 #define NODE_WIRE_SIZE 80
 
@@ -367,7 +383,8 @@ int tsdb_node_manager_encode(tsdb_node_manager_t *mgr, uint8_t *buf, int cap) {
         memcpy(p, n->gossip_addr, glen); p += 24;
 
         p[0] = (uint8_t)n->state; p++;
-        p[0] = 0; p[1] = 0; p[2] = 0; p += 3; /* pad */
+        p[0] = (uint8_t)n->role;  p++;
+        p[0] = 0; p[1] = 0; p += 2; /* pad */
 
         uint64_t ver = n->version;
         memcpy(p, &ver, 8); p += 8;
@@ -402,7 +419,8 @@ void tsdb_node_manager_decode(tsdb_node_manager_t *mgr,
         memcpy(info.gossip_addr, p, 24); info.gossip_addr[23] = '\0'; p += 24;
 
         info.state = (tsdb_node_state_t)p[0]; p++;
-        p += 3; /* pad */
+        info.role  = (tsdb_node_role_t)p[0];  p++;
+        p += 2; /* pad */
 
         memcpy(&info.version, p, 8); p += 8;
         memcpy(&info.last_heartbeat_ns, p, 8); p += 8;

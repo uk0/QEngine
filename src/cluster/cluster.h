@@ -33,12 +33,15 @@ typedef struct tsdb_cluster tsdb_cluster_t;
  * rpc_addr     - "host:port" for TCP RPC (default port 28081)
  * gossip_addr  - "host:port" for UDP gossip (default port 28080)
  * seeds        - comma-separated "host:gossip_port" strings (may be NULL)
+ * local_role   - TSDB_ROLE_MASTER (default) or TSDB_ROLE_DATA.
+ *                MASTERs participate in Raft; DATA nodes forward DDL.
  */
 tsdb_cluster_t *tsdb_cluster_new(tsdb_db_t *db,
                                  tsdb_node_id_t local_id,
                                  const char *rpc_addr,
                                  const char *gossip_addr,
-                                 const char *seeds);
+                                 const char *seeds,
+                                 tsdb_node_role_t local_role);
 
 /* Stop gossip/RPC threads and free resources. */
 void tsdb_cluster_free(tsdb_cluster_t *c);

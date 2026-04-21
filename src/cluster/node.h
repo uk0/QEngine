@@ -28,12 +28,26 @@ typedef enum {
     TSDB_NODE_DEAD     = 3
 } tsdb_node_state_t;
 
+/* Node role in the catalog/data split.
+ *
+ * master nodes run the Raft consensus module and own the authoritative
+ * catalog; data nodes only store time-series shards and forward any DDL
+ * they receive to a master.  The split mirrors TDengine's mnode/vnode
+ * model.  Default on existing clusters is MASTER so older data dirs
+ * keep serving DDL without a migration.
+ */
+typedef enum {
+    TSDB_ROLE_MASTER = 0,
+    TSDB_ROLE_DATA   = 1
+} tsdb_node_role_t;
+
 /* Information we track per cluster member. */
 typedef struct {
     tsdb_node_id_t  id;
     char            addr[TSDB_ADDR_MAX];   /* "host:port" (RPC TCP port) */
     char            gossip_addr[TSDB_ADDR_MAX]; /* "host:port" (UDP gossip port) */
     tsdb_node_state_t state;
+    tsdb_node_role_t  role;                /* MASTER or DATA; see above */
     uint64_t        version;               /* monotonic generation / incarnation */
     int64_t         last_heartbeat_ns;     /* CLOCK_MONOTONIC nanoseconds */
     int             suspect_count;         /* consecutive probe failures */
@@ -54,10 +68,15 @@ typedef struct tsdb_node_manager tsdb_node_manager_t;
  * local_id    - unique ID for this node
  * local_addr  - "host:port" (RPC TCP)
  * gossip_addr - "host:port" (UDP gossip)
+ * local_role  - MASTER or DATA; drives catalog/DDL routing
  */
 tsdb_node_manager_t *tsdb_node_manager_new(tsdb_node_id_t local_id,
                                            const char *local_addr,
-                                           const char *gossip_addr);
+                                           const char *gossip_addr,
+                                           tsdb_node_role_t local_role);
+
+/* Return the local node's role (MASTER / DATA). */
+tsdb_node_role_t tsdb_node_manager_local_role(tsdb_node_manager_t *mgr);
 
 /* Free the node manager. */
 void tsdb_node_manager_free(tsdb_node_manager_t *mgr);

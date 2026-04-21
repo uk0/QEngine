@@ -18,6 +18,7 @@
 #include "schema.h"
 #include "memtable.h"
 #include "../cluster/cluster.h"
+#include <strings.h> /* strcasecmp for TSDB_NODE_ROLE parsing */
 #include "../cluster/node.h"
 #include "../cluster/rawblock.h"
 #include "../../include/tsdb_cluster.h"
@@ -280,10 +281,22 @@ int tsdb_open_cluster(const char *data_dir,
 
     tsdb_node_id_t node_id = generate_node_id(data_dir, bind_addr);
 
+    /* Pick up the master/data role from the env.  Default is MASTER so
+     * every pre-existing data dir keeps accepting DDL via the legacy
+     * fanout path until the operator explicitly opts into `data`. */
+    tsdb_node_role_t local_role = TSDB_ROLE_MASTER;
+    {
+        const char *r = getenv("TSDB_NODE_ROLE");
+        if (r && (!strcasecmp(r, "data") || !strcasecmp(r, "dnode"))) {
+            local_role = TSDB_ROLE_DATA;
+        }
+    }
+
     tsdb_cluster_t *cluster = tsdb_cluster_new(db, node_id,
                                                bind_addr  ? bind_addr  : "0.0.0.0:28081",
                                                gossip_addr,
-                                               gossip_seeds);
+                                               gossip_seeds,
+                                               local_role);
     if (!cluster) {
         tsdb_close(db);
         return TSDB_ERR_IO;
