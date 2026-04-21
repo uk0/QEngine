@@ -52,14 +52,20 @@ static inline int64_t  rb_get_i64(const uint8_t *p) {
 
 /* ---- Serialize / parse ----------------------------------------------------- */
 
+/* Stats block on the wire: 5 × i64 + u16 + 6 bytes pad = 48 bytes,
+ * matching the V3 index entry tail byte-for-byte so the replica can
+ * memcpy the payload straight into its idx file. */
+#define RAWBLK_WIRE_STATS_SIZE 48u
+
 int tsdb_rawblock_serialize(const tsdb_rawblock_push_t *r,
                              uint8_t **buf, size_t *len)
 {
     if (!r || !buf || !len) return TSDB_ERR_INVAL;
 
     uint8_t tlen = (uint8_t)strnlen(r->table, 63);
-    /* 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8 + 4 + block_bytes_len */
-    size_t total = 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8 + 4 + r->block_bytes_len;
+    /* 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8 + 48 stats + 4 + block_bytes_len */
+    size_t total = 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8
+                   + RAWBLK_WIRE_STATS_SIZE + 4 + r->block_bytes_len;
 
     uint8_t *p = malloc(total);
     if (!p) return TSDB_ERR_NOMEM;
@@ -74,6 +80,17 @@ int tsdb_rawblock_serialize(const tsdb_rawblock_push_t *r,
     rb_put_u32(w, r->count);    w += 4;
     rb_put_i64(w, r->ts_min);   w += 8;
     rb_put_i64(w, r->ts_max);   w += 8;
+
+    /* stats block */
+    memset(w, 0, RAWBLK_WIRE_STATS_SIZE);
+    rb_put_i64(w +  0, r->stats_min);
+    rb_put_i64(w +  8, r->stats_max);
+    rb_put_i64(w + 16, r->stats_sum);
+    rb_put_i64(w + 24, r->stats_first);
+    rb_put_i64(w + 32, r->stats_last);
+    rb_put_u16(w + 40, r->stats_flags);
+    w += RAWBLK_WIRE_STATS_SIZE;
+
     rb_put_u32(w, r->block_bytes_len); w += 4;
     if (r->block_bytes_len > 0 && r->block_bytes)
         memcpy(w, r->block_bytes, r->block_bytes_len);
@@ -108,6 +125,16 @@ int tsdb_rawblock_parse(const uint8_t *buf, size_t len,
     RB_NEED(4); out->count    = rb_get_u32(p); p += 4;
     RB_NEED(8); out->ts_min   = rb_get_i64(p); p += 8;
     RB_NEED(8); out->ts_max   = rb_get_i64(p); p += 8;
+
+    RB_NEED(RAWBLK_WIRE_STATS_SIZE);
+    out->stats_min   = rb_get_i64(p +  0);
+    out->stats_max   = rb_get_i64(p +  8);
+    out->stats_sum   = rb_get_i64(p + 16);
+    out->stats_first = rb_get_i64(p + 24);
+    out->stats_last  = rb_get_i64(p + 32);
+    out->stats_flags = (uint16_t)p[40] | ((uint16_t)p[41] << 8);
+    p += RAWBLK_WIRE_STATS_SIZE;
+
     RB_NEED(4); out->block_bytes_len = rb_get_u32(p); p += 4;
     RB_NEED(out->block_bytes_len);
     out->block_bytes = (uint8_t *)p; /* points into caller's buf */
@@ -146,15 +173,18 @@ static void rawblk_write_header(uint8_t *hdr,
  * and extended with the new block's [ts_min, ts_max]. */
 
 #define RAWBLK_IDX_MAGIC       0x31584449u /* "IDX1" */
-#define RAWBLK_IDX_VER         2
+#define RAWBLK_IDX_VER         3
 #define RAWBLK_IDX_HDR_SIZE_V1 20u
-#define RAWBLK_IDX_HDR_SIZE    36u
-#define RAWBLK_IDX_ENT_SIZE    40u
+#define RAWBLK_IDX_HDR_SIZE_V2 36u
+#define RAWBLK_IDX_HDR_SIZE    40u   /* V3 */
+#define RAWBLK_IDX_ENT_SIZE_V2 40u
+#define RAWBLK_IDX_ENT_SIZE    88u   /* V3 */
 
 static void rawblk_write_idx_header(uint8_t *buf, uint32_t count,
                                     uint64_t total_rows,
                                     int64_t  file_ts_min,
                                     int64_t  file_ts_max) {
+    memset(buf, 0, RAWBLK_IDX_HDR_SIZE);
     rb_put_u32(buf + 0,  RAWBLK_IDX_MAGIC);
     rb_put_u32(buf + 4,  count);
     rb_put_u16(buf + 8,  RAWBLK_IDX_VER);
@@ -162,20 +192,34 @@ static void rawblk_write_idx_header(uint8_t *buf, uint32_t count,
     for (int i = 0; i < 8; i++) buf[12+i] = (uint8_t)((total_rows >> (i*8)) & 0xFF);
     rb_put_i64(buf + 20, file_ts_min);
     rb_put_i64(buf + 28, file_ts_max);
+    rb_put_u16(buf + 36, (uint16_t)RAWBLK_IDX_ENT_SIZE);   /* entry_size */
+    rb_put_u16(buf + 38, 0);                                /* stats_variant */
 }
 
+/* Forward the primary's stats block verbatim.  When the caller doesn't
+ * have a meta handy (e.g. v2 replication) `stats_src` is NULL and the
+ * stats tail is zeroed — readers treat stats_flags==0 as absent. */
 static void rawblk_write_idx_entry(uint8_t *buf,
                                    uint64_t offset, uint32_t size, uint32_t count,
-                                   int64_t ts_min, int64_t ts_max)
+                                   int64_t ts_min, int64_t ts_max,
+                                   const tsdb_block_meta_t *stats_src)
 {
-    /* offset u64 */
+    memset(buf, 0, RAWBLK_IDX_ENT_SIZE);
     for (int i = 0; i < 8; i++) buf[0+i] = (uint8_t)(((uint64_t)offset >> (i*8)) & 0xFF);
     rb_put_u32(buf + 8,  size);
     rb_put_u32(buf + 12, count);
     rb_put_i64(buf + 16, ts_min);
     rb_put_i64(buf + 24, ts_max);
-    /* reserved */
-    memset(buf + 32, 0, 8);
+    /* [32..39] bloom/reserved — callers currently write zero; the block
+     * header carries the real bloom for SYMBOL columns. */
+    if (stats_src) {
+        rb_put_i64(buf + 40, stats_src->stats_min);
+        rb_put_i64(buf + 48, stats_src->stats_max);
+        rb_put_i64(buf + 56, stats_src->stats_sum);
+        rb_put_i64(buf + 64, stats_src->stats_first);
+        rb_put_i64(buf + 72, stats_src->stats_last);
+        rb_put_u16(buf + 80, stats_src->stats_flags);
+    }
 }
 
 /* ---- Apply on replica ------------------------------------------------------ */
@@ -212,7 +256,7 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
 
-    /* --- Idempotency: skip if last idx entry matches. Reads either v1 or v2. */
+    /* --- Idempotency: skip if last idx entry matches. Handles v1/v2/v3. */
     {
         FILE *idx_r = fopen(idx_path, "rb");
         if (idx_r) {
@@ -222,13 +266,19 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
                 && rb_get_u32(hdr) == RAWBLK_IDX_MAGIC) {
                 uint32_t cnt = rb_get_u32(hdr + 4);
                 uint16_t ver = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);
-                size_t   hsz = (ver >= 2) ? RAWBLK_IDX_HDR_SIZE
-                                          : RAWBLK_IDX_HDR_SIZE_V1;
+                size_t   hsz = (ver == 1) ? RAWBLK_IDX_HDR_SIZE_V1
+                             : (ver == 2) ? RAWBLK_IDX_HDR_SIZE_V2
+                                          : RAWBLK_IDX_HDR_SIZE;
+                size_t   esz = (ver == 3 && hdr_n >= RAWBLK_IDX_HDR_SIZE)
+                               ? (size_t)((uint16_t)hdr[36]
+                                          | ((uint16_t)hdr[37] << 8))
+                               : (size_t)RAWBLK_IDX_ENT_SIZE_V2;
+                if (esz == 0) esz = RAWBLK_IDX_ENT_SIZE_V2;
                 if (cnt > 0) {
-                    long off = (long)(hsz + (uint64_t)(cnt - 1) * RAWBLK_IDX_ENT_SIZE);
+                    long off = (long)(hsz + (uint64_t)(cnt - 1) * esz);
                     if (fseek(idx_r, off, SEEK_SET) == 0) {
                         uint8_t ent[RAWBLK_IDX_ENT_SIZE];
-                        if (fread(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_r) == RAWBLK_IDX_ENT_SIZE) {
+                        if (fread(ent, 1, esz, idx_r) == esz) {
                             uint32_t e_size  = rb_get_u32(ent + 8);
                             uint32_t e_count = rb_get_u32(ent + 12);
                             int64_t  e_tmin  = rb_get_i64(ent + 16);
@@ -288,36 +338,57 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
                 && rb_get_u32(ih) == RAWBLK_IDX_MAGIC) {
                 old_count = rb_get_u32(ih + 4);
                 uint16_t ver = (uint16_t)ih[8] | ((uint16_t)ih[9] << 8);
-                size_t   hsz = (ver >= 2) ? RAWBLK_IDX_HDR_SIZE
-                                          : RAWBLK_IDX_HDR_SIZE_V1;
+                size_t   hsz = (ver == 1) ? RAWBLK_IDX_HDR_SIZE_V1
+                             : (ver == 2) ? RAWBLK_IDX_HDR_SIZE_V2
+                                          : RAWBLK_IDX_HDR_SIZE;
+                size_t   esz = (ver == 3 && ih_n >= RAWBLK_IDX_HDR_SIZE)
+                               ? (size_t)((uint16_t)ih[36]
+                                          | ((uint16_t)ih[37] << 8))
+                               : (size_t)RAWBLK_IDX_ENT_SIZE_V2;
+                if (esz == 0) esz = RAWBLK_IDX_ENT_SIZE_V2;
+
                 uint64_t tr = 0;
                 for (int i = 7; i >= 0; i--) tr = (tr << 8) | ih[12+i];
                 old_total = tr;
-                if (ver >= 2 && ih_n >= RAWBLK_IDX_HDR_SIZE) {
+                if (ver >= 2 && ih_n >= RAWBLK_IDX_HDR_SIZE_V2) {
                     old_fmn = rb_get_i64(ih + 20);
                     old_fmx = rb_get_i64(ih + 28);
                     have_old_zone = (old_count > 0);
                 }
                 if (old_count > 0) {
                     if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
-                        old_entries = malloc((size_t)old_count * RAWBLK_IDX_ENT_SIZE);
-                        if (old_entries) {
-                            if (fread(old_entries, 1,
-                                      (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_r)
-                                != (size_t)old_count * RAWBLK_IDX_ENT_SIZE) {
-                                free(old_entries); old_entries = NULL; old_count = 0;
-                            } else if (!have_old_zone) {
-                                /* v1 fallback: derive zone from per-block entries. */
+                        /* Read old entries at their native size then widen
+                         * to V3 so the resulting file is uniform. */
+                        size_t raw_sz = (size_t)old_count * esz;
+                        uint8_t *raw = malloc(raw_sz);
+                        if (raw && fread(raw, 1, raw_sz, idx_r) == raw_sz) {
+                            old_entries = calloc((size_t)old_count,
+                                                  RAWBLK_IDX_ENT_SIZE);
+                            if (old_entries) {
+                                size_t copy_prefix = (esz < RAWBLK_IDX_ENT_SIZE)
+                                                     ? esz : RAWBLK_IDX_ENT_SIZE;
                                 for (uint32_t b = 0; b < old_count; b++) {
-                                    uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
-                                    int64_t mn = rb_get_i64(e + 16);
-                                    int64_t mx = rb_get_i64(e + 24);
-                                    if (mn < old_fmn) old_fmn = mn;
-                                    if (mx > old_fmx) old_fmx = mx;
+                                    memcpy(old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE,
+                                           raw + (size_t)b * esz,
+                                           copy_prefix);
                                 }
-                                have_old_zone = 1;
+                                if (!have_old_zone) {
+                                    for (uint32_t b = 0; b < old_count; b++) {
+                                        uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
+                                        int64_t mn = rb_get_i64(e + 16);
+                                        int64_t mx = rb_get_i64(e + 24);
+                                        if (mn < old_fmn) old_fmn = mn;
+                                        if (mx > old_fmx) old_fmx = mx;
+                                    }
+                                    have_old_zone = 1;
+                                }
+                            } else {
+                                old_count = 0;
                             }
+                        } else {
+                            old_count = 0;
                         }
+                        free(raw);
                     }
                 }
             }
@@ -344,11 +415,21 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     if (old_count > 0 && old_entries)
         fwrite(old_entries, 1, (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_w);
 
-    /* New entry. */
+    /* New entry — forward the stats carried by the wire push so the
+     * replica's idx is byte-equivalent to the primary's. */
+    tsdb_block_meta_t stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.stats_min   = r->stats_min;
+    stats.stats_max   = r->stats_max;
+    stats.stats_sum   = r->stats_sum;
+    stats.stats_first = r->stats_first;
+    stats.stats_last  = r->stats_last;
+    stats.stats_flags = r->stats_flags;
+
     uint8_t ent[RAWBLK_IDX_ENT_SIZE];
     rawblk_write_idx_entry(ent, (uint64_t)col_offset,
                            r->block_bytes_len, r->count,
-                           r->ts_min, r->ts_max);
+                           r->ts_min, r->ts_max, &stats);
     fwrite(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_w);
 
     fclose(idx_w);
@@ -412,6 +493,12 @@ int tsdb_rawblock_replicate(tsdb_cluster_t *c,
     r.count           = meta->count;
     r.ts_min          = meta->ts_min;
     r.ts_max          = meta->ts_max;
+    r.stats_min       = meta->stats_min;
+    r.stats_max       = meta->stats_max;
+    r.stats_sum       = meta->stats_sum;
+    r.stats_first     = meta->stats_first;
+    r.stats_last      = meta->stats_last;
+    r.stats_flags     = meta->stats_flags;
     r.block_bytes_len = (uint32_t)block_len;
     r.block_bytes     = (uint8_t *)block_bytes;
 

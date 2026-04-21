@@ -699,6 +699,7 @@ typedef enum {
     PROJ_AGG_AVG,
     PROJ_AGG_MIN,
     PROJ_AGG_MAX,
+    PROJ_AGG_SPREAD,    /* spread(col) == max(col) - min(col) */
     PROJ_AGG_COUNT,
     /* T-digest based approximate quantiles and stddev */
     PROJ_AGG_P50,
@@ -790,6 +791,7 @@ static int is_agg_call(qast_expr_t *e) {
     const char *n = e->v.s;
     return strcasecmp(n, "sum") == 0       || strcasecmp(n, "avg") == 0        ||
            strcasecmp(n, "min") == 0       || strcasecmp(n, "max") == 0        ||
+           strcasecmp(n, "spread") == 0    ||
            strcasecmp(n, "count") == 0     ||
            strcasecmp(n, "p50") == 0       || strcasecmp(n, "p90") == 0        ||
            strcasecmp(n, "p99") == 0       || strcasecmp(n, "percentile") == 0 ||
@@ -866,6 +868,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             else if (strcasecmp(name, "avg") == 0)        k = PROJ_AGG_AVG;
             else if (strcasecmp(name, "min") == 0)        k = PROJ_AGG_MIN;
             else if (strcasecmp(name, "max") == 0)        k = PROJ_AGG_MAX;
+            else if (strcasecmp(name, "spread") == 0)     k = PROJ_AGG_SPREAD;
             else if (strcasecmp(name, "count") == 0)      k = PROJ_AGG_COUNT;
             else if (strcasecmp(name, "p50") == 0)        k = PROJ_AGG_P50;
             else if (strcasecmp(name, "p90") == 0)        k = PROJ_AGG_P90;
@@ -1214,6 +1217,16 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
             p->agg_count += cn;
             break;
         }
+        case PROJ_AGG_SPREAD: {
+            /* spread keeps both bounds simultaneously. */
+            double lo, hi;
+            tsdb_agg_min_f64(src, cn, NULL, &lo);
+            tsdb_agg_max_f64(src, cn, NULL, &hi);
+            if (lo < p->agg_min_f) p->agg_min_f = lo;
+            if (hi > p->agg_max_f) p->agg_max_f = hi;
+            p->agg_count += cn;
+            break;
+        }
         default: break;
         }
     } else if (t == TSDB_TYPE_INT64 || t == TSDB_TYPE_TIMESTAMP) {
@@ -1247,6 +1260,15 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
             int64_t m;
             tsdb_agg_max_i64(src, cn, NULL, &m);
             if (m > p->agg_max_i) p->agg_max_i = m;
+            p->agg_count += cn;
+            break;
+        }
+        case PROJ_AGG_SPREAD: {
+            int64_t lo, hi;
+            tsdb_agg_min_i64(src, cn, NULL, &lo);
+            tsdb_agg_max_i64(src, cn, NULL, &hi);
+            if (lo < p->agg_min_i) p->agg_min_i = lo;
+            if (hi > p->agg_max_i) p->agg_max_i = hi;
             p->agg_count += cn;
             break;
         }
@@ -1340,6 +1362,21 @@ static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx
         if (src_t == TSDB_TYPE_FLOAT64) out_f = p->agg_max_f;
         else                            out_i = p->agg_max_i;
         break;
+    case PROJ_AGG_SPREAD:
+        if (src_t == TSDB_TYPE_FLOAT64) {
+            if (p->agg_count == 0 ||
+                p->agg_max_f == -INFINITY || p->agg_min_f == INFINITY)
+                out_f = 0.0 / 0.0;
+            else
+                out_f = p->agg_max_f - p->agg_min_f;
+        } else {
+            if (p->agg_count == 0 ||
+                p->agg_max_i == INT64_MIN || p->agg_min_i == INT64_MAX)
+                out_i = 0;
+            else
+                out_i = p->agg_max_i - p->agg_min_i;
+        }
+        break;
     /* T-digest quantile/stddev kinds — always float64. */
     case PROJ_AGG_P50:
     case PROJ_AGG_P90:
@@ -1404,6 +1441,189 @@ typedef struct {
     char           err[256];
 } par_task_t;
 
+/* Classify a projection kind for the stats-fast-path gate.
+ *   bits: bit0=HAS_MIN_MAX, bit1=HAS_SUM, bit2=HAS_FIRST_LAST
+ *   eligible: 1 if this kind can be served from stats at all. */
+static int agg_stats_requires(int kind, uint16_t *bits, int *eligible) {
+    *bits = 0;
+    *eligible = 1;
+    switch (kind) {
+        case PROJ_AGG_COUNT:                                    return 0;
+        case PROJ_AGG_MIN: case PROJ_AGG_MAX: case PROJ_AGG_SPREAD:
+            *bits = TSDB_STATS_HAS_MIN_MAX;                     return 0;
+        case PROJ_AGG_SUM: case PROJ_AGG_AVG:
+            *bits = TSDB_STATS_HAS_SUM;                         return 0;
+        case PROJ_AGG_TS_FIRST: case PROJ_AGG_TS_LAST:
+            *bits = TSDB_STATS_HAS_FIRST_LAST;                  return 0;
+        default:
+            *eligible = 0;                                      return 0;
+    }
+}
+
+/* Apply pre-computed block stats to a single projection.
+ * Must only be called after the gate has verified all required bits. */
+static void agg_apply_stats(proj_t *p, tsdb_schema_t *s,
+                             const tsdb_block_meta_t *meta,
+                             uint32_t row_count)
+{
+    tsdb_type_t ct = (p->col >= 0) ? s->cols[p->col].type : TSDB_TYPE_INT64;
+    switch (p->kind) {
+        case PROJ_AGG_COUNT:
+            p->agg_count += row_count;
+            return;
+        case PROJ_AGG_MIN: {
+            if (ct == TSDB_TYPE_FLOAT64) {
+                double v; memcpy(&v, &meta->stats_min, 8);
+                if (v < p->agg_min_f) p->agg_min_f = v;
+            } else {
+                if (meta->stats_min < p->agg_min_i) p->agg_min_i = meta->stats_min;
+            }
+            p->agg_count += row_count;
+            return;
+        }
+        case PROJ_AGG_MAX: {
+            if (ct == TSDB_TYPE_FLOAT64) {
+                double v; memcpy(&v, &meta->stats_max, 8);
+                if (v > p->agg_max_f) p->agg_max_f = v;
+            } else {
+                if (meta->stats_max > p->agg_max_i) p->agg_max_i = meta->stats_max;
+            }
+            p->agg_count += row_count;
+            return;
+        }
+        case PROJ_AGG_SPREAD: {
+            /* Fold both bounds from this block into proj state; output
+             * subtracts them in agg_write. */
+            if (ct == TSDB_TYPE_FLOAT64) {
+                double lo, hi;
+                memcpy(&lo, &meta->stats_min, 8);
+                memcpy(&hi, &meta->stats_max, 8);
+                if (lo < p->agg_min_f) p->agg_min_f = lo;
+                if (hi > p->agg_max_f) p->agg_max_f = hi;
+            } else {
+                if (meta->stats_min < p->agg_min_i) p->agg_min_i = meta->stats_min;
+                if (meta->stats_max > p->agg_max_i) p->agg_max_i = meta->stats_max;
+            }
+            p->agg_count += row_count;
+            return;
+        }
+        case PROJ_AGG_SUM:
+        case PROJ_AGG_AVG: {
+            if (ct == TSDB_TYPE_FLOAT64) {
+                double v; memcpy(&v, &meta->stats_sum, 8);
+                p->agg_sum_f += v;
+            } else {
+                p->agg_sum_i += meta->stats_sum;
+            }
+            p->agg_count += row_count;
+            return;
+        }
+        case PROJ_AGG_TS_FIRST: {
+            /* Update only if this block predates the recorded ts_first. */
+            if (meta->ts_min < p->ts_first) {
+                p->ts_first = meta->ts_min;
+                if (ct == TSDB_TYPE_FLOAT64)
+                    memcpy(&p->ts_first_f, &meta->stats_first, 8);
+                else
+                    p->ts_first_i = meta->stats_first;
+            }
+            return;
+        }
+        case PROJ_AGG_TS_LAST: {
+            if (meta->ts_max > p->ts_last) {
+                p->ts_last = meta->ts_max;
+                if (ct == TSDB_TYPE_FLOAT64)
+                    memcpy(&p->ts_last_f, &meta->stats_last, 8);
+                else
+                    p->ts_last_i = meta->stats_last;
+            }
+            return;
+        }
+        default:
+            return; /* gate should have excluded these */
+    }
+}
+
+/* Attempt the stats fast-path for a single source + projection set.
+ * Returns 1 if the fast-path was taken (projections updated, caller
+ * should skip the normal decode); 0 if we fell through and the caller
+ * must run the regular scan.
+ *
+ * Shared between the parallel worker and the serial executor. */
+static int try_stats_fastpath(scan_src_t *src,
+                               proj_t *projs, int nprojs,
+                               tsdb_schema_t *s,
+                               const ts_range_t *ts_r,
+                               int ts_contained_override)
+{
+    if (src->mem) return 0;
+
+    /* Structural gate: every projection must be stats-serviceable. */
+    for (int pi = 0; pi < nprojs; pi++) {
+        proj_t *p = &projs[pi];
+        if (p->kind < PROJ_AGG_RANGE_BEGIN || p->kind > PROJ_AGG_RANGE_END)
+            return 0;
+        uint16_t bits = 0; int eligible = 0;
+        agg_stats_requires(p->kind, &bits, &eligible);
+        if (!eligible) return 0;
+    }
+
+    int ts_contained = ts_contained_override;
+    if (ts_contained < 0) {
+        ts_contained = 1;
+        if (ts_r && ts_r->has_lo && src->ts_min < ts_r->lo) ts_contained = 0;
+        if (ts_r && ts_r->has_hi && src->ts_max > ts_r->hi) ts_contained = 0;
+    }
+    if (!ts_contained) return 0;
+
+    /* Per-column meta lookups.  We cache the metas by col so each one
+     * is fetched at most once per source. */
+    tsdb_block_meta_t *col_hits[TSDB_MAX_COLS]       = {0};
+    tsdb_block_meta_t *col_metas_arr[TSDB_MAX_COLS]  = {0};
+    int ok = 1;
+    for (int pi = 0; pi < nprojs && ok; pi++) {
+        int c = projs[pi].col;
+        if (c < 0 || col_hits[c]) continue;
+        tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+        if (tsdb_part_col_blocks(src->part, c, &metas, &nb) != TSDB_OK) {
+            ok = 0; break;
+        }
+        col_metas_arr[c] = metas;
+        for (size_t b = 0; b < nb; b++) {
+            if (metas[b].ts_min == src->meta.ts_min &&
+                metas[b].count  == src->meta.count) {
+                col_hits[c] = &metas[b]; break;
+            }
+        }
+        if (!col_hits[c]) { ok = 0; break; }
+    }
+    if (ok) {
+        for (int pi = 0; pi < nprojs && ok; pi++) {
+            proj_t *p = &projs[pi];
+            uint16_t bits = 0; int eligible = 0;
+            agg_stats_requires(p->kind, &bits, &eligible);
+            if (bits == 0) continue;              /* COUNT(*): no stats */
+            if (p->col < 0) { ok = 0; break; }
+            tsdb_block_meta_t *hit = col_hits[p->col];
+            if (!hit || (hit->stats_flags & bits) != bits) { ok = 0; break; }
+        }
+    }
+
+    if (ok) {
+        for (int pi = 0; pi < nprojs; pi++) {
+            proj_t *p = &projs[pi];
+            tsdb_block_meta_t *hit = (p->col >= 0) ? col_hits[p->col] : NULL;
+            tsdb_block_meta_t fb;
+            if (!hit) { fb = src->meta; hit = &fb; }
+            agg_apply_stats(p, s, hit, src->meta.count);
+        }
+    }
+
+    for (int c = 0; c < TSDB_MAX_COLS; c++)
+        if (col_metas_arr[c]) free(col_metas_arr[c]);
+    return ok;
+}
+
 /* Worker function: scan the assigned sources and accumulate into private projs[]. */
 void tsdb_par_scan_task(void *arg) {
     par_task_t *t = (par_task_t *)arg;
@@ -1413,6 +1633,30 @@ void tsdb_par_scan_task(void *arg) {
      * reused across every block this worker processes. */
     void *agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
+
+    /* Kill switch — TSDB_DISABLE_STATS_FASTPATH=1 forces the scan path for
+     * every aggregate, so we can A/B against precomputed stats. */
+    static int fastpath_disabled = -1;
+    if (fastpath_disabled < 0) {
+        const char *e = getenv("TSDB_DISABLE_STATS_FASTPATH");
+        fastpath_disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
+    /* Structural gate: every projection must be stats-serviceable and
+     * there must be no non-ts WHERE.  If so, `stats_gate_ok` stays 1 and
+     * we can try the fast path per-source. */
+    int stats_gate_ok = !fastpath_disabled && (t->where == NULL);
+    if (stats_gate_ok) {
+        for (int pi = 0; pi < t->nprojs; pi++) {
+            proj_t *p = &t->projs[pi];
+            if (p->kind < PROJ_AGG_RANGE_BEGIN || p->kind > PROJ_AGG_RANGE_END) {
+                stats_gate_ok = 0; break;
+            }
+            uint16_t bits = 0; int eligible = 0;
+            agg_stats_requires(p->kind, &bits, &eligible);
+            if (!eligible) { stats_gate_ok = 0; break; }
+        }
+    }
 
     /* Extract ts bounds once per worker; used to skip blocks entirely. */
     ts_range_t ts_r;
@@ -1428,6 +1672,20 @@ void tsdb_par_scan_task(void *arg) {
         if ((ts_r.has_lo || ts_r.has_hi) &&
             ts_range_excludes(&ts_r, src->ts_min, src->ts_max))
             continue;
+
+        /* ---- Stats fast-path --------------------------------------
+         * When the block is fully within the ts predicate and every
+         * projection can be served from precomputed column stats we
+         * skip decoding entirely.  Stats are an optimisation; a miss
+         * simply falls through to the scan path below. */
+        if (stats_gate_ok) {
+            if (try_stats_fastpath(src, t->projs, t->nprojs, t->schema,
+                                    &ts_r, /*ts_contained_override=*/-1)) {
+                tsdb_metric_inc("qengine_agg_stats_hit_total");
+                continue;
+            }
+            tsdb_metric_inc("qengine_agg_stats_miss_total");
+        }
 
         void **bufs = calloc((size_t)t->schema->ncols, sizeof(void *));
         if (!bufs) { t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
@@ -2266,6 +2524,13 @@ static int gb_merge_into(gb_slot_t **dst_tbl, size_t *dst_cap, size_t *dst_nused
             case PROJ_AGG_MAX:
                 if (sp->agg_max_f > dp->agg_max_f) dp->agg_max_f = sp->agg_max_f;
                 if (sp->agg_max_i > dp->agg_max_i) dp->agg_max_i = sp->agg_max_i;
+                break;
+            case PROJ_AGG_SPREAD:
+                if (sp->agg_min_f < dp->agg_min_f) dp->agg_min_f = sp->agg_min_f;
+                if (sp->agg_min_i < dp->agg_min_i) dp->agg_min_i = sp->agg_min_i;
+                if (sp->agg_max_f > dp->agg_max_f) dp->agg_max_f = sp->agg_max_f;
+                if (sp->agg_max_i > dp->agg_max_i) dp->agg_max_i = sp->agg_max_i;
+                dp->agg_count  += sp->agg_count;
                 break;
             case PROJ_AGG_P50:
             case PROJ_AGG_P90:
@@ -3818,6 +4083,13 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         if (pp->agg_max_f > mp->agg_max_f) mp->agg_max_f = pp->agg_max_f;
                         if (pp->agg_max_i > mp->agg_max_i) mp->agg_max_i = pp->agg_max_i;
                         break;
+                    case PROJ_AGG_SPREAD:
+                        if (pp->agg_min_f < mp->agg_min_f) mp->agg_min_f = pp->agg_min_f;
+                        if (pp->agg_min_i < mp->agg_min_i) mp->agg_min_i = pp->agg_min_i;
+                        if (pp->agg_max_f > mp->agg_max_f) mp->agg_max_f = pp->agg_max_f;
+                        if (pp->agg_max_i > mp->agg_max_i) mp->agg_max_i = pp->agg_max_i;
+                        mp->agg_count += pp->agg_count;
+                        break;
                     case PROJ_AGG_P50:
                     case PROJ_AGG_P90:
                     case PROJ_AGG_P99:
@@ -3905,6 +4177,29 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 g_bloom_blocks_skipped++;
                 tsdb_metric_inc("qengine_bloom_skips_total");
                 continue;
+            }
+        }
+
+        /* Stats fast-path (serial).  Same shape as the parallel worker.
+         * Gate is conservative: simple aggregate query, no predicate,
+         * no windowing, no grouping — anything more complex falls to
+         * the full scan where the existing code already handles it. */
+        {
+            static int fp_off = -1;
+            if (fp_off < 0) {
+                const char *e = getenv("TSDB_DISABLE_STATS_FASTPATH");
+                fp_off = (e && e[0] && e[0] != '0') ? 1 : 0;
+            }
+            int eligible_query = has_agg && !q->where
+                               && !q->has_sample_by
+                               && !q->has_adv_window
+                               && q->ngroup_by == 0;
+            if (eligible_query && !fp_off && !src->mem) {
+                if (try_stats_fastpath(src, projs, nprojs, s, &ts_r, 1)) {
+                    tsdb_metric_inc("qengine_agg_stats_hit_total");
+                    continue;
+                }
+                tsdb_metric_inc("qengine_agg_stats_miss_total");
             }
         }
 

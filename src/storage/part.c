@@ -157,14 +157,19 @@ static int read_block_header(const uint8_t *buf,
 }
 
 /*
- * IdxHeader v2 layout (36 bytes, little-endian):
- *   [0..3]    magic        u32 = TSDB_IDX_MAGIC
- *   [4..7]    count        u32
- *   [8..9]    version      u16 = 2
- *   [10..11]  _pad         u16
- *   [12..19]  total_rows   u64
- *   [20..27]  file_ts_min  i64   (file-level zone map — new in v2)
- *   [28..35]  file_ts_max  i64
+ * IdxHeader v3 layout (40 bytes, little-endian):
+ *   [0..3]    magic          u32 = TSDB_IDX_MAGIC
+ *   [4..7]    count          u32
+ *   [8..9]    version        u16 = 3
+ *   [10..11]  _pad           u16
+ *   [12..19]  total_rows     u64
+ *   [20..27]  file_ts_min    i64   (file-level zone map — v2+)
+ *   [28..35]  file_ts_max    i64
+ *   [36..37]  entry_size     u16   = TSDB_IDX_ENTRY_SIZE (88)
+ *   [38..39]  stats_variant  u16   = 0  (reserved; future stats layouts)
+ *
+ * V2 header is 36 bytes (no entry_size/variant). V1 is 20 bytes (no zone
+ * map). Readers negotiate by version.
  */
 static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows,
                                int64_t file_ts_min, int64_t file_ts_max) {
@@ -175,18 +180,23 @@ static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows
     put_u64le(buf + 12, total_rows);
     put_i64le(buf + 20, file_ts_min);
     put_i64le(buf + 28, file_ts_max);
+    put_u16le(buf + 36, (uint16_t)TSDB_IDX_ENTRY_SIZE);  /* entry_size */
+    put_u16le(buf + 38, 0u);                              /* stats_variant */
     return TSDB_IDX_HEADER_SIZE;
 }
 
 /*
- * Decode an IdxHeader supporting both v1 and v2.
- * Returns the number of header bytes consumed (20 for v1, 36 for v2),
- * or -1 on corruption.
+ * Decode an IdxHeader supporting v1 / v2 / v3.
+ *
+ * Returns the number of header bytes consumed (20 for v1, 36 for v2,
+ * 40 for v3), or -1 on corruption.  Also reports the per-entry size:
+ *   v1/v2 → 40; v3 → value read from header (normally 88).
  */
-static int read_idx_header(const uint8_t *buf, size_t avail,
-                           uint32_t *out_count, uint16_t *out_version,
-                           uint64_t *out_total_rows,
-                           int64_t  *out_file_ts_min, int64_t *out_file_ts_max)
+static int read_idx_header_ex(const uint8_t *buf, size_t avail,
+                              uint32_t *out_count, uint16_t *out_version,
+                              uint64_t *out_total_rows,
+                              int64_t  *out_file_ts_min, int64_t *out_file_ts_max,
+                              uint32_t *out_entry_size)
 {
     if (avail < TSDB_IDX_HEADER_SIZE_V1) return -1;
     if (get_u32le(buf) != TSDB_IDX_MAGIC) return -1;
@@ -195,33 +205,60 @@ static int read_idx_header(const uint8_t *buf, size_t avail,
     *out_total_rows = get_u64le(buf + 12);
 
     if (*out_version == 1) {
-        /* Zone map unknown — caller must fall back. */
         *out_file_ts_min = INT64_MAX;
         *out_file_ts_max = INT64_MIN;
+        *out_entry_size  = TSDB_IDX_ENTRY_SIZE_V2;
         return (int)TSDB_IDX_HEADER_SIZE_V1;
     }
     if (*out_version == 2) {
+        if (avail < TSDB_IDX_HEADER_SIZE_V2) return -1;
+        *out_file_ts_min = get_i64le(buf + 20);
+        *out_file_ts_max = get_i64le(buf + 28);
+        *out_entry_size  = TSDB_IDX_ENTRY_SIZE_V2;
+        return (int)TSDB_IDX_HEADER_SIZE_V2;
+    }
+    if (*out_version == 3) {
         if (avail < TSDB_IDX_HEADER_SIZE) return -1;
         *out_file_ts_min = get_i64le(buf + 20);
         *out_file_ts_max = get_i64le(buf + 28);
+        uint16_t esz = get_u16le(buf + 36);
+        /* stats_variant @38..39 — unused today */
+        *out_entry_size = (esz == 0) ? TSDB_IDX_ENTRY_SIZE : esz;
         return (int)TSDB_IDX_HEADER_SIZE;
     }
     return -1;   /* unknown version */
 }
 
+
 /*
- * BlockIndexEntry layout (40 bytes, little-endian):
+ * BlockIndexEntry layout.
+ *
+ * Bytes 0..39 are stable across v1/v2/v3:
  *   [0..7]    offset    u64
  *   [8..11]   size      u32
  *   [12..15]  count     u32
  *   [16..23]  ts_min    i64
  *   [24..31]  ts_max    i64
- *   [32..39]  _reserved u64
+ *   [32..39]  _reserved u64   (used as 64-bit bloom for SYMBOL columns)
+ *
+ * V3 entries append a 48-byte column-stats payload at bytes 40..87:
+ *   [40..47]  stats_min    i64 bits  (reinterpret as double for FLOAT64)
+ *   [48..55]  stats_max    i64 bits
+ *   [56..63]  stats_sum    i64 bits
+ *   [64..71]  stats_first  i64 bits  (block is ts-ordered on flush)
+ *   [72..79]  stats_last   i64 bits
+ *   [80..81]  stats_flags  u16       (see TSDB_STATS_HAS_* in part.h)
+ *   [82..87]  _pad         6 bytes   (reserved)
+ *
+ * The stats payload is written unconditionally at V3 so the layout is
+ * uniform; for SYMBOL columns stats_flags == 0 and the fields are 0 —
+ * those columns are served from the existing bloom filter instead.
  */
 static size_t write_idx_entry(uint8_t *buf,
                               uint64_t offset, uint32_t size, uint32_t count,
                               int64_t ts_min, int64_t ts_max,
-                              uint64_t bloom)
+                              uint64_t bloom,
+                              const tsdb_block_meta_t *stats)
 {
     put_u64le(buf + 0,  offset);
     put_u32le(buf + 8,  size);
@@ -229,6 +266,19 @@ static size_t write_idx_entry(uint8_t *buf,
     put_i64le(buf + 16, ts_min);
     put_i64le(buf + 24, ts_max);
     put_u64le(buf + 32, bloom);
+
+    /* Stats payload.  A NULL `stats` means "no stats" — e.g. a legacy
+     * V1/V2 entry being widened on merge.  We still zero the payload
+     * so readers see a consistent 88-byte record. */
+    memset(buf + 40, 0, TSDB_IDX_STATS_BYTES);
+    if (stats) {
+        put_i64le(buf + 40, stats->stats_min);
+        put_i64le(buf + 48, stats->stats_max);
+        put_i64le(buf + 56, stats->stats_sum);
+        put_i64le(buf + 64, stats->stats_first);
+        put_i64le(buf + 72, stats->stats_last);
+        put_u16le(buf + 80, stats->stats_flags);
+    }
     return TSDB_IDX_ENTRY_SIZE;
 }
 
@@ -313,8 +363,10 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
             uint16_t ver = 0;
             uint64_t tot = 0;
             int64_t  fmn = INT64_MAX, fmx = INT64_MIN;
-            int hsz = read_idx_header(hdr, n, &cnt, &ver, &tot, &fmn, &fmx);
-            if (hsz > 0) {
+            uint32_t esz = 0;
+            int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
+                                          &fmn, &fmx, &esz);
+            if (hsz > 0 && esz > 0) {
                 w->block_count = cnt;
                 w->total_rows  = tot;
                 if (ver >= 2) {
@@ -322,12 +374,12 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
                     w->file_ts_max = fmx;
                     w->has_zone    = (cnt > 0);
                 } else if (cnt > 0) {
-                    /* v1 idx: derive zone from per-block entries. */
+                    /* v1 idx: derive zone from per-block entries.
+                     * Entries are 40 bytes in v1. */
                     if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
                         for (uint32_t b = 0; b < cnt; b++) {
-                            uint8_t e[TSDB_IDX_ENTRY_SIZE];
-                            if (fread(e, 1, TSDB_IDX_ENTRY_SIZE, idx_r)
-                                != TSDB_IDX_ENTRY_SIZE) break;
+                            uint8_t e[TSDB_IDX_ENTRY_SIZE];  /* oversized buf */
+                            if (fread(e, 1, esz, idx_r) != esz) break;
                             int64_t mn = get_i64le(e + 16);
                             int64_t mx = get_i64le(e + 24);
                             if (mn < w->file_ts_min) w->file_ts_min = mn;
@@ -345,6 +397,91 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     w->idx_entries = malloc(w->idx_cap * TSDB_IDX_ENTRY_SIZE);
     if (!w->idx_entries) { fclose(w->col_fp); return TSDB_ERR_NOMEM; }
     return TSDB_OK;
+}
+
+/*
+ * Compute per-column block statistics (min/max/sum/first/last).
+ *
+ * Block rows are ts-sorted at flush time (see tsdb_memtable_sorted_indices),
+ * so `first` = raw_vals[0] and `last` = raw_vals[count-1] in ts order.
+ *
+ * Sum semantics:
+ *   INT64     — saturating i64 add; if we detect overflow, clear the
+ *               SUM bit so the reader falls back to scanning.
+ *   FLOAT64   — double accumulator; if it goes non-finite we clear SUM.
+ *   TIMESTAMP — MIN/MAX/FIRST/LAST only (sum of timestamps is nonsense).
+ *   SYMBOL    — all stats cleared; bloom is the right tool there.
+ */
+static void compute_block_stats(tsdb_type_t type,
+                                 const void *raw_vals, size_t count,
+                                 tsdb_block_meta_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (count == 0 || type == TSDB_TYPE_SYMBOL) return;
+
+    switch (type) {
+        case TSDB_TYPE_TIMESTAMP:
+        case TSDB_TYPE_INT64: {
+            const int64_t *v = (const int64_t *)raw_vals;
+            int64_t mn = v[0], mx = v[0];
+            __int128 sum = v[0];
+            int sum_ok = 1;
+            for (size_t i = 1; i < count; i++) {
+                int64_t x = v[i];
+                if (x < mn) mn = x;
+                if (x > mx) mx = x;
+                if (sum_ok) {
+                    sum += x;
+                    if (sum >  ((__int128)INT64_MAX) ||
+                        sum < -((__int128)INT64_MAX) - 1) {
+                        sum_ok = 0;
+                    }
+                }
+            }
+            out->stats_min   = mn;
+            out->stats_max   = mx;
+            out->stats_sum   = sum_ok ? (int64_t)sum : 0;
+            out->stats_first = v[0];
+            out->stats_last  = v[count - 1];
+            out->stats_flags = TSDB_STATS_HAS_MIN_MAX
+                             | TSDB_STATS_HAS_FIRST_LAST
+                             | (sum_ok && type == TSDB_TYPE_INT64
+                                    ? TSDB_STATS_HAS_SUM : 0u);
+            /* TIMESTAMP: SUM deliberately left off even when lossless. */
+            break;
+        }
+        case TSDB_TYPE_FLOAT64: {
+            const double *v = (const double *)raw_vals;
+            double mn = v[0], mx = v[0], s = v[0];
+            int sum_ok = (s == s && s < 1e308 && s > -1e308);
+            int mnmx_ok = (mn == mn && mx == mx);
+            for (size_t i = 1; i < count; i++) {
+                double x = v[i];
+                if (!(x == x)) { /* NaN poisons min/max */
+                    mnmx_ok = 0;
+                    continue;
+                }
+                if (x < mn) mn = x;
+                if (x > mx) mx = x;
+                if (sum_ok) {
+                    s += x;
+                    if (!(s == s) || s > 1e308 || s < -1e308) sum_ok = 0;
+                }
+            }
+            /* Reinterpret doubles into the i64 slots bit-for-bit. */
+            memcpy(&out->stats_min,   &mn, 8);
+            memcpy(&out->stats_max,   &mx, 8);
+            memcpy(&out->stats_sum,   &s,  8);
+            memcpy(&out->stats_first, &v[0], 8);
+            memcpy(&out->stats_last,  &v[count - 1], 8);
+            out->stats_flags = (mnmx_ok ? TSDB_STATS_HAS_MIN_MAX : 0u)
+                             | (sum_ok  ? TSDB_STATS_HAS_SUM     : 0u)
+                             | TSDB_STATS_HAS_FIRST_LAST;
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 static int col_writer_write_block(col_writer_t *w,
@@ -386,10 +523,15 @@ static int col_writer_write_block(col_writer_t *w,
         free(comp_buf); return TSDB_ERR_IO;
     }
 
+    /* Precompute the stats payload up-front so the raw-block hook + the
+     * idx entry both see the same numbers. */
+    tsdb_block_meta_t stats;
+    compute_block_stats(type, raw_vals, count, &stats);
+
     /* Raw-block replication hook: fire BEFORE freeing comp_buf. */
     if (w->raw_block_fn) {
-        tsdb_block_meta_t meta;
-        meta.offset = w->col_offset;  /* offset of this block's header */
+        tsdb_block_meta_t meta = stats;        /* carry stats to peers */
+        meta.offset = w->col_offset;
         meta.size   = (uint32_t)comp_bytes;
         meta.count  = (uint32_t)count;
         meta.ts_min = ts_min;
@@ -415,7 +557,7 @@ static int col_writer_write_block(col_writer_t *w,
     }
     uint8_t *entry = w->idx_entries + w->idx_n * TSDB_IDX_ENTRY_SIZE;
     write_idx_entry(entry, w->col_offset, (uint32_t)comp_bytes,
-                    (uint32_t)count, ts_min, ts_max, bloom);
+                    (uint32_t)count, ts_min, ts_max, bloom, &stats);
     w->idx_n++;
     w->col_offset  += TSDB_BLOCK_HEADER_SIZE + (uint64_t)comp_bytes;
     w->total_rows  += count;
@@ -443,10 +585,12 @@ static int col_writer_close(col_writer_t *w) {
     }
 
     if (w->idx_n > 0 && rc == TSDB_OK) {
-        /* Read all existing entries from old idx (if any). Handles both
-         * v1 (20-byte) and v2 (36-byte) headers transparently. */
-        uint8_t *old_entries = NULL;
-        uint32_t old_count   = 0;
+        /* Read all existing entries from old idx (if any).  Handles v1 /
+         * v2 (40-byte entries) and v3 (88-byte entries) transparently —
+         * we widen legacy entries to V3 on write-out so the resulting
+         * file is single-format. */
+        uint8_t *old_entries_v3 = NULL;   /* widened to V3 layout */
+        uint32_t old_count      = 0;
 
         {
             FILE *idx_r = fopen(w->idx_path, "rb");
@@ -460,40 +604,52 @@ static int col_writer_close(col_writer_t *w) {
                 uint16_t ver = 0;
                 uint64_t tot = 0;
                 int64_t  fmn = 0, fmx = 0;
-                int hsz = read_idx_header(hdr, n, &cnt, &ver, &tot, &fmn, &fmx);
-                if (hsz > 0) {
+                uint32_t esz = 0;
+                int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
+                                              &fmn, &fmx, &esz);
+                if (hsz > 0 && esz > 0) {
                     old_count = cnt;
                     if (old_count > 0) {
-                        /* Seek past whatever header size the old file has. */
-                        if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
-                            old_entries = malloc((size_t)old_count * TSDB_IDX_ENTRY_SIZE);
-                            if (old_entries) {
-                                if (fread(old_entries, 1,
-                                          (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_r)
-                                    != (size_t)old_count * TSDB_IDX_ENTRY_SIZE) {
-                                    free(old_entries);
-                                    old_entries = NULL;
-                                    old_count   = 0;
+                        size_t old_raw_sz = (size_t)old_count * esz;
+                        uint8_t *old_raw = malloc(old_raw_sz);
+                        if (old_raw && fseek(idx_r, (long)hsz, SEEK_SET) == 0 &&
+                            fread(old_raw, 1, old_raw_sz, idx_r) == old_raw_sz)
+                        {
+                            /* Always widen into fresh V3 buffer — even if
+                             * esz is already 88, zeroing the stats tail
+                             * for legacy entries never hurts. */
+                            old_entries_v3 = calloc((size_t)old_count,
+                                                    TSDB_IDX_ENTRY_SIZE);
+                            if (old_entries_v3) {
+                                size_t copy_prefix = (esz < TSDB_IDX_ENTRY_SIZE)
+                                                     ? esz : TSDB_IDX_ENTRY_SIZE;
+                                for (uint32_t i = 0; i < old_count; i++) {
+                                    memcpy(old_entries_v3 + (size_t)i * TSDB_IDX_ENTRY_SIZE,
+                                           old_raw + (size_t)i * esz,
+                                           copy_prefix);
                                 }
+                                /* Zero-init stats tail already via calloc.
+                                 * stats_flags == 0 signals "absent" — the
+                                 * reader will skip the fast-path on these
+                                 * legacy blocks, which is the safe answer. */
+                            } else {
+                                old_count = 0;
                             }
+                        } else {
+                            old_count = 0;
                         }
+                        free(old_raw);
                     }
                 }
                 fclose(idx_r);
             }
         }
 
-        /* Rewrite idx in place.  The footer-first read order in
-         * tsdb_part_open eliminates the reader's mmap-vs-idx visibility
-         * race without needing atomic publish: if the reader hits this
-         * mid-rewrite it either (a) sees a short/zero read and drops the
-         * column for this open (next open retries), or (b) sees fewer
-         * entries than actually committed, which is still consistent —
-         * all observed entries reference durable col bytes, since data
-         * is fflushed above before we ever touch the idx file. */
+        /* Rewrite idx in place.  Same read/write visibility argument as
+         * before: footer-first reader, data fflushed before we touch idx. */
         FILE *idx_w = fopen(w->idx_path, "wb");
         if (!idx_w) {
-            free(old_entries);
+            free(old_entries_v3);
             rc = TSDB_ERR_IO;
         } else {
             uint32_t total_count = old_count + (uint32_t)w->idx_n;
@@ -502,13 +658,14 @@ static int col_writer_close(col_writer_t *w) {
             uint8_t  hdr[TSDB_IDX_HEADER_SIZE];
             write_idx_header(hdr, total_count, w->total_rows, fmn, fmx);
             fwrite(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_w);
-            if (old_count > 0 && old_entries) {
-                fwrite(old_entries, 1, (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_w);
+            if (old_count > 0 && old_entries_v3) {
+                fwrite(old_entries_v3, 1,
+                       (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_w);
             }
             fwrite(w->idx_entries, 1, w->idx_n * TSDB_IDX_ENTRY_SIZE, idx_w);
             fflush(idx_w);
             fclose(idx_w);
-            free(old_entries);
+            free(old_entries_v3);
         }
     }
 
@@ -749,28 +906,33 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         uint16_t idx_version  = 0;
         uint64_t total_rows_u = 0;
         int64_t  fmn = 0, fmx = 0;
-        int      hdr_size = read_idx_header(idx_hdr, hdr_n,
-                                            &block_count, &idx_version,
-                                            &total_rows_u, &fmn, &fmx);
-        if (hdr_size < 0 || block_count == 0) { fclose(idx_f); continue; }
+        uint32_t entry_size   = 0;
+        int      hdr_size = read_idx_header_ex(idx_hdr, hdr_n,
+                                                &block_count, &idx_version,
+                                                &total_rows_u, &fmn, &fmx,
+                                                &entry_size);
+        if (hdr_size < 0 || block_count == 0 || entry_size == 0) {
+            fclose(idx_f); continue;
+        }
 
         if (fseek(idx_f, (long)hdr_size, SEEK_SET) != 0) {
             fclose(idx_f); continue;
         }
 
         /* Read all entries up-front so we can finalise col_metas later
-         * against the mmap snapshot in one consistent pass. */
-        uint8_t *entries = malloc((size_t)block_count * TSDB_IDX_ENTRY_SIZE);
+         * against the mmap snapshot in one consistent pass.  Buffer uses
+         * the file's `entry_size` (40 for V1/V2, 88 for V3). */
+        uint8_t *entries = malloc((size_t)block_count * entry_size);
         if (!entries) { fclose(idx_f); tsdb_part_close(p); return TSDB_ERR_NOMEM; }
-        size_t nread = fread(entries, TSDB_IDX_ENTRY_SIZE,
+        size_t nread = fread(entries, entry_size,
                              (size_t)block_count, idx_f);
         fclose(idx_f);
         if (nread == 0) { free(entries); continue; }
 
         uint64_t max_end = 0;
         for (size_t i = 0; i < nread; i++) {
-            uint64_t off = get_u64le(entries + i * TSDB_IDX_ENTRY_SIZE);
-            uint32_t sz  = get_u32le(entries + i * TSDB_IDX_ENTRY_SIZE + 8);
+            uint64_t off = get_u64le(entries + i * entry_size);
+            uint32_t sz  = get_u32le(entries + i * entry_size + 8);
             uint64_t end = off + TSDB_BLOCK_HEADER_SIZE + (uint64_t)sz;
             if (end > max_end) max_end = end;
         }
@@ -819,21 +981,32 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
          * non-atomic idx).  With the new write path it should be a
          * no-op on every entry. */
         size_t map_sz = p->col_maps[ci].map_size;
+        int    stats_present = (entry_size >= TSDB_IDX_ENTRY_SIZE);
         for (size_t i = 0; i < nread; i++) {
-            uint8_t *entry  = entries + i * TSDB_IDX_ENTRY_SIZE;
+            uint8_t *entry  = entries + i * entry_size;
             uint64_t offset = get_u64le(entry + 0);
             uint32_t bsize  = get_u32le(entry + 8);
             uint64_t end = offset + TSDB_BLOCK_HEADER_SIZE + (uint64_t)bsize;
             if (end > (uint64_t)map_sz) continue;
             size_t slot = p->col_meta_n[ci];
-            p->col_metas[ci][slot].offset = offset;
-            p->col_metas[ci][slot].size   = bsize;
-            p->col_metas[ci][slot].count  = get_u32le(entry + 12);
-            p->col_metas[ci][slot].ts_min = get_i64le(entry + 16);
-            p->col_metas[ci][slot].ts_max = get_i64le(entry + 24);
-            p->col_metas[ci][slot].bloom  = get_u64le(entry + 32);
-            p->col_metas[ci][slot].codec  = TSDB_CODEC_NONE;
-            p->col_metas[ci][slot].flags  = 0;
+            tsdb_block_meta_t *m = &p->col_metas[ci][slot];
+            memset(m, 0, sizeof(*m));
+            m->offset = offset;
+            m->size   = bsize;
+            m->count  = get_u32le(entry + 12);
+            m->ts_min = get_i64le(entry + 16);
+            m->ts_max = get_i64le(entry + 24);
+            m->bloom  = get_u64le(entry + 32);
+            m->codec  = TSDB_CODEC_NONE;
+            m->flags  = 0;
+            if (stats_present) {
+                m->stats_min   = get_i64le(entry + 40);
+                m->stats_max   = get_i64le(entry + 48);
+                m->stats_sum   = get_i64le(entry + 56);
+                m->stats_first = get_i64le(entry + 64);
+                m->stats_last  = get_i64le(entry + 72);
+                m->stats_flags = get_u16le(entry + 80);
+            }
             p->col_meta_n[ci]++;
         }
         free(entries);

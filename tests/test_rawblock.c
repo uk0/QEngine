@@ -233,6 +233,14 @@ static void test_flush_apply(void) {
         r.count           = ctx.blocks[i].meta.count;
         r.ts_min          = ctx.blocks[i].meta.ts_min;
         r.ts_max          = ctx.blocks[i].meta.ts_max;
+        /* Forward precomputed column stats so the replica idx matches
+         * the primary byte-for-byte. */
+        r.stats_min       = ctx.blocks[i].meta.stats_min;
+        r.stats_max       = ctx.blocks[i].meta.stats_max;
+        r.stats_sum       = ctx.blocks[i].meta.stats_sum;
+        r.stats_first     = ctx.blocks[i].meta.stats_first;
+        r.stats_last      = ctx.blocks[i].meta.stats_last;
+        r.stats_flags     = ctx.blocks[i].meta.stats_flags;
         r.block_bytes_len = (uint32_t)ctx.blocks[i].bytes_len;
         r.block_bytes     = ctx.blocks[i].bytes;
 
@@ -569,6 +577,14 @@ static void test_benchmark(void) {
         r.count           = ctx.blocks[i].meta.count;
         r.ts_min          = ctx.blocks[i].meta.ts_min;
         r.ts_max          = ctx.blocks[i].meta.ts_max;
+        /* Forward precomputed column stats so the replica idx matches
+         * the primary byte-for-byte. */
+        r.stats_min       = ctx.blocks[i].meta.stats_min;
+        r.stats_max       = ctx.blocks[i].meta.stats_max;
+        r.stats_sum       = ctx.blocks[i].meta.stats_sum;
+        r.stats_first     = ctx.blocks[i].meta.stats_first;
+        r.stats_last      = ctx.blocks[i].meta.stats_last;
+        r.stats_flags     = ctx.blocks[i].meta.stats_flags;
         r.block_bytes_len = (uint32_t)ctx.blocks[i].bytes_len;
         r.block_bytes     = ctx.blocks[i].bytes;
         ASSERT(tsdb_rawblock_apply(rdb, &r) == TSDB_OK);

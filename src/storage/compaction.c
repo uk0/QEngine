@@ -71,11 +71,13 @@ static inline void put_i64le(uint8_t *p, int64_t v)  { put_u64le(p, (uint64_t)v)
 
 #define BLK_MAGIC       0x314B4C42u
 #define IDX_MAGIC       0x31584449u
-#define IDX_VERSION     2u
+#define IDX_VERSION     3u
 #define BLK_HDR_SZ      32u
 #define IDX_HDR_SZ_V1   20u
-#define IDX_HDR_SZ      36u
-#define IDX_ENTRY_SZ    40u
+#define IDX_HDR_SZ_V2   36u
+#define IDX_HDR_SZ      40u   /* V3 */
+#define IDX_ENTRY_SZ_V2 40u
+#define IDX_ENTRY_SZ    88u   /* V3 (prefix 40 + stats 48) */
 
 /* Max compressed output for one COMPACT_BLOCK_POINTS chunk. */
 #define MAX_COMP_OUT  (COMPACT_BLOCK_POINTS * 8 * 2 + 512)
@@ -99,11 +101,13 @@ static int is_partition_dir(const char *name) {
 /* ---- Block I/O helpers ---------------------------------------------------- */
 
 /*
- * Write a v2 IdxHeader into buf (exactly IDX_HDR_SZ bytes).
+ * Write a v3 IdxHeader into buf (exactly IDX_HDR_SZ bytes).
+ * Mirrors the layout in src/storage/part.c.
  */
 static void write_idx_hdr(uint8_t *buf, uint32_t nblocks, uint64_t total_rows,
                           int64_t ts_min, int64_t ts_max)
 {
+    memset(buf, 0, IDX_HDR_SZ);
     put_u32le(buf + 0,  IDX_MAGIC);
     put_u32le(buf + 4,  nblocks);
     put_u16le(buf + 8,  (uint16_t)IDX_VERSION);
@@ -111,22 +115,30 @@ static void write_idx_hdr(uint8_t *buf, uint32_t nblocks, uint64_t total_rows,
     put_u64le(buf + 12, total_rows);
     put_i64le(buf + 20, ts_min);
     put_i64le(buf + 28, ts_max);
+    put_u16le(buf + 36, (uint16_t)IDX_ENTRY_SZ);   /* entry_size */
+    put_u16le(buf + 38, 0);                         /* stats_variant */
 }
 
 /*
  * Write a BlockIndexEntry (IDX_ENTRY_SZ bytes) into buf.
+ * Compaction currently does not compute per-column stats (it works on
+ * raw bytes of already-compressed blocks), so the stats tail is zeroed
+ * — stats_flags==0 signals absent to readers.  A future pass can fold
+ * stats in during the decode/re-encode step.
  */
 static void write_idx_entry(uint8_t *buf,
                             uint64_t offset, uint32_t size,
                             uint32_t count,
                             int64_t ts_min, int64_t ts_max)
 {
+    memset(buf, 0, IDX_ENTRY_SZ);
     put_u64le(buf + 0,  offset);
     put_u32le(buf + 8,  size);
     put_u32le(buf + 12, count);
     put_i64le(buf + 16, ts_min);
     put_i64le(buf + 24, ts_max);
     put_u64le(buf + 32, 0);
+    /* bytes 40..87 already zero — stats_flags=0 means "absent" */
 }
 
 /*
@@ -243,7 +255,14 @@ static int compact_column_file(const char *part_dir,
         return TSDB_OK;
     }
 
-    int hdr_sz = (idx_ver == 1) ? (int)IDX_HDR_SZ_V1 : (int)IDX_HDR_SZ;
+    /* Decide header / entry sizes based on on-disk version. */
+    int    hdr_sz   = (idx_ver == 1) ? (int)IDX_HDR_SZ_V1
+                    : (idx_ver == 2) ? (int)IDX_HDR_SZ_V2
+                                     : (int)IDX_HDR_SZ;
+    size_t entry_sz = (idx_ver == 3 && hdr_n >= IDX_HDR_SZ)
+                     ? (size_t)get_u16le(hdr_buf + 36)
+                     : (size_t)IDX_ENTRY_SZ_V2;
+    if (entry_sz == 0) entry_sz = IDX_ENTRY_SZ_V2;
 
     /* ---- 3. Read all BlockIndexEntry records ------------------------------- */
 
@@ -261,22 +280,28 @@ static int compact_column_file(const char *part_dir,
         return TSDB_ERR_IO;
     }
 
+    uint8_t *ebuf = malloc(entry_sz);
+    if (!ebuf) {
+        free(infos); fclose(idx_f);
+        munmap(col_map, map_len);
+        return TSDB_ERR_NOMEM;
+    }
     for (uint32_t b = 0; b < block_count; b++) {
-        uint8_t e[IDX_ENTRY_SZ];
-        if (fread(e, 1, IDX_ENTRY_SZ, idx_f) != IDX_ENTRY_SZ) {
-            free(infos);
+        if (fread(ebuf, 1, entry_sz, idx_f) != entry_sz) {
+            free(ebuf); free(infos);
             fclose(idx_f);
             munmap(col_map, map_len);
             return TSDB_ERR_IO;
         }
-        infos[b].offset = get_u64le(e + 0);
-        infos[b].data_sz= get_u32le(e + 8);
-        infos[b].count  = get_u32le(e + 12);
-        infos[b].ts_min = get_i64le(e + 16);
-        infos[b].ts_max = get_i64le(e + 24);
+        infos[b].offset = get_u64le(ebuf + 0);
+        infos[b].data_sz= get_u32le(ebuf + 8);
+        infos[b].count  = get_u32le(ebuf + 12);
+        infos[b].ts_min = get_i64le(ebuf + 16);
+        infos[b].ts_max = get_i64le(ebuf + 24);
         infos[b].codec  = 0;
         infos[b].flags  = 0;
     }
+    free(ebuf);
     fclose(idx_f);
 
     /* Back-fill codec and flags from BlockHeaders in the mmap. */

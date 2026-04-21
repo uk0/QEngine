@@ -142,6 +142,14 @@ static metric_t g_metrics[] = {
     { "qengine_bloom_skips_total",
       "Total partitions skipped due to bloom-filter negative", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_agg_stats_hit_total",
+      "Times the aggregate fast-path consumed a block's precomputed stats",
+      MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_agg_stats_miss_total",
+      "Times the aggregate fell back to full-block scan (stats absent or gate failed)",
+      MT_COUNTER, { .c = { 0 } } },
+
     /* --- gauges --- */
     { "qengine_connections_active",
       "Current number of active client connections", MT_GAUGE, { .g = { 0 } } },

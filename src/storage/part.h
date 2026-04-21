@@ -59,17 +59,34 @@ extern "C" {
 /* Magic constants. */
 #define TSDB_BLOCK_MAGIC  0x314B4C42u  /* "BLK1" LE */
 #define TSDB_IDX_MAGIC    0x31584449u  /* "IDX1" LE */
-#define TSDB_IDX_VERSION  2            /* writer version (adds file-level zone map) */
+#define TSDB_IDX_VERSION  3            /* writer version: v3 adds per-block column stats */
 
 /* Block header on-disk size. */
 #define TSDB_BLOCK_HEADER_SIZE  32u
 
-/* Index header sizes. V1 = legacy (no zone map); V2 = current writer. */
+/* Index header sizes.
+ *   V1 = legacy (no zone map)
+ *   V2 = adds file-level ts zone map
+ *   V3 = adds explicit entry_size + stats_variant so stats layout can
+ *        evolve without another header bump. */
 #define TSDB_IDX_HEADER_SIZE_V1  20u
-#define TSDB_IDX_HEADER_SIZE     36u
+#define TSDB_IDX_HEADER_SIZE_V2  36u
+#define TSDB_IDX_HEADER_SIZE     40u   /* V3 */
 
-/* Block index entry on-disk size. */
-#define TSDB_IDX_ENTRY_SIZE     40u
+/* Block index entry on-disk sizes.
+ *   V1/V2 entries = 40 bytes (offset,size,count,ts_min,ts_max,bloom).
+ *   V3 entries    = 88 bytes (V1/V2 prefix + 48 bytes of column stats). */
+#define TSDB_IDX_ENTRY_SIZE_V2  40u
+#define TSDB_IDX_ENTRY_SIZE     88u   /* V3 */
+
+/* Stats payload (bytes 40..87 of a V3 BlockIndexEntry) — see comment at
+ * the top of part.c for full layout. */
+#define TSDB_IDX_STATS_BYTES  48u
+
+/* Column-stats flag bits (bytes 80..81 of a V3 entry, little-endian u16). */
+#define TSDB_STATS_HAS_MIN_MAX    0x0001u
+#define TSDB_STATS_HAS_SUM        0x0002u
+#define TSDB_STATS_HAS_FIRST_LAST 0x0004u
 
 /* Block metadata returned to query layer. */
 typedef struct {
@@ -81,6 +98,23 @@ typedef struct {
     uint8_t  codec;
     uint16_t flags;    /* TSDB_BF_* bitmask from block header */
     uint64_t bloom;    /* 64-bit bloom filter (TSDB_BF_HAS_BLOOM must be set); 0 otherwise */
+
+    /* Per-column precomputed statistics (V3 stats payload).
+     *
+     * Interpretation depends on the column type:
+     *   TIMESTAMP/INT64 → min/max/sum/first/last are int64 values
+     *                     stored in the 8-byte fields below.
+     *   FLOAT64         → same fields hold IEEE 754 doubles (reinterpret).
+     *   SYMBOL          → stats_flags == 0 (absent); use bloom instead.
+     *
+     * stats_flags indicates which fields are valid.  0 means "absent"
+     * (V1/V2 entry, a SYMBOL column, or a widened legacy entry). */
+    int64_t  stats_min;
+    int64_t  stats_max;
+    int64_t  stats_sum;
+    int64_t  stats_first;
+    int64_t  stats_last;
+    uint16_t stats_flags;
 } tsdb_block_meta_t;
 
 /*

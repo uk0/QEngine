@@ -38,6 +38,17 @@ typedef struct {
     uint32_t  count;
     int64_t   ts_min;
     int64_t   ts_max;
+    /* Per-column block stats (forwarded to the replica so its index
+     * mirrors the primary's V3 entry exactly).  Fields carry the same
+     * semantics as the `stats_*` fields on tsdb_block_meta_t.
+     * stats_flags == 0 means the primary did not compute stats for this
+     * block (e.g. SYMBOL column) — the replica writes zeros. */
+    int64_t   stats_min;
+    int64_t   stats_max;
+    int64_t   stats_sum;
+    int64_t   stats_first;
+    int64_t   stats_last;
+    uint16_t  stats_flags;
     uint32_t  block_bytes_len;
     uint8_t  *block_bytes;       /* caller-owned; NOT freed by parse/serialize */
 } tsdb_rawblock_push_t;
