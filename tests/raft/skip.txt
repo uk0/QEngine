@@ -1,0 +1,6 @@
+# Scenarios currently skipped while Raft is being implemented.  When a
+# scenario passes locally, remove its name from this file so CI catches
+# regressions.  Expected to reach zero lines by the time Raft ships.
+s01_elect_leader
+s02_ddl_replicates
+s03_kill_leader
