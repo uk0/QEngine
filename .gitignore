@@ -61,6 +61,8 @@ bench/results/
 bench/*.csv
 jdbc/target/
 sdk/go/bench5m
+sdk/go/e2e-report
+sdk/go/e2e-report.linux
 sdk/java/target/
 sdk/go/bin/
 example-go/example-router

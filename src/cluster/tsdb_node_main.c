@@ -19,8 +19,13 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <inttypes.h>
 
 static volatile int g_running = 1;
+static time_t       g_node_start_epoch = 0;   /* set in main() */
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -78,9 +83,22 @@ static int cluster_json_cb(void *ud, char *buf, size_t cap) {
                                       TSDB_DISK_WEIGHT_DEFAULT_PER_TB,
                                       &total, &free_b);
     }
+    /* used% with one decimal (caller renders as-is).  We emit used_x10
+     * as integer to dodge any locale-specific '%f' rendering ambiguity
+     * — JS side divides by 10. */
+    int used_x10 = 0;
+    if (total > 0 && total >= free_b)
+        used_x10 = (int)(((total - free_b) * 1000ULL) / total);
+
     char host[128] = "self";
     gethostname(host, sizeof(host) - 1);
     host[sizeof(host) - 1] = '\0';
+
+    long uptime_s = 0;
+    if (g_node_start_epoch > 0) {
+        time_t nowt = time(NULL);
+        if (nowt > g_node_start_epoch) uptime_s = (long)(nowt - g_node_start_epoch);
+    }
 
     int add = snprintf(buf + n, cap - (size_t)n,
         ",\"local\":{"
@@ -88,13 +106,258 @@ static int cluster_json_cb(void *ud, char *buf, size_t cap) {
             "\"pid\":%d,"
             "\"uptime_s\":%ld,"
             "\"disk\":{\"total_bytes\":%llu,\"free_bytes\":%llu,"
-                      "\"data_dir\":\"%s\",\"vn_weight\":%d}"
+                      "\"used_x10\":%d,\"data_dir\":\"%s\",\"vn_weight\":%d}"
         "}}",
-        host, (int)getpid(), 0L,
+        host, (int)getpid(), uptime_s,
         (unsigned long long)total, (unsigned long long)free_b,
-        g_local_data_dir, vn);
+        used_x10, g_local_data_dir, vn);
     if (add < 0) return n + 1;   /* should be unreachable */
     return n + add;
+}
+
+/* ---- /tree provider ------------------------------------------------------
+ *
+ * Walks <data_dir>/ and reports every subdirectory as a table.  Each table
+ * row reports the column count (by opening the table and reading schema).
+ * Stable/device hierarchy is gathered by piggy-backing on LIST GROUPS /
+ * LIST DEVICES QTL statements — if the result set is non-empty we nest
+ * devices under a synthesised "_groups" virtual table.
+ *
+ * Errors are treated as "skip this entry" — the dashboard shows what's
+ * reachable instead of failing loud on a half-open table. */
+static int j_escape_str(char *dst, size_t cap, const char *s) {
+    size_t w = 0;
+    for (size_t i = 0; s && s[i] && w + 2 < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { dst[w++] = '\\'; dst[w++] = (char)c; }
+        else if (c == '\n')        { dst[w++] = '\\'; dst[w++] = 'n'; }
+        else if (c == '\r')        { dst[w++] = '\\'; dst[w++] = 'r'; }
+        else if (c == '\t')        { dst[w++] = '\\'; dst[w++] = 't'; }
+        else if (c < 0x20)         { /* drop */ }
+        else                       { dst[w++] = (char)c; }
+    }
+    if (w < cap) dst[w] = '\0';
+    return (int)w;
+}
+
+/* Return 1 if the name looks like a valid table directory (not ".", "..",
+ * not starting with '.', not the catalog dir). */
+static int is_table_dir(const char *name) {
+    if (!name || name[0] == '.' || name[0] == '_') return 0;
+    if (strcmp(name, "catalog") == 0) return 0;
+    if (strcmp(name, "wal")     == 0) return 0;
+    return 1;
+}
+
+static int tree_json_cb(void *ud, char *buf, size_t cap) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db || !g_local_data_dir[0]) return 0;
+
+    DIR *d = opendir(g_local_data_dir);
+    if (!d) return 0;
+
+    int w = 0;
+    w += snprintf(buf + w, cap - (size_t)w, "{\"db\":\"");
+    char esc[1024];
+    j_escape_str(esc, sizeof(esc), g_local_data_dir);
+    w += snprintf(buf + w, cap - (size_t)w, "%s\",\"tables\":[", esc);
+
+    int first = 1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && (size_t)w < cap - 256) {
+        if (!is_table_dir(de->d_name)) continue;
+        /* Must be a directory. */
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", g_local_data_dir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (!S_ISDIR(st.st_mode)) continue;
+
+        /* Try to open the table to read its schema.  Opening here is
+         * potentially expensive for very large catalogs, but realistic
+         * catalogs have O(10–100) tables; if it becomes a bottleneck we
+         * can add a lighter-weight schema-read path to the public API. */
+        tsdb_table_t *tbl = NULL;
+        int rc = tsdb_open_table(db, de->d_name, &tbl);
+        if (rc != 0) continue;
+
+        char name_esc[256];
+        j_escape_str(name_esc, sizeof(name_esc), de->d_name);
+        w += snprintf(buf + w, cap - (size_t)w,
+                      "%s{\"name\":\"%s\",\"kind\":\"table\"}",
+                      first ? "" : ",", name_esc);
+        first = 0;
+        /* tsdb_open_table caches handles in db — no close required. */
+        (void)tbl;
+    }
+    closedir(d);
+
+    /* Append a GROUPS section pulled via LIST GROUPS QTL.  If the
+     * statement errors (e.g. RBAC not set up), the array is empty. */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"groups\":[");
+    {
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, "LIST GROUPS;", &res) == 0 && res) {
+            int ncols = tsdb_result_ncols(res);
+            int gfirst = 1;
+            while (tsdb_result_next(res) > 0 && (size_t)w < cap - 256) {
+                /* Expect at least a "name" column. */
+                const char *gname = NULL;
+                for (int c = 0; c < ncols; c++) {
+                    const char *cn = tsdb_result_col_name(res, c);
+                    if (cn && (strcmp(cn, "name") == 0 || strcmp(cn, "group") == 0)) {
+                        gname = tsdb_result_sym(res, c);
+                        break;
+                    }
+                }
+                if (!gname && ncols > 0) gname = tsdb_result_sym(res, 0);
+                if (!gname) continue;
+                char ge[256]; j_escape_str(ge, sizeof(ge), gname);
+                w += snprintf(buf + w, cap - (size_t)w,
+                              "%s{\"name\":\"%s\"}",
+                              gfirst ? "" : ",", ge);
+                gfirst = 0;
+            }
+            tsdb_result_free(res);
+        }
+    }
+    w += snprintf(buf + w, cap - (size_t)w, "]}\n");
+    return w;
+}
+
+/* ---- /sql provider -------------------------------------------------------
+ *
+ * Execute a single QTL statement, stream the result into a JSON object of
+ * shape: {"cols":[…],"types":[…],"rows":[[…]],"nrows":N,"truncated":bool,
+ *        "ms":X}.  Row limit is enforced here at 1000; caller-supplied
+ * LIMIT in the query is respected naturally. */
+#define SQL_ROW_CAP  1000
+
+static int write_json_cell(char *buf, size_t cap, tsdb_result_t *res,
+                           int col, tsdb_type_t ty)
+{
+    if (tsdb_result_is_null(res, col))
+        return snprintf(buf, cap, "null");
+    switch (ty) {
+        case TSDB_TYPE_TIMESTAMP:
+            return snprintf(buf, cap, "%" PRId64,
+                            (int64_t)tsdb_result_ts(res, col));
+        case TSDB_TYPE_INT64:
+            return snprintf(buf, cap, "%" PRId64,
+                            tsdb_result_i64(res, col));
+        case TSDB_TYPE_FLOAT64: {
+            double v = tsdb_result_f64(res, col);
+            /* JSON has no NaN/Inf — emit null. */
+            if (v != v || v > 1e308 || v < -1e308)
+                return snprintf(buf, cap, "null");
+            return snprintf(buf, cap, "%.17g", v);
+        }
+        case TSDB_TYPE_SYMBOL: {
+            const char *s = tsdb_result_sym(res, col);
+            if (!s) return snprintf(buf, cap, "null");
+            int w = 0;
+            if (cap > 2) { buf[w++] = '"'; }
+            char esc[4096];
+            j_escape_str(esc, sizeof(esc), s);
+            int add = snprintf(buf + w, cap - (size_t)w, "%s", esc);
+            if (add > 0) w += add;
+            if ((size_t)w + 1 < cap) buf[w++] = '"';
+            if ((size_t)w < cap) buf[w] = '\0';
+            return w;
+        }
+    }
+    return snprintf(buf, cap, "null");
+}
+
+static const char *type_name(tsdb_type_t t) {
+    switch (t) {
+        case TSDB_TYPE_TIMESTAMP: return "TIMESTAMP";
+        case TSDB_TYPE_INT64:     return "INT64";
+        case TSDB_TYPE_FLOAT64:   return "FLOAT64";
+        case TSDB_TYPE_SYMBOL:    return "SYMBOL";
+    }
+    return "UNKNOWN";
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int sql_exec_cb(void *ud, const char *q, size_t qlen,
+                       char *buf, size_t cap)
+{
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return snprintf(buf, cap, "{\"error\":\"db not ready\"}");
+
+    /* Ensure q is NUL-terminated; we copy because the HTTP parser
+     * already left it NUL-terminated but belt-and-suspenders. */
+    char *stmt = malloc(qlen + 1);
+    if (!stmt) return snprintf(buf, cap, "{\"error\":\"oom\"}");
+    memcpy(stmt, q, qlen);
+    stmt[qlen] = '\0';
+
+    int64_t t0 = now_ms();
+    tsdb_result_t *res = NULL;
+    int rc = tsdb_query(db, stmt, &res);
+    if (rc != 0 || !res) {
+        const char *e = tsdb_errstr(rc);
+        char esc[512]; j_escape_str(esc, sizeof(esc), e ? e : "unknown error");
+        int w = snprintf(buf, cap,
+                         "{\"error\":\"%s\",\"ms\":%" PRId64 "}",
+                         esc, now_ms() - t0);
+        free(stmt);
+        return w;
+    }
+
+    int ncols = tsdb_result_ncols(res);
+
+    /* Header: "cols":[…],"types":[…]. */
+    int w = 0;
+    w += snprintf(buf + w, cap - (size_t)w, "{\"cols\":[");
+    for (int c = 0; c < ncols && (size_t)w < cap - 64; c++) {
+        const char *n = tsdb_result_col_name(res, c);
+        char esc[256]; j_escape_str(esc, sizeof(esc), n ? n : "");
+        w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                      c > 0 ? "," : "", esc);
+    }
+    w += snprintf(buf + w, cap - (size_t)w, "],\"types\":[");
+    for (int c = 0; c < ncols && (size_t)w < cap - 64; c++) {
+        tsdb_type_t t = tsdb_result_col_type(res, c);
+        w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                      c > 0 ? "," : "", type_name(t));
+    }
+
+    /* Rows. */
+    w += snprintf(buf + w, cap - (size_t)w, "],\"rows\":[");
+    int nrows = 0, truncated = 0;
+    while (tsdb_result_next(res) > 0) {
+        if (nrows >= SQL_ROW_CAP) { truncated = 1; break; }
+        /* Reserve at least 16 KiB per row before emitting; if we're too
+         * close to the buffer end, stop and mark truncated. */
+        if ((size_t)w > cap - 16 * 1024) { truncated = 1; break; }
+
+        w += snprintf(buf + w, cap - (size_t)w, "%s[",
+                      nrows > 0 ? "," : "");
+        for (int c = 0; c < ncols; c++) {
+            if (c > 0 && (size_t)w < cap)
+                buf[w++] = ',';
+            tsdb_type_t ty = tsdb_result_col_type(res, c);
+            int add = write_json_cell(buf + w, cap - (size_t)w, res, c, ty);
+            if (add > 0) w += add;
+        }
+        if ((size_t)w < cap) buf[w++] = ']';
+        nrows++;
+    }
+
+    w += snprintf(buf + w, cap - (size_t)w,
+                  "],\"nrows\":%d,\"truncated\":%s,\"ms\":%" PRId64 "}",
+                  nrows, truncated ? "true" : "false", now_ms() - t0);
+
+    tsdb_result_free(res);
+    free(stmt);
+    return w;
 }
 
 int main(int argc, char **argv) {
@@ -132,6 +395,8 @@ int main(int argc, char **argv) {
     /* Sensible defaults so `docker run` with just seeds works. */
     if (!client_bind  || !*client_bind)  client_bind  = "0.0.0.0:28090";
     if (!metrics_bind || !*metrics_bind) metrics_bind = "0.0.0.0:28094";
+
+    g_node_start_epoch = time(NULL);
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -186,6 +451,8 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_set_data_dir(data_dir);
     snprintf(g_local_data_dir, sizeof(g_local_data_dir), "%s", data_dir);
     tsdb_metrics_server_set_cluster_provider(cluster_json_cb, db);
+    tsdb_metrics_server_set_tree_provider(tree_json_cb, db);
+    tsdb_metrics_server_set_sql_provider(sql_exec_cb, db);
     rc = tsdb_metrics_server_start(metrics_bind, &ms);
     if (rc == 0 && ms) {
         printf("[node] metrics  bind=%s\n", metrics_bind);

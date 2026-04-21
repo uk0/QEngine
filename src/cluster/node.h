@@ -37,6 +37,10 @@ typedef struct {
     uint64_t        version;               /* monotonic generation / incarnation */
     int64_t         last_heartbeat_ns;     /* CLOCK_MONOTONIC nanoseconds */
     int             suspect_count;         /* consecutive probe failures */
+    /* Local-view only (never on-wire): when we first upserted this peer.
+     * Used by /cluster to report "known_for_s" so operators can see how
+     * long a peer has been part of our local membership view. */
+    int64_t         first_seen_ns;         /* CLOCK_MONOTONIC nanoseconds */
 } tsdb_node_info_t;
 
 /* Maximum cluster size. */

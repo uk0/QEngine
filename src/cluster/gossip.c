@@ -244,6 +244,21 @@ static void *recv_loop(void *arg) {
         case TSDB_GOSSIP_STATE_SYNC:
             if (plen > 0) {
                 tsdb_node_manager_decode(g->node_mgr, payload, plen);
+
+                /* Receiving STATE_SYNC from anyone is also evidence that
+                 * the sender is alive.  Reset per-node probe-fail counts
+                 * for any node we now observe as ALIVE — this lets a
+                 * peer that flapped recover without waiting for SUSPECT
+                 * timeout to run down. */
+                pthread_mutex_lock(&g->probe_lock);
+                for (int i = 0; i < g->nprobe_ids; i++) {
+                    tsdb_node_info_t ni = {0};
+                    if (tsdb_node_manager_get(g->node_mgr, g->probe_ids[i], &ni) == 0 &&
+                        ni.state == TSDB_NODE_ALIVE) {
+                        g->probe_fails[i] = 0;
+                    }
+                }
+                pthread_mutex_unlock(&g->probe_lock);
             }
             break;
         }
@@ -255,6 +270,7 @@ static void *recv_loop(void *arg) {
 
 static void *tick_loop(void *arg) {
     struct tsdb_gossip *g = (struct tsdb_gossip *)arg;
+    uint32_t tick_counter = 0;
 
     while (g->running) {
         /* Sleep GOSSIP_INTERVAL_MS ms in 10ms increments so we can exit cleanly. */
@@ -265,6 +281,7 @@ static void *tick_loop(void *arg) {
         if (!g->running) break;
 
         tsdb_node_manager_heartbeat(g->node_mgr);
+        tick_counter++;
 
         /* 1. Fan out STATE_SYNC to 3 random ALIVE peers. */
         tsdb_node_id_t peers[3];
@@ -282,6 +299,28 @@ static void *tick_loop(void *arg) {
             send_state_sync(g, g->seeds[s]);
         }
         pthread_mutex_unlock(&g->seed_lock);
+
+        /* 2b. Re-probe DEAD nodes periodically so they can rejoin after
+         * transient UDP drops / container restarts / conntrack flushes.
+         * Without this, once a node is marked DEAD it's excluded from
+         * both `random_alive` and (usually) the seed list, so we stop
+         * sending STATE_SYNC to it entirely — it can't refute because
+         * it never hears the DEAD claim.  A 2.5s cadence (every 5
+         * rounds at 500ms) is cheap even with 64 DEAD entries. */
+        if ((tick_counter % 5) == 0) {
+            tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+            int nsn = tsdb_node_manager_snapshot(g->node_mgr, snap,
+                                                  TSDB_CLUSTER_MAX_NODES);
+            tsdb_node_id_t self = tsdb_node_manager_local_id(g->node_mgr);
+            for (int i = 0; i < nsn; i++) {
+                if (snap[i].id == self) continue;
+                if (snap[i].state == TSDB_NODE_DEAD ||
+                    snap[i].state == TSDB_NODE_SUSPECT) {
+                    if (snap[i].gossip_addr[0])
+                        send_state_sync(g, snap[i].gossip_addr);
+                }
+            }
+        }
 
         /* 3. SWIM probe: pick one random ALIVE peer and PING it. */
         tsdb_node_id_t probe_target = 0;

@@ -391,8 +391,9 @@ int tsdb_autobalance_stats_str(tsdb_autobalance_t *ab, char *buf, int cap) {
 
     pthread_mutex_lock(&ab->load_table.lock);
     int n = 0;
+    /* ids as strings — see note in cluster.c about JS number precision. */
     n += snprintf(buf + n, (size_t)(cap - n),
-                  "{\"local_id\":%llu,\"ema_writes_sec\":%.1f,\"interval_ms\":%d"
+                  "{\"local_id\":\"%llu\",\"ema_writes_sec\":%.1f,\"interval_ms\":%d"
                   ",\"alpha\":%.2f,\"beta\":%.2f,\"dampen\":%.2f,\"nodes\":[",
                   (unsigned long long)ab->local_id,
                   ab->ema_writes_sec,
@@ -404,7 +405,7 @@ int tsdb_autobalance_stats_str(tsdb_autobalance_t *ab, char *buf, int cap) {
         const tsdb_node_load_t *r = &ab->load_table.loads[i];
         int vn = tsdb_hashring_get_weight(ring, r->node_id);
         n += snprintf(buf + n, (size_t)(cap - n),
-                      "%s{\"id\":%llu,\"writes_sec\":%llu,\"storage_mb\":%.1f"
+                      "%s{\"id\":\"%llu\",\"writes_sec\":%llu,\"storage_mb\":%.1f"
                       ",\"cpu_pct\":%.2f,\"vn\":%d}",
                       (i > 0 ? "," : ""),
                       (unsigned long long)r->node_id,

@@ -222,19 +222,47 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
 
     static const char *state_names[] = { "JOINING", "ALIVE", "SUSPECT", "DEAD" };
 
+    /* Snapshot monotonic clock once so per-node ages agree. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
     int written = 0;
+    /* Emit ids as STRINGS.  tsdb_node_id_t is uint64_t; any value above
+     * 2^53 (≈ 9e15) silently loses precision when JSON.parse rounds it
+     * into a JS Number — the dashboard saw ids ending in "…000" because
+     * of that round trip.  Strings preserve every digit and also match
+     * how the dashboard already keys its join tables. */
     written += snprintf(buf + written, cap - written,
-                        "{\"local_id\":%llu,\"nodes\":[",
+                        "{\"local_id\":\"%llu\",\"nodes\":[",
                         (unsigned long long)c->local_id);
 
     for (int i = 0; i < n && (size_t)written < cap - 2; i++) {
         const char *sname = (snap[i].state <= 3) ? state_names[snap[i].state] : "?";
+        /* hb_age_ms: wall time since we last observed a heartbeat from
+         *            this node (ms).  >3000ms is already suspicious.
+         * known_for_s: seconds since first upsert into local node_mgr.
+         *              Proxy for per-peer uptime as observed by this node.
+         * Both are local-clock based — peers may have different wall
+         * clocks, so computing on the server side is the right place. */
+        int64_t hb_age_ms = 0;
+        if (snap[i].last_heartbeat_ns > 0 && now > snap[i].last_heartbeat_ns)
+            hb_age_ms = (now - snap[i].last_heartbeat_ns) / 1000000LL;
+        int64_t known_for_s = 0;
+        if (snap[i].first_seen_ns > 0 && now > snap[i].first_seen_ns)
+            known_for_s = (now - snap[i].first_seen_ns) / 1000000000LL;
+
         written += snprintf(buf + written, cap - written,
-                            "%s{\"id\":%llu,\"addr\":\"%s\",\"state\":\"%s\",\"ver\":%llu}",
+                            "%s{\"id\":\"%llu\",\"addr\":\"%s\",\"state\":\"%s\","
+                            "\"ver\":%llu,\"hb_age_ms\":%lld,\"known_for_s\":%lld,"
+                            "\"suspect_count\":%d}",
                             (i > 0 ? "," : ""),
                             (unsigned long long)snap[i].id,
                             snap[i].addr, sname,
-                            (unsigned long long)snap[i].version);
+                            (unsigned long long)snap[i].version,
+                            (long long)hb_age_ms,
+                            (long long)known_for_s,
+                            snap[i].suspect_count);
     }
     written += snprintf(buf + written, cap - written, "]");
 

@@ -55,6 +55,34 @@ void tsdb_metrics_server_set_cluster_provider(tsdb_cluster_json_fn fn,
  * (so it can report total_bytes / free_bytes from statvfs). */
 void tsdb_metrics_server_set_data_dir(const char *path);
 
+/* ---- /tree provider hook ------------------------------------------------- *
+ * Returns a JSON tree describing this node's catalog for the dashboard's
+ * left-hand navigator.  Concrete shape is provider-defined; the dashboard
+ * expects:
+ *   { "db": "…",
+ *     "tables": [{"name":"…","ncols":N,"nrows_hint":N,
+ *                 "is_stable":bool,"children":[{"name":"<device>"}]}] }
+ */
+typedef int (*tsdb_tree_json_fn)(void *userdata, char *buf, size_t cap);
+void tsdb_metrics_server_set_tree_provider(tsdb_tree_json_fn fn,
+                                            void *userdata);
+
+/* ---- /sql provider hook -------------------------------------------------- *
+ * Runs a single SQL / QTL statement and writes a JSON result body.  The
+ * dashboard POSTs {"q":"<sql>"} and renders {"cols":[…], "types":[…],
+ * "rows":[[…]], "nrows":N, "truncated":bool, "ms":X} on success or
+ * {"error":"…"} on failure.  Caller (metrics_server) handles the HTTP
+ * envelope; the provider only produces the body bytes.
+ *
+ * Returns bytes written; negative on failure, 0 → fallback to built-in
+ * "disabled" body.
+ */
+typedef int (*tsdb_sql_exec_fn)(void *userdata,
+                                const char *q, size_t qlen,
+                                char *buf, size_t cap);
+void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
+                                           void *userdata);
+
 #ifdef __cplusplus
 }
 #endif

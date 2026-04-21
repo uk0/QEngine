@@ -68,6 +68,7 @@ tsdb_node_manager_t *tsdb_node_manager_new(tsdb_node_id_t local_id,
     self.state   = TSDB_NODE_ALIVE;
     self.version = 1;
     self.last_heartbeat_ns = now_ns();
+    self.first_seen_ns     = self.last_heartbeat_ns;
 
     mgr->nodes[mgr->nnodes++] = self;
     tsdb_hashring_add(mgr->ring, local_id);
@@ -115,14 +116,40 @@ void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
         }
         idx = mgr->nnodes++;
         mgr->nodes[idx] = *info;
+        /* first_seen_ns is local-only: stamp it now. */
+        mgr->nodes[idx].first_seen_ns = now_ns();
         /* Add to hashring only if ALIVE. */
         if (info->state == TSDB_NODE_ALIVE || info->state == TSDB_NODE_JOINING) {
             tsdb_hashring_add(mgr->ring, info->id);
         }
     } else {
-        if (info->version > mgr->nodes[idx].version) {
+        /* Resurrect short-circuit: an ALIVE record where we have the
+         * node DEAD/SUSPECT locally is strong evidence the failure
+         * detector was wrong (UDP drops, container restart, Docker
+         * bridge conntrack flush).  Accept it even when info.version
+         * is not strictly greater — as long as it's not older.
+         *
+         * Without this short-circuit a node that was incorrectly
+         * declared DEAD stays stuck forever: when we marked it DEAD we
+         * bumped our stored version, and the peer's own STATE_SYNC
+         * carries its natural heartbeat version which trails ours. */
+        int resurrect =
+            (info->state == TSDB_NODE_ALIVE) &&
+            (mgr->nodes[idx].state == TSDB_NODE_DEAD ||
+             mgr->nodes[idx].state == TSDB_NODE_SUSPECT) &&
+            (info->version >= mgr->nodes[idx].version);
+
+        if (info->version > mgr->nodes[idx].version || resurrect) {
             tsdb_node_state_t old_state = mgr->nodes[idx].state;
+            /* Preserve the local-only first_seen_ns across wire updates. */
+            int64_t prev_first_seen = mgr->nodes[idx].first_seen_ns;
             mgr->nodes[idx] = *info;
+            mgr->nodes[idx].first_seen_ns = prev_first_seen;
+            if (resurrect) {
+                /* Clear SWIM probe state so the next tick doesn't
+                 * instantly re-kill this peer from stale fail counts. */
+                mgr->nodes[idx].suspect_count = 0;
+            }
 
             /* Sync ring membership. */
             int was_in_ring = (old_state == TSDB_NODE_ALIVE || old_state == TSDB_NODE_JOINING);
