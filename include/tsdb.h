@@ -33,7 +33,14 @@ typedef enum {
     TSDB_ERR_PARSE       = -10,
     TSDB_ERR_SCHEMA      = -11,
     TSDB_ERR_INTERNAL    = -12,
-    TSDB_ERR_PERMISSION  = -13
+    TSDB_ERR_PERMISSION  = -13,
+    TSDB_ERR_BUSY        = -14  /* a prior in-flight operation must
+                                   commit before this one can start
+                                   (e.g. a Raft membership change is
+                                   still in the leader's uncommitted
+                                   tail — we serialise ADD/REMOVE
+                                   MASTER one at a time rather than
+                                   run joint consensus) */
 } tsdb_err_t;
 
 /* Column types */

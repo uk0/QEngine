@@ -130,6 +130,14 @@ struct tsdb_raft {
      * a propose call completes (success OR stale-leader failure) so
      * we don't spin proposing the same entry. */
     int                pending_seed;
+
+    /* Companion to pending_seed: set in become_leader_locked so the
+     * very first thing a new leader does is commit a NOOP in its own
+     * term.  §5.4.2 requires a current-term commit before the tail of
+     * an earlier term can be counted as committed — without it we
+     * observed term-2 SEEDs stuck uncommitted forever after a
+     * term-3 leader took over. */
+    int                pending_noop;
 };
 
 /* Max entries packed into one AppendEntries call.  Keeps the RPC
@@ -186,17 +194,56 @@ static void bump_heartbeat_deadline(tsdb_raft_t *r) {
 
 /* --- Peer table ------------------------------------------------------- */
 
-/* Rebuild peer[] from node_mgr: every ALIVE or SUSPECT master except
- * self.  This MVP keeps using gossip for both peer discovery AND
- * quorum — the persisted r->config is advisory only (populated by
- * ADD MASTER / REMOVE MASTER log entries for audit + LIST MASTERS).
- * Swapping to a config-gated quorum is the "real" Raft membership
- * change and is tracked as a follow-up; it needs PreVote +
- * stepdown-on-self-removal + joint consensus handling. */
+/* Rebuild peer[] — the list of remote nodes whose match_index counts
+ * toward our quorum when we're leader.  Two-source strategy:
+ *
+ *   - Once r->config has been committed to (SEED applied), use it as
+ *     the authoritative member list.  A node that just ADDed itself
+ *     via a committed CONFIG_ADD is immediately part of the quorum;
+ *     a node REMOVEd via committed CONFIG_REMOVE stops counting.
+ *     This is the Raft §6 definition of membership and the only
+ *     safe source once membership can change.
+ *
+ *   - Before the first SEED commits, fall back to gossip node_mgr
+ *     filtered by role=master.  The SEED itself needs a quorum to
+ *     commit, and if we gated peer discovery on config.bin we'd
+ *     deadlock (no peers ⇒ can't commit SEED ⇒ can't populate
+ *     config.bin ⇒ no peers).  Gossip-based discovery is narrow
+ *     enough here: it only runs until the leader's very first
+ *     committed entry lands on every follower's config.
+ *
+ * Phase 2 of task #47 — PreVote + stepdown are already in place, so
+ * flipping this over is safe: a returning partitioned node can't
+ * hijack leadership with its inflated term, and an ex-member can't
+ * count toward a quorum once its REMOVE commits. */
 static void rebuild_peers_locked(tsdb_raft_t *r) {
+    int k = 0;
+
+    if (r->config && tsdb_raft_config_is_initialised(r->config)) {
+        tsdb_raft_cfg_member_t mems[TSDB_RAFT_CFG_MAX_MASTERS];
+        int nm = tsdb_raft_config_snapshot(r->config, mems,
+                                            TSDB_RAFT_CFG_MAX_MASTERS);
+        for (int i = 0; i < nm && k < MAX_PEERS; i++) {
+            if (mems[i].id == r->self_id) continue;
+            int found = -1;
+            for (int j = 0; j < r->npeers; j++) {
+                if (r->peers[j].id == mems[i].id) { found = j; break; }
+            }
+            if (found >= 0) {
+                r->peers[k++] = r->peers[found];
+            } else {
+                r->peers[k].id          = mems[i].id;
+                r->peers[k].next_index  = tsdb_raft_log_last_index(r->log) + 1;
+                r->peers[k].match_index = 0;
+                k++;
+            }
+        }
+        r->npeers = k;
+        return;
+    }
+
     tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
     int n = tsdb_node_manager_snapshot(r->node_mgr, snap, TSDB_CLUSTER_MAX_NODES);
-    int k = 0;
     for (int i = 0; i < n && k < MAX_PEERS; i++) {
         if (snap[i].id == r->self_id) continue;
         if (snap[i].role != TSDB_ROLE_MASTER) continue;
@@ -220,6 +267,23 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
 static int quorum_needed(const tsdb_raft_t *r) {
     int total = r->npeers + 1;
     return total / 2 + 1;
+}
+
+/* Returns 1 if `id` is in the committed member set, 0 otherwise.
+ * Before the first SEED commits the config is uninitialised; we treat
+ * every candidate as a member in that window so the bootstrap
+ * election isn't blocked.  Once the SEED commits the filter tightens
+ * up and a non-member (ex-member after REMOVE, or any id that never
+ * joined) can no longer disrupt us. */
+static int config_has_member_locked(const tsdb_raft_t *r, uint64_t id) {
+    if (!r->config || !tsdb_raft_config_is_initialised(r->config)) return 1;
+    tsdb_raft_cfg_member_t mems[TSDB_RAFT_CFG_MAX_MASTERS];
+    int nm = tsdb_raft_config_snapshot(r->config, mems,
+                                         TSDB_RAFT_CFG_MAX_MASTERS);
+    for (int i = 0; i < nm; i++) {
+        if (mems[i].id == id) return 1;
+    }
+    return 0;
 }
 
 /* --- State transitions (all under r->lock) --------------------------- */
@@ -267,6 +331,15 @@ static void become_leader_locked(tsdb_raft_t *r) {
     if (r->config && !tsdb_raft_config_is_initialised(r->config)) {
         r->pending_seed = 1;
     }
+
+    /* §5.4.2 NOOP: a new leader cannot commit entries from prior
+     * terms until at least one current-term entry commits.  Without a
+     * NOOP, a cluster that elected a new leader after a term bump
+     * would leave the previous-term tail permanently uncommitted,
+     * and the apply thread would never make progress past the last
+     * stale index.  Queue one up so the tick thread proposes it
+     * right after drive_pending_seed. */
+    r->pending_noop = 1;
 }
 
 /* --- RPC handlers (called from rpc.c via the dispatcher) ------------- */
@@ -322,6 +395,12 @@ static int on_pre_vote(void *ud,
      * a pre-vote for current/past term can't win a real election. */
     if (grant && req->term <= cur_term) grant = 0;
 
+    /* Config-gated membership filter (§6): refuse pre-votes from ids
+     * that aren't in the committed config.  Covers the "ghost node
+     * after REMOVE" disruption case — a node whose REMOVE already
+     * committed should never be able to win an election again. */
+    if (grant && !config_has_member_locked(r, req->candidate_id)) grant = 0;
+
     resp->term         = cur_term;
     resp->vote_granted = (uint8_t)grant;
     pthread_mutex_unlock(&r->lock);
@@ -363,7 +442,9 @@ static int on_request_vote(void *ud,
              req->last_log_index >= our_last_idx) log_ok = 1;
 
     int granted = 0;
-    if (log_ok && (voted_for == 0 || voted_for == req->candidate_id)) {
+    int member_ok = config_has_member_locked(r, req->candidate_id);
+    if (log_ok && member_ok &&
+        (voted_for == 0 || voted_for == req->candidate_id)) {
         (void)tsdb_raft_log_set_voted_for(r->log, req->candidate_id);
         reset_election_timer(r);
         granted = 1;
@@ -1182,6 +1263,27 @@ static void drive_pending_seed(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
 }
 
+/* Propose a zero-payload NOOP in the leader's own term so commit can
+ * advance past entries from prior terms (§5.4.2).  Structurally
+ * identical to drive_pending_seed: snapshot state, drop lock, propose,
+ * re-lock to clear the flag. */
+static void drive_pending_noop(tsdb_raft_t *r) {
+    pthread_mutex_lock(&r->lock);
+    if (r->state != TSDB_RAFT_LEADER || !r->pending_noop) {
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+    pthread_mutex_unlock(&r->lock);
+
+    int prc = tsdb_raft_propose(r, TSDB_RAFT_ENTRY_NOOP, NULL, 0, 500);
+
+    pthread_mutex_lock(&r->lock);
+    if (prc == TSDB_OK || prc == TSDB_ERR_PERMISSION) {
+        r->pending_noop = 0;
+    }
+    pthread_mutex_unlock(&r->lock);
+}
+
 /* --- Tick thread ----------------------------------------------------- */
 
 static void *tick_thread_main(void *arg) {
@@ -1209,6 +1311,7 @@ static void *tick_thread_main(void *arg) {
          * normal replication.  See become_leader_locked() for the
          * flag that kicks this off. */
         if (st == TSDB_RAFT_LEADER) {
+            drive_pending_noop(r);
             drive_pending_seed(r);
 
             if (now >= hb) {
@@ -1425,10 +1528,37 @@ static uint32_t encode_cfg_payload(uint8_t op, uint64_t id, const char *addr,
     return 10u + al;
 }
 
+/* Serialise membership changes: refuse to propose a new CONFIG entry
+ * while an earlier one is still in the (last_applied, last_index]
+ * window.  Joint consensus is the textbook way to let overlapping
+ * changes converge safely; we're taking the simpler route of
+ * one-at-a-time, which requires no joint-config state machine but
+ * does need callers (or the human behind ADD/REMOVE MASTER) to wait
+ * for the previous change to commit.  Cheap O(#uncommitted) scan. */
+static int has_pending_config_locked(tsdb_raft_t *r) {
+    uint64_t applied = r->last_applied;
+    uint64_t last    = tsdb_raft_log_last_index(r->log);
+    if (last <= applied) return 0;
+    for (uint64_t idx = applied + 1; idx <= last; idx++) {
+        tsdb_raft_entry_t e = {0};
+        if (tsdb_raft_log_read(r->log, idx, &e) != 0) continue;
+        int is_cfg = (e.type == TSDB_RAFT_ENTRY_CONFIG);
+        free(e.payload);
+        if (is_cfg) return 1;
+    }
+    return 0;
+}
+
 int tsdb_raft_add_master(tsdb_raft_t *r,
                           uint64_t id, const char *addr, int timeout_ms)
 {
     if (!r) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&r->lock);
+    int busy = has_pending_config_locked(r);
+    pthread_mutex_unlock(&r->lock);
+    if (busy) return TSDB_ERR_BUSY;
+
     uint8_t payload[128];
     uint32_t plen = encode_cfg_payload(TSDB_RAFT_CFG_OP_ADD, id, addr,
                                         payload, sizeof(payload));
@@ -1439,6 +1569,12 @@ int tsdb_raft_add_master(tsdb_raft_t *r,
 
 int tsdb_raft_remove_master(tsdb_raft_t *r, uint64_t id, int timeout_ms) {
     if (!r) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&r->lock);
+    int busy = has_pending_config_locked(r);
+    pthread_mutex_unlock(&r->lock);
+    if (busy) return TSDB_ERR_BUSY;
+
     uint8_t payload[16];
     uint32_t plen = encode_cfg_payload(TSDB_RAFT_CFG_OP_REMOVE, id, NULL,
                                         payload, sizeof(payload));

@@ -36,6 +36,7 @@ const char *tsdb_errstr(int err) {
     case TSDB_ERR_SCHEMA:      return "schema mismatch";
     case TSDB_ERR_INTERNAL:    return "internal error";
     case TSDB_ERR_PERMISSION:  return "permission denied";
+    case TSDB_ERR_BUSY:        return "busy — prior op still pending";
     default:                   return "unknown";
     }
 }
