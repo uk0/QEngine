@@ -95,6 +95,18 @@ int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
                                         int *out_acked_peers,
                                         int *out_total_peers);
 
+/* Variant that targets data nodes only — used by the Raft apply
+ * callback on the master side.  Other masters replicate the same
+ * log entry through Raft's own AppendEntries, so they must NOT be
+ * broadcast to (that would cause a duplicate apply).  Data nodes
+ * don't run Raft and have no other path to see catalog-only DDL
+ * like CREATE DATABASE / CREATE GROUP; without this fanout, their
+ * local catalog lags the cluster forever. */
+int tsdb_cluster_broadcast_catalog_qtl_to_data(tsdb_db_t *db,
+                                                 const char *qtl,
+                                                 int *out_acked_peers,
+                                                 int *out_total_peers);
+
 /* Bridges into the cluster layer for modules that live above it
  * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each
  * returns NULL / 0 if the db is in standalone mode. */

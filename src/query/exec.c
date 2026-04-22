@@ -5364,8 +5364,16 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
      * legacy single-process server where db has no cluster binding —
      * there, local DDL is still the right behaviour. */
     if (!raft && is_catalog_ddl(stmt.kind) && !tsdb_g_inside_raft_apply &&
+        !tsdb_g_suppress_catalog_broadcast &&
         tsdb_cluster_node_mgr_for_db(db) != NULL)
     {
+        /* The suppress-broadcast flag is set by the APPLY_CATALOG_QTL
+         * RPC receiver (rpc.c) when a committed catalog DDL arrives
+         * from a master's raft apply: in that window the local DDL
+         * IS the authoritative truth the data node needs to absorb.
+         * Without this bypass, the guard would refuse the incoming
+         * broadcast and data-node catalogs would lag the cluster
+         * forever. */
         tsdb_arena_free(&a);
         result_status(r,
             "ERR: catalog DDL is not accepted on a data node — send "

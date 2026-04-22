@@ -375,6 +375,53 @@ static int collect_alive_peers(tsdb_cluster_t *c,
     return k;
 }
 
+/* Collect alive non-master peers — used by the Raft apply callback on
+ * the master side to broadcast catalog DDL (CREATE DATABASE, DROP
+ * DATABASE, …) to data nodes.  Other masters apply the same entry
+ * via Raft so they don't need the broadcast; data nodes don't run
+ * Raft at all and would otherwise never see these statements. */
+static int collect_alive_data_peers(tsdb_cluster_t *c,
+                                     tsdb_node_id_t *out, int cap)
+{
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+
+    int k = 0;
+    for (int i = 0; i < n && k < cap; i++) {
+        if (snap[i].id == self) continue;
+        if (snap[i].state != TSDB_NODE_ALIVE) continue;
+        if (snap[i].role == TSDB_ROLE_MASTER) continue;
+        out[k++] = snap[i].id;
+    }
+    return k;
+}
+
+int tsdb_cluster_broadcast_catalog_qtl_to_data(tsdb_db_t *db,
+                                                 const char *qtl,
+                                                 int *out_acked_peers,
+                                                 int *out_total_peers)
+{
+    if (out_acked_peers) *out_acked_peers = 0;
+    if (out_total_peers) *out_total_peers = 0;
+    if (!db || !qtl) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_data_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    if (out_total_peers) *out_total_peers = npeers;
+    if (npeers == 0) return TSDB_OK;
+
+    int acked = 0;
+    int rc = tsdb_replica_broadcast_catalog_qtl(tsdb_cluster_replica_mgr(c),
+                                                 qtl, peers, npeers, &acked);
+    if (out_acked_peers) *out_acked_peers = acked;
+    return rc;
+}
+
 int tsdb_cluster_broadcast_truncate(tsdb_db_t *db,
                                      const char *table_name,
                                      int *out_acked_peers,

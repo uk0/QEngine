@@ -257,6 +257,17 @@ static int raft_apply_cb(void *ud, const tsdb_raft_entry_t *e) {
          * the catalog row from a prior broadcast. */
         fprintf(stderr, "[raft-apply] tsdb_query rc=%d qtl=%s\n", qrc, qtl);
     }
+
+    /* Fan the committed QTL out to data-node peers so their local
+     * catalog stays in sync.  Masters already apply this entry
+     * through their own Raft state machine and must be skipped
+     * (broadcasting to them would cause a duplicate DDL attempt
+     * and spurious EXISTS errors).  If qrc was neither OK nor
+     * EXISTS, skip the broadcast — we don't want to propagate a
+     * partial/failed state machine transition to observers. */
+    if (qrc == TSDB_OK || qrc == TSDB_ERR_EXISTS) {
+        (void)tsdb_cluster_broadcast_catalog_qtl_to_data(db, qtl, NULL, NULL);
+    }
     free(qtl);
     return 0;
 }

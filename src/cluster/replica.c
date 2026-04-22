@@ -249,11 +249,25 @@ static void *fanout_worker(void *arg) {
     tsdb_node_id_t nid = wa->node_id;
     free(wa);
 
-    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(ctx->rmgr, nid);
+    /* One fast retry on transient failure.  The receive side now
+     * truthfully reports TSDB_RPC_ERR when the local write
+     * (table-open / batch-begin / batch-commit) didn't land, so
+     * every rc != OK here corresponds to rows that need to be
+     * re-sent somewhere.  A single retry closes most of the
+     * concurrent-write-loss window observed under the 4-writer
+     * stress scenario without introducing an unbounded loop that
+     * could keep a dying peer alive. */
     int rc = TSDB_ERR_IO;
-    if (conn) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(ctx->rmgr, nid);
+        if (!conn) { rc = TSDB_ERR_IO; break; }
         rc = tsdb_rpc_call(conn, ctx->rpc_kind, ctx->payload, ctx->payload_len);
-        if (rc != TSDB_OK) evict_one_conn(ctx->rmgr, nid, conn);
+        if (rc == TSDB_OK) break;
+        evict_one_conn(ctx->rmgr, nid, conn);
+        if (attempt == 0) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 5 * 1000000 };
+            nanosleep(&ts, NULL);
+        }
     }
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_replicate_ack_total");

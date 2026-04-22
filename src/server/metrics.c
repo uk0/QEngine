@@ -130,6 +130,12 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_fail_total",
       "Total per-peer WRITE_BATCH RPCs that failed (conn dead or peer error)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_replicate_recv_ok_total",
+      "WRITE_BATCH RPCs received where the local batch_commit landed rows", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replicate_recv_err_total",
+      "WRITE_BATCH RPCs received where the local apply failed (missing table, batch_begin fail, commit fail)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replica_dial_total",
       "Total new TCP connections established to peers", MT_COUNTER, { .c = { 0 } } },
 

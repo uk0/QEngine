@@ -10,6 +10,7 @@
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
 #include "../federation/fedrpc.h"
+#include "../server/metrics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -293,7 +294,17 @@ static void *connection_handler(void *arg) {
             }
             break;
 
-        case TSDB_RPC_WRITE_BATCH:
+        case TSDB_RPC_WRITE_BATCH: {
+            /* Track whether the entire decode→open→begin→commit chain
+             * actually landed the rows so we can reflect the truth in
+             * the RPC reply — previously the receiver unconditionally
+             * ACKed even when the table was missing or batch_commit
+             * failed, so the sender counted it as a successful replica
+             * and dropped the rows silently.  Under concurrent writes
+             * this is the smoking gun for the 3-8% row-loss we've
+             * observed: send-side ack_count climbs, receive-side
+             * memtable stays empty. */
+            int write_ok = 0;
             if (db && msg.payload_len > 0) {
                 char table_name[64] = {0};
                 int ncols = 0, nrows = 0;
@@ -376,16 +387,21 @@ static void *connection_handler(void *arg) {
                                 }
                                 tsdb_batch_row_end(batch);
                             }
-                            tsdb_batch_commit(batch);
+                            if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
                         }
                         tsdb_table_unlock_write(tbl);
                     }
                 }
+            }
+            if (write_ok) {
                 send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_replicate_recv_ok_total");
             } else {
                 send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_replicate_recv_err_total");
             }
             break;
+        }
 
         case TSDB_RPC_FED_QUERY:
             /* Federation query: run QTL on local DB, encode result, send back. */
