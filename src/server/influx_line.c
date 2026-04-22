@@ -594,8 +594,17 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
             continue;
         }
 
+        /* Serialize with any concurrent replication receives on the
+         * same table.  The WRITE_BATCH RPC handler takes
+         * tsdb_table_lock_write before appending; without matching
+         * serialization here, a concurrent influx ingest and a
+         * replication receive can both mutate the memtable at once
+         * and step on each other's in-flight row — observed as
+         * cross-node row drift under the 4-writer stress. */
+        tsdb_table_lock_write(tbl);
         tsdb_batch_t *batch = NULL;
         if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
+            tsdb_table_unlock_write(tbl);
             for (size_t j = i; j < nrows; j++) {
                 if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0) {
                     errors++;
@@ -621,6 +630,7 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
         } else {
             if (tsdb_batch_commit(batch) != TSDB_OK) errors++;
         }
+        tsdb_table_unlock_write(tbl);
     }
 
     pthread_mutex_unlock(&g_ingest_mu);
