@@ -148,46 +148,32 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
 {
     if (!c || !table_name || nrows == 0) return TSDB_OK;
 
-    /* Determine replica nodes under node_mgr lock for thread safety.
-     * The hashring is modified by gossip threads; we must snapshot it
-     * while holding the same mutex. */
-    tsdb_node_id_t all_replicas[3];
-    int nreplicas = tsdb_node_manager_ring_owner(c->node_mgr, table_name, 3, all_replicas);
-    if (nreplicas == 0) return TSDB_OK;
-
-    /* Determine our role.
+    /* Replicate to every alive non-self node.
      *
-     * With N=R=3, every node is a replica of every shard, so the writer
-     * is always in the replica set.  We treat the writer as the "primary"
-     * for this particular write (acting primary).  The hash-determined
-     * primary matters only for routing writes received from a non-replica
-     * (forwarding — not yet implemented, not needed for N=R=3 tests).
+     * The previous implementation used a consistent-hash ring to pick
+     * max-R replicas (R=3 by default) and only replicated when the
+     * writer happened to be in that set.  That was fine when N (cluster
+     * size) == R because every writer was always a replica — but once
+     * the cluster grew beyond R, writes landing on a non-replica were
+     * silently dropped from the replication path: the row stayed on
+     * whichever node the client hit, and queries against any other
+     * node returned empty.  Fanout to every alive peer is the right
+     * default for the "any node should answer any query" model the
+     * rest of the system (DDL via Raft, dashboard load balancing)
+     * already assumes.  Sharding/forwarding can be reintroduced when
+     * the read path learns to combine partial results.
      *
-     * The on_replicate hook is set to skip_replicate=1 on replicas (via
-     * tsdb_batch_set_local_only), so re-replication loops are impossible.
-     */
-    int is_replica = 0;
-    for (int i = 0; i < nreplicas; i++) {
-        if (all_replicas[i] == c->local_id) {
-            is_replica = 1;
-            break;
-        }
-    }
-
-    if (!is_replica) {
-        /* Not responsible for this shard.  TODO: forward to primary. */
-        return TSDB_OK;
-    }
-
-    /* We are in the replica set and received a write — act as coordinator.
-     * Fan out to the other replicas in the set. */
-    /* Collect the remote replica IDs (excluding self). */
-    tsdb_node_id_t remote_replicas[3];
+     * The hook on the receiver side marks the batch local-only, so no
+     * secondary re-replication loop is possible. */
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int ntotal = tsdb_node_manager_snapshot(c->node_mgr, snap,
+                                             TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t remote_replicas[TSDB_CLUSTER_MAX_NODES];
     int nremote = 0;
-    for (int i = 0; i < nreplicas; i++) {
-        if (all_replicas[i] != c->local_id) {
-            remote_replicas[nremote++] = all_replicas[i];
-        }
+    for (int i = 0; i < ntotal && nremote < TSDB_CLUSTER_MAX_NODES; i++) {
+        if (snap[i].id == c->local_id) continue;
+        if (snap[i].state == TSDB_NODE_DEAD) continue;
+        remote_replicas[nremote++] = snap[i].id;
     }
 
     /* Track write load for the auto-balancer. */
@@ -195,12 +181,17 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
 
     if (nremote == 0) return TSDB_OK; /* single-node cluster */
 
+    /* Quorum = 1 remote ACK (best-effort replication; local write
+     * already counts toward durability).  Previously we used
+     * TSDB_WRITE_QUORUM which was tuned for R=3 and blocked writes
+     * when only N/2 peers were reachable; that was too strict once
+     * N>R. */
     return tsdb_replica_write(c->replica_mgr,
                               table_name,
                               ncols, col_types,
                               nrows, col_data,
                               remote_replicas, nremote,
-                              TSDB_WRITE_QUORUM);
+                              1);
 }
 
 int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
