@@ -153,10 +153,16 @@ typedef int (*tsdb_raft_on_req_append_fn)(void *ud,
 typedef int (*tsdb_raft_on_req_install_fn)(void *ud,
                                            const tsdb_raft_req_install_t *req,
                                            tsdb_raft_resp_install_t *resp);
+/* PreVote uses the same payload struct as RequestVote — it's the same
+ * question minus the persistence. */
+typedef int (*tsdb_raft_on_req_pre_vote_fn)(void *ud,
+                                             const tsdb_raft_req_vote_t *req,
+                                             tsdb_raft_resp_vote_t *resp);
 
 void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn    vote_fn,
                                  tsdb_raft_on_req_append_fn  append_fn,
                                  tsdb_raft_on_req_install_fn install_fn,
+                                 tsdb_raft_on_req_pre_vote_fn pre_vote_fn,
                                  void *ud);
 
 /* Called by rpc.c when a RAFT_* frame arrives.  Returns 0 if the
@@ -171,6 +177,9 @@ int tsdb_raft_rpc_handle_append(const uint8_t *req_payload, uint32_t req_len,
 int tsdb_raft_rpc_handle_install(const uint8_t *req_payload, uint32_t req_len,
                                   uint8_t *resp_buf, uint32_t resp_cap,
                                   uint32_t *resp_len);
+int tsdb_raft_rpc_handle_pre_vote(const uint8_t *req_payload, uint32_t req_len,
+                                   uint8_t *resp_buf, uint32_t resp_cap,
+                                   uint32_t *resp_len);
 
 #ifdef __cplusplus
 }

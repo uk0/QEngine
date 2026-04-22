@@ -55,8 +55,18 @@ typedef enum {
     TSDB_RPC_APPLY_CATALOG_QTL  = 13, /* cluster broadcast: run a catalog QTL statement locally */
     TSDB_RPC_RAFT_REQUEST_VOTE  = 14, /* candidate asks peer for a vote   */
     TSDB_RPC_RAFT_APPEND_ENTRIES = 15, /* leader replicates log to follower */
-    TSDB_RPC_RAFT_INSTALL_SNAPSHOT = 16 /* leader ships snapshot bytes to a
+    TSDB_RPC_RAFT_INSTALL_SNAPSHOT = 16, /* leader ships snapshot bytes to a
                                           far-behind follower */
+    TSDB_RPC_RAFT_PRE_VOTE      = 17 /* PreVote probe (§9.6): hypothetical
+                                        RequestVote that doesn't mutate
+                                        currentTerm on either side.  The
+                                        real RequestVote fires only when
+                                        a quorum grants the pre-vote,
+                                        so a partitioned node returning
+                                        with an inflated term can't
+                                        disrupt the cluster on rejoin.
+                                        Reuses the req_vote/resp_vote
+                                        codecs verbatim. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */

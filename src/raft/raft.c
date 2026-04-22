@@ -95,6 +95,12 @@ struct tsdb_raft {
     int64_t            next_heartbeat_ns;
     int                election_timeout_ms; /* rolled per election */
     int64_t            startup_grace_until_ns; /* no elections before this */
+    /* Timestamp of the last valid contact from a real leader (AE or
+     * IS at term >= currentTerm).  PreVote responders use this to
+     * refuse grants while a leader is still around, so a returning
+     * partitioned node can't unseat the current leader by bumping
+     * its own term — §9.6 "disruptive servers". */
+    int64_t            last_leader_contact_ns;
 
     /* Apply callback. */
     tsdb_raft_apply_fn apply_fn;
@@ -265,6 +271,63 @@ static void become_leader_locked(tsdb_raft_t *r) {
 
 /* --- RPC handlers (called from rpc.c via the dispatcher) ------------- */
 
+/* PreVote responder (§9.6).  Answers "would you grant me a vote if I
+ * actually started an election?" without touching persistent state.
+ * Refuses in two cases that together close the "returning partitioned
+ * node disrupts the cluster" window:
+ *   1. A valid leader is still around (last_leader_contact_ns is
+ *      fresh enough).  Anyone voting yes here would be contradicting
+ *      the follow-the-leader guarantee.
+ *   2. The candidate's log is not at least as up-to-date as ours
+ *      (same §5.4.1 rule the real RequestVote uses).
+ *
+ * PreVote does NOT consult or mutate votedFor, so granting a pre-vote
+ * here does not prevent us from also granting the subsequent real
+ * RequestVote.  It also does NOT treat req->term > currentTerm as
+ * grounds to step down — that's the whole point: a candidate with
+ * an inflated term should not be able to make us lose our leader. */
+static int on_pre_vote(void *ud,
+                        const tsdb_raft_req_vote_t *req,
+                        tsdb_raft_resp_vote_t *resp)
+{
+    tsdb_raft_t *r = (tsdb_raft_t *)ud;
+    if (!r) return -1;
+    pthread_mutex_lock(&r->lock);
+
+    uint64_t cur_term = tsdb_raft_log_current_term(r->log);
+    /* Hypothetical term: a real election would bump our term to
+     * at least req->term, so PreVote asks about that term.  If
+     * req->term <= cur_term the pre-vote is moot — no election
+     * could win without first bumping above cur_term. */
+    int grant = 1;
+
+    /* Leader-lease check: refuse if we heard from a leader this
+     * election-timeout window.  Use ELECTION_MIN_MS as the lease
+     * (same clock used to roll election_timeout_ms). */
+    int64_t elapsed = now_ns() - r->last_leader_contact_ns;
+    if (elapsed < ms_to_ns(ELECTION_MIN_MS)) grant = 0;
+
+    /* Log up-to-date check. */
+    if (grant) {
+        uint64_t our_last_idx  = tsdb_raft_log_last_index(r->log);
+        uint64_t our_last_term = tsdb_raft_log_last_term(r->log);
+        int log_ok = 0;
+        if (req->last_log_term > our_last_term) log_ok = 1;
+        else if (req->last_log_term == our_last_term &&
+                 req->last_log_index >= our_last_idx) log_ok = 1;
+        if (!log_ok) grant = 0;
+    }
+
+    /* Also refuse if the hypothetical term isn't actually higher —
+     * a pre-vote for current/past term can't win a real election. */
+    if (grant && req->term <= cur_term) grant = 0;
+
+    resp->term         = cur_term;
+    resp->vote_granted = (uint8_t)grant;
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
+
 static int on_request_vote(void *ud,
                             const tsdb_raft_req_vote_t *req,
                             tsdb_raft_resp_vote_t *resp)
@@ -332,7 +395,9 @@ static int on_append_entries(void *ud,
     }
 
     /* Any valid AppendEntries resets our election timer — we heard
-     * from the leader, so don't start an election for another round. */
+     * from the leader, so don't start an election for another round.
+     * Also stamp last_leader_contact_ns so subsequent PreVote
+     * responders refuse to unseat this leader during its lease. */
     if (req->term > cur_term) {
         become_follower_locked(r, req->term, req->leader_id);
         cur_term = req->term;
@@ -345,6 +410,7 @@ static int on_append_entries(void *ud,
         r->leader_id = req->leader_id;
         reset_election_timer(r);
     }
+    r->last_leader_contact_ns = now_ns();
 
     /* Log matching: if prev_log_index > 0, the entry at that index
      * must exist with the right term. */
@@ -502,6 +568,7 @@ static int on_install_snapshot(void *ud,
         r->leader_id = req->leader_id;
         reset_election_timer(r);
     }
+    r->last_leader_contact_ns = now_ns();
 
     /* If we've already applied past this snapshot index there's
      * nothing to do — ack with our term. */
@@ -635,6 +702,63 @@ static int send_request_vote(tsdb_raft_t *r, uint64_t peer_id,
     }
     pthread_mutex_unlock(&r->lock);
     return resp.vote_granted ? 1 : 0;
+}
+
+/* PreVote sender (§9.6) — structurally identical to send_request_vote
+ * except:
+ *   - sends TSDB_RPC_RAFT_PRE_VOTE instead of REQUEST_VOTE;
+ *   - NEVER calls become_follower_locked on a higher-term response.
+ *     We haven't bumped our term yet, so adopting an advertised term
+ *     would itself be a disruption vector — just abandon the round.
+ *
+ * Returns 1 on a grant, 0 on a reject or any transport failure. */
+static int send_pre_vote(tsdb_raft_t *r, uint64_t peer_id,
+                          uint64_t hyp_term,
+                          uint64_t last_idx, uint64_t last_term)
+{
+    tsdb_raft_req_vote_t req = {
+        .term = hyp_term, .candidate_id = r->self_id,
+        .last_log_index = last_idx, .last_log_term = last_term
+    };
+    uint8_t req_buf[32];
+    int rn = tsdb_raft_encode_req_vote(req_buf, sizeof(req_buf), &req);
+    if (rn <= 0) return 0;
+
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+    if (!conn) return 0;
+
+    uint8_t resp_buf[32];
+    uint32_t resp_len = 0;
+    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_PRE_VOTE,
+                                 req_buf, (uint32_t)rn,
+                                 resp_buf, sizeof(resp_buf), &resp_len);
+    if (rc != TSDB_OK) return 0;
+
+    tsdb_raft_resp_vote_t resp = {0};
+    if (tsdb_raft_decode_resp_vote(resp_buf, resp_len, &resp) != 0) return 0;
+    return resp.vote_granted ? 1 : 0;
+}
+
+/* Run a pre-vote round: ask every known peer "would you grant me a
+ * vote if I started an election for term (currentTerm+1)?"  Returns
+ * the number of grants including our own self-grant.  Called from
+ * the tick thread with r->lock NOT held. */
+static int run_prevote_unlocked(tsdb_raft_t *r) {
+    pthread_mutex_lock(&r->lock);
+    uint64_t cur_term = tsdb_raft_log_current_term(r->log);
+    uint64_t last_idx = tsdb_raft_log_last_index(r->log);
+    uint64_t last_trm = tsdb_raft_log_last_term(r->log);
+    uint64_t peers[MAX_PEERS];
+    int np = r->npeers;
+    for (int i = 0; i < np; i++) peers[i] = r->peers[i].id;
+    pthread_mutex_unlock(&r->lock);
+
+    int granted = 1; /* self */
+    uint64_t hyp_term = cur_term + 1;
+    for (int i = 0; i < np; i++) {
+        granted += send_pre_vote(r, peers[i], hyp_term, last_idx, last_trm);
+    }
+    return granted;
 }
 
 /* Run an election: send RequestVote to each known master in parallel.
@@ -1110,10 +1234,30 @@ static void *tick_thread_main(void *arg) {
                 reset_election_timer(r);
                 pthread_mutex_unlock(&r->lock);
             } else if (now >= ed) {
+                /* PreVote gate (§9.6): probe peers with a hypothetical
+                 * term BEFORE bumping currentTerm.  Only if a quorum
+                 * would grant a real vote do we commit to the term
+                 * increment.  This keeps a returning partitioned node
+                 * (whose term race-bumped way past ours) from forcing
+                 * the current leader into a stepdown — its pre-vote
+                 * will be refused by everyone still hearing from the
+                 * real leader, so it never reaches the real election
+                 * phase to disrupt us.  On failure we simply reset the
+                 * timer and try again next timeout. */
                 pthread_mutex_lock(&r->lock);
-                become_candidate_locked(r);
+                int quorum = quorum_needed(r);
                 pthread_mutex_unlock(&r->lock);
-                run_election_unlocked(r);
+                int granted = run_prevote_unlocked(r);
+                if (granted >= quorum) {
+                    pthread_mutex_lock(&r->lock);
+                    become_candidate_locked(r);
+                    pthread_mutex_unlock(&r->lock);
+                    run_election_unlocked(r);
+                } else {
+                    pthread_mutex_lock(&r->lock);
+                    reset_election_timer(r);
+                    pthread_mutex_unlock(&r->lock);
+                }
             }
         }
 
@@ -1171,6 +1315,9 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
      * quorum counts so existing clusters keep functioning. */
 
     r->startup_grace_until_ns = now_ns() + ms_to_ns(RAFT_STARTUP_GRACE_MS);
+    /* Treat bootstrap as "just heard from a leader" so a fresh node
+     * doesn't immediately grant PreVotes to a storm of candidates. */
+    r->last_leader_contact_ns = now_ns();
     reset_election_timer(r);
     /* Push the first election deadline past the grace window so an
      * unusually short random timeout can't sneak an election in before
@@ -1182,7 +1329,7 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
     /* Register RPC handlers before we start ticking, so a peer's
      * RequestVote on a cold cluster always lands in our state machine. */
     tsdb_raft_rpc_set_handlers(on_request_vote, on_append_entries,
-                               on_install_snapshot, r);
+                               on_install_snapshot, on_pre_vote, r);
 
     r->tick_running = 1;
     if (pthread_create(&r->tick_thread, NULL, tick_thread_main, r) != 0) {
@@ -1208,7 +1355,7 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
     pthread_join(r->tick_thread, NULL);
     pthread_join(r->apply_thread, NULL);
-    tsdb_raft_rpc_set_handlers(NULL, NULL, NULL, NULL);
+    tsdb_raft_rpc_set_handlers(NULL, NULL, NULL, NULL, NULL);
     tsdb_raft_config_close(r->config);
     tsdb_raft_log_close(r->log);
     pthread_cond_destroy(&r->commit_cv);
@@ -1369,6 +1516,30 @@ static void *apply_thread_main(void *arg) {
                                 (void)tsdb_raft_config_add(r->config, id, addr);
                             else
                                 (void)tsdb_raft_config_remove(r->config, id);
+
+                            /* Stepdown on committed self-removal (§6).
+                             * Once a REMOVE for our own id has
+                             * committed, we're no longer a voting
+                             * member — continuing as leader would
+                             * mean counting a non-member in the
+                             * quorum.  Demote to follower; don't
+                             * bump the term (the REMOVE itself
+                             * committed under cur_term via the old
+                             * quorum that included us).  Surviving
+                             * peers observe our heartbeats stop and
+                             * run their own PreVote.  Subsequent
+                             * proposes return TSDB_ERR_PERMISSION. */
+                            if (op == TSDB_RAFT_CFG_OP_REMOVE &&
+                                id == r->self_id)
+                            {
+                                pthread_mutex_lock(&r->lock);
+                                if (r->state == TSDB_RAFT_LEADER) {
+                                    r->state     = TSDB_RAFT_FOLLOWER;
+                                    r->leader_id = 0;
+                                    reset_election_timer(r);
+                                }
+                                pthread_mutex_unlock(&r->lock);
+                            }
                         }
                     } else if (op == TSDB_RAFT_CFG_OP_SEED) {
                         if (e.payload_len >= 2) {

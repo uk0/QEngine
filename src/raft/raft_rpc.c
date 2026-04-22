@@ -262,22 +262,25 @@ int tsdb_raft_decode_resp_install(const uint8_t *buf, size_t len,
 
 /* ---- Handler registration + dispatch ------------------------------------ */
 
-static pthread_mutex_t             g_h_lock = PTHREAD_MUTEX_INITIALIZER;
-static tsdb_raft_on_req_vote_fn    g_vote_fn    = NULL;
-static tsdb_raft_on_req_append_fn  g_append_fn  = NULL;
-static tsdb_raft_on_req_install_fn g_install_fn = NULL;
-static void                       *g_h_ud       = NULL;
+static pthread_mutex_t               g_h_lock = PTHREAD_MUTEX_INITIALIZER;
+static tsdb_raft_on_req_vote_fn      g_vote_fn      = NULL;
+static tsdb_raft_on_req_append_fn    g_append_fn    = NULL;
+static tsdb_raft_on_req_install_fn   g_install_fn   = NULL;
+static tsdb_raft_on_req_pre_vote_fn  g_pre_vote_fn  = NULL;
+static void                         *g_h_ud         = NULL;
 
-void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn    vote_fn,
-                                 tsdb_raft_on_req_append_fn  append_fn,
-                                 tsdb_raft_on_req_install_fn install_fn,
+void tsdb_raft_rpc_set_handlers(tsdb_raft_on_req_vote_fn     vote_fn,
+                                 tsdb_raft_on_req_append_fn   append_fn,
+                                 tsdb_raft_on_req_install_fn  install_fn,
+                                 tsdb_raft_on_req_pre_vote_fn pre_vote_fn,
                                  void *ud)
 {
     pthread_mutex_lock(&g_h_lock);
-    g_vote_fn    = vote_fn;
-    g_append_fn  = append_fn;
-    g_install_fn = install_fn;
-    g_h_ud       = ud;
+    g_vote_fn     = vote_fn;
+    g_append_fn   = append_fn;
+    g_install_fn  = install_fn;
+    g_pre_vote_fn = pre_vote_fn;
+    g_h_ud        = ud;
     pthread_mutex_unlock(&g_h_lock);
 }
 
@@ -317,6 +320,31 @@ int tsdb_raft_rpc_handle_vote(const uint8_t *req_payload, uint32_t req_len,
 
     pthread_mutex_lock(&g_h_lock);
     tsdb_raft_on_req_vote_fn fn = g_vote_fn;
+    void *ud = g_h_ud;
+    pthread_mutex_unlock(&g_h_lock);
+    if (!fn) return -1;
+
+    tsdb_raft_resp_vote_t resp = {0};
+    if (fn(ud, &req, &resp) != 0) return -1;
+
+    int n = tsdb_raft_encode_resp_vote(resp_buf, resp_cap, &resp);
+    if (n < 0) return -1;
+    *resp_len = (uint32_t)n;
+    return 0;
+}
+
+int tsdb_raft_rpc_handle_pre_vote(const uint8_t *req_payload, uint32_t req_len,
+                                   uint8_t *resp_buf, uint32_t resp_cap,
+                                   uint32_t *resp_len)
+{
+    if (!resp_len) return -1;
+    *resp_len = 0;
+
+    tsdb_raft_req_vote_t req;
+    if (tsdb_raft_decode_req_vote(req_payload, req_len, &req) != 0) return -1;
+
+    pthread_mutex_lock(&g_h_lock);
+    tsdb_raft_on_req_pre_vote_fn fn = g_pre_vote_fn;
     void *ud = g_h_ud;
     pthread_mutex_unlock(&g_h_lock);
     if (!fn) return -1;

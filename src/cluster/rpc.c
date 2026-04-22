@@ -584,6 +584,24 @@ static void *connection_handler(void *arg) {
             break;
         }
 
+        case TSDB_RPC_RAFT_PRE_VOTE: {
+            /* Pre-vote probe (§9.6): same payload as REQUEST_VOTE but
+             * answered without touching persistent term/vote — a
+             * partitioned returning node can't disrupt the cluster
+             * just by announcing a higher term. */
+            uint8_t rb[64];
+            uint32_t rn = 0;
+            extern int tsdb_raft_rpc_handle_pre_vote(const uint8_t *, uint32_t,
+                                                     uint8_t *, uint32_t,
+                                                     uint32_t *);
+            if (tsdb_raft_rpc_handle_pre_vote(msg.payload, msg.payload_len,
+                                               rb, sizeof(rb), &rn) == 0)
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+            else
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            break;
+        }
+
         default:
             send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
