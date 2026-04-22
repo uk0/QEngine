@@ -1115,6 +1115,25 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[node] influx start(%s) failed\n", influx_bind);
         }
     }
+
+    /* Anti-entropy catch-up: a node that was down during writes
+     * rejoins with a stale local state.  Ask each peer for every
+     * known table's (count, max_ts), and pull any rows we're
+     * missing.  Runs on a short-lived background thread started
+     * after cluster-ready so the main loop stays responsive; off
+     * by default during the first 5 s so gossip can converge. */
+    {
+        pthread_t resync_thr;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        extern void *tsdb_resync_startup_thread(void *ud);
+        if (pthread_create(&resync_thr, &attr,
+                           tsdb_resync_startup_thread, db) == 0) {
+            printf("[node] anti-entropy catch-up armed\n");
+        }
+        pthread_attr_destroy(&attr);
+    }
     fflush(stdout);
 
     /* Main loop: optionally print stats every 5s (gated by env). */

@@ -987,6 +987,20 @@ tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name) {
     return t;
 }
 
+int tsdb_db_list_table_names(tsdb_db_t *db, char (*out_names)[64], int max) {
+    if (!db || !out_names || max <= 0) return 0;
+    pthread_mutex_lock(&db->lock);
+    int k = 0;
+    for (int i = 0; i < db->ntables && k < max; i++) {
+        tsdb_table_internal_t *t = db->tables[i];
+        if (!t) continue;
+        snprintf(out_names[k], 64, "%s", t->name);
+        k++;
+    }
+    pthread_mutex_unlock(&db->lock);
+    return k;
+}
+
 tsdb_schema_t   *tsdb_tbl_schema(tsdb_table_internal_t *t)   { return t ? t->schema : NULL; }
 tsdb_memtable_t *tsdb_tbl_memtable(tsdb_table_internal_t *t) { return t ? t->memtable : NULL; }
 const char      *tsdb_tbl_dir(tsdb_table_internal_t *t)      { return (t && t->schema) ? t->schema->dir : NULL; }

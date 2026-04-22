@@ -136,6 +136,9 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_recv_err_total",
       "WRITE_BATCH RPCs received where the local apply failed (missing table, batch_begin fail, commit fail)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_antientropy_rows_pulled_total",
+      "Rows pulled from a peer via anti-entropy resync (catch-up after downtime)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replica_dial_total",
       "Total new TCP connections established to peers", MT_COUNTER, { .c = { 0 } } },
 

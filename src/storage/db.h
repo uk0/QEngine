@@ -27,6 +27,14 @@ typedef struct tsdb_table_internal tsdb_table_internal_t;
 const char            *tsdb_db_data_dir(tsdb_db_t *db);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 
+/* Snapshot the list of open table names into `out_names` (each a
+ * NUL-terminated copy, at most name_cap bytes).  Returns the number of
+ * names written (≤ max).  Used by anti-entropy resync to iterate
+ * every known table without cloning the catalog lookup path. */
+int tsdb_db_list_table_names(tsdb_db_t *db,
+                              char (*out_names)[64],
+                              int max);
+
 /* Wipe all row data for a table, keeping schema + symbol tables intact.
  * Partition directories under <data_dir>/<name>/ are removed, the memtable
  * is cleared, and the WAL is truncated to zero.  Idempotent — a concurrent

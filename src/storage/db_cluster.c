@@ -21,6 +21,9 @@
 #include <strings.h> /* strcasecmp for TSDB_NODE_ROLE parsing */
 #include "../cluster/node.h"
 #include "../cluster/rawblock.h"
+#include "../cluster/replica.h"
+#include "../cluster/rpc.h"
+#include "../federation/fedrpc.h"
 #include "../../include/tsdb_cluster.h"
 #include "../core/types.h"
 #include "../server/metrics.h"
@@ -576,4 +579,252 @@ int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
                                                  qtl, peers, npeers, &acked);
     if (out_acked_peers) *out_acked_peers = acked;
     return rc;
+}
+
+/* ---- Anti-entropy resync ------------------------------------------------ */
+
+/* Ask peer `peer_id` for (count, max_ts) of `table_name`.  Returns 0
+ * on success with out_count / out_max_ts populated; -1 on failure. */
+static int peer_table_stats(tsdb_cluster_t *c,
+                             tsdb_node_id_t peer_id,
+                             const char *table_name,
+                             uint64_t *out_count,
+                             int64_t  *out_max_ts)
+{
+    if (!c || !table_name) return -1;
+
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return -1;
+
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
+    if (!conn) return -1;
+
+    char qtl[256];
+    snprintf(qtl, sizeof(qtl),
+             "SELECT count(*), max(ts) FROM %s", table_name);
+
+    tsdb_result_t *res = NULL;
+    int rc = fedrpc_query(conn, qtl, 5000, &res);
+    if (rc != TSDB_OK || !res) {
+        if (res) tsdb_result_free(res);
+        return -1;
+    }
+
+    int ok = 0;
+    if (tsdb_result_next(res)) {
+        *out_count  = (uint64_t)tsdb_result_i64(res, 0);
+        *out_max_ts = tsdb_result_ts(res, 1);
+        ok = 1;
+    }
+    tsdb_result_free(res);
+    return ok ? 0 : -1;
+}
+
+/* Pull every row at ts > since_ts from `peer_id` and insert locally
+ * with local_only = 1 so the write does not re-fan-out.  Returns the
+ * number of rows inserted, or -1 on transport / schema failure. */
+static int pull_table_delta(tsdb_db_t *db,
+                             tsdb_cluster_t *c,
+                             tsdb_node_id_t peer_id,
+                             const char *table_name,
+                             int64_t since_ts)
+{
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return -1;
+
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
+    if (!conn) return -1;
+
+    char qtl[256];
+    snprintf(qtl, sizeof(qtl),
+             "SELECT * FROM %s WHERE ts > %lld",
+             table_name, (long long)since_ts);
+
+    tsdb_result_t *res = NULL;
+    int rc = fedrpc_query(conn, qtl, 60000, &res);
+    if (rc != TSDB_OK || !res) {
+        if (res) tsdb_result_free(res);
+        return -1;
+    }
+
+    int ncols = tsdb_result_ncols(res);
+    if (ncols < 1) { tsdb_result_free(res); return 0; }
+
+    tsdb_table_t *tbl = NULL;
+    if (tsdb_open_table(db, table_name, &tbl) != TSDB_OK || !tbl) {
+        tsdb_result_free(res);
+        return -1;
+    }
+
+    int ts_ci = -1;
+    for (int i = 0; i < ncols; i++) {
+        if (tsdb_result_col_type(res, i) == TSDB_TYPE_TIMESTAMP) {
+            ts_ci = i; break;
+        }
+    }
+    if (ts_ci < 0) { tsdb_result_free(res); return -1; }
+
+    tsdb_table_lock_write(tbl);
+    tsdb_batch_t *batch = NULL;
+    if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
+        tsdb_table_unlock_write(tbl);
+        tsdb_result_free(res);
+        return -1;
+    }
+    tsdb_batch_set_local_only(batch);
+
+    int pulled = 0;
+    while (tsdb_result_next(res)) {
+        tsdb_batch_row_ts(batch, tsdb_result_ts(res, ts_ci));
+        for (int i = 0; i < ncols; i++) {
+            if (i == ts_ci) continue;
+            switch (tsdb_result_col_type(res, i)) {
+            case TSDB_TYPE_INT64:
+                tsdb_batch_row_i64(batch, i, tsdb_result_i64(res, i));
+                break;
+            case TSDB_TYPE_FLOAT64:
+                tsdb_batch_row_f64(batch, i, tsdb_result_f64(res, i));
+                break;
+            default:
+                break;
+            }
+        }
+        tsdb_batch_row_end(batch);
+        pulled++;
+    }
+
+    if (tsdb_batch_commit(batch) != TSDB_OK) {
+        tsdb_table_unlock_write(tbl);
+        tsdb_result_free(res);
+        return -1;
+    }
+    tsdb_table_unlock_write(tbl);
+    tsdb_result_free(res);
+    return pulled;
+}
+
+int tsdb_cluster_resync_table(tsdb_db_t *db,
+                               const char *table_name,
+                               int *out_rows_pulled)
+{
+    if (out_rows_pulled) *out_rows_pulled = 0;
+    if (!db || !table_name) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;
+
+    uint64_t local_count = 0;
+    int64_t  local_max_ts = 0;
+    {
+        char qtl[256];
+        snprintf(qtl, sizeof(qtl),
+                 "SELECT count(*), max(ts) FROM %s", table_name);
+        tsdb_result_t *res = NULL;
+        if (tsdb_query(db, qtl, &res) == TSDB_OK && res &&
+            tsdb_result_next(res))
+        {
+            local_count  = (uint64_t)tsdb_result_i64(res, 0);
+            local_max_ts = tsdb_result_ts(res, 1);
+        }
+        if (res) tsdb_result_free(res);
+    }
+
+    /* Find the peer with the highest (count, max_ts). */
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t best = 0;
+    uint64_t best_count = local_count;
+    int64_t  best_max_ts = local_max_ts;
+
+    for (int i = 0; i < npeers; i++) {
+        uint64_t pc = 0; int64_t pmax = 0;
+        if (peer_table_stats(c, peers[i], table_name, &pc, &pmax) != 0) continue;
+        if (pc > best_count ||
+            (pc == best_count && pmax > best_max_ts))
+        {
+            best = peers[i];
+            best_count = pc;
+            best_max_ts = pmax;
+        }
+    }
+
+    if (best == 0) return TSDB_OK; /* already up-to-date */
+
+    int pulled = pull_table_delta(db, c, best, table_name, local_max_ts);
+    if (pulled < 0) return TSDB_ERR_IO;
+    if (out_rows_pulled) *out_rows_pulled = pulled;
+    tsdb_metric_add("qengine_antientropy_rows_pulled_total", (uint64_t)pulled);
+    return TSDB_OK;
+}
+
+/* ---- Anti-entropy startup thread ---------------------------------------- */
+
+#include <pthread.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* True for directories that represent a user table (excludes dot-
+ * prefixed files, "catalog", "wal", "raft" plumbing dirs). */
+static int resync_is_table_dir(const char *name) {
+    if (!name || name[0] == '.' || name[0] == '_') return 0;
+    if (strcmp(name, "catalog") == 0 ||
+        strcmp(name, "wal")     == 0 ||
+        strcmp(name, "raft")    == 0) return 0;
+    return 1;
+}
+
+/* Detached worker: sleep long enough for gossip + replication to settle,
+ * then walk the data_dir to populate db->tables[] (which is otherwise
+ * empty after a fresh restart), and for each known table call
+ * tsdb_cluster_resync_table to pull any missing tail from a peer. */
+void *tsdb_resync_startup_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return NULL;
+
+    int delay_ms = 5000;
+    const char *envd = getenv("TSDB_ANTIENTROPY_DELAY_MS");
+    if (envd && *envd) delay_ms = atoi(envd);
+    struct timespec ts = { .tv_sec = delay_ms / 1000,
+                           .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
+    nanosleep(&ts, NULL);
+
+    const char *data_dir = tsdb_db_data_dir(db);
+    if (!data_dir) return NULL;
+
+    /* Pre-open every on-disk table so db->tables[] reflects them. */
+    DIR *d = opendir(data_dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!resync_is_table_dir(de->d_name)) continue;
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", data_dir, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            tsdb_table_t *tbl = NULL;
+            (void)tsdb_open_table(db, de->d_name, &tbl);
+        }
+        closedir(d);
+    }
+
+    char names[TSDB_CLUSTER_MAX_NODES * 8][64];
+    int max_names = (int)(sizeof(names) / sizeof(names[0]));
+    int n = tsdb_db_list_table_names(db, names, max_names);
+    fprintf(stderr, "[anti-entropy] scanning %d tables for gaps\n", n);
+
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        int pulled = 0;
+        if (tsdb_cluster_resync_table(db, names[i], &pulled) == TSDB_OK &&
+            pulled > 0)
+        {
+            total += pulled;
+            fprintf(stderr, "[anti-entropy] %s: pulled %d rows\n",
+                    names[i], pulled);
+        }
+    }
+    fprintf(stderr, "[anti-entropy] startup catch-up: %d rows across %d tables\n",
+            total, n);
+    return NULL;
 }

@@ -107,6 +107,23 @@ int tsdb_cluster_broadcast_catalog_qtl_to_data(tsdb_db_t *db,
                                                  int *out_acked_peers,
                                                  int *out_total_peers);
 
+/* Anti-entropy resync.  Pulls missing rows (ts > local_max_ts) from
+ * the peer that holds the most up-to-date copy of `table_name`.  The
+ * pulled rows are applied with the local-only flag so they do not
+ * re-replicate (that would amplify traffic and could loop if two
+ * peers both try to catch up at once).  Covers the common case of a
+ * data node being offline during writes — on restart the node can
+ * call this for every table in its catalog to close the gap.
+ *
+ * Returns TSDB_OK on success (including the "already up-to-date"
+ * case) and sets *out_rows_pulled to the number of rows inserted.
+ * Returns TSDB_ERR_IO only when the transport / peer schema path
+ * actively fails; callers that want best-effort catch-up can
+ * safely retry next interval. */
+int tsdb_cluster_resync_table(tsdb_db_t *db,
+                               const char *table_name,
+                               int *out_rows_pulled);
+
 /* Bridges into the cluster layer for modules that live above it
  * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each
  * returns NULL / 0 if the db is in standalone mode. */
