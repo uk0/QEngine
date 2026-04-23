@@ -67,6 +67,7 @@ services:
       TSDB_NODE_ROLE:              master
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
+      TSDB_AUTH_SEED_BANNER:       "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       # RPC + gossip advertise using the docker-network alias so peers
@@ -116,6 +117,7 @@ services:
       TSDB_NODE_ROLE:              data
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
+      TSDB_AUTH_SEED_BANNER:       "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-2:28081
@@ -163,6 +165,7 @@ services:
       TSDB_NODE_ROLE:              data
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
+      TSDB_AUTH_SEED_BANNER:       "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-3:28081

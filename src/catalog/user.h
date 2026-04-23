@@ -125,6 +125,15 @@ int tsdb_auth_token_role(tsdb_auth_t      *a,
                           const char       *token,
                           tsdb_user_role_t *out_role);
 
+/* Resolve the username owning a session token — used by the audit log so
+ * every record can name the actor.  Returns TSDB_OK and writes up to
+ * out_cap bytes (NUL-terminated) into out_user; TSDB_ERR_PERMISSION when
+ * the token is unknown. */
+int tsdb_auth_token_user(tsdb_auth_t *a,
+                          const char  *token,
+                          char        *out_user,
+                          size_t       out_cap);
+
 #ifdef __cplusplus
 }
 #endif

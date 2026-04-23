@@ -369,9 +369,15 @@ int tsdb_auth_open(const char *data_dir, tsdb_auth_t **out) {
         int rc2 = tsdb_auth_user_create(a, duser, dpass, TSDB_USER_ROLE_ADMIN);
         if (rc2 == TSDB_OK) {
             (void)tsdb_auth_grant(a, duser, TSDB_PRIV_ALL, "*");
-            fprintf(stderr,
-                "[auth] seeded default admin '%s' (role=admin, grant ALL on *); "
-                "CHANGE THE PASSWORD in production\n", duser);
+            /* Banner gated by TSDB_AUTH_SEED_BANNER=1 so unit tests
+             * (which open dozens of fresh DBs) don't flood stderr.
+             * Enabled explicitly by docker-compose / cluster bring-up. */
+            const char *banner = getenv("TSDB_AUTH_SEED_BANNER");
+            if (banner && *banner && *banner != '0') {
+                fprintf(stderr,
+                    "[auth] seeded default admin '%s' (role=admin, grant ALL on *); "
+                    "CHANGE THE PASSWORD in production\n", duser);
+            }
         }
         return TSDB_OK;
     }
@@ -671,6 +677,22 @@ int tsdb_auth_token_role(tsdb_auth_t      *a,
     for (int i = 0; i < a->ntokens; i++) {
         if (strcmp(a->tokens[i].token, token) == 0) {
             *out_role = a->tokens[i].role;
+            pthread_mutex_unlock(&a->lock);
+            return TSDB_OK;
+        }
+    }
+    pthread_mutex_unlock(&a->lock);
+    return TSDB_ERR_PERMISSION;
+}
+
+int tsdb_auth_token_user(tsdb_auth_t *a, const char *token,
+                          char *out_user, size_t out_cap)
+{
+    if (!a || !token || !out_user || out_cap == 0) return TSDB_ERR_PERMISSION;
+    pthread_mutex_lock(&a->lock);
+    for (int i = 0; i < a->ntokens; i++) {
+        if (strcmp(a->tokens[i].token, token) == 0) {
+            snprintf(out_user, out_cap, "%s", a->tokens[i].user);
             pthread_mutex_unlock(&a->lock);
             return TSDB_OK;
         }

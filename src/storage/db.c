@@ -11,6 +11,7 @@
 #include "../catalog/tmq.h"
 #include "../catalog/udf.h"
 #include "../catalog/user.h"
+#include "../catalog/audit.h"
 #include "../server/metrics.h"
 #include "retention.h"
 #include <stdio.h>
@@ -85,6 +86,11 @@ struct tsdb_db {
 
     /* UDF catalog (scalar user-defined functions). NULL if open failed. */
     tsdb_udf_catalog_t  *udf;
+
+    /* Audit log. Best-effort; NULL if the append-only file cannot be
+     * created (e.g. read-only filesystem).  Callers must tolerate a
+     * NULL pointer; tsdb_audit_write degrades to a no-op. */
+    tsdb_audit_t        *audit;
 
     /* Opt-in enforcement flag.  Default false: tsdb_auth_enforce is a no-op.
      * Flip to true to auto-consult tsdb_auth_check via tsdb_auth_enforce. */
@@ -180,6 +186,13 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         db->udf = NULL;
     }
 
+    /* Open append-only audit log.  Non-fatal — the server keeps
+     * running with audit disabled if the log file cannot be created
+     * (rare in practice: the catalog/ dir already exists by here). */
+    if (tsdb_audit_open(data_dir, &db->audit) != 0) {
+        db->audit = NULL;
+    }
+
     *out = db;
     return TSDB_OK;
 }
@@ -221,6 +234,7 @@ void tsdb_close(tsdb_db_t *db) {
     }
 
     if (db->udf)     tsdb_udf_catalog_close(db->udf);
+    if (db->audit)   tsdb_audit_close(db->audit);
     if (db->auth)    tsdb_auth_close(db->auth);
     if (db->tmq)     tsdb_tmq_close(db->tmq);
     if (db->catalog) tsdb_catalog_close(db->catalog);
@@ -1013,6 +1027,7 @@ tsdb_catalog_t  *tsdb_db_catalog(tsdb_db_t *db)              { return db ? db->c
 tsdb_tmq_t      *tsdb_db_tmq(tsdb_db_t *db)                  { return db ? db->tmq : NULL; }
 tsdb_auth_t     *tsdb_db_auth(tsdb_db_t *db)                 { return db ? db->auth : NULL; }
 tsdb_udf_catalog_t *tsdb_db_udf(tsdb_db_t *db)               { return db ? db->udf  : NULL; }
+tsdb_audit_t    *tsdb_db_audit(tsdb_db_t *db)                { return db ? db->audit : NULL; }
 pthread_mutex_t *tsdb_tbl_compact_mtx(tsdb_table_internal_t *t) { return t ? &t->compact_mtx : NULL; }
 
 /* ---- RBAC public API (in include/tsdb.h) ------------------------------- */
@@ -1024,7 +1039,16 @@ int tsdb_auth_authenticate(tsdb_db_t *db, const char *username,
     if (!db) return TSDB_ERR_INVAL;
     tsdb_auth_t *a = db->auth;
     if (!a) return TSDB_ERR_INTERNAL;
-    return tsdb_auth_login(a, username, password, out_token, token_cap);
+    int rc = tsdb_auth_login(a, username, password, out_token, token_cap);
+    /* Record every login attempt (success or failure) so the operator
+     * can detect brute-force or enumeration patterns from the audit
+     * trail — the login function itself lives in the catalog layer
+     * which has no db handle, so the audit call is hoisted here. */
+    tsdb_audit_write(db->audit, username ? username : "", "AUTH",
+                     rc == TSDB_OK ? "LOGIN" : "LOGIN_FAILED",
+                     "", rc,
+                     rc == TSDB_OK ? "" : "invalid credentials");
+    return rc;
 }
 
 int tsdb_auth_check(tsdb_db_t *db, const char *token,

@@ -51,6 +51,8 @@ static tsdb_sql_exec_fn     g_sql_fn      = NULL;
 static void                *g_sql_ud      = NULL;
 static tsdb_retention_sweep_fn g_ret_sweep_fn = NULL;
 static void                *g_ret_sweep_ud = NULL;
+static tsdb_audit_tail_fn   g_audit_tail_fn = NULL;
+static void                *g_audit_tail_ud = NULL;
 static tsdb_auth_login_fn   g_auth_login_fn = NULL;
 static tsdb_auth_check_fn   g_auth_check_fn = NULL;
 static void                *g_auth_ud       = NULL;
@@ -81,6 +83,13 @@ void tsdb_metrics_server_set_retention_sweep_provider(
 {
     g_ret_sweep_fn = fn;
     g_ret_sweep_ud = userdata;
+}
+
+void tsdb_metrics_server_set_audit_provider(tsdb_audit_tail_fn fn,
+                                              void *userdata)
+{
+    g_audit_tail_fn = fn;
+    g_audit_tail_ud = userdata;
 }
 
 void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
@@ -257,6 +266,7 @@ static void *handle_connection(void *arg) {
     int route_ret_sweep = 0;
     int route_login   = 0;
     int route_logout  = 0;
+    int route_audit   = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /login", 10) == 0)        route_login = 1;
     else if (strncmp(req, "POST /login", 11) == 0)       route_login = 2; /* 2 = POST */
@@ -266,6 +276,7 @@ static void *handle_connection(void *arg) {
     else if (strncmp(req, "GET /tree", 9) == 0)          route_tree    = 1;
     else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
     else if (strncmp(req, "GET /backup", 11) == 0)       route_backup  = 1;
+    else if (strncmp(req, "GET /audit", 10) == 0)        route_audit   = 1;
     else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
              strncmp(req, "GET /retention/sweep",  20) == 0)
                                                           route_ret_sweep = 1;
@@ -291,7 +302,8 @@ static void *handle_connection(void *arg) {
      * Every gated route below mutates state or exposes schema/catalog. */
     int route_needs_auth = g_auth_enabled &&
         (route_dash || route_cluster || route_tree ||
-         route_backup || route_ret_sweep || route_sql);
+         route_backup || route_ret_sweep || route_sql ||
+         route_audit);
 
     /* Extract tsdb_auth token from Cookie header (first match wins).
      * HTTP headers are case-insensitive per RFC 7230; most clients use
@@ -738,6 +750,61 @@ static void *handle_connection(void *arg) {
             deleted >= 0 ? "200 OK" : "503 Service Unavailable", blen);
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body, (size_t)blen);
+    } else if (route_audit) {
+        /* Tail the audit log.  Query-string "n=<N>" picks how many
+         * rows to return; default 200, cap at 2000 so a huge log can't
+         * blow the 2 MiB response buffer. */
+        int nrows = 200;
+        const char *q = strchr(req, '?');
+        if (q) {
+            const char *n = strstr(q, "n=");
+            if (n) { int v = atoi(n + 2); if (v > 0) nrows = v; }
+        }
+        if (nrows > 2000) nrows = 2000;
+
+        const size_t AUD_CAP = 2 * 1024 * 1024;
+        char *body = malloc(AUD_CAP);
+        if (!body) {
+            const char *oom = "HTTP/1.1 500 Internal Server Error\r\n"
+                              "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            write_all(fd, oom, strlen(oom)); goto done;
+        }
+        int n = snprintf(body, AUD_CAP, "{\"rows\":[");
+        int wrote = 0;
+        if (g_audit_tail_fn) {
+            char raw[1024 * 1024];
+            int got = g_audit_tail_fn(g_audit_tail_ud, nrows,
+                                       raw, sizeof(raw));
+            if (got > 0) {
+                /* raw is newline-separated JSONL; rewrap as JSON array. */
+                int first = 1;
+                char *p = raw, *line_end;
+                raw[got < (int)sizeof(raw) ? got : (int)sizeof(raw) - 1] = '\0';
+                while ((line_end = strchr(p, '\n')) != NULL) {
+                    *line_end = '\0';
+                    if (*p) {
+                        int add = snprintf(body + n, AUD_CAP - (size_t)n,
+                                           "%s%s", first ? "" : ",", p);
+                        if (add > 0 && (size_t)n + (size_t)add + 32 < AUD_CAP) {
+                            n += add; wrote++; first = 0;
+                        } else {
+                            break;
+                        }
+                    }
+                    p = line_end + 1;
+                }
+            }
+        }
+        n += snprintf(body + n, AUD_CAP - (size_t)n,
+                      "],\"nrows\":%d}\n", wrote);
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n", n);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)n);
+        free(body);
     } else if (route_health) {
         /* Minimal liveness payload — kept JSON-only so k8s / curl
          * integrations parse it trivially.  Uptime is seconds since the

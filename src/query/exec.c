@@ -25,6 +25,7 @@
 #include "../catalog/tmq.h"
 #include "../catalog/udf.h"
 #include "../catalog/user.h"
+#include "../catalog/audit.h"
 #include "../../include/tsdb.h"
 #include "../../include/tsdb_cluster.h"
 #include "../raft/raft.h"
@@ -6158,6 +6159,57 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     }
 }
 
+/* Classify a statement for the audit log.  Returns the event category
+ * ("DDL", "AUTH", "GRANT", "REVOKE", "DATA", "QUERY", "RAFT") and the
+ * specific action string ("CREATE TABLE", "LOGIN", ...).  `kind` is
+ * whatever tsdb_query_auth already knows about the stmt. */
+static void stmt_audit_kind(const qast_stmt_t *stmt,
+                             const char **out_event,
+                             const char **out_action)
+{
+    const char *ev = "QUERY", *act = "SELECT";
+    switch (stmt->kind) {
+    case QAST_STMT_SELECT:                  ev = "QUERY"; act = "SELECT"; break;
+    case QAST_STMT_CREATE_DATABASE:         ev = "DDL"; act = "CREATE DATABASE"; break;
+    case QAST_STMT_DROP_DATABASE:           ev = "DDL"; act = "DROP DATABASE"; break;
+    case QAST_STMT_LIST_DATABASES:          ev = "QUERY"; act = "LIST DATABASES"; break;
+    case QAST_STMT_CREATE_GROUP:            ev = "DDL"; act = "CREATE GROUP"; break;
+    case QAST_STMT_DROP_GROUP:              ev = "DDL"; act = "DROP GROUP"; break;
+    case QAST_STMT_LIST_GROUPS:             ev = "QUERY"; act = "LIST GROUPS"; break;
+    case QAST_STMT_CREATE_DEVICE:           ev = "DDL"; act = "CREATE DEVICE"; break;
+    case QAST_STMT_DROP_DEVICE:             ev = "DDL"; act = "DROP DEVICE"; break;
+    case QAST_STMT_LIST_DEVICES:            ev = "QUERY"; act = "LIST DEVICES"; break;
+    case QAST_STMT_LIST_VTABLES:            ev = "QUERY"; act = "LIST VTABLES"; break;
+    case QAST_STMT_LIST_PTABLES:            ev = "QUERY"; act = "LIST PTABLES"; break;
+    case QAST_STMT_CREATE_STABLE:           ev = "DDL"; act = "CREATE STABLE"; break;
+    case QAST_STMT_DROP_STABLE:             ev = "DDL"; act = "DROP STABLE"; break;
+    case QAST_STMT_CREATE_CHILD_TABLE:      ev = "DDL"; act = "CREATE CHILD TABLE"; break;
+    case QAST_STMT_CREATE_TABLE:            ev = "DDL"; act = "CREATE TABLE"; break;
+    case QAST_STMT_ALTER_ADD_COLUMN:        ev = "DDL"; act = "ALTER ADD COLUMN"; break;
+    case QAST_STMT_TRUNCATE_TABLE:          ev = "DATA"; act = "TRUNCATE TABLE"; break;
+    case QAST_STMT_DELETE_RANGE:            ev = "DATA"; act = "DELETE RANGE"; break;
+    case QAST_STMT_CREATE_CONSUMER_GROUP:   ev = "DDL"; act = "CREATE CONSUMER GROUP"; break;
+    case QAST_STMT_JOIN_GROUP:              ev = "DDL"; act = "JOIN GROUP"; break;
+    case QAST_STMT_LEAVE_GROUP:             ev = "DDL"; act = "LEAVE GROUP"; break;
+    case QAST_STMT_COMMIT_OFFSET:           ev = "DDL"; act = "COMMIT OFFSET"; break;
+    case QAST_STMT_EXPORT_PARQUET:          ev = "DATA"; act = "EXPORT PARQUET"; break;
+    case QAST_STMT_CREATE_USER:             ev = "AUTH"; act = "CREATE USER"; break;
+    case QAST_STMT_DROP_USER:               ev = "AUTH"; act = "DROP USER"; break;
+    case QAST_STMT_LIST_USERS:              ev = "QUERY"; act = "LIST USERS"; break;
+    case QAST_STMT_GRANT:                   ev = "GRANT"; act = "GRANT"; break;
+    case QAST_STMT_REVOKE:                  ev = "REVOKE"; act = "REVOKE"; break;
+    case QAST_STMT_ALTER_USER_PASSWORD:     ev = "AUTH"; act = "ALTER USER PASSWORD"; break;
+    case QAST_STMT_CREATE_FUNCTION:         ev = "DDL"; act = "CREATE FUNCTION"; break;
+    case QAST_STMT_DROP_FUNCTION:           ev = "DDL"; act = "DROP FUNCTION"; break;
+    case QAST_STMT_LIST_FUNCTIONS:          ev = "QUERY"; act = "LIST FUNCTIONS"; break;
+    case QAST_STMT_LIST_MASTERS:            ev = "QUERY"; act = "LIST MASTERS"; break;
+    case QAST_STMT_ADD_MASTER:              ev = "RAFT"; act = "ADD MASTER"; break;
+    case QAST_STMT_REMOVE_MASTER:           ev = "RAFT"; act = "REMOVE MASTER"; break;
+    }
+    if (out_event)  *out_event  = ev;
+    if (out_action) *out_action = act;
+}
+
 int tsdb_query_auth(tsdb_db_t *db, const char *token,
                      const char *qtl, tsdb_result_t **out)
 {
@@ -6180,28 +6232,60 @@ int tsdb_query_auth(tsdb_db_t *db, const char *token,
     const char *resource = "*";
     stmt_required_authz(&stmt, &priv, &resource, &admin_only);
 
-    /* Snapshot resource before releasing the arena. */
+    /* Snapshot resource + audit kind before releasing the arena. */
     char resbuf[TSDB_USER_RESOURCE_MAX];
     snprintf(resbuf, sizeof(resbuf), "%s", resource ? resource : "*");
+    const char *ev = NULL, *act = NULL;
+    stmt_audit_kind(&stmt, &ev, &act);
     tsdb_arena_free(&a);
+
+    /* Resolve the actor name for the audit record; best-effort — if the
+     * token is unknown we'll see TSDB_ERR_PERMISSION on the auth check
+     * below and still log the attempt with an empty user field. */
+    char who[TSDB_USER_NAME_MAX] = "";
+    (void)tsdb_auth_token_user(auth, token, who, sizeof(who));
+    tsdb_audit_t *aud = tsdb_db_audit(db);
 
     if (admin_only) {
         tsdb_user_role_t role;
         rc = tsdb_auth_token_role(auth, token, &role);
-        if (rc != TSDB_OK) return TSDB_ERR_PERMISSION;
-        if (role != TSDB_USER_ROLE_ADMIN) return TSDB_ERR_PERMISSION;
+        if (rc != TSDB_OK) {
+            tsdb_audit_write(aud, who, ev, act, resbuf,
+                             TSDB_ERR_PERMISSION, "invalid token");
+            return TSDB_ERR_PERMISSION;
+        }
+        if (role != TSDB_USER_ROLE_ADMIN) {
+            tsdb_audit_write(aud, who, ev, act, resbuf,
+                             TSDB_ERR_PERMISSION, "admin role required");
+            return TSDB_ERR_PERMISSION;
+        }
     } else if (priv != 0) {
         rc = tsdb_auth_verify(auth, token, priv, resbuf);
-        if (rc != TSDB_OK) return rc;
+        if (rc != TSDB_OK) {
+            tsdb_audit_write(aud, who, ev, act, resbuf, rc, "denied");
+            return rc;
+        }
     } else {
         /* Unknown statement kind with no authz mapping — require a valid
          * token as a minimum bar rather than silently allowing. */
         tsdb_user_role_t role;
         rc = tsdb_auth_token_role(auth, token, &role);
-        if (rc != TSDB_OK) return TSDB_ERR_PERMISSION;
+        if (rc != TSDB_OK) {
+            tsdb_audit_write(aud, who, ev, act, resbuf,
+                             TSDB_ERR_PERMISSION, "invalid token");
+            return TSDB_ERR_PERMISSION;
+        }
     }
 
-    return tsdb_query(db, qtl, out);
+    rc = tsdb_query(db, qtl, out);
+    /* Only audit state-changing events — logging every SELECT would make
+     * the audit trail unreadable at dashboard scale.  Read-only LIST /
+     * QUERY categories are skipped; everything that mutates state,
+     * grants, or cluster membership is recorded. */
+    if (aud && ev && strcmp(ev, "QUERY") != 0) {
+        tsdb_audit_write(aud, who, ev, act, resbuf, rc, "");
+    }
+    return rc;
 }
 
 void tsdb_result_free(tsdb_result_t *r) {

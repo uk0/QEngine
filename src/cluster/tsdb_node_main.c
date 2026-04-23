@@ -15,6 +15,7 @@
 #include "../server/metrics.h"
 #include "../server/influx_line.h"
 #include "../storage/retention.h"
+#include "../catalog/audit.h"
 #include "../storage/db.h"
 #include "../raft/raft.h"
 #include "disk_weight.h"
@@ -982,6 +983,18 @@ int tsdb_node_retention_sweep_trampoline(void *ud) {
     return rc == TSDB_OK ? deleted : -1;
 }
 
+/* Trampoline: /audit provider.  Pull the audit handle out of the db
+ * and forward the tail to the HTTP handler.  Returns 0 (silent) when
+ * the log isn't open so the dashboard renders an empty "rows":[]. */
+int tsdb_node_audit_tail_trampoline(void *ud, int max_rows,
+                                     char *buf, size_t cap)
+{
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    tsdb_audit_t *a = tsdb_db_audit(db);
+    if (!a) return 0;
+    return tsdb_audit_tail(a, max_rows, buf, cap);
+}
+
 /* Dashboard auth trampolines.  /login POST calls the login form,
  * subsequent requests present a cookie which we validate as a generic
  * SELECT grant on any resource — the dashboard is essentially a
@@ -1225,6 +1238,13 @@ int main(int argc, char **argv) {
      * Trampoline defined just above main(). */
     tsdb_metrics_server_set_retention_sweep_provider(
         tsdb_node_retention_sweep_trampoline, db);
+
+    /* Expose the append-only audit log via /audit?n=N so the dashboard
+     * can tail the latest DDL / LOGIN / GRANT events.  Provider reads
+     * from <data_dir>/catalog/audit.log — silent 0-row response when
+     * the log file hasn't been created yet. */
+    tsdb_metrics_server_set_audit_provider(
+        tsdb_node_audit_tail_trampoline, db);
 
     /* Wire the dashboard auth hooks.  Only armed when
      * TSDB_DASHBOARD_AUTH=1 at process start; otherwise the metrics

@@ -95,6 +95,12 @@ struct tsdb_auth      *tsdb_db_auth(tsdb_db_t *db);
 struct tsdb_udf_catalog;
 struct tsdb_udf_catalog *tsdb_db_udf(tsdb_db_t *db);
 
+/* Access the append-only audit log.  May be NULL if opening failed
+ * (read-only fs); callers must tolerate a NULL pointer — the module's
+ * public write functions silently no-op in that case. */
+struct tsdb_audit;
+struct tsdb_audit      *tsdb_db_audit(tsdb_db_t *db);
+
 tsdb_schema_t          *tsdb_tbl_schema(tsdb_table_internal_t *t);
 tsdb_memtable_t        *tsdb_tbl_memtable(tsdb_table_internal_t *t);
 const char             *tsdb_tbl_dir(tsdb_table_internal_t *t);

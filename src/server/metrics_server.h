@@ -95,6 +95,15 @@ typedef int (*tsdb_retention_sweep_fn)(void *userdata);
 void tsdb_metrics_server_set_retention_sweep_provider(
     tsdb_retention_sweep_fn fn, void *userdata);
 
+/* ---- /audit provider hook ---------------------------------------------- *
+ * Returns the last `max_rows` JSONL records from the audit log into buf,
+ * returning the number of bytes written (0 = empty, negative = error).
+ * The HTTP handler wraps them as `{"rows":[...]}` for the dashboard. */
+typedef int (*tsdb_audit_tail_fn)(void *userdata, int max_rows,
+                                    char *buf, size_t cap);
+void tsdb_metrics_server_set_audit_provider(tsdb_audit_tail_fn fn,
+                                              void *userdata);
+
 /* ---- Dashboard login hooks --------------------------------------------- *
  * When configured (TSDB_DASHBOARD_AUTH=1), the server gates every route
  * that isn't in the "always public" set (/health, /metrics, /login,
