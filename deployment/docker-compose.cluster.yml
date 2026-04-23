@@ -64,6 +64,9 @@ services:
     hostname: qengine-cnode-1
     environment:
       TSDB_ROLE:                   cluster-node
+      TSDB_NODE_ROLE:              master
+      TSDB_CONSENSUS:              raft
+      TSDB_DASHBOARD_AUTH:         "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       # RPC + gossip advertise using the docker-network alias so peers
@@ -82,13 +85,18 @@ services:
       # node1 is the seed — no TSDB_SEEDS.
     ports:
       - "29301:28090"
+      - "29321:28092"
       - "29311:28094"
     volumes:
-      - cnode1-data:/var/lib/tsdb
+      - /home/nas/tsdb/cnode1/data:/var/lib/tsdb
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-1]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -105,6 +113,9 @@ services:
         condition: service_healthy
     environment:
       TSDB_ROLE:                   cluster-node
+      TSDB_NODE_ROLE:              data
+      TSDB_CONSENSUS:              raft
+      TSDB_DASHBOARD_AUTH:         "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-2:28081
@@ -121,13 +132,18 @@ services:
       TSDB_SEEDS:                  qengine-cnode-1:28080
     ports:
       - "29302:28090"
+      - "29322:28092"
       - "29312:28094"
     volumes:
-      - cnode2-data:/var/lib/tsdb
+      - /home/nas/tsdb/cnode2/data:/var/lib/tsdb
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-2]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -144,6 +160,9 @@ services:
         condition: service_healthy
     environment:
       TSDB_ROLE:                   cluster-node
+      TSDB_NODE_ROLE:              data
+      TSDB_CONSENSUS:              raft
+      TSDB_DASHBOARD_AUTH:         "1"
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-3:28081
@@ -159,13 +178,18 @@ services:
       TSDB_SEEDS:                  qengine-cnode-1:28080,qengine-cnode-2:28080
     ports:
       - "29303:28090"
+      - "29323:28092"
       - "29313:28094"
     volumes:
-      - cnode3-data:/var/lib/tsdb
+      - /home/nas/tsdb/cnode3/data:/var/lib/tsdb
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-3]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -178,7 +202,3 @@ networks:
     driver: bridge
     name: tsdb-cnet
 
-volumes:
-  cnode1-data:
-  cnode2-data:
-  cnode3-data:

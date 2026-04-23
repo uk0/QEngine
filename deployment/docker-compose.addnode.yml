@@ -27,6 +27,8 @@ services:
     hostname: qengine-cnode-4
     environment:
       TSDB_ROLE:                   cluster-node
+      TSDB_NODE_ROLE:              data
+      TSDB_CONSENSUS:              raft
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-4:28081
@@ -38,14 +40,19 @@ services:
       # Seed points to node1's gossip address (= RPC port − 1).
       TSDB_SEEDS:                  qengine-cnode-1:28080
     ports:
-      - "29304:28090"     # client
+      - "29304:28090"
+      - "29324:28092"     # client
       - "29314:28094"     # dashboard
     volumes:
-      - cnode4-data:/var/lib/tsdb
+      - /home/nas/tsdb/cnode4/data:/var/lib/tsdb
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-4]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -60,5 +67,3 @@ networks:
     external: true
     name: tsdb-cnet
 
-volumes:
-  cnode4-data:
