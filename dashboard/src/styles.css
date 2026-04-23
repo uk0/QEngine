@@ -170,18 +170,22 @@ button:disabled {
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
-.node .x {
+.node .x,
+.node .plus {
   flex-shrink: 0;
   opacity: 0;
   color: #94a3b8;
-  font-size: 12px;
-  padding: 0 3px;
+  font-size: 13px;
+  padding: 0 5px;
   border-radius: 3px;
   cursor: pointer;
   transition: opacity 0.12s;
+  line-height: 1.2;
 }
-.node:hover .x { opacity: 1; }
-.node .x:hover { background: #fee2e2; color: #991b1b; }
+.node:hover .x,
+.node:hover .plus { opacity: 1; }
+.node .x:hover    { background: #fee2e2; color: #991b1b; }
+.node .plus:hover { background: #dbeafe; color: #1e3a8a; }
 
 /* Leaf rows (PTable, plain table) ellipsis so long names don't push
  * the trailing size/count off-screen. */
@@ -242,6 +246,75 @@ button:disabled {
   gap: 8px;
 }
 .card h3 .mu { font-weight: 400; }
+
+/* ─── SQL shell: split-pane with QTL catalog ─── */
+.sql-shell {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+.sql-shell.with-catalog {
+  grid-template-columns: 260px 1fr;
+}
+.qtl-catalog {
+  background: #f8fafc;
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.qtl-search {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  font-size: 12px;
+  margin-bottom: 8px;
+  background: #fff;
+}
+.qtl-group { margin-bottom: 4px; }
+.qtl-group-hdr {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  color: var(--fg);
+}
+.qtl-group-hdr:hover { background: var(--hover); }
+.qtl-group-hdr .caret {
+  width: 10px;
+  font-size: 9px;
+  color: var(--mu);
+}
+.qtl-group-hdr .caret.open { transform: rotate(90deg); }
+.qtl-group-hdr > span:nth-child(2) { flex: 1; }
+.qtl-group-hdr .count {
+  font-size: 11px;
+  color: var(--mu);
+  font-weight: 400;
+}
+.qtl-group-items {
+  margin-left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.qtl-item {
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: #334155;
+}
+.qtl-item:hover {
+  background: var(--hi);
+  color: #1e3a8a;
+}
 
 /* ─── SQL editor ─── */
 .sql-wrap { display: flex; flex-direction: column; gap: 6px; }
@@ -431,6 +504,90 @@ table.rows tbody tr:hover { background: var(--hover); }
   margin-top: 10px;
   min-height: 14px;
 }
+
+/* ─── Modal ─── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 90;
+  padding: 20px;
+  animation: fadeIn 0.1s ease-out;
+}
+.modal {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.18);
+  min-width: 360px;
+  max-width: 540px;
+  width: 100%;
+  animation: modalIn 0.13s ease-out;
+}
+.modal-head {
+  padding: 14px 18px 8px;
+  border-bottom: 1px solid var(--bd);
+}
+.modal-title {
+  font-weight: 700;
+  font-size: 14px;
+}
+.modal-body {
+  padding: 12px 18px;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.modal-body.mu { color: var(--mu); }
+.modal-fields {
+  padding: 12px 18px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.modal-field label {
+  display: block;
+  font-size: 12px;
+  color: #334155;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.modal-field input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: 13px ui-monospace, Menlo, monospace;
+  background: #fafafa;
+}
+.modal-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: #fff;
+}
+.modal-field input[readonly] {
+  background: #f1f5f9;
+  color: var(--mu);
+}
+.modal-field-help {
+  font-size: 11px;
+  color: var(--mu);
+  margin-top: 4px;
+}
+.modal-actions {
+  padding: 10px 18px 14px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  border-top: 1px solid var(--bd);
+  margin-top: 8px;
+}
+@keyframes fadeIn   { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modalIn  { from { transform: translateY(-6px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
 /* ─── Toast ─── */
 .toast-stack {

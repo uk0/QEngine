@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { api, SqlResult } from '../api';
 import { useToastCtx } from './Toasts';
+import { QtlExamples } from './QtlExamples';
 
 interface Props {
   sql: string;
@@ -12,6 +13,7 @@ export function SqlConsole({ sql, onSql, onRefreshTree }: Props) {
   const [result, setResult] = useState<SqlResult | null>(null);
   const [err, setErr] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  const [showCatalog, setShowCatalog] = useState(true);
   const toast = useToastCtx();
 
   const run = useCallback(async () => {
@@ -21,7 +23,6 @@ export function SqlConsole({ sql, onSql, onRefreshTree }: Props) {
     try {
       const r = await api.sql(sql);
       setResult(r);
-      // Refresh tree on DDL so the sidebar tracks the new catalog state.
       if (/^\s*(CREATE|DROP|ALTER|TRUNCATE|DELETE)\b/i.test(sql)) onRefreshTree();
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'query failed';
@@ -43,27 +44,34 @@ export function SqlConsole({ sql, onSql, onRefreshTree }: Props) {
   return (
     <>
       <div className="card">
-        <h3>SQL <span className="mu">— ⌘/Ctrl+Enter to run</span></h3>
-        <div className="sql-wrap">
-          <textarea
-            className="sql"
-            value={sql}
-            onChange={e => onSql(e.target.value)}
-            onKeyDown={onKey}
-            spellCheck={false}
-          />
-          <div className="sql-actions">
-            <button className="primary" onClick={run} disabled={busy}>
-              {busy ? 'Running…' : 'Run'}
+        <h3>
+          SQL <span className="mu">— ⌘/Ctrl+Enter to run</span>
+          <span style={{ marginLeft: 'auto' }}>
+            <button onClick={() => setShowCatalog(s => !s)}>
+              {showCatalog ? 'Hide examples' : 'Show examples'}
             </button>
-            <button onClick={() => onSql('')}>Clear</button>
-            <span className="hint">
-              Examples:
-              <button onClick={() => onSql('LIST DATABASES')}>LIST DBs</button>
-              <button onClick={() => onSql('LIST VTABLES')}>LIST VTables</button>
-              <button onClick={() => onSql('LIST PTABLES')}>LIST PTables</button>
-              <button onClick={() => onSql('LIST USERS')}>LIST USERS</button>
-            </span>
+          </span>
+        </h3>
+        <div className={`sql-shell ${showCatalog ? 'with-catalog' : ''}`}>
+          {showCatalog && <QtlExamples onPick={onSql} />}
+          <div className="sql-wrap">
+            <textarea
+              className="sql"
+              value={sql}
+              onChange={e => onSql(e.target.value)}
+              onKeyDown={onKey}
+              spellCheck={false}
+              placeholder="Type a QTL statement or pick an example →"
+            />
+            <div className="sql-actions">
+              <button className="primary" onClick={run} disabled={busy}>
+                {busy ? 'Running…' : 'Run'}
+              </button>
+              <button onClick={() => onSql('')} disabled={busy}>Clear</button>
+              <span className="hint">
+                {sql.length > 0 && `${sql.length} chars`}
+              </span>
+            </div>
           </div>
         </div>
       </div>

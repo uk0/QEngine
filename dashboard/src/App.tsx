@@ -6,6 +6,7 @@ import { AuditPanel } from './components/AuditPanel';
 import { ClusterPanel } from './components/ClusterPanel';
 import { Login } from './components/Login';
 import { Toasts, ToastCtx, useToasts } from './components/Toasts';
+import { ModalProvider } from './components/ModalCtx';
 import { api } from './api';
 
 type Tab = 'query' | 'audit' | 'cluster';
@@ -49,25 +50,27 @@ export function App() {
   }
   return (
     <ToastCtx.Provider value={toasts}>
-      <div className="app">
-        <Topbar tab={tab} onTab={setTab} onLogout={async () => {
-          await api.logout();
-          setAuthed(false);
-        }} />
-        <div className="main">
-          <Sidebar
-            bump={treeBump}
-            onSql={runSql}
-            onRefresh={refreshTree}
-          />
-          <div className="content">
-            {tab === 'query'   && <SqlConsole sql={sql} onSql={setSql} onRefreshTree={refreshTree} />}
-            {tab === 'audit'   && <AuditPanel />}
-            {tab === 'cluster' && <ClusterPanel />}
+      <ModalProvider>
+        <div className="app">
+          <Topbar tab={tab} onTab={setTab} onLogout={async () => {
+            await api.logout();
+            setAuthed(false);
+          }} />
+          <div className="main">
+            <Sidebar
+              bump={treeBump}
+              onSql={runSql}
+              onRefresh={refreshTree}
+            />
+            <div className="content">
+              {tab === 'query'   && <SqlConsole sql={sql} onSql={setSql} onRefreshTree={refreshTree} />}
+              {tab === 'audit'   && <AuditPanel />}
+              {tab === 'cluster' && <ClusterPanel />}
+            </div>
           </div>
         </div>
-      </div>
-      <Toasts items={toasts.items} />
+        <Toasts items={toasts.items} />
+      </ModalProvider>
     </ToastCtx.Provider>
   );
 }

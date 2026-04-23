@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ddl, Tree } from '../api';
 import { useToastCtx } from './Toasts';
+import { useModalCtx } from './ModalCtx';
 
 interface Props {
   bump: number;
@@ -13,6 +14,7 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
   const [err, setErr] = useState<string>('');
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const toast = useToastCtx();
+  const modal = useModalCtx();
 
   const load = useCallback(async () => {
     try {
@@ -29,14 +31,20 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
   const toggle = (key: string) => setOpen(o => ({ ...o, [key]: !o[key] }));
   const isOpen = (key: string) => !!open[key];
 
-  async function run(
+  /** Confirm a drop via modal, then run the SQL and toast the outcome. */
+  async function drop(
     kind: string,
     name: string,
-    fn: () => Promise<unknown>,
+    runFn: () => Promise<unknown>,
   ) {
-    if (!confirm(`Drop ${kind} "${name}" ?`)) return;
+    const ok = await modal.confirm(
+      `Drop ${kind}`,
+      <>Drop <b>{kind}</b> <code>{name}</code>?<br /><span className="mu">This cannot be undone.</span></>,
+      { danger: true, confirmText: `Drop ${kind}` },
+    );
+    if (!ok) return;
     try {
-      await fn();
+      await runFn();
       toast.ok(`${kind} "${name}" dropped`);
       onRefresh();
     } catch (e) {
@@ -44,38 +52,124 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
     }
   }
 
-  async function createDb() {
-    const name = prompt('New database name:');
-    if (!name) return;
+  // ── Top-level creators (header toolbar) ─────────────────────────────
+  async function createDbRoot() {
+    const v = await modal.form('Create database', [
+      { name: 'name',        label: 'Database name', placeholder: 'e.g. prod' },
+      { name: 'description', label: 'Description (optional)', placeholder: 'free-form text' },
+    ]);
+    if (!v || !v.name) return;
     try {
-      await ddl.createDatabase(name);
-      toast.ok(`database "${name}" created`);
+      await ddl.createDatabase(v.name, v.description);
+      toast.ok(`database "${v.name}" created`);
       onRefresh();
     } catch (e) {
       toast.err(e instanceof Error ? e.message : 'create failed');
     }
   }
 
-  async function createGroup() {
-    const db = prompt('Database (optional, blank for global):') || '';
-    const name = prompt('New group name:');
-    if (!name) return;
+  // ── Per-DB group creator: clicked on a specific DB ──────────────────
+  async function createGroupUnder(dbName: string) {
+    const v = await modal.form('Create group', [
+      { name: 'db',   label: 'Parent database', value: dbName, readonly: true },
+      { name: 'name', label: 'Group name',      placeholder: 'e.g. ops' },
+    ]);
+    if (!v || !v.name) return;
     try {
-      await ddl.createGroup(name, db || undefined);
-      toast.ok(`group "${name}" created`);
+      await ddl.createGroup(v.name, dbName || undefined);
+      toast.ok(`group "${v.name}" created`);
       onRefresh();
     } catch (e) {
       toast.err(e instanceof Error ? e.message : 'create failed');
     }
+  }
+
+  // ── Per-group: create a VTable (STable).  Columns and TAGS can't sensibly
+  //    be collected in a modal, so we load a fully-scoped CREATE STABLE
+  //    template into the SQL editor for the operator to tweak.  Parent
+  //    context (DB + group) is filled in so LIST VTABLES IN DATABASE /
+  //    IN GROUP finds the result under the correct bucket.
+  async function createVTableIn(dbName: string, gName: string) {
+    const v = await modal.form('Create VTable (STable)', [
+      { name: 'db',    label: 'Database', value: dbName,       readonly: true },
+      { name: 'group', label: 'Group',    value: gName || '(none)', readonly: true },
+      { name: 'name',  label: 'VTable name', placeholder: 'e.g. cpu_vt' },
+    ], {
+      submitText: 'Load template',
+      body: (
+        <span className="mu">
+          A CREATE STABLE template will be loaded into the SQL editor
+          with columns + TAGS you can tweak; child PTables are created
+          by clicking <b>+</b> on the resulting VTable row.
+        </span>
+      ),
+    });
+    if (!v || !v.name) return;
+    const scope = [
+      dbName ? `IN DATABASE ${dbName}` : '',
+      gName  ? `IN GROUP ${gName}`     : '',
+    ].filter(Boolean).join(' ');
+    const tmpl = `CREATE STABLE ${v.name} (
+  ts TIMESTAMP,
+  usage FLOAT64
+)
+TAGS (host SYMBOL)
+${scope};`;
+    onSql(tmpl);
+    toast.ok('VTable template loaded — edit columns/tags, then Run');
+  }
+
+  // ── Per-VTable: create a child table (PTable) bound to the parent via
+  //    USING + TAGS(...).  TAG values are positional; if the parent
+  //    VTable only has one tag the modal asks for a single value, else
+  //    a template with placeholders is loaded into the SQL editor.
+  async function createPTableIn(vtable: { name: string; ncols: number; tags?: { name: string; type?: string }[] }) {
+    const tags = vtable.tags ?? [];
+    if (tags.length === 1) {
+      // Fast path: one tag → ask for the value inline.
+      const t = tags[0];
+      const v = await modal.form('Create PTable (child table)', [
+        { name: 'vt',   label: 'Parent VTable', value: vtable.name, readonly: true },
+        { name: 'name', label: 'PTable name',   placeholder: `e.g. ${vtable.name}_host01` },
+        { name: 'tag',  label: `Tag value for ${t.name} (${t.type ?? 'SYMBOL'})`,
+          placeholder: t.type === 'INT64' ? '42' : "'host01'" },
+      ]);
+      if (!v || !v.name || !v.tag) return;
+      try {
+        await api.sql(`CREATE TABLE ${v.name} USING ${vtable.name} TAGS (${v.tag})`);
+        toast.ok(`PTable "${v.name}" created under ${vtable.name}`);
+        onRefresh();
+      } catch (e) {
+        toast.err(e instanceof Error ? e.message : 'create failed');
+      }
+      return;
+    }
+    // Multi-tag: template load.
+    const v = await modal.form('Create PTable (child table)', [
+      { name: 'vt',   label: 'Parent VTable', value: vtable.name, readonly: true },
+      { name: 'name', label: 'PTable name',   placeholder: `e.g. ${vtable.name}_host01` },
+    ], {
+      submitText: 'Load template',
+      body: (
+        <span className="mu">
+          TAGS are positional — order must match the VTable's TAGS
+          declaration. Template includes placeholders for you to fill in.
+        </span>
+      ),
+    });
+    if (!v || !v.name) return;
+    const placeholder = tags.length
+      ? tags.map(t => (t.type === 'INT64' ? '0' : `'${t.name}_value'`)).join(', ')
+      : "'tag_value'";
+    const tmpl = `CREATE TABLE ${v.name} USING ${vtable.name} TAGS (${placeholder});`;
+    onSql(tmpl);
+    toast.ok('PTable template loaded — fill TAG values, then Run');
   }
 
   if (err) return <aside className="sidebar"><div className="empty">{err}</div></aside>;
   if (!tree) return <aside className="sidebar"><div className="empty">Loading…</div></aside>;
 
-  // Build index structures the same way the old dashboard did:
-  //   grpsByDb    — rendered under "Groups" of each DB
-  //   vtByDbGrp   — rendered under each group
-  //   ptByVt      — PTables attached to a given VTable
+  // Build index structures — same as before.
   const grpsByDb: Record<string, { name: string }[]> = {};
   (tree.groups ?? []).forEach(g => {
     const k = g.database ?? '';
@@ -85,7 +179,7 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
   const vtByDb: Record<string, { name: string; group?: string }[]> = {};
   (tree.vtables ?? []).forEach(v => {
     const db = v.database ?? '';
-    const key = `${db}${v.group ?? ''}`;
+    const key = `${db}${v.group ?? ''}`;
     (vtByDbGrp[key] ??= []).push(v);
     (vtByDb[db] ??= []).push(v);
   });
@@ -103,14 +197,13 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
     const ps = ptByVt[vtName] ?? [];
     if (!ps.length) return <div className="empty">no ptables</div>;
     return ps.map(p => (
-      <div key={p.name} className="node leaf"
-           title={p.name}
+      <div key={p.name} className="node leaf" title={p.name}
            onDoubleClick={() => onSql(`SELECT * FROM ${p.name} LIMIT 1000`)}>
         <span className="caret"></span>
         <span className="ic p">P</span>
         <span className="nm">{p.name}</span>
         <span className="x" title="DROP PTABLE"
-              onClick={ev => { ev.stopPropagation(); run('PTABLE', p.name, () => ddl.dropPTable(p.name)); }}>✕</span>
+              onClick={ev => { ev.stopPropagation(); drop('PTABLE', p.name, () => ddl.dropPTable(p.name)); }}>✕</span>
       </div>
     ));
   };
@@ -126,8 +219,10 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
           <span className="ic v" onClick={() => toggle(k)}>V</span>
           <span className="nm" onClick={() => toggle(k)}>{v.name}</span>
           <span className="count">{v.ncols}c · {pc}p</span>
+          <span className="plus" title="Create PTable under this VTable"
+                onClick={ev => { ev.stopPropagation(); createPTableIn(v); }}>+</span>
           <span className="x" title="DROP VTABLE"
-                onClick={ev => { ev.stopPropagation(); run('VTABLE', v.name, () => ddl.dropVTable(v.name)); }}>✕</span>
+                onClick={ev => { ev.stopPropagation(); drop('VTABLE', v.name, () => ddl.dropVTable(v.name)); }}>✕</span>
         </div>
         {o && <div className="kids">{renderPtables(v.name)}</div>}
       </div>
@@ -135,7 +230,7 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
   };
 
   const renderGroup = (dbName: string, gName: string) => {
-    const key = `${dbName}${gName}`;
+    const key = `${dbName}${gName}`;
     const k = `gr:${key}`;
     const o = isOpen(k);
     const vs = vtByDbGrp[key] ?? [];
@@ -147,9 +242,11 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
           <span className="ic g" onClick={() => toggle(k)}>G</span>
           <span className="nm" onClick={() => toggle(k)}>{label}</span>
           <span className="count">{vs.length}v</span>
+          <span className="plus" title="Create VTable (STable) here"
+                onClick={ev => { ev.stopPropagation(); createVTableIn(dbName, gName); }}>+</span>
           {gName && (
             <span className="x" title="DROP GROUP"
-                  onClick={ev => { ev.stopPropagation(); run('GROUP', gName, () => ddl.dropGroup(gName)); }}>✕</span>
+                  onClick={ev => { ev.stopPropagation(); drop('GROUP', gName, () => ddl.dropGroup(gName)); }}>✕</span>
           )}
         </div>
         {o && (
@@ -183,8 +280,12 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
             {isProtected ? '🔒' : `${allGrps.length + (hasUngrouped ? 1 : 0)}g · ${vs.length}v`}
           </span>
           {!isOrphan && !isProtected && (
-            <span className="x" title="DROP DATABASE"
-                  onClick={ev => { ev.stopPropagation(); run('DATABASE', dbName, () => ddl.dropDatabase(dbName)); }}>✕</span>
+            <>
+              <span className="plus" title="Create group here"
+                    onClick={ev => { ev.stopPropagation(); createGroupUnder(dbName); }}>+</span>
+              <span className="x" title="DROP DATABASE"
+                    onClick={ev => { ev.stopPropagation(); drop('DATABASE', dbName, () => ddl.dropDatabase(dbName)); }}>✕</span>
+            </>
           )}
         </div>
         {o && (
@@ -218,9 +319,7 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
       </div>
 
       <div className="tool-row">
-        <button onClick={createDb}>+ DB</button>
-        <button onClick={createGroup}>+ Group</button>
-        <button onClick={() => onSql('CREATE TABLE t (ts TIMESTAMP, v INT64) TIMESTAMP(ts)')}>+ Table</button>
+        <button onClick={createDbRoot}>+ Database</button>
         <button onClick={onRefresh} title="reload">↻</button>
       </div>
 
@@ -233,15 +332,14 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
         <>
           <div className="section-label">Tables ({orphanTables.length})</div>
           {orphanTables.map(t => (
-            <div key={t.name} className="node leaf"
-                 title={t.name}
+            <div key={t.name} className="node leaf" title={t.name}
                  onDoubleClick={() => onSql(`SELECT * FROM ${t.name} LIMIT 1000`)}>
               <span className="caret"></span>
               <span className="ic t">T</span>
               <span className="nm">{t.name}</span>
               <span className="count">{t.ncols}c</span>
               <span className="x" title="DROP TABLE"
-                    onClick={ev => { ev.stopPropagation(); run('TABLE', t.name, () => ddl.dropTable(t.name)); }}>✕</span>
+                    onClick={ev => { ev.stopPropagation(); drop('TABLE', t.name, () => ddl.dropTable(t.name)); }}>✕</span>
             </div>
           ))}
         </>

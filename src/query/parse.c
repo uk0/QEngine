@@ -937,6 +937,40 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                 if (p.tok.kind == QTOK_RPAREN) break;
             }
             if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            /* Optional trailing "IN DATABASE <db>" / "IN GROUP <grp>"
+             * — either position is accepted so users can write
+             *   CREATE STABLE t (cols) TAGS (...) IN DATABASE prod
+             * the same way a CREATE GROUP can trail the IN clause.
+             * The leading form above still wins; this loop only runs
+             * when the prior block didn't already fill the fields. */
+            for (int clause = 0; clause < 2 && accept(&p, QTOK_IN); clause++) {
+                if (p.tok.kind == QTOK_IDENT &&
+                    (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->database, sizeof(st->database));
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_IDENT &&
+                           ident_ci(&p.tok, "group")) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->group, sizeof(st->group));
+                    advance(&p);
+                } else if (accept(&p, QTOK_GROUP)) {
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, st->group, sizeof(st->group));
+                    advance(&p);
+                } else {
+                    perr(&p, "expected DATABASE or GROUP after IN");
+                    return TSDB_ERR_PARSE;
+                }
+            }
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
