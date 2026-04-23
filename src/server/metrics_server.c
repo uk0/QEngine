@@ -1711,16 +1711,21 @@ static void *handle_connection(void *arg) {
  * orphans at the node level — the whole node IS a database.  Render
  * them under a single DB-header named after the node's data_dir so
  * the 4-level hierarchy (DB → Group → VTable → PTable) is never
- * broken by a flat list at the bottom. */
-" if(tbs.length){"
+ * broken by a flat list at the bottom.  PTables that already show up
+ * under a VTable in the catalog are filtered out so they don't appear
+ * twice (once under their VTable and once here). */
+" const ptNames=new Set();"
+" pts.forEach(p=>ptNames.add(p.name));"
+" const orphanTbs=tbs.filter(x=>!ptNames.has(x.name));"
+" if(orphanTbs.length){"
 "   const ddName=(dbi.name||'default');"
 "   let bh=`<div class=\"item db node open\" data-nodeid=db_default>`"
 "     +'<span class=ic>DB</span>'"
 "     +`<span class=nm>${esc(ddName)}</span>`"
-"     +`<span class=sz>${tbs.length} ${esc(t('db.tables'))}</span>`"
+"     +`<span class=sz>${orphanTbs.length} ${esc(t('db.tables'))}</span>`"
 "     +'</div><div class=kids>';"
-"   bh+='<div class=grp><span>'+esc(t('common.tables'))+' ('+tbs.length+')</span></div>';"
-"   tbs.forEach(x=>{"
+"   bh+='<div class=grp><span>'+esc(t('common.tables'))+' ('+orphanTbs.length+')</span></div>';"
+"   orphanTbs.forEach(x=>{"
 "     const sz=x.bytes?fmtBytes(x.bytes):'';"
 "     bh+=`<div class=item data-tbl='${esc(x.name)}' title='${esc(t('common.click_load'))}'>`"
 "       +`<span class=nm>${esc(x.name)}</span>`"

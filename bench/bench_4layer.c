@@ -351,8 +351,15 @@ static int create_hierarchy(bench_t *b) {
     for (int i = 0; i < b->n_vtables; i++) {
         vtable_t *vt = &b->vtables[i];
         size_t w = 0;
+        /* Bind the STable into the 4-level hierarchy explicitly so the
+         * dashboard tree renders it under DB → Group → VTable instead
+         * of the "(未归属)" orphan bucket.  The parser accepts the IN
+         * DATABASE / IN GROUP clauses in either order; both optional
+         * but both are required for a proper hierarchy. */
         w += (size_t)snprintf(qtl + w, sizeof(qtl) - w,
-                              "CREATE STABLE %s (ts TIMESTAMP", vt->name);
+                              "CREATE STABLE %s IN DATABASE %s IN GROUP %s"
+                              " (ts TIMESTAMP",
+                              vt->name, vt->database, vt->group);
         for (int f = 0; f < vt->ncols; f++) {
             w += (size_t)snprintf(qtl + w, sizeof(qtl) - w,
                                   ", %s %s", vt->field_names[f],
