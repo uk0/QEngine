@@ -77,8 +77,11 @@ void tsdb_metrics_server_set_tree_provider(tsdb_tree_json_fn fn,
  * Returns bytes written; negative on failure, 0 → fallback to built-in
  * "disabled" body.
  */
+/* token: hex session cookie from Cookie header, or "" if unauthenticated /
+ * auth disabled.  Provider uses it to enforce RBAC via tsdb_query_auth. */
 typedef int (*tsdb_sql_exec_fn)(void *userdata,
                                 const char *q, size_t qlen,
+                                const char *token,
                                 char *buf, size_t cap);
 void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata);

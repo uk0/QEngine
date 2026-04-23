@@ -874,7 +874,7 @@ static int query_is_catalog_ddl(const char *q, size_t qlen) {
 }
 
 static int sql_exec_cb(void *ud, const char *q, size_t qlen,
-                       char *buf, size_t cap)
+                       const char *token, char *buf, size_t cap)
 {
     tsdb_db_t *db = (tsdb_db_t *)ud;
     if (!db) return snprintf(buf, cap, "{\"error\":\"db not ready\"}");
@@ -899,7 +899,17 @@ static int sql_exec_cb(void *ud, const char *q, size_t qlen,
 
     int64_t t0 = now_ms();
     tsdb_result_t *res = NULL;
-    int rc = tsdb_query(db, stmt, &res);
+    /* RBAC: when the HTTP layer forwarded a session token, route through
+     * tsdb_query_auth which maps each statement to (priv, object) and
+     * refuses the op with "permission denied" if the user lacks the
+     * grant.  Empty token → auth disabled / internal path → fall back to
+     * tsdb_query so tests and Prometheus probes keep working. */
+    int rc;
+    if (token && token[0]) {
+        rc = tsdb_query_auth(db, token, stmt, &res);
+    } else {
+        rc = tsdb_query(db, stmt, &res);
+    }
     if (rc != 0 || !res) {
         const char *e = tsdb_errstr(rc);
         char esc[512]; j_escape_str(esc, sizeof(esc), e ? e : "unknown error");

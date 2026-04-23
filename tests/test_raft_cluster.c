@@ -38,9 +38,12 @@ static void rm_rf(const char *path) {
     (void)system(cmd);
 }
 
-/* Smoke: open → self alone → should stay follower (npeers==0 guard). */
+/* Smoke: open → self alone → after grace window elapses, solo master
+ * self-elects.  The original "npeers==0 stays follower" guard was
+ * dropped in 90e9e36 because a single-master topology is a legitimate
+ * operating mode: the lone node must elect itself or nothing commits. */
 static void t_solo_stays_follower(void) {
-    printf("\n[1] solo raft stays follower (no peers)\n");
+    printf("\n[1] solo raft self-elects after grace (no peers)\n");
     const char *dir = "/tmp/tsdb-raft-solo";
     rm_rf(dir);
 
@@ -62,14 +65,15 @@ static void t_solo_stays_follower(void) {
     uint64_t leader = tsdb_raft_leader_id(r);
     printf("  state=%d term=%llu leader=%llu\n",
            s, (unsigned long long)term, (unsigned long long)leader);
-    assert(s == TSDB_RAFT_FOLLOWER);   /* never self-elected */
-    assert(leader == 0);
+    assert(s == TSDB_RAFT_LEADER);
+    assert(leader == 42ULL);
+    assert(term >= 1);
 
     tsdb_raft_close(r);
     tsdb_node_manager_free(mgr);
     tsdb_replica_mgr_free(rmgr);
     rm_rf(dir);
-    printf("PASS: solo node stays follower (no split-brain)\n");
+    printf("PASS: solo node self-elects as sole master\n");
 }
 
 /* Log append through raft_log API (not propose), verifies tsdb_raft

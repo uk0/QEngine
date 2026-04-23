@@ -150,11 +150,13 @@ int main(void) {
 
     /* ---- Phase 8: ADMIN role ------------------------------------------- */
     printf("\n[phase 8] ADMIN role\n");
-    CHECK_OK(run_qtl(db, "CREATE USER root IDENTIFIED BY 'pw' ROLE ADMIN;"),
-             "CREATE USER root ROLE ADMIN");
-    rc = tsdb_auth_authenticate(db, "root", "pw",
+    /* Use a fresh name; the default admin ('root') is auto-seeded on
+     * tsdb_open so we cannot re-CREATE it here. */
+    CHECK_OK(run_qtl(db, "CREATE USER admin1 IDENTIFIED BY 'pw' ROLE ADMIN;"),
+             "CREATE USER admin1 ROLE ADMIN");
+    rc = tsdb_auth_authenticate(db, "admin1", "pw",
                                  admin_token, sizeof(admin_token));
-    CHECK(rc == TSDB_OK, "authenticate root");
+    CHECK(rc == TSDB_OK, "authenticate admin1");
     rc = tsdb_auth_check(db, admin_token, TSDB_PRIV_SELECT, "random_t");
     CHECK(rc == TSDB_OK, "ADMIN -> SELECT on random_t ok (implicit ALL on *)");
     rc = tsdb_auth_check(db, admin_token, TSDB_PRIV_DDL, "foo");
@@ -222,11 +224,11 @@ int main(void) {
     CHECK(rc == TSDB_OK, "reopen #2: INSERT on tx survives reopen");
 
     /* ADMIN role also survives reopen. */
-    rc = tsdb_auth_authenticate(db, "root", "pw",
+    rc = tsdb_auth_authenticate(db, "admin1", "pw",
                                  admin_token, sizeof(admin_token));
-    CHECK(rc == TSDB_OK, "reopen #2: authenticate root (ADMIN)");
+    CHECK(rc == TSDB_OK, "reopen #2: authenticate admin1 (ADMIN)");
     rc = tsdb_auth_check(db, admin_token, TSDB_PRIV_DDL, "anything");
-    CHECK(rc == TSDB_OK, "reopen #2: root ADMIN -> DDL on anything");
+    CHECK(rc == TSDB_OK, "reopen #2: admin1 ADMIN -> DDL on anything");
 
     /* Drop user + verify. */
     CHECK_OK(run_qtl(db, "DROP USER alice;"), "DROP USER alice");

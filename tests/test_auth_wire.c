@@ -114,9 +114,10 @@ static int start_server(bool require_auth) {
     int rc = tsdb_open(g_dir, &g_db);
     if (rc != TSDB_OK) return rc;
 
-    /* Bootstrap admin + normal user via bypass. */
+    /* Bootstrap admin + normal user via bypass. 'root' is auto-seeded
+     * by tsdb_open, so only an ALTER is needed to reset its password. */
     tsdb_result_t *r = NULL;
-    tsdb_query(g_db, "CREATE USER root IDENTIFIED BY 'root_pw' ROLE admin;", &r);
+    tsdb_query(g_db, "ALTER USER root SET PASSWORD 'root_pw';", &r);
     if (r) tsdb_result_free(r); r = NULL;
     tsdb_query(g_db, "CREATE USER alice IDENTIFIED BY 'alice_pw';", &r);
     if (r) tsdb_result_free(r); r = NULL;

@@ -635,7 +635,8 @@ static void *handle_connection(void *arg) {
             rlen = snprintf(res, RES_CAP,
                             "{\"error\":\"sql provider not installed\"}\n");
         } else {
-            rlen = g_sql_fn(g_sql_ud, q_start, q_len, res, RES_CAP);
+            rlen = g_sql_fn(g_sql_ud, q_start, q_len,
+                            cookie_tok, res, RES_CAP);
             if (rlen <= 0)
                 rlen = snprintf(res, RES_CAP,
                                 "{\"error\":\"provider returned %d\"}\n", rlen);

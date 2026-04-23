@@ -86,7 +86,7 @@ int main(void) {
 
     /* ---- Phase 1 — bootstrap via bypass path --------------------------- */
     printf("\n[1] bootstrap: create users + table\n");
-    bypass_ok(db, "CREATE USER root IDENTIFIED BY 'root_pw' ROLE admin;");
+    bypass_ok(db, "CREATE USER rootX IDENTIFIED BY 'root_pw' ROLE admin;");
     bypass_ok(db, "CREATE USER alice IDENTIFIED BY 'alice_pw';"); /* NORMAL */
     /* QTL has no CREATE TABLE for non-child tables; use the C API. */
     tsdb_col_t cols[] = {
@@ -97,7 +97,7 @@ int main(void) {
 
     char tok_admin[64] = {0};
     char tok_alice[64] = {0};
-    OK(tsdb_auth_authenticate(db, "root",  "root_pw",  tok_admin, sizeof(tok_admin)));
+    OK(tsdb_auth_authenticate(db, "rootX", "root_pw",  tok_admin, sizeof(tok_admin)));
     OK(tsdb_auth_authenticate(db, "alice", "alice_pw", tok_alice, sizeof(tok_alice)));
     ASSERT(strlen(tok_admin) == 32);
     ASSERT(strlen(tok_alice) == 32);
