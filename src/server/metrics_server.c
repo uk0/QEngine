@@ -121,6 +121,122 @@ void tsdb_metrics_server_set_data_dir(const char *path) {
     snprintf(g_data_dir, sizeof(g_data_dir), "%s", path);
 }
 
+/* Forward decl — defined below; static-file helper above needs it. */
+static void write_all(int fd, const char *buf, size_t len);
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Optional static-file serving.  When TSDB_DASHBOARD_DIR is set at process
+ * start, GET / and GET /<path> read files from that directory instead of
+ * returning the embedded HTML.  Intended use: the Vite+React dashboard
+ * under repo root `dashboard/` is built into `dashboard/dist/`, the
+ * operator points TSDB_DASHBOARD_DIR at it, and every request is served
+ * as a static asset with its MIME type.  Missing env or missing index
+ * file → falls through to the embedded HTML so nothing breaks.
+ * ────────────────────────────────────────────────────────────────────── */
+static char g_dashboard_dir[4096] = {0};
+static int  g_dashboard_dir_probed = 0;
+
+static const char *dashboard_dir(void) {
+    if (!g_dashboard_dir_probed) {
+        g_dashboard_dir_probed = 1;
+        const char *e = getenv("TSDB_DASHBOARD_DIR");
+        if (e && e[0]) {
+            snprintf(g_dashboard_dir, sizeof(g_dashboard_dir), "%s", e);
+        }
+    }
+    return g_dashboard_dir[0] ? g_dashboard_dir : NULL;
+}
+
+static const char *mime_of(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    dot++;
+    if (!strcasecmp(dot, "html") || !strcasecmp(dot, "htm")) return "text/html; charset=utf-8";
+    if (!strcasecmp(dot, "js")  || !strcasecmp(dot, "mjs")) return "application/javascript; charset=utf-8";
+    if (!strcasecmp(dot, "css")) return "text/css; charset=utf-8";
+    if (!strcasecmp(dot, "json")) return "application/json; charset=utf-8";
+    if (!strcasecmp(dot, "svg")) return "image/svg+xml";
+    if (!strcasecmp(dot, "png")) return "image/png";
+    if (!strcasecmp(dot, "jpg") || !strcasecmp(dot, "jpeg")) return "image/jpeg";
+    if (!strcasecmp(dot, "gif")) return "image/gif";
+    if (!strcasecmp(dot, "woff2")) return "font/woff2";
+    if (!strcasecmp(dot, "woff")) return "font/woff";
+    if (!strcasecmp(dot, "ttf")) return "font/ttf";
+    if (!strcasecmp(dot, "ico")) return "image/x-icon";
+    if (!strcasecmp(dot, "txt") || !strcasecmp(dot, "map")) return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+/* Resolve a request path (e.g. "/" or "/assets/main.js") against the
+ * configured dashboard dir, blocking "../" traversal.  Returns the
+ * mmap-safe absolute path on success, "" on reject. */
+static int resolve_static_path(const char *urlpath, char *out, size_t cap) {
+    const char *root = dashboard_dir();
+    if (!root) return -1;
+
+    /* "/" → "/index.html" */
+    const char *rel = urlpath && urlpath[0] ? urlpath : "/";
+    if (rel[0] != '/') return -1;
+    if (rel[1] == '\0') rel = "/index.html";
+
+    /* Block ../ traversal, double slashes, and absolute paths. */
+    for (const char *s = rel; *s; s++) {
+        if (s[0] == '.' && s[1] == '.') return -1;
+        if (s[0] == '/' && s[1] == '/') return -1;
+    }
+
+    int n = snprintf(out, cap, "%s%s", root, rel);
+    if (n <= 0 || (size_t)n >= cap) return -1;
+    return 0;
+}
+
+static int try_serve_static(int fd, const char *urlpath) {
+    char path[4200];
+    if (resolve_static_path(urlpath, path, sizeof(path)) != 0) return 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long len = ftell(f);
+    if (len < 0) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+
+    char hdr[512];
+    const char *ct = mime_of(path);
+    /* Hashed Vite assets live under /assets/ and are safe to cache for a
+     * year; the top-level index.html must stay fresh so dashboard pushes
+     * propagate on reload. */
+    const char *cc = strstr(urlpath, "/assets/") == urlpath
+                       ? "public, max-age=31536000, immutable"
+                       : "no-store";
+    int hn = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Cache-Control: %s\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n\r\n",
+        ct, cc, len);
+    write_all(fd, hdr, (size_t)hn);
+
+    /* Heap-allocate — a 64 KiB stack buffer overflowed a tight worker
+     * thread stack on macOS and fread() returned 0 despite feof=0.
+     * Holding the buffer on the heap sidesteps that. */
+    const size_t BUFCAP = 64 * 1024;
+    char *buf = malloc(BUFCAP);
+    if (!buf) { fclose(f); return 0; }
+    while (len > 0) {
+        size_t take = len > (long)BUFCAP ? BUFCAP : (size_t)len;
+        size_t got  = fread(buf, 1, take, f);
+        if (got == 0) break;
+        write_all(fd, buf, got);
+        len -= (long)got;
+    }
+    free(buf);
+    fclose(f);
+    return 1;
+}
+
 /* Build the default synthetic /cluster JSON used when no provider is
  * registered.  Reports the single local node with disk capacity. */
 static int build_standalone_cluster_json(char *buf, size_t cap) {
@@ -295,6 +411,29 @@ static void *handle_connection(void *arg) {
              strncmp(req, "GET /sql",  8) == 0)          route_sql     = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
              strncmp(req, "GET /index", 10) == 0)        route_dash    = 1;
+    /* GET /assets/*, /favicon.ico and /vite.svg are served from the
+     * static bundle when TSDB_DASHBOARD_DIR is set — gated by the
+     * dashboard auth cookie like the dashboard proper. */
+    int route_static = 0;
+    if (strncmp(req, "GET /assets/", 12) == 0 ||
+        strncmp(req, "GET /favicon", 12) == 0 ||
+        strncmp(req, "GET /vite.svg", 13) == 0) route_static = 1;
+    /* Extract just the URL path (request-target) for static-file handlers
+     * that need to know which file to read.  `req` points at the full
+     * request line; the path starts after "GET " and ends at SP/?. */
+    char req_path[512] = "/";
+    {
+        const char *s = strchr(req, ' ');
+        if (s) {
+            s++;
+            const char *e = s;
+            while (*e && *e != ' ' && *e != '?' && *e != '\r' && *e != '\n') e++;
+            size_t plen = (size_t)(e - s);
+            if (plen >= sizeof(req_path)) plen = sizeof(req_path) - 1;
+            memcpy(req_path, s, plen);
+            req_path[plen] = '\0';
+        }
+    }
 
     /* ---- Optional dashboard login gate ----------------------------------
      * When TSDB_DASHBOARD_AUTH is set at process start, every route that
@@ -314,7 +453,7 @@ static void *handle_connection(void *arg) {
     int route_needs_auth = g_auth_enabled &&
         (route_dash || route_cluster || route_tree ||
          route_backup || route_ret_sweep || route_sql ||
-         route_audit || route_pitr);
+         route_audit || route_pitr || route_static);
 
     /* Extract tsdb_auth token from Cookie header (first match wins).
      * HTTP headers are case-insensitive per RFC 7230; most clients use
@@ -872,7 +1011,25 @@ static void *handle_connection(void *arg) {
             blen);
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body, (size_t)blen);
+    } else if (route_static) {
+        /* Vite asset bundle — /assets/*, /favicon.ico, /vite.svg.
+         * Served verbatim from TSDB_DASHBOARD_DIR with immutable caching
+         * on hashed /assets/ paths.  404 when the dir isn't configured
+         * or the file doesn't exist, so a stale bookmark can't confuse
+         * the embedded HTML fallback path. */
+        if (!try_serve_static(fd, req_path)) {
+            const char *r = "HTTP/1.1 404 Not Found\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            write_all(fd, r, strlen(r));
+        }
     } else if (route_dash) {
+        /* Dashboard — prefer the Vite+React build from TSDB_DASHBOARD_DIR
+         * when the env var is set and dashboard/dist/index.html exists;
+         * otherwise fall through to the single-file embedded HTML below.
+         * The embedded version remains the canonical minimal-config
+         * fallback so every tsdb install has a working dashboard even
+         * without bundling the Vite artefacts. */
+        if (try_serve_static(fd, "/index.html")) goto done;
         /* Single-page HTML dashboard.  No external assets; fetches
          * /health + /metrics from the same origin via XHR every 2 s.
          * Renders: (1) cumulative stat cards, (2) derived-rate cards,
@@ -938,13 +1095,14 @@ static void *handle_connection(void *arg) {
 ".bar>span{display:block;height:100%;background:var(--accent)}"
 ".bar.warn>span{background:var(--warn)}.bar.bad>span{background:var(--bad)}"
 /* SQL console + tree */
-".qshell{display:grid;grid-template-columns:260px 1fr;gap:10px;align-items:stretch}"
+".qshell{display:grid;grid-template-columns:360px 1fr;gap:10px;align-items:stretch}"
 ".tree{background:var(--card);border:1px solid var(--bd);border-radius:8px;"
 "padding:8px 10px;min-height:300px;max-height:520px;overflow:auto;font-size:12px}"
 ".tree .dbhdr{border-bottom:1px solid var(--bd);padding:4px 2px 8px 2px;"
 "margin-bottom:6px}"
 ".tree .dbhdr .dbname{font-weight:700;color:var(--fg);font-size:13px;"
-"display:flex;align-items:center;gap:6px}"
+"display:flex;align-items:center;gap:6px;word-break:break-all}"
+".tree .dbhdr .dbname>span:last-child{flex:1;overflow-wrap:anywhere}"
 ".tree .dbhdr .dbname .ic{background:#e0e7ff;color:#1e3a8a;border-radius:4px;"
 "padding:1px 5px;font-size:10px;font-weight:600;letter-spacing:.04em}"
 ".tree .dbhdr .dbmeta{color:var(--mu);font-size:10px;margin-top:3px;"
@@ -961,6 +1119,12 @@ static void *handle_connection(void *arg) {
 ".tree .item{padding:3px 6px;border-radius:4px;cursor:pointer;"
 "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
 "display:flex;align-items:center;gap:6px}"
+/* DB + Group rows show full name (wrap) so operators can read the
+ * entire identifier even when nested deeply; deeper rows (VTable /
+ * PTable) keep the single-line ellipsis so the tree stays compact. */
+".tree .item.db,.tree .item.gr{white-space:normal;word-break:break-word}"
+".tree .item.db>.nm,.tree .item.gr>.nm{white-space:normal;overflow:visible;"
+"text-overflow:clip;word-break:break-word;overflow-wrap:anywhere}"
 ".tree .item:hover{background:#f1f5f9}"
 ".tree .item.active{background:#dbeafe;color:#1e3a8a}"
 ".tree .item .nm{flex:1;overflow:hidden;text-overflow:ellipsis}"
@@ -1728,7 +1892,7 @@ static void *handle_connection(void *arg) {
 " if(!ps.length)return '<div class=empty>'+esc(t('tree.no_ptables'))+'</div>';"
 " let ph='';"
 " ps.forEach(p=>{"
-"   ph+=`<div class=\"item dev\" data-dev='${esc(p.name)}'>`"
+"   ph+=`<div class=\"item dev\" data-dev='${esc(p.name)}' title='${esc(p.name)}'>`"
 "     +`<span class=nm>${esc(p.name)}</span>`"
 "     +`<span class=x data-dropptbl='${esc(p.name)}' title='DROP PTABLE'>✕</span>`"
 "     +'</div>';});"
@@ -1736,7 +1900,7 @@ static void *handle_connection(void *arg) {
 "}"
 "function renderVtable(v,idx){"
 " const ps=ptByVt[v.name]||[];"
-" let vh=`<div class=\"item gr node\" data-nodeid=vt_${idx}>`"
+" let vh=`<div class=\"item gr node\" data-nodeid=vt_${idx} title='${esc(v.name)}'>`"
 "   +'<span class=ic>V</span>'"
 "   +`<span class=nm>${esc(v.name)}</span>`"
 "   +`<span class=sz>${v.ncols} ${esc(t('tree.lbl_cols'))} · ${ps.length} ${esc(t('tree.lbl_ptables'))}</span>`"

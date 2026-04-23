@@ -5519,6 +5519,24 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         else result_status(r, "ERR: drop stable failed");
         break;
     }
+    case QAST_STMT_DROP_TABLE: {
+        const char *tn = stmt.u.drop_table.name;
+        /* Cascade: if the name is registered as a child-table in the
+         * catalog, remove that row so LIST PTABLES stops showing it.
+         * Normal tables return NOTFOUND from tsdb_child_table_drop,
+         * which we intentionally ignore. */
+        (void)tsdb_child_table_drop(cat, tn);
+        rc = tsdb_drop_table(db, tn);
+        if (rc == TSDB_OK) {
+            rc = result_status(r, "OK: table dropped");
+        }
+        else if (rc == TSDB_ERR_NOTFOUND) {
+            result_status(r, "ERR: table not found"); rc = TSDB_ERR_NOTFOUND;
+        } else {
+            result_status(r, "ERR: drop table failed");
+        }
+        break;
+    }
     case QAST_STMT_TRUNCATE_TABLE: {
         rc = tsdb_truncate_table(db, stmt.u.truncate_table.name);
         if (rc == TSDB_OK) {
@@ -6117,6 +6135,10 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
         *out_priv     = TSDB_PRIV_DDL;
         *out_resource = stmt->u.alter_add_column.table;
         break;
+    case QAST_STMT_DROP_TABLE:
+        *out_priv     = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.drop_table.name;
+        break;
 
     /* TRUNCATE / DELETE — data-mutating operations on a specific table.
      * Treat them as DELETE privilege on that table. */
@@ -6185,6 +6207,7 @@ static void stmt_audit_kind(const qast_stmt_t *stmt,
     case QAST_STMT_DROP_STABLE:             ev = "DDL"; act = "DROP STABLE"; break;
     case QAST_STMT_CREATE_CHILD_TABLE:      ev = "DDL"; act = "CREATE CHILD TABLE"; break;
     case QAST_STMT_CREATE_TABLE:            ev = "DDL"; act = "CREATE TABLE"; break;
+    case QAST_STMT_DROP_TABLE:              ev = "DDL"; act = "DROP TABLE"; break;
     case QAST_STMT_ALTER_ADD_COLUMN:        ev = "DDL"; act = "ALTER ADD COLUMN"; break;
     case QAST_STMT_TRUNCATE_TABLE:          ev = "DATA"; act = "TRUNCATE TABLE"; break;
     case QAST_STMT_DELETE_RANGE:            ev = "DATA"; act = "DELETE RANGE"; break;

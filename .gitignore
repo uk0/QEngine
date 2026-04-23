@@ -66,3 +66,6 @@ sdk/go/e2e-report.linux
 sdk/java/target/
 sdk/go/bin/
 example-go/example-router
+out/
+dashboard/node_modules
+dashboard/dist

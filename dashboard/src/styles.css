@@ -1,0 +1,392 @@
+:root {
+  --fg: #0f172a;
+  --mu: #64748b;
+  --bd: #e2e8f0;
+  --bg: #f8fafc;
+  --card: #ffffff;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+  --hi: #dbeafe;
+  --hover: #f1f5f9;
+  /* Wider sidebar — user asked for left-column room + full DB names. */
+  --side-w: 380px;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  font: 14px/1.45 -apple-system, system-ui, "Helvetica Neue", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+button:hover { background: var(--hover); }
+button.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+button.primary:hover { filter: brightness(1.1); }
+button.danger {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+button.danger:hover { background: #fecaca; }
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ─── Layout ─── */
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  background: var(--card);
+  border-bottom: 1px solid var(--bd);
+}
+.topbar .brand {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+}
+.topbar .mu { color: var(--mu); font-size: 12px; }
+.topbar .spacer { flex: 1; }
+.topbar .tab {
+  padding: 6px 12px;
+  border-radius: 6px;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 13px;
+}
+.topbar .tab.active { background: var(--hi); color: #1e3a8a; }
+.topbar .tab:hover:not(.active) { background: var(--hover); }
+
+.main {
+  display: grid;
+  grid-template-columns: var(--side-w) 1fr;
+  gap: 12px;
+  padding: 12px;
+  min-height: 0;
+}
+
+/* ─── Sidebar tree ─── */
+.sidebar {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow: auto;
+  max-height: calc(100vh - 80px);
+}
+.sidebar .tool-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.sidebar .tool-row button {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+.sidebar .section-label {
+  font-size: 10px;
+  color: var(--mu);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 10px 0 4px;
+  font-weight: 600;
+}
+.node {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.node:hover { background: var(--hover); }
+.node.active { background: var(--hi); color: #1e3a8a; }
+.node .caret {
+  width: 10px;
+  font-size: 9px;
+  color: var(--mu);
+  flex-shrink: 0;
+  line-height: 1.6;
+}
+.node .caret.open { transform: rotate(90deg); }
+.node .ic {
+  font-size: 9px;
+  background: var(--hi);
+  color: #1e3a8a;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+  line-height: 1.4;
+}
+.node .ic.g  { background: #fef3c7; color: #92400e; }
+.node .ic.v  { background: #dcfce7; color: #15803d; }
+.node .ic.p  { background: #ede9fe; color: #5b21b6; }
+.node .ic.t  { background: #fee2e2; color: #991b1b; }
+.node .nm {
+  flex: 1;
+  /* DB / Group / VTable names are allowed to wrap so the sidebar never
+   * hides the tail of a long identifier.  PTables & plain tables keep
+   * single-line + ellipsis via the dedicated rule below. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.node .count {
+  font-size: 11px;
+  color: var(--mu);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.node .x {
+  flex-shrink: 0;
+  opacity: 0;
+  color: #94a3b8;
+  font-size: 12px;
+  padding: 0 3px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: opacity 0.12s;
+}
+.node:hover .x { opacity: 1; }
+.node .x:hover { background: #fee2e2; color: #991b1b; }
+
+/* Leaf rows (PTable, plain table) ellipsis so long names don't push
+ * the trailing size/count off-screen. */
+.node.leaf .nm {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kids { margin-left: 18px; }
+.empty {
+  font-style: italic;
+  color: var(--mu);
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+/* ─── DB header card ─── */
+.db-hdr {
+  padding: 6px 4px 10px;
+  border-bottom: 1px solid var(--bd);
+  margin-bottom: 6px;
+}
+.db-hdr .db-name {
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  word-break: break-word;
+}
+.db-hdr .db-meta {
+  color: var(--mu);
+  font-size: 11px;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+/* ─── Main content ─── */
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.card h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card h3 .mu { font-weight: 400; }
+
+/* ─── SQL editor ─── */
+.sql-wrap { display: flex; flex-direction: column; gap: 6px; }
+textarea.sql {
+  width: 100%;
+  min-height: 80px;
+  font: 13px/1.4 ui-monospace, Menlo, monospace;
+  padding: 8px 10px;
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  resize: vertical;
+  background: #fafafa;
+}
+.sql-actions { display: flex; gap: 8px; align-items: center; }
+.sql-actions .hint { color: var(--mu); font-size: 11px; }
+
+/* ─── Result table ─── */
+.result-meta {
+  font-size: 11px;
+  color: var(--mu);
+  margin-bottom: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.result {
+  max-height: 560px;
+  overflow: auto;
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+}
+table.rows {
+  width: 100%;
+  border-collapse: collapse;
+  font: 12px/1.35 ui-monospace, Menlo, monospace;
+}
+table.rows thead th {
+  position: sticky;
+  top: 0;
+  background: var(--hi);
+  text-align: left;
+  padding: 6px 8px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--bd);
+  z-index: 1;
+}
+table.rows tbody td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--bd);
+  white-space: nowrap;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.rows tbody tr:hover { background: var(--hover); }
+
+/* ─── Audit ─── */
+.audit-row {
+  display: grid;
+  grid-template-columns: 180px 80px 100px 160px 60px 1fr;
+  gap: 10px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--bd);
+  font: 12px/1.4 ui-monospace, Menlo, monospace;
+  align-items: center;
+}
+.audit-row.header {
+  font-weight: 600;
+  background: var(--hi);
+  position: sticky;
+  top: 0;
+}
+.audit-row .ev { text-align: center; border-radius: 10px; padding: 1px 6px; font-size: 10px; font-weight: 600; }
+.audit-row .ev.AUTH   { background: #dbeafe; color: #1e3a8a; }
+.audit-row .ev.DDL    { background: #fef3c7; color: #92400e; }
+.audit-row .ev.GRANT  { background: #dcfce7; color: #15803d; }
+.audit-row .ev.REVOKE { background: #fecaca; color: #991b1b; }
+.audit-row .ev.DATA   { background: #ede9fe; color: #5b21b6; }
+.audit-row .ev.RAFT   { background: #fce7f3; color: #9d174d; }
+.audit-row .ev.QUERY  { background: #f1f5f9; color: #475569; }
+.audit-row .rc.ok  { color: var(--ok); }
+.audit-row .rc.bad { color: var(--bad); }
+
+/* ─── Login screen ─── */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.login-card {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 10px;
+  padding: 26px 30px;
+  width: 320px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+}
+.login-card h1 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+.login-card p { margin: 0 0 18px; color: var(--mu); font-size: 12px; }
+.login-card label {
+  display: block;
+  font-size: 12px;
+  color: #334155;
+  margin: 10px 0 4px;
+}
+.login-card input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.login-card .err {
+  color: var(--bad);
+  font-size: 12px;
+  margin-top: 10px;
+  min-height: 14px;
+}
+
+/* ─── Toast ─── */
+.toast-stack {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 100;
+}
+.toast {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+  max-width: 400px;
+  animation: slideIn 0.15s ease-out;
+}
+.toast.ok  { border-left: 3px solid var(--ok); }
+.toast.err { border-left: 3px solid var(--bad); }
+@keyframes slideIn {
+  from { transform: translateY(6px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}

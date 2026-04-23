@@ -1415,6 +1415,23 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
+        /* DROP TABLE name — normal table or ptable.  Cascades to catalog
+         * child-table entry if the name is registered there.  Also accept
+         * PTABLE as a synonym so the dashboard's data-dropptbl button can
+         * call it explicitly. */
+        if (accept(&p, QTOK_TABLE) ||
+            (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "ptable")
+             && (advance(&p), 1))) {
+            out->kind = QAST_STMT_DROP_TABLE;
+            if (p.tok.kind != QTOK_IDENT) {
+                perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+            }
+            tok_copy(&p.tok, out->u.drop_table.name, sizeof(out->u.drop_table.name));
+            advance(&p);
+            accept(&p, QTOK_SEMI);
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
         /* DROP USER <name> */
         if (accept(&p, QTOK_USER)) {
             out->kind = QAST_STMT_DROP_USER;
@@ -1440,7 +1457,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUP, DEVICE, STABLE, USER, or FUNCTION after DROP");
+        perr(&p, "expected TABLE, GROUP, DEVICE, STABLE, USER, or FUNCTION after DROP");
         return TSDB_ERR_PARSE;
     }
 

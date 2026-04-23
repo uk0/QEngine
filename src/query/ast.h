@@ -190,6 +190,9 @@ typedef enum {
     /* Normal table DDL: CREATE TABLE name (col TYPE, ...) TIMESTAMP(ts)
      * [WITH (BLOCK_POINTS=N, PARTITION='hour'|'day')] */
     QAST_STMT_CREATE_TABLE,
+    /* DROP TABLE name — drops any physical table (normal or child/ptable).
+     * Cascades to catalog child-table entry if the name is registered as one. */
+    QAST_STMT_DROP_TABLE,
     /* ALTER TABLE t ADD COLUMN c TYPE */
     QAST_STMT_ALTER_ADD_COLUMN,
     /* TRUNCATE TABLE t — wipe all rows, keep schema. */
@@ -264,6 +267,8 @@ typedef struct {
             int                      block_points;    /* 0 = db default   */
             int                      partition_hour;  /* 0 = DAY, 1 = HOUR */
         } create_table;
+        /* QAST_STMT_DROP_TABLE — drops physical table by name (normal or ptable). */
+        struct { char name[64]; }            drop_table;
         /* ALTER TABLE t ADD COLUMN c TYPE */
         struct {
             char         table[64];
