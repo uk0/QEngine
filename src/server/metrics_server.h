@@ -83,6 +83,15 @@ typedef int (*tsdb_sql_exec_fn)(void *userdata,
 void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata);
 
+/* ---- /retention/sweep provider hook ------------------------------------- *
+ * Synchronous trigger for the retention GC.  Invoked by the
+ * /retention/sweep HTTP endpoint.  Returns the number of partitions
+ * deleted (or -1 on failure).  Runs in the HTTP request thread so
+ * keep it bounded. */
+typedef int (*tsdb_retention_sweep_fn)(void *userdata);
+void tsdb_metrics_server_set_retention_sweep_provider(
+    tsdb_retention_sweep_fn fn, void *userdata);
+
 /* ---- /raft provider hook ------------------------------------------------- *
  * Returns a JSON snapshot of the local Raft state machine for the
  * acceptance harness and the topology dashboard.  Expected shape:

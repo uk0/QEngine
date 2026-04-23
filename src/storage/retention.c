@@ -5,6 +5,7 @@
 
 #include "retention.h"
 #include "../server/log.h"
+#include "../server/metrics.h"
 #include "../../include/tsdb.h"
 
 #include <stdio.h>
@@ -416,6 +417,17 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
     r->stats.sweeps_done++;
     r->stats.last_sweep_ns = now_realtime_ns();
     pthread_mutex_unlock(&r->lock);
+
+    /* Publish to process-wide metrics so /metrics observers can see
+     * retention activity without opening the internal handle. */
+    tsdb_metric_inc("qengine_retention_sweeps_total");
+    if (deleted > 0) {
+        tsdb_metric_add("qengine_retention_partitions_deleted_total",
+                        (uint64_t)deleted);
+    }
+    if (bytes > 0) {
+        tsdb_metric_add("qengine_retention_bytes_reclaimed_total", bytes);
+    }
 
     if (deleted_out) *deleted_out = deleted;
     TSDB_LOG_INFO("retention",

@@ -214,6 +214,11 @@ int tsdb_db_set_group_commit(tsdb_db_t *db, int64_t batch_window_ns);
 struct tsdb_retention;
 void tsdb_db_attach_retention(tsdb_db_t *db, struct tsdb_retention *r);
 
+/* Return the retention handle currently attached to db (may be NULL
+ * if tsdb_db_set_retention was not called).  Used by management
+ * endpoints that want to trigger a manual sweep. */
+struct tsdb_retention *tsdb_db_retention(tsdb_db_t *db);
+
 /*
  * Return the per-table compaction mutex.  Held by flush_and_clear_ex() and
  * by the compactor's rename phase to prevent reading a half-swapped file pair.

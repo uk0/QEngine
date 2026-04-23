@@ -47,6 +47,8 @@ static tsdb_tree_json_fn    g_tree_fn     = NULL;
 static void                *g_tree_ud     = NULL;
 static tsdb_sql_exec_fn     g_sql_fn      = NULL;
 static void                *g_sql_ud      = NULL;
+static tsdb_retention_sweep_fn g_ret_sweep_fn = NULL;
+static void                *g_ret_sweep_ud = NULL;
 static tsdb_raft_json_fn    g_raft_fn     = NULL;
 static void                *g_raft_ud     = NULL;
 static char                 g_data_dir[4096] = {0};
@@ -67,6 +69,13 @@ void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata) {
     g_sql_ud = userdata;
     g_sql_fn = fn;
+}
+
+void tsdb_metrics_server_set_retention_sweep_provider(
+    tsdb_retention_sweep_fn fn, void *userdata)
+{
+    g_ret_sweep_fn = fn;
+    g_ret_sweep_ud = userdata;
 }
 
 void tsdb_metrics_server_set_raft_provider(tsdb_raft_json_fn fn,
@@ -230,11 +239,17 @@ static void *handle_connection(void *arg) {
     int route_tree    = 0;
     int route_sql     = 0;
     int route_raft    = 0;
+    int route_backup  = 0;
+    int route_ret_sweep = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /health", 11) == 0)       route_health  = 1;
     else if (strncmp(req, "GET /cluster", 12) == 0)      route_cluster = 1;
     else if (strncmp(req, "GET /tree", 9) == 0)          route_tree    = 1;
     else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
+    else if (strncmp(req, "GET /backup", 11) == 0)       route_backup  = 1;
+    else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
+             strncmp(req, "GET /retention/sweep",  20) == 0)
+                                                          route_ret_sweep = 1;
     else if (strncmp(req, "POST /sql", 9) == 0 ||
              strncmp(req, "GET /sql",  8) == 0)          route_sql     = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
@@ -451,6 +466,91 @@ static void *handle_connection(void *arg) {
         write_all(fd, res, (size_t)rlen);
         free(res);
         free(q_copy);
+    } else if (route_backup) {
+        /* Stream a tar.gz of g_data_dir so an operator can snapshot a
+         * single node for disaster recovery.  Uses popen(tar …) and
+         * forwards bytes to the HTTP client with chunked transfer
+         * encoding.  Caveats:
+         *   - read-only best-effort: the memtable/flush path is not
+         *     quiesced, so an actively-written table may show torn
+         *     partitions in the tarball.  Ingest pause + /backup is
+         *     the safe pattern for production.
+         *   - no auth on this endpoint today — same security posture
+         *     as /metrics and /sql, rely on network isolation.
+         * Restore: stop node, extract the tarball into the node's
+         * data_dir, restart.  The anti-entropy thread will close any
+         * remaining gap against live peers automatically. */
+        tsdb_metric_inc("qengine_backup_requests_total");
+        if (!g_data_dir[0]) {
+            const char *err = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\nConnection: close\r\n\r\ndata_dir not configured";
+            write_all(fd, err, strlen(err));
+            goto done;
+        }
+
+        /* tar -cz -C <parent> <leaf>: gives a relative tree.  We
+         * use --ignore-failed-read so in-flight tmp/gc files don't
+         * abort the whole stream. */
+        char parent[4096];
+        snprintf(parent, sizeof(parent), "%s", g_data_dir);
+        char *slash = strrchr(parent, '/');
+        const char *leaf = g_data_dir;
+        if (slash) { *slash = '\0'; leaf = slash + 1; }
+        else       { snprintf(parent, sizeof(parent), "."); }
+
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd),
+                 "tar --ignore-failed-read -cz -C '%s' '%s' 2>/dev/null",
+                 parent, leaf);
+        FILE *tar = popen(cmd, "r");
+        if (!tar) {
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 10\r\nConnection: close\r\n\r\ntar failed";
+            write_all(fd, err, strlen(err));
+            goto done;
+        }
+
+        char fname[256];
+        snprintf(fname, sizeof(fname), "%s-backup.tar.gz",
+                 leaf[0] ? leaf : "tsdb");
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/gzip\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n",
+            fname);
+        write_all(fd, hdr, (size_t)hlen);
+
+        uint8_t chunk[64 * 1024];
+        uint64_t total = 0;
+        for (;;) {
+            size_t n = fread(chunk, 1, sizeof(chunk), tar);
+            if (n == 0) break;
+            char size_hdr[32];
+            int slen = snprintf(size_hdr, sizeof(size_hdr), "%zx\r\n", n);
+            write_all(fd, size_hdr, (size_t)slen);
+            write_all(fd, (char *)chunk, n);
+            write_all(fd, "\r\n", 2);
+            total += n;
+        }
+        write_all(fd, "0\r\n\r\n", 5);
+        pclose(tar);
+        tsdb_metric_add("qengine_backup_bytes_streamed_total", total);
+    } else if (route_ret_sweep) {
+        int deleted = -1;
+        if (g_ret_sweep_fn) deleted = g_ret_sweep_fn(g_ret_sweep_ud);
+        char body[128];
+        int blen = snprintf(body, sizeof(body),
+            "{\"ok\":%s,\"partitions_deleted\":%d}\n",
+            deleted >= 0 ? "true" : "false", deleted);
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n",
+            deleted >= 0 ? "200 OK" : "503 Service Unavailable", blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)blen);
     } else if (route_health) {
         /* Minimal liveness payload — kept JSON-only so k8s / curl
          * integrations parse it trivially.  Uptime is seconds since the

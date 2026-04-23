@@ -139,6 +139,21 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_rows_pulled_total",
       "Rows pulled from a peer via anti-entropy resync (catch-up after downtime)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_retention_sweeps_total",
+      "Retention GC sweeps completed (background or manual)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_retention_partitions_deleted_total",
+      "Partitions deleted by the retention GC", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_retention_bytes_reclaimed_total",
+      "Bytes freed on disk by retention GC", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_backup_bytes_streamed_total",
+      "Total bytes streamed by the /backup endpoint (before HTTP framing)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_backup_requests_total",
+      "Total /backup invocations", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replica_dial_total",
       "Total new TCP connections established to peers", MT_COUNTER, { .c = { 0 } } },
 

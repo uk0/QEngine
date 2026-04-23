@@ -290,6 +290,10 @@ void tsdb_db_attach_retention(tsdb_db_t *db, struct tsdb_retention *r) {
     if (old) tsdb_retention_stop(old);
 }
 
+struct tsdb_retention *tsdb_db_retention(tsdb_db_t *db) {
+    return db ? db->retention : NULL;
+}
+
 /* ---- Table lookup (must hold db->lock) ---------------------------------- */
 
 static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {

@@ -14,6 +14,8 @@
 #include "../server/metrics_server.h"
 #include "../server/metrics.h"
 #include "../server/influx_line.h"
+#include "../storage/retention.h"
+#include "../storage/db.h"
 #include "../raft/raft.h"
 #include "disk_weight.h"
 #include <stdio.h>
@@ -957,6 +959,19 @@ static int sql_exec_cb(void *ud, const char *q, size_t qlen,
     return w;
 }
 
+/* Trampoline: metrics_server's retention-sweep provider takes a
+ * callback + opaque ud.  We stash the db pointer as ud here and
+ * route through tsdb_db_retention so the endpoint stays oblivious
+ * to whether a sweeper was actually attached (returns -1 if not). */
+int tsdb_node_retention_sweep_trampoline(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    struct tsdb_retention *r = tsdb_db_retention(db);
+    if (!r) return -1;
+    int deleted = 0;
+    int rc = tsdb_retention_sweep_once(r, &deleted);
+    return rc == TSDB_OK ? deleted : -1;
+}
+
 int main(int argc, char **argv) {
     const char *data_dir     = NULL;
     const char *rpc_addr     = NULL;
@@ -1134,6 +1149,59 @@ int main(int argc, char **argv) {
         }
         pthread_attr_destroy(&attr);
     }
+
+    /* Retention GC sweeper.  retention.conf (if present at
+     * <data_dir>/retention.conf) defines per-table retention windows
+     * via fnmatch patterns; partitions older than the window are
+     * deleted on each sweep.  For quick setups we honour
+     * TSDB_RETENTION_DEFAULT (e.g. "30d", "24h", "1m") by writing a
+     * one-line wildcard config on first boot; operators can later
+     * override with a hand-crafted retention.conf.
+     *
+     * TSDB_RETENTION_SWEEP_MS compresses the default 1-hour sweep
+     * interval — useful for tests and for clusters with high churn.
+     * TSDB_RETENTION_DRY_RUN=1 logs decisions without unlinking. */
+    {
+        const char *def = getenv("TSDB_RETENTION_DEFAULT");
+        if (def && *def) {
+            char conf_path[4096];
+            snprintf(conf_path, sizeof(conf_path), "%s/retention.conf",
+                     data_dir);
+            struct stat st;
+            if (stat(conf_path, &st) != 0) {
+                FILE *f = fopen(conf_path, "w");
+                if (f) {
+                    fprintf(f, "# auto-generated from TSDB_RETENTION_DEFAULT\n"
+                               "* = %s\n", def);
+                    fclose(f);
+                    printf("[retention] seeded %s with '* = %s'\n",
+                           conf_path, def);
+                }
+            }
+        }
+
+        tsdb_retention_opts_t ropts = { .sweep_interval_ns = 0,
+                                         .dry_run = 0 };
+        const char *sweep_ms = getenv("TSDB_RETENTION_SWEEP_MS");
+        if (sweep_ms && *sweep_ms) {
+            long long ms = atoll(sweep_ms);
+            if (ms > 0) ropts.sweep_interval_ns = (int64_t)ms * 1000000LL;
+        }
+        const char *dry = getenv("TSDB_RETENTION_DRY_RUN");
+        if (dry && *dry && *dry != '0') ropts.dry_run = 1;
+
+        if (tsdb_db_set_retention(db, NULL, &ropts) == TSDB_OK) {
+            printf("[retention] GC armed (interval=%s%s)\n",
+                   sweep_ms && *sweep_ms ? sweep_ms : "default",
+                   ropts.dry_run ? " dry-run" : "");
+        }
+    }
+
+    /* Expose manual sweep via /retention/sweep so operators and tests
+     * can force a GC cycle without waiting for the interval timer.
+     * Trampoline defined just above main(). */
+    tsdb_metrics_server_set_retention_sweep_provider(
+        tsdb_node_retention_sweep_trampoline, db);
     fflush(stdout);
 
     /* Main loop: optionally print stats every 5s (gated by env). */
