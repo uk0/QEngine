@@ -68,6 +68,7 @@ YAML
       TSDB_ROLE: cluster-node
       TSDB_NODE_ROLE: master
       TSDB_CONSENSUS: raft
+      TSDB_DASHBOARD_AUTH: "0"
       TSDB_DATA_DIR: /var/lib/tsdb
       TSDB_BIND: 0.0.0.0:28090
       TSDB_RPC_BIND: ${rpc_alias}:28081
