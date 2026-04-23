@@ -68,6 +68,7 @@ services:
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
       TSDB_AUTH_SEED_BANNER:       "1"
+      TSDB_DASHBOARD_DIR:          /etc/tsdb/dashboard/dist
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       # RPC + gossip advertise using the docker-network alias so peers
@@ -90,6 +91,7 @@ services:
       - "29311:28094"
     volumes:
       - /home/nas/tsdb/cnode1/data:/var/lib/tsdb
+      - /home/nas/tsdb/src/deployment/dashboard-dist:/etc/tsdb/dashboard/dist:ro
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-1]
@@ -118,6 +120,7 @@ services:
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
       TSDB_AUTH_SEED_BANNER:       "1"
+      TSDB_DASHBOARD_DIR:          /etc/tsdb/dashboard/dist
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-2:28081
@@ -138,6 +141,7 @@ services:
       - "29312:28094"
     volumes:
       - /home/nas/tsdb/cnode2/data:/var/lib/tsdb
+      - /home/nas/tsdb/src/deployment/dashboard-dist:/etc/tsdb/dashboard/dist:ro
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-2]
@@ -166,6 +170,7 @@ services:
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
       TSDB_AUTH_SEED_BANNER:       "1"
+      TSDB_DASHBOARD_DIR:          /etc/tsdb/dashboard/dist
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-3:28081
@@ -185,6 +190,7 @@ services:
       - "29313:28094"
     volumes:
       - /home/nas/tsdb/cnode3/data:/var/lib/tsdb
+      - /home/nas/tsdb/src/deployment/dashboard-dist:/etc/tsdb/dashboard/dist:ro
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-3]

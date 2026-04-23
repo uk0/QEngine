@@ -15,6 +15,67 @@ export interface SqlResult {
   ms: number;
 }
 
+/* ── Cluster + Raft types ─────────────────────────────────────────── */
+
+export interface ClusterNode {
+  id: string;
+  addr: string;
+  state: 'ALIVE' | 'SUSPECT' | 'DEAD' | string;
+  role: 'master' | 'data' | string;
+  ver: number;
+  hb_age_ms: number;
+  known_for_s: number;
+  suspect_count: number;
+}
+
+export interface AutobalanceNode {
+  id: string;
+  writes_sec: number;
+  storage_mb: number;
+  cpu_pct: number;
+  vn: number;
+}
+
+export interface AutobalanceInfo {
+  local_id: string;
+  ema_writes_sec: number;
+  interval_ms: number;
+  alpha: number;
+  beta: number;
+  dampen: number;
+  nodes: AutobalanceNode[];
+}
+
+export interface LocalDisk {
+  total_bytes: number;
+  free_bytes: number;
+  used_x10: number;
+  data_dir: string;
+  vn_weight: number;
+}
+
+export interface ClusterInfo {
+  local_id: string;
+  nodes: ClusterNode[];
+  autobalance?: AutobalanceInfo;
+  local?: {
+    host: string;
+    pid: number;
+    uptime_s: number;
+    disk: LocalDisk;
+  };
+}
+
+export interface RaftInfo {
+  self_id?: string;
+  role?: 'leader' | 'follower' | 'candidate' | string;
+  current_term?: number;
+  leader_id?: string;
+  commit_index?: number;
+  last_applied?: number;
+  last_index?: number;
+}
+
 export interface AuditRecord {
   ts: string;
   user: string;
@@ -124,12 +185,30 @@ export const api = {
     return req<Tree>('GET', '/tree');
   },
 
-  cluster(): Promise<unknown> {
-    return req<unknown>('GET', '/cluster');
+  cluster(): Promise<ClusterInfo> {
+    return req<ClusterInfo>('GET', '/cluster');
   },
 
-  raft(): Promise<unknown> {
-    return req<unknown>('GET', '/raft');
+  raft(): Promise<RaftInfo> {
+    return req<RaftInfo>('GET', '/raft');
+  },
+
+  /** Prometheus-text /metrics — parse key counters the dashboard uses
+   *  to estimate replication health and memtable pressure. */
+  async metrics(): Promise<Record<string, number>> {
+    const resp = await fetch('/metrics', { credentials: 'include' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const txt = await resp.text();
+    const out: Record<string, number> = {};
+    for (const line of txt.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const sp = line.indexOf(' ');
+      if (sp < 0) continue;
+      const k = line.slice(0, sp).trim();
+      const v = Number(line.slice(sp + 1).trim());
+      if (!Number.isNaN(v)) out[k] = v;
+    }
+    return out;
   },
 
   health(): Promise<{ status: string; uptime_s: number; pid: number }> {

@@ -33,6 +33,9 @@ services:
       TSDB_BIND:                   0.0.0.0:28090
       TSDB_RPC_BIND:               qengine-cnode-4:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
+      TSDB_DASHBOARD_AUTH:         "1"
+      TSDB_AUTH_SEED_BANNER:       "1"
+      TSDB_DASHBOARD_DIR:          /etc/tsdb/dashboard/dist
       TSDB_IOPOLICY:               hdd
       # See docker-compose.cluster.yml for the rationale; keep in sync.
       TSDB_REPLICA_CONNS_PER_PEER: "1"
@@ -45,6 +48,7 @@ services:
       - "29314:28094"     # dashboard
     volumes:
       - /home/nas/tsdb/cnode4/data:/var/lib/tsdb
+      - /home/nas/tsdb/src/deployment/dashboard-dist:/etc/tsdb/dashboard/dist:ro
     networks:
       tsdb-cnet:
         aliases: [qengine-cnode-4]
