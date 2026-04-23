@@ -249,22 +249,44 @@ static void *fanout_worker(void *arg) {
     tsdb_node_id_t nid = wa->node_id;
     free(wa);
 
-    /* One fast retry on transient failure.  The receive side now
-     * truthfully reports TSDB_RPC_ERR when the local write
-     * (table-open / batch-begin / batch-commit) didn't land, so
-     * every rc != OK here corresponds to rows that need to be
-     * re-sent somewhere.  A single retry closes most of the
-     * concurrent-write-loss window observed under the 4-writer
-     * stress scenario without introducing an unbounded loop that
-     * could keep a dying peer alive. */
+    /* Retry fanout against a single peer up to MAX_ATTEMPTS times
+     * before giving up.  Two distinct failure modes:
+     *
+     *   - Dial failure (conn == NULL): peer's RPC server isn't
+     *     accepting yet — typical during a cluster cold start where
+     *     gossip marks the peer ALIVE a moment before the listen
+     *     socket binds, or right after a container restart.  Back
+     *     off a little longer here (50 ms) to let the listener come
+     *     up, then try again.  Without this, bench startups show
+     *     dozens to hundreds of dial_fails on the first fanout wave
+     *     that actually landed cleanly on retry.
+     *
+     *   - RPC-level failure (rc != OK): the socket was good but the
+     *     peer's handler returned TSDB_RPC_ERR (e.g. receive-side
+     *     batch_commit failed) or the call timed out.  Evict the
+     *     (possibly poisoned) conn from the pool and retry with a
+     *     short 5 ms wait so a peer's in-flight table-lock has a
+     *     chance to drain.
+     *
+     * MAX_ATTEMPTS stays small so a permanently-dead peer doesn't
+     * wedge the dispatcher forever — the quorum waiter still
+     * returns as soon as enough other peers have acked. */
+    const int MAX_ATTEMPTS = 3;
     int rc = TSDB_ERR_IO;
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(ctx->rmgr, nid);
-        if (!conn) { rc = TSDB_ERR_IO; break; }
+        if (!conn) {
+            rc = TSDB_ERR_IO;
+            if (attempt + 1 < MAX_ATTEMPTS) {
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000000 };
+                nanosleep(&ts, NULL);
+            }
+            continue;
+        }
         rc = tsdb_rpc_call(conn, ctx->rpc_kind, ctx->payload, ctx->payload_len);
         if (rc == TSDB_OK) break;
         evict_one_conn(ctx->rmgr, nid, conn);
-        if (attempt == 0) {
+        if (attempt + 1 < MAX_ATTEMPTS) {
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 5 * 1000000 };
             nanosleep(&ts, NULL);
         }
