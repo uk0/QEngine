@@ -104,6 +104,14 @@ typedef int (*tsdb_audit_tail_fn)(void *userdata, int max_rows,
 void tsdb_metrics_server_set_audit_provider(tsdb_audit_tail_fn fn,
                                               void *userdata);
 
+/* ---- /pitr provider hook ----------------------------------------------- *
+ * Point-in-time recovery trim.  Called from POST /pitr?ts=<ns>;
+ * returns the number of partitions deleted across all tables, or
+ * negative on failure. */
+typedef int (*tsdb_pitr_trim_fn)(void *userdata, int64_t target_ns);
+void tsdb_metrics_server_set_pitr_provider(tsdb_pitr_trim_fn fn,
+                                             void *userdata);
+
 /* ---- Dashboard login hooks --------------------------------------------- *
  * When configured (TSDB_DASHBOARD_AUTH=1), the server gates every route
  * that isn't in the "always public" set (/health, /metrics, /login,

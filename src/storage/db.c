@@ -757,6 +757,51 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
     return TSDB_OK;
 }
 
+/* ---- PITR trim --------------------------------------------------------- *
+ * Discard every partition strictly after `target_ns` across every open
+ * table in the db.  Intended use: restore a /backup tarball, then call
+ * tsdb_pitr_trim_to(target_ns) to roll the state forward to a specific
+ * instant — anything written after that is dropped as if it never
+ * happened.  Runs through tsdb_delete_range so the same partition-level
+ * lock and unlink logic apply; the call is idempotent.
+ *
+ * Returns TSDB_OK with *out_parts_removed set to the total partition
+ * count removed across all tables.  NOT cluster-wide: the caller is
+ * expected to either restore the same backup on every node, or invoke
+ * this on each node separately. */
+int tsdb_pitr_trim_to(tsdb_db_t *db, int64_t target_ns,
+                      int *out_parts_removed)
+{
+    if (!db) return TSDB_ERR_INVAL;
+
+    /* Snapshot the table name list so we don't hold db->lock while
+     * tsdb_delete_range re-acquires it.  Names are owned by the
+     * tables themselves and outlive this call. */
+    pthread_mutex_lock(&db->lock);
+    int n = db->ntables;
+    const char **names = n > 0 ? calloc((size_t)n, sizeof(*names)) : NULL;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (db->tables[i] && db->tables[i]->name[0])
+            names[k++] = db->tables[i]->name;
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    int total = 0;
+    for (int i = 0; i < k; i++) {
+        int removed = 0;
+        /* op_lt=0, inclusive=0 → drop partitions whose pstart > target_ns. */
+        if (tsdb_delete_range(db, names[i], target_ns,
+                              /*op_lt*/ 0, /*inclusive*/ 0,
+                              &removed) == TSDB_OK) {
+            total += removed;
+        }
+    }
+    free(names);
+    if (out_parts_removed) *out_parts_removed = total;
+    return TSDB_OK;
+}
+
 /* ---- ALTER TABLE ADD COLUMN -------------------------------------------- */
 
 int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,

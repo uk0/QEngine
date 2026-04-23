@@ -60,6 +60,15 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
                       int64_t cutoff_ns, int op_lt, int inclusive,
                       int *out_removed);
 
+/* Point-in-time recovery (PITR) trim.  Discards every partition whose
+ * start timestamp is strictly greater than target_ns across every open
+ * table in the db, so the caller can fast-forward a freshly-restored
+ * /backup tarball to a specific instant and drop any writes that
+ * landed after it.  On success *out_parts_removed is set to the total
+ * partition count removed across all tables; pass NULL to ignore. */
+int tsdb_pitr_trim_to(tsdb_db_t *db, int64_t target_ns,
+                      int *out_parts_removed);
+
 /* Acquire / release the per-table batch serialization lock.
  *
  * Required by any caller running a tsdb_batch_begin → row_*... →

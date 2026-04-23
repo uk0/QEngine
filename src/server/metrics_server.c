@@ -53,6 +53,8 @@ static tsdb_retention_sweep_fn g_ret_sweep_fn = NULL;
 static void                *g_ret_sweep_ud = NULL;
 static tsdb_audit_tail_fn   g_audit_tail_fn = NULL;
 static void                *g_audit_tail_ud = NULL;
+static tsdb_pitr_trim_fn    g_pitr_fn       = NULL;
+static void                *g_pitr_ud       = NULL;
 static tsdb_auth_login_fn   g_auth_login_fn = NULL;
 static tsdb_auth_check_fn   g_auth_check_fn = NULL;
 static void                *g_auth_ud       = NULL;
@@ -90,6 +92,13 @@ void tsdb_metrics_server_set_audit_provider(tsdb_audit_tail_fn fn,
 {
     g_audit_tail_fn = fn;
     g_audit_tail_ud = userdata;
+}
+
+void tsdb_metrics_server_set_pitr_provider(tsdb_pitr_trim_fn fn,
+                                             void *userdata)
+{
+    g_pitr_fn = fn;
+    g_pitr_ud = userdata;
 }
 
 void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
@@ -267,6 +276,7 @@ static void *handle_connection(void *arg) {
     int route_login   = 0;
     int route_logout  = 0;
     int route_audit   = 0;
+    int route_pitr    = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /login", 10) == 0)        route_login = 1;
     else if (strncmp(req, "POST /login", 11) == 0)       route_login = 2; /* 2 = POST */
@@ -277,6 +287,7 @@ static void *handle_connection(void *arg) {
     else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
     else if (strncmp(req, "GET /backup", 11) == 0)       route_backup  = 1;
     else if (strncmp(req, "GET /audit", 10) == 0)        route_audit   = 1;
+    else if (strncmp(req, "POST /pitr", 10) == 0)        route_pitr    = 1;
     else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
              strncmp(req, "GET /retention/sweep",  20) == 0)
                                                           route_ret_sweep = 1;
@@ -303,7 +314,7 @@ static void *handle_connection(void *arg) {
     int route_needs_auth = g_auth_enabled &&
         (route_dash || route_cluster || route_tree ||
          route_backup || route_ret_sweep || route_sql ||
-         route_audit);
+         route_audit || route_pitr);
 
     /* Extract tsdb_auth token from Cookie header (first match wins).
      * HTTP headers are case-insensitive per RFC 7230; most clients use
@@ -805,6 +816,41 @@ static void *handle_connection(void *arg) {
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body, (size_t)n);
         free(body);
+    } else if (route_pitr) {
+        /* Point-in-time recovery trim.  POST /pitr?ts=<ns> drops every
+         * partition whose start timestamp is > ts across every open
+         * table.  Intended to run immediately after extracting a
+         * /backup tarball so the operator can roll the restored node
+         * forward to an exact instant. */
+        int64_t ts_ns = 0;
+        const char *q = strchr(req, '?');
+        if (q) {
+            const char *t = strstr(q, "ts=");
+            if (t) ts_ns = strtoll(t + 3, NULL, 10);
+        }
+        int removed = -1;
+        if (ts_ns <= 0) {
+            const char *r = "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: 38\r\nConnection: close\r\n\r\n"
+                            "{\"error\":\"missing ?ts=<ns> parameter\"}\n";
+            write_all(fd, r, strlen(r));
+            goto done;
+        }
+        if (g_pitr_fn) removed = g_pitr_fn(g_pitr_ud, ts_ns);
+
+        char body[160];
+        int blen = snprintf(body, sizeof(body),
+            "{\"ok\":%s,\"target_ns\":%lld,\"partitions_removed\":%d}\n",
+            removed >= 0 ? "true" : "false",
+            (long long)ts_ns, removed);
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n",
+            removed >= 0 ? "200 OK" : "503 Service Unavailable", blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)blen);
     } else if (route_health) {
         /* Minimal liveness payload — kept JSON-only so k8s / curl
          * integrations parse it trivially.  Uptime is seconds since the

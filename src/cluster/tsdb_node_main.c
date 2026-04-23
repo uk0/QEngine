@@ -995,6 +995,16 @@ int tsdb_node_audit_tail_trampoline(void *ud, int max_rows,
     return tsdb_audit_tail(a, max_rows, buf, cap);
 }
 
+/* Trampoline: /pitr provider.  Drops every partition with start > ts
+ * across all open tables.  Returns the total partition count removed,
+ * or -1 if the call fails; bubbles up as 503 in the HTTP handler. */
+int tsdb_node_pitr_trim_trampoline(void *ud, int64_t ts_ns) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    int removed = 0;
+    int rc = tsdb_pitr_trim_to(db, ts_ns, &removed);
+    return rc == TSDB_OK ? removed : -1;
+}
+
 /* Dashboard auth trampolines.  /login POST calls the login form,
  * subsequent requests present a cookie which we validate as a generic
  * SELECT grant on any resource — the dashboard is essentially a
@@ -1255,6 +1265,14 @@ int main(int argc, char **argv) {
      * the log file hasn't been created yet. */
     tsdb_metrics_server_set_audit_provider(
         tsdb_node_audit_tail_trampoline, db);
+
+    /* Point-in-time recovery trim.  POST /pitr?ts=<ns> discards every
+     * partition with pstart > ts across all tables — typical flow is
+     *   1. restore the /backup tarball on a fresh data dir
+     *   2. start the node
+     *   3. POST /pitr?ts=<target>  to prune writes past that point */
+    tsdb_metrics_server_set_pitr_provider(
+        tsdb_node_pitr_trim_trampoline, db);
 
     /* Wire the dashboard auth hooks.  Only armed when
      * TSDB_DASHBOARD_AUTH=1 at process start; otherwise the metrics
