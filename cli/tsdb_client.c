@@ -982,10 +982,142 @@ static int do_subscribe(tsdb_conn_t *c, const char *line) {
 
 /* ─── Command dispatch ────────────────────────────────────────────────────── */
 
+/* Session-level context — tsdb-cli is a pure-client REPL, so USE is a
+ * purely local construct.  The server stays stateless; we just show
+ * the current scope in the prompt and auto-inject IN DATABASE / IN
+ * GROUP clauses into LIST VTABLES / LIST PTABLES so users don't have
+ * to type them every time.  SET/UNSET via:
+ *
+ *   USE DATABASE <name>   — scope subsequent LISTs to that db
+ *   USE VTABLE   <name>   — shorthand for LIST PTABLES USING <name>
+ *   USE PTABLE   <name>   — marker (no auto-inject yet)
+ *   USE NONE              — clear everything
+ */
+static char g_cur_db[64]     = "";
+static char g_cur_vtable[64] = "";
+static char g_cur_ptable[64] = "";
+
+/* Snapshot of the composed prompt; regenerated whenever context
+ * changes so REPL can display "tsdb [iot > meters] > " instead of
+ * the bare "tsdb> ". */
+static char g_prompt[160] = "tsdb> ";
+
+static void rebuild_prompt(void) {
+    if (!g_cur_db[0] && !g_cur_vtable[0] && !g_cur_ptable[0]) {
+        snprintf(g_prompt, sizeof(g_prompt), "tsdb> ");
+        return;
+    }
+    char inner[128];
+    size_t w = 0;
+    if (g_cur_db[0])     w += (size_t)snprintf(inner + w, sizeof(inner) - w,
+                                                "%s%s", w ? " > " : "", g_cur_db);
+    if (g_cur_vtable[0]) w += (size_t)snprintf(inner + w, sizeof(inner) - w,
+                                                "%s%s", w ? " > " : "", g_cur_vtable);
+    if (g_cur_ptable[0]) w += (size_t)snprintf(inner + w, sizeof(inner) - w,
+                                                "%s%s", w ? " > " : "", g_cur_ptable);
+    snprintf(g_prompt, sizeof(g_prompt), "tsdb [%s]> ", inner);
+}
+
+/* Match "USE KIND name" case-insensitively; strips trailing whitespace
+ * and a terminating ';'.  Returns 1 if matched + sets *out. */
+static int parse_use(const char *cmd, const char *kind, char *out, size_t cap) {
+    /* Require leading "USE" + space, then kind, then a name. */
+    const char *p = cmd;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncasecmp(p, "USE", 3) != 0) return 0;
+    p += 3;
+    if (!isspace((unsigned char)*p)) return 0;
+    while (isspace((unsigned char)*p)) p++;
+
+    size_t kl = strlen(kind);
+    if (strncasecmp(p, kind, kl) != 0) return 0;
+    p += kl;
+    if (!isspace((unsigned char)*p)) return 0;
+    while (isspace((unsigned char)*p)) p++;
+
+    size_t w = 0;
+    while (*p && !isspace((unsigned char)*p) && *p != ';' && w + 1 < cap) {
+        out[w++] = *p++;
+    }
+    out[w] = '\0';
+    return out[0] ? 1 : 0;
+}
+
+/* Rewrite a LIST VTABLES / LIST PTABLES query to carry IN DATABASE
+ * <g_cur_db> automatically when a DB context is active AND the user
+ * didn't already specify one.  Returns a copy (caller frees). */
+static char *maybe_inject_list_scope(const char *cmd) {
+    if (!g_cur_db[0]) return NULL;
+    /* Cheap keyword sniff — anything case-insensitively starting with
+     * LIST VTABLES / LIST STABLES / LIST PTABLES / LIST TABLES. */
+    const char *p = cmd;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncasecmp(p, "LIST", 4) != 0) return NULL;
+    p += 4;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncasecmp(p, "VTABLES",  7) != 0 &&
+        strncasecmp(p, "STABLES",  7) != 0 &&
+        strncasecmp(p, "PTABLES",  7) != 0 &&
+        strncasecmp(p, "TABLES",   6) != 0) return NULL;
+
+    /* If the user already wrote IN DATABASE anywhere, don't override. */
+    const char *scan = cmd;
+    while (*scan) {
+        if (strncasecmp(scan, "IN DATABASE", 11) == 0 ||
+            strncasecmp(scan, "IN DB", 5) == 0) return NULL;
+        scan++;
+    }
+
+    size_t cap = strlen(cmd) + 64;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    snprintf(out, cap, "%s IN DATABASE %s", cmd, g_cur_db);
+    return out;
+}
+
 static bool do_command(tsdb_conn_t *c, const char *cmd) {
     /* Trim leading whitespace */
     while (isspace((unsigned char)*cmd)) cmd++;
     if (*cmd == '\0' || *cmd == '#') return true; /* empty / comment */
+
+    /* Client-side USE context — intercepted before anything hits the
+     * wire so a stateless HTTP-style server stays stateless. */
+    char name_buf[64];
+    if (parse_use(cmd, "DATABASE", name_buf, sizeof(name_buf)) ||
+        parse_use(cmd, "DB",       name_buf, sizeof(name_buf))) {
+        snprintf(g_cur_db, sizeof(g_cur_db), "%s", name_buf);
+        g_cur_vtable[0] = '\0';
+        g_cur_ptable[0] = '\0';
+        rebuild_prompt();
+        printf("context: database = %s\n", g_cur_db);
+        return true;
+    }
+    if (parse_use(cmd, "VTABLE", name_buf, sizeof(name_buf)) ||
+        parse_use(cmd, "STABLE", name_buf, sizeof(name_buf))) {
+        snprintf(g_cur_vtable, sizeof(g_cur_vtable), "%s", name_buf);
+        g_cur_ptable[0] = '\0';
+        rebuild_prompt();
+        printf("context: vtable = %s\n", g_cur_vtable);
+        return true;
+    }
+    if (parse_use(cmd, "PTABLE", name_buf, sizeof(name_buf)) ||
+        parse_use(cmd, "TABLE",  name_buf, sizeof(name_buf))) {
+        snprintf(g_cur_ptable, sizeof(g_cur_ptable), "%s", name_buf);
+        rebuild_prompt();
+        printf("context: ptable = %s\n", g_cur_ptable);
+        return true;
+    }
+    {
+        const char *p = cmd;
+        while (isspace((unsigned char)*p)) p++;
+        if (strncasecmp(p, "USE NONE", 8) == 0 ||
+            strncasecmp(p, "USE CLEAR", 9) == 0) {
+            g_cur_db[0] = g_cur_vtable[0] = g_cur_ptable[0] = '\0';
+            rebuild_prompt();
+            printf("context: cleared\n");
+            return true;
+        }
+    }
 
     /* Check for \G vertical mode suffix */
     bool vertical = false;
@@ -1027,8 +1159,12 @@ static bool do_command(tsdb_conn_t *c, const char *cmd) {
     } else if (strncasecmp(line, "SUBSCRIBE", 9) == 0) {
         do_subscribe(c, line);
     } else {
-        /* Default: treat as QTL query */
-        do_query(c, line, vertical);
+        /* Default: treat as QTL query.  If USE DATABASE is active and
+         * the statement is a LIST [V|P]TABLES, inject IN DATABASE so
+         * the catalog filter kicks in server-side. */
+        char *rewritten = maybe_inject_list_scope(line);
+        do_query(c, rewritten ? rewritten : line, vertical);
+        free(rewritten);
     }
     return true;
 }
@@ -1041,17 +1177,17 @@ static void repl(tsdb_conn_t *c) {
     using_history();
 #endif
 
+    rebuild_prompt();
     for (;;) {
 #ifdef HAVE_READLINE
-        char *input = readline("tsdb> ");
+        char *input = readline(g_prompt);
         if (!input) break;
-        /* add to history if non-empty */
         if (*input) add_history(input);
         bool cont = do_command(c, input);
         free(input);
         if (!cont) break;
 #else
-        printf("tsdb> "); fflush(stdout);
+        fputs(g_prompt, stdout); fflush(stdout);
         char line[65536];
         if (!fgets(line, sizeof(line), stdin)) break;
         size_t n = strlen(line);

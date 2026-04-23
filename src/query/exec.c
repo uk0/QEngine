@@ -5118,7 +5118,11 @@ static int exec_list_databases(tsdb_catalog_t *cat, tsdb_result_t *r) {
     return rc;
 }
 
-static int exec_list_vtables(tsdb_catalog_t *cat, tsdb_result_t *r) {
+static int exec_list_vtables(tsdb_catalog_t *cat,
+                              const char *db_filter,
+                              const char *grp_filter,
+                              tsdb_result_t *r)
+{
     int rc = result_init_ddl(r, LIST_VTABS_NCOLS,
                               LIST_VTABS_COLS, LIST_VTABS_TYPES);
     if (rc != TSDB_OK) return rc;
@@ -5129,8 +5133,10 @@ static int exec_list_vtables(tsdb_catalog_t *cat, tsdb_result_t *r) {
     if (rc != TSDB_OK) return rc;
 
     for (size_t i = 0; i < n; i++) {
-        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         tsdb_stable_t *s = &arr[i];
+        if (db_filter && *db_filter && strcmp(s->database, db_filter) != 0) continue;
+        if (grp_filter && *grp_filter && strcmp(s->group, grp_filter) != 0) continue;
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         result_append_sym(r, 0, s->name);
         result_append_i64_val(r, 1, (int64_t)s->ncols);
         result_append_i64_val(r, 2, (int64_t)s->ntag_cols);
@@ -5143,7 +5149,10 @@ static int exec_list_vtables(tsdb_catalog_t *cat, tsdb_result_t *r) {
     return rc;
 }
 
-static int exec_list_ptables(tsdb_catalog_t *cat, const char *vtable_filter,
+static int exec_list_ptables(tsdb_catalog_t *cat,
+                              const char *vtable_filter,
+                              const char *db_filter,
+                              const char *grp_filter,
                               tsdb_result_t *r)
 {
     int rc = result_init_ddl(r, LIST_PTABS_NCOLS,
@@ -5158,8 +5167,10 @@ static int exec_list_ptables(tsdb_catalog_t *cat, const char *vtable_filter,
     if (rc != TSDB_OK) return rc;
 
     for (size_t i = 0; i < n; i++) {
-        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         tsdb_child_table_t *ct = &arr[i];
+        if (db_filter && *db_filter && strcmp(ct->database, db_filter) != 0) continue;
+        if (grp_filter && *grp_filter && strcmp(ct->group, grp_filter) != 0) continue;
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         result_append_sym(r, 0, ct->name);
         result_append_sym(r, 1, ct->stable_name);
         result_append_i64_val(r, 2, (int64_t)ct->ntags);
@@ -5468,10 +5479,15 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         rc = exec_list_devices(cat, stmt.u.list_devices.group, r);
         break;
     case QAST_STMT_LIST_VTABLES:
-        rc = exec_list_vtables(cat, r);
+        rc = exec_list_vtables(cat,
+                               stmt.u.list_vtables.database,
+                               stmt.u.list_vtables.group, r);
         break;
     case QAST_STMT_LIST_PTABLES:
-        rc = exec_list_ptables(cat, stmt.u.list_ptables.vtable, r);
+        rc = exec_list_ptables(cat,
+                               stmt.u.list_ptables.vtable,
+                               stmt.u.list_ptables.database,
+                               stmt.u.list_ptables.group, r);
         break;
 
     /* ---- STable DDL ---------------------------------------------------- */

@@ -1543,23 +1543,54 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return TSDB_OK;
         }
 
-        /* LIST VTABLES  (alias: LIST STABLES) */
+        /* LIST VTABLES [IN DATABASE <db>] [IN GROUP <grp>]
+         * Alias: LIST STABLES.  Both scoping clauses are optional and
+         * may appear in either order; each restricts the returned
+         * VTables to that database / group. */
         if (p.tok.kind == QTOK_IDENT &&
             (ident_ci(&p.tok, "vtables") || ident_ci(&p.tok, "stables"))) {
             out->kind = QAST_STMT_LIST_VTABLES;
+            out->u.list_vtables.database[0] = '\0';
+            out->u.list_vtables.group[0]    = '\0';
             advance(&p);
+            for (int c = 0; c < 2 && accept(&p, QTOK_IN); c++) {
+                if (p.tok.kind == QTOK_IDENT &&
+                    (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, out->u.list_vtables.database,
+                             sizeof(out->u.list_vtables.database));
+                    advance(&p);
+                } else if (accept(&p, QTOK_GROUP) ||
+                           (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "group")
+                            && (advance(&p), 1))) {
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, out->u.list_vtables.group,
+                             sizeof(out->u.list_vtables.group));
+                    advance(&p);
+                } else {
+                    perr(&p, "expected DATABASE or GROUP after IN");
+                    return TSDB_ERR_PARSE;
+                }
+            }
             accept(&p, QTOK_SEMI);
-            return TSDB_OK;
+            return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        /* LIST PTABLES [USING <vtable>]  (alias: LIST TABLES) */
+        /* LIST PTABLES [USING <vtable>] [IN DATABASE <db>] [IN GROUP <grp>]
+         * Alias: LIST TABLES. */
         if (p.tok.kind == QTOK_IDENT &&
             (ident_ci(&p.tok, "ptables") || ident_ci(&p.tok, "tables"))) {
             out->kind = QAST_STMT_LIST_PTABLES;
-            out->u.list_ptables.vtable[0] = '\0';
+            out->u.list_ptables.vtable[0]   = '\0';
+            out->u.list_ptables.database[0] = '\0';
+            out->u.list_ptables.group[0]    = '\0';
             advance(&p);
-            if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "using")) {
-                advance(&p);
+            if (accept(&p, QTOK_USING)) {
                 if (p.tok.kind != QTOK_IDENT) {
                     perr(&p, "expected vtable name after USING");
                     return TSDB_ERR_PARSE;
@@ -1567,6 +1598,30 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                 tok_copy(&p.tok, out->u.list_ptables.vtable,
                          sizeof(out->u.list_ptables.vtable));
                 advance(&p);
+            }
+            for (int c = 0; c < 2 && accept(&p, QTOK_IN); c++) {
+                if (p.tok.kind == QTOK_IDENT &&
+                    (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
+                    advance(&p);
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected database name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, out->u.list_ptables.database,
+                             sizeof(out->u.list_ptables.database));
+                    advance(&p);
+                } else if (accept(&p, QTOK_GROUP) ||
+                           (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "group")
+                            && (advance(&p), 1))) {
+                    if (p.tok.kind != QTOK_IDENT) {
+                        perr(&p, "expected group name"); return TSDB_ERR_PARSE;
+                    }
+                    tok_copy(&p.tok, out->u.list_ptables.group,
+                             sizeof(out->u.list_ptables.group));
+                    advance(&p);
+                } else {
+                    perr(&p, "expected DATABASE or GROUP after IN");
+                    return TSDB_ERR_PARSE;
+                }
             }
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;

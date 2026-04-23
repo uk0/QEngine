@@ -239,8 +239,14 @@ typedef struct {
         struct { tsdb_device_t spec; } create_device;    /* QAST_STMT_CREATE_DEVICE */
         struct { char group[64]; char id[128]; } drop_device;  /* QAST_STMT_DROP_DEVICE */
         struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
-        /* LIST PTABLES [USING <vtable>] — empty vtable = all */
-        struct { char vtable[64]; }    list_ptables;
+        /* LIST PTABLES [USING <vtable>] [IN DATABASE <db>] [IN GROUP <grp>]
+         * Empty string for each filter means "no filter for that axis". */
+        struct { char vtable[64]; char database[64]; char group[64]; }
+            list_ptables;
+        /* LIST VTABLES [IN DATABASE <db>] [IN GROUP <grp>] — same filter
+         * semantics as list_ptables. */
+        struct { char database[64]; char group[64]; }
+            list_vtables;
         /* Raft membership */
         struct { char target[96]; }    add_master;      /* "host:port" */
         struct { char target[96]; }    remove_master;   /* node_id or addr */
