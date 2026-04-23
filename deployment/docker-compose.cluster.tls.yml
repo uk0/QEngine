@@ -1,0 +1,42 @@
+# docker-compose.cluster.tls.yml — TLS overlay for docker-compose.cluster.yml.
+#
+# Usage:
+#   deployment/tls-gen.sh                       # one-time cert generation
+#   docker-compose \
+#     -f deployment/docker-compose.cluster.yml \
+#     -f deployment/docker-compose.cluster.tls.yml \
+#     up -d
+#
+# Mounts the PEM bundle produced by tls-gen.sh into every master/data node
+# and points tsdb at it via TSDB_TLS_CERT / TSDB_TLS_KEY / TSDB_TLS_CA.
+# The wire-protocol listener (port 28090 → host 2930x) now requires TLS;
+# the dashboard HTTP port 28094 is unchanged — put it behind a reverse
+# proxy (nginx / traefik) for TLS termination.
+#
+# Client connection example:
+#   tsdb-cli --host qengine-cnode-1:29301 --tls --tls-ca /path/to/ca.crt
+
+services:
+  node1:
+    environment:
+      TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+    volumes:
+      - ./tls:/etc/tsdb/tls:ro
+
+  node2:
+    environment:
+      TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+    volumes:
+      - ./tls:/etc/tsdb/tls:ro
+
+  node3:
+    environment:
+      TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+    volumes:
+      - ./tls:/etc/tsdb/tls:ro

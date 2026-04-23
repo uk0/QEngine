@@ -1075,12 +1075,22 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     /* Start the wire-protocol client server so external clients (Go SDK,
-     * JDBC, CLI) can reach this node the same way they reach tsdb-server. */
+     * JDBC, CLI) can reach this node the same way they reach tsdb-server.
+     *
+     * TLS is opt-in via three env vars so the same binary can run in
+     * plaintext (dev / behind a mesh) or TLS modes without recompiling:
+     *   TSDB_TLS_CERT  PEM server certificate       (required to arm TLS)
+     *   TSDB_TLS_KEY   PEM private key              (required)
+     *   TSDB_TLS_CA    PEM CA bundle for mTLS       (optional)
+     * If CERT or KEY is missing the server falls back to plaintext. */
     tsdb_metrics_init();
     tsdb_server_opts_t sopts = {
         .bind_addr    = client_bind,
         .max_conns    = 1024,
         .db           = db,
+        .tls_cert     = getenv("TSDB_TLS_CERT"),
+        .tls_key      = getenv("TSDB_TLS_KEY"),
+        .tls_ca       = getenv("TSDB_TLS_CA"),
     };
     tsdb_server_t *srv = NULL;
     rc = tsdb_server_start(&sopts, &srv);
