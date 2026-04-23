@@ -92,6 +92,24 @@ typedef int (*tsdb_retention_sweep_fn)(void *userdata);
 void tsdb_metrics_server_set_retention_sweep_provider(
     tsdb_retention_sweep_fn fn, void *userdata);
 
+/* ---- Dashboard login hooks --------------------------------------------- *
+ * When configured (TSDB_DASHBOARD_AUTH=1), the server gates every route
+ * that isn't in the "always public" set (/health, /metrics, /login,
+ * /logout) behind a session cookie.  The auth provider is responsible
+ * for turning (user, password) into a hex session token and for
+ * validating a previously-issued token.  Returning TSDB_OK = permit;
+ * anything else = redirect to /login.  Tokens are issued and checked
+ * through the auth module in src/catalog/user.c so the usual RBAC
+ * grant tables stay authoritative. */
+typedef int (*tsdb_auth_login_fn)(void *userdata,
+                                    const char *user,
+                                    const char *password,
+                                    char *out_token, size_t cap);
+typedef int (*tsdb_auth_check_fn)(void *userdata, const char *token);
+void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
+                                             tsdb_auth_check_fn check,
+                                             void *userdata);
+
 /* ---- /raft provider hook ------------------------------------------------- *
  * Returns a JSON snapshot of the local Raft state machine for the
  * acceptance harness and the topology dashboard.  Expected shape:

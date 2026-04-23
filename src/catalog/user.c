@@ -353,6 +353,29 @@ int tsdb_auth_open(const char *data_dir, tsdb_auth_t **out) {
         return TSDB_ERR_IO;
     }
 
+    /* Seed a default admin when the user table is empty so a fresh
+     * install has a working login credential out of the box.  The
+     * TSDB_DEFAULT_ADMIN_USER / _PASSWORD env vars let operators
+     * override at deploy time; absent both, use root/123456 — a
+     * convenience for dev clusters that MUST be changed in prod.
+     * Any later CREATE USER / DROP USER will persist through the
+     * append-only log as usual. */
+    if (a->nusers == 0) {
+        const char *duser = getenv("TSDB_DEFAULT_ADMIN_USER");
+        const char *dpass = getenv("TSDB_DEFAULT_ADMIN_PASSWORD");
+        if (!duser || !*duser) duser = "root";
+        if (!dpass || !*dpass) dpass = "123456";
+        *out = a;
+        int rc2 = tsdb_auth_user_create(a, duser, dpass, TSDB_USER_ROLE_ADMIN);
+        if (rc2 == TSDB_OK) {
+            (void)tsdb_auth_grant(a, duser, TSDB_PRIV_ALL, "*");
+            fprintf(stderr,
+                "[auth] seeded default admin '%s' (role=admin, grant ALL on *); "
+                "CHANGE THE PASSWORD in production\n", duser);
+        }
+        return TSDB_OK;
+    }
+
     *out = a;
     return TSDB_OK;
 }

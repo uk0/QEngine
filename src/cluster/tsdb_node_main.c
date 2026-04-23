@@ -972,6 +972,19 @@ int tsdb_node_retention_sweep_trampoline(void *ud) {
     return rc == TSDB_OK ? deleted : -1;
 }
 
+/* Dashboard auth trampolines.  /login POST calls the login form,
+ * subsequent requests present a cookie which we validate as a generic
+ * SELECT grant on any resource — the dashboard is essentially a
+ * read-mostly client and any logged-in user gets to open it. */
+int tsdb_node_auth_login_trampoline(void *ud, const char *user,
+                                      const char *pass, char *out, size_t cap) {
+    return tsdb_auth_authenticate((tsdb_db_t *)ud, user, pass, out, cap);
+}
+
+int tsdb_node_auth_check_trampoline(void *ud, const char *token) {
+    return tsdb_auth_check((tsdb_db_t *)ud, token, TSDB_PRIV_SELECT, "*");
+}
+
 int main(int argc, char **argv) {
     const char *data_dir     = NULL;
     const char *rpc_addr     = NULL;
@@ -1202,6 +1215,16 @@ int main(int argc, char **argv) {
      * Trampoline defined just above main(). */
     tsdb_metrics_server_set_retention_sweep_provider(
         tsdb_node_retention_sweep_trampoline, db);
+
+    /* Wire the dashboard auth hooks.  Only armed when
+     * TSDB_DASHBOARD_AUTH=1 at process start; otherwise the metrics
+     * server no-ops and every route stays public (current default).
+     * A fresh install ships with a seeded root/123456 admin — see
+     * user.c tsdb_auth_open. */
+    tsdb_metrics_server_set_auth_provider(
+        tsdb_node_auth_login_trampoline,
+        tsdb_node_auth_check_trampoline,
+        db);
     fflush(stdout);
 
     /* Main loop: optionally print stats every 5s (gated by env). */

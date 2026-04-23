@@ -12,9 +12,11 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#define _GNU_SOURCE          /* for strcasestr */
 #include "metrics_server.h"
 #include "metrics.h"
 #include "../cluster/disk_weight.h"
+#include "../../include/tsdb.h"   /* for TSDB_OK, TSDB_ERR_PERMISSION */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +51,9 @@ static tsdb_sql_exec_fn     g_sql_fn      = NULL;
 static void                *g_sql_ud      = NULL;
 static tsdb_retention_sweep_fn g_ret_sweep_fn = NULL;
 static void                *g_ret_sweep_ud = NULL;
+static tsdb_auth_login_fn   g_auth_login_fn = NULL;
+static tsdb_auth_check_fn   g_auth_check_fn = NULL;
+static void                *g_auth_ud       = NULL;
 static tsdb_raft_json_fn    g_raft_fn     = NULL;
 static void                *g_raft_ud     = NULL;
 static char                 g_data_dir[4096] = {0};
@@ -76,6 +81,15 @@ void tsdb_metrics_server_set_retention_sweep_provider(
 {
     g_ret_sweep_fn = fn;
     g_ret_sweep_ud = userdata;
+}
+
+void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
+                                             tsdb_auth_check_fn check,
+                                             void *userdata)
+{
+    g_auth_login_fn = login;
+    g_auth_check_fn = check;
+    g_auth_ud       = userdata;
 }
 
 void tsdb_metrics_server_set_raft_provider(tsdb_raft_json_fn fn,
@@ -241,7 +255,12 @@ static void *handle_connection(void *arg) {
     int route_raft    = 0;
     int route_backup  = 0;
     int route_ret_sweep = 0;
+    int route_login   = 0;
+    int route_logout  = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
+    else if (strncmp(req, "GET /login", 10) == 0)        route_login = 1;
+    else if (strncmp(req, "POST /login", 11) == 0)       route_login = 2; /* 2 = POST */
+    else if (strncmp(req, "GET /logout", 11) == 0)       route_logout = 1;
     else if (strncmp(req, "GET /health", 11) == 0)       route_health  = 1;
     else if (strncmp(req, "GET /cluster", 12) == 0)      route_cluster = 1;
     else if (strncmp(req, "GET /tree", 9) == 0)          route_tree    = 1;
@@ -254,6 +273,173 @@ static void *handle_connection(void *arg) {
              strncmp(req, "GET /sql",  8) == 0)          route_sql     = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
              strncmp(req, "GET /index", 10) == 0)        route_dash    = 1;
+
+    /* ---- Optional dashboard login gate ----------------------------------
+     * When TSDB_DASHBOARD_AUTH is set at process start, every route that
+     * mutates state or exposes internal data requires a valid session
+     * cookie.  /health, /metrics, /login, /logout stay public so
+     * Prometheus / k8s probes and the login flow itself keep working.
+     * The cookie is issued by POST /login and checked via the registered
+     * auth provider (which calls into tsdb_auth_check). */
+    static int g_auth_enabled = -1;
+    if (g_auth_enabled < 0) {
+        const char *e = getenv("TSDB_DASHBOARD_AUTH");
+        g_auth_enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    /* /raft stays public: it's read-only telemetry consumed by both
+     * the dashboard and the Raft acceptance scenarios over plain curl.
+     * Every gated route below mutates state or exposes schema/catalog. */
+    int route_needs_auth = g_auth_enabled &&
+        (route_dash || route_cluster || route_tree ||
+         route_backup || route_ret_sweep || route_sql);
+
+    /* Extract tsdb_auth token from Cookie header (first match wins).
+     * HTTP headers are case-insensitive per RFC 7230; most clients use
+     * "Cookie:" but we accept "cookie:" too. */
+    char cookie_tok[65] = {0};
+    if (route_needs_auth) {
+        const char *ch = strstr(req, "\nCookie:");
+        if (!ch) ch = strstr(req, "\ncookie:");
+        if (!ch) ch = strstr(req, "\r\nCookie:");
+        if (!ch) ch = strstr(req, "\r\ncookie:");
+        if (ch) {
+            ch = strstr(ch, "tsdb_auth=");
+            if (ch) {
+                ch += 10;
+                size_t w = 0;
+                while (*ch && *ch != ';' && *ch != '\r' && *ch != '\n' &&
+                       w < sizeof(cookie_tok) - 1) {
+                    cookie_tok[w++] = *ch++;
+                }
+                cookie_tok[w] = '\0';
+            }
+        }
+
+        int authed = 0;
+        if (cookie_tok[0] && g_auth_check_fn &&
+            g_auth_check_fn(g_auth_ud, cookie_tok) == TSDB_OK) authed = 1;
+
+        if (!authed) {
+            /* Redirect browsers (dashboard GET) to /login; return 401
+             * for XHR (POST /sql etc) so client-side JS can handle. */
+            if (route_dash) {
+                const char *r =
+                    "HTTP/1.1 302 Found\r\nLocation: /login\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                write_all(fd, r, strlen(r));
+            } else {
+                const char *r =
+                    "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 32\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"login required\"}\n";
+                write_all(fd, r, strlen(r));
+            }
+            goto done;
+        }
+    }
+
+    if (route_login == 1) {
+        /* GET /login — minimal form that POSTs back to /login. */
+        static const char FORM[] =
+            "<!doctype html><html><head><meta charset=utf-8>"
+            "<title>tsdb login</title>"
+            "<style>body{font:14px/1.5 system-ui,sans-serif;display:flex;"
+            "align-items:center;justify-content:center;min-height:100vh;"
+            "margin:0;background:#f1f5f9}"
+            ".card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;"
+            "padding:24px 28px;width:320px;box-shadow:0 2px 6px rgba(0,0,0,.04)}"
+            ".card h1{margin:0 0 4px;font-size:18px}"
+            ".card p{margin:0 0 18px;color:#64748b;font-size:12px}"
+            ".card label{display:block;font-size:12px;color:#334155;margin:10px 0 4px}"
+            ".card input{width:100%;padding:8px 10px;border:1px solid #cbd5e1;"
+            "border-radius:6px;font-size:13px;box-sizing:border-box}"
+            ".card button{width:100%;margin-top:16px;padding:9px;border:none;"
+            "border-radius:6px;background:#6366f1;color:#fff;font-size:13px;"
+            "cursor:pointer}"
+            ".err{margin-top:12px;padding:8px;border-radius:6px;background:#fee2e2;"
+            "color:#991b1b;font-size:12px;display:none}"
+            ".err.on{display:block}"
+            "</style></head><body><div class=card>"
+            "<h1>tsdb dashboard</h1>"
+            "<p>Login required — default root / 123456 for fresh installs.</p>"
+            "<form id=f method=POST action=/login>"
+            "<label>Username</label><input name=user autofocus value=root>"
+            "<label>Password</label><input name=pass type=password value=123456>"
+            "<button type=submit>Login</button>"
+            "<div class=err id=e>invalid credentials</div>"
+            "</form>"
+            "<script>"
+            "if(location.search.indexOf('bad')>=0)document.getElementById('e').classList.add('on');"
+            "</script></div></body></html>";
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n", sizeof(FORM) - 1);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, FORM, sizeof(FORM) - 1);
+        goto done;
+    }
+
+    if (route_login == 2) {
+        /* POST /login — body is form-urlencoded: user=...&pass=... */
+        char user[64] = {0};
+        char pass[128] = {0};
+        if (body_len > 0) {
+            const char *u = strstr(body, "user=");
+            if (u) {
+                u += 5;
+                size_t w = 0;
+                while (*u && *u != '&' && w < sizeof(user) - 1 &&
+                       (size_t)(u - body) < body_len) {
+                    user[w++] = (*u == '+') ? ' ' : *u;
+                    u++;
+                }
+            }
+            const char *p = strstr(body, "pass=");
+            if (p) {
+                p += 5;
+                size_t w = 0;
+                while (*p && *p != '&' && w < sizeof(pass) - 1 &&
+                       (size_t)(p - body) < body_len) {
+                    pass[w++] = (*p == '+') ? ' ' : *p;
+                    p++;
+                }
+            }
+        }
+
+        char tok[65] = {0};
+        int rc = g_auth_login_fn
+            ? g_auth_login_fn(g_auth_ud, user, pass, tok, sizeof(tok))
+            : TSDB_ERR_PERMISSION;
+
+        if (rc == TSDB_OK && tok[0]) {
+            char hdr[512];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 302 Found\r\n"
+                "Set-Cookie: tsdb_auth=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400\r\n"
+                "Location: /\r\nContent-Length: 0\r\n"
+                "Connection: close\r\n\r\n", tok);
+            write_all(fd, hdr, (size_t)hlen);
+        } else {
+            const char *r =
+                "HTTP/1.1 302 Found\r\nLocation: /login?bad=1\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            write_all(fd, r, strlen(r));
+        }
+        goto done;
+    }
+
+    if (route_logout) {
+        const char *r =
+            "HTTP/1.1 302 Found\r\n"
+            "Set-Cookie: tsdb_auth=; Path=/; HttpOnly; Max-Age=0\r\n"
+            "Location: /login\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        write_all(fd, r, strlen(r));
+        goto done;
+    }
 
     if (route_metrics) {
         size_t body_len = 0;
@@ -1514,23 +1700,37 @@ static void *handle_connection(void *arg) {
 " dh+='</div>';"
 " return dh;"
 "}"
-"if(!dbs.length && !((grpsByDb['']||[]).length) && !((vtByDb['']||[]).length))"
+"if(!dbs.length && !((grpsByDb['']||[]).length) && !((vtByDb['']||[]).length) && !tbs.length)"
 "h+='<div class=empty>'+esc(t('tree.no_dbs'))+'</div>';"
 "else{"
 " dbs.forEach((d,i)=>{h+=renderDb(d.name,d.description,i+1,false,!!d.protected);});"
 " if((grpsByDb['']||[]).length || (vtByDb['']||[]).length)"
 "   h+=renderDb('',null,0,true,false);"
+/* ---- Default-DB bucket ----
+ * Tables created via plain CREATE TABLE (no vtable, no group) are not
+ * orphans at the node level — the whole node IS a database.  Render
+ * them under a single DB-header named after the node's data_dir so
+ * the 4-level hierarchy (DB → Group → VTable → PTable) is never
+ * broken by a flat list at the bottom. */
+" if(tbs.length){"
+"   const ddName=(dbi.name||'default');"
+"   let bh=`<div class=\"item db node open\" data-nodeid=db_default>`"
+"     +'<span class=ic>DB</span>'"
+"     +`<span class=nm>${esc(ddName)}</span>`"
+"     +`<span class=sz>${tbs.length} ${esc(t('db.tables'))}</span>`"
+"     +'</div><div class=kids>';"
+"   bh+='<div class=grp><span>'+esc(t('common.tables'))+' ('+tbs.length+')</span></div>';"
+"   tbs.forEach(x=>{"
+"     const sz=x.bytes?fmtBytes(x.bytes):'';"
+"     bh+=`<div class=item data-tbl='${esc(x.name)}' title='${esc(t('common.click_load'))}'>`"
+"       +`<span class=nm>${esc(x.name)}</span>`"
+"       +(sz?`<span class=sz>${sz}</span>`:'')"
+"       +`<span class=x data-drop='${esc(x.name)}' title='DROP TABLE'>✕</span>`"
+"       +'</div>';});"
+"   bh+='</div>';"
+"   h+=bh;"
+" }"
 "}"
-/* ---- Orphan tables (legacy, not bound to a group) ---- */
-"if(tbs.length){"
-"h+='<div class=grp><span>'+esc(t('common.tables'))+' ('+tbs.length+')</span></div>';"
-"tbs.forEach(x=>{"
-"const sz=x.bytes?fmtBytes(x.bytes):'';"
-"h+=`<div class=item data-tbl='${esc(x.name)}' title='${esc(t('common.click_load'))}'>`"
-"+`<span class=nm>${esc(x.name)}</span>`"
-"+(sz?`<span class=sz>${sz}</span>`:'')"
-"+`<span class=x data-drop='${esc(x.name)}' title='DROP TABLE'>✕</span>`"
-"+'</div>';});}"
 "el.innerHTML=h;"
 /* ---- Wire listeners ---- */
 /* Collapsible node toggle */
