@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: dev.tsdb.jdbc.IntegrationTest
--------------------------------------------------------------------------------
-Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.703 s -- in dev.tsdb.jdbc.IntegrationTest
