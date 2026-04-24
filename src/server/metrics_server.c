@@ -403,7 +403,10 @@ static void *handle_connection(void *arg) {
     else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
     else if (strncmp(req, "GET /backup", 11) == 0)       route_backup  = 1;
     else if (strncmp(req, "GET /audit", 10) == 0)        route_audit   = 1;
-    else if (strncmp(req, "POST /pitr", 10) == 0)        route_pitr    = 1;
+    /* /pitr accepts POST (canonical) and GET (so the auth gate still
+     * applies to a GET probe instead of 404-ing before the gate). */
+    else if (strncmp(req, "POST /pitr", 10) == 0 ||
+             strncmp(req, "GET /pitr",  9) == 0)          route_pitr    = 1;
     else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
              strncmp(req, "GET /retention/sweep",  20) == 0)
                                                           route_ret_sweep = 1;
@@ -960,7 +963,17 @@ static void *handle_connection(void *arg) {
          * partition whose start timestamp is > ts across every open
          * table.  Intended to run immediately after extracting a
          * /backup tarball so the operator can roll the restored node
-         * forward to an exact instant. */
+         * forward to an exact instant.  GET is rejected with 405 so
+         * curl-exploration never accidentally triggers a trim. */
+        if (strncmp(req, "GET /pitr", 9) == 0) {
+            const char *r = "HTTP/1.1 405 Method Not Allowed\r\n"
+                            "Allow: POST\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: 37\r\nConnection: close\r\n\r\n"
+                            "{\"error\":\"use POST /pitr?ts=<ns>\"}\n";
+            write_all(fd, r, strlen(r));
+            goto done;
+        }
         int64_t ts_ns = 0;
         const char *q = strchr(req, '?');
         if (q) {
