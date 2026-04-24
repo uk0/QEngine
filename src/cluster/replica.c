@@ -10,6 +10,7 @@
 #include "node.h"
 #include "rpc.h"
 #include "../server/metrics.h"
+#include "../federation/dr_forwarder.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,11 @@ struct tsdb_replica_mgr {
     pthread_mutex_t      lock;     /* protects peers[].node_id / conns[] insertion */
     peer_slot_t          peers[MAX_PEERS];
     int                  conns_per_peer;  /* fixed at mgr_new time */
+    /* Optional cross-DC forwarder.  Non-NULL means every outbound
+     * row-batch payload is also copied to the forwarder's ring for
+     * async delivery to the remote DC.  Transparent to cluster RPC
+     * fanout — see src/federation/dr_forwarder.c. */
+    struct tsdb_dr_forwarder *dr;
 };
 
 static int env_conns_per_peer(void) {
@@ -59,6 +65,11 @@ tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr) {
     r->conns_per_peer = env_conns_per_peer();
     pthread_mutex_init(&r->lock, NULL);
     return r;
+}
+
+void tsdb_replica_mgr_set_dr(tsdb_replica_mgr_t *rmgr, struct tsdb_dr_forwarder *fw) {
+    if (!rmgr) return;
+    rmgr->dr = fw;
 }
 
 void tsdb_replica_mgr_free(tsdb_replica_mgr_t *rmgr) {
@@ -427,6 +438,13 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                                            ncols, col_types,
                                            nrows, col_data);
     if (plen < 0) { free(payload); return TSDB_ERR_INTERNAL; }
+
+    /* Cross-DC fan-out piggybacks on the intra-cluster payload so we
+     * only pay the encode cost once.  The forwarder copies the buffer
+     * internally; drops are reported on the sender's /metrics. */
+    if (rmgr->dr) {
+        tsdb_dr_forwarder_enqueue(rmgr->dr, payload, (size_t)plen);
+    }
 
     return fanout_wait_quorum(rmgr, payload, (uint32_t)plen,
                               replicas, nreplicas,

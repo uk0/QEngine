@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>dev.tsdb</groupId>
+    <artifactId>tsdb-jdbc</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <name>tsdb-jdbc</name>
+    <description>
+        JDBC 4.2 driver for the tsdb time-series database.
+        Talks to the HTTP /sql endpoint — same wire format the dashboard
+        uses — so one jar works against every node without needing to
+        speak the native binary protocol.  Zero external runtime
+        dependencies (stdlib JSON parser).
+    </description>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Test-only: JUnit 5 + a lightweight JSON library for the
+             integration test to parse the audit log response.  The
+             driver itself has no runtime deps. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- Integration test hits a running cluster;
+                         skip unless explicitly enabled. -->
+                    <skipTests>${skipTests}</skipTests>
+                </configuration>
+            </plugin>
+            <plugin>
+                <!-- Register Driver via META-INF/services so
+                     DriverManager auto-discovers it. -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

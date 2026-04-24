@@ -139,6 +139,24 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_rows_pulled_total",
       "Rows pulled from a peer via anti-entropy resync (catch-up after downtime)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_dr_sent_total",
+      "Cross-DC WRITE_BATCH RPCs the forwarder pushed to the remote DC", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_dr_ack_total",
+      "Cross-DC WRITE_BATCH RPCs the remote DC ACKed successfully", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_dr_fail_total",
+      "Cross-DC WRITE_BATCH RPCs that failed (remote unreachable or apply error)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_dr_dropped_total",
+      "Cross-DC batches dropped because the forwarder ring was full (backpressure)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_dr_recv_ok_total",
+      "FED_INGEST RPCs received where local apply landed rows", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_dr_recv_err_total",
+      "FED_INGEST RPCs received where local apply failed", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_retention_sweeps_total",
       "Retention GC sweeps completed (background or manual)", MT_COUNTER, { .c = { 0 } } },
 

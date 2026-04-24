@@ -403,6 +403,78 @@ static void *connection_handler(void *arg) {
             break;
         }
 
+        case TSDB_RPC_FED_INGEST: {
+            /* Cross-DC ingest — payload is identical to WRITE_BATCH.
+             * We apply it locally with the local_only flag set so the
+             * batch does NOT re-enter the intra-cluster replication
+             * loop.  Separate counters make it possible to tell "DC
+             * fan-in" volume apart from "cluster fanout" on /metrics. */
+            int write_ok = 0;
+            if (db && msg.payload_len > 0) {
+                char table_name[64] = {0};
+                int ncols = 0, nrows = 0;
+                int col_types[TSDB_MAX_COLS];
+                uint8_t *col_data[TSDB_MAX_COLS] = {0};
+                int rc = tsdb_rpc_decode_write_batch(
+                    msg.payload, msg.payload_len,
+                    table_name, sizeof(table_name),
+                    &ncols, col_types, &nrows,
+                    (uint8_t **)col_data);
+                if (rc == 0 && nrows > 0) {
+                    tsdb_table_t *tbl = NULL;
+                    if (tsdb_open_table(db, table_name, &tbl) == TSDB_OK && tbl) {
+                        tsdb_table_lock_write(tbl);
+                        tsdb_batch_t *batch = NULL;
+                        if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
+                            tsdb_batch_set_local_only(batch);
+                            /* Column offsets inside the column-major payload. */
+                            int base[TSDB_MAX_COLS];
+                            int boff = 0;
+                            for (int c = 0; c < ncols; c++) {
+                                base[c] = boff;
+                                boff += ((col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8) * nrows;
+                            }
+                            int ts_ci = -1;
+                            for (int c = 0; c < ncols; c++)
+                                if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
+                            for (int row = 0; row < nrows; row++) {
+                                int64_t ts_val = 0;
+                                if (ts_ci >= 0) memcpy(&ts_val, col_data[0] + base[ts_ci] + row * 8, 8);
+                                tsdb_batch_row_ts(batch, ts_val);
+                                for (int c = 0; c < ncols; c++) {
+                                    if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
+                                    int stride = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
+                                    uint8_t *ptr = col_data[0] + base[c] + row * stride;
+                                    switch (col_types[c]) {
+                                    case TSDB_TYPE_INT64: {
+                                        int64_t v; memcpy(&v, ptr, 8);
+                                        tsdb_batch_row_i64(batch, c, v); break;
+                                    }
+                                    case TSDB_TYPE_FLOAT64: {
+                                        double v; memcpy(&v, ptr, 8);
+                                        tsdb_batch_row_f64(batch, c, v); break;
+                                    }
+                                    default: break;
+                                    }
+                                }
+                                tsdb_batch_row_end(batch);
+                            }
+                            if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+                        }
+                        tsdb_table_unlock_write(tbl);
+                    }
+                }
+            }
+            if (write_ok) {
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_dr_recv_ok_total");
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_dr_recv_err_total");
+            }
+            break;
+        }
+
         case TSDB_RPC_FED_QUERY:
             /* Federation query: run QTL on local DB, encode result, send back. */
             if (db && msg.payload_len >= 2) {

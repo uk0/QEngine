@@ -18,6 +18,8 @@
 #include "../catalog/audit.h"
 #include "../storage/db.h"
 #include "../raft/raft.h"
+#include "../federation/dr_forwarder.h"
+#include "replica.h"
 #include "disk_weight.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1137,6 +1139,33 @@ int main(int argc, char **argv) {
      *   TSDB_CONSENSUS == raft   (explicit opt-in; fanout stays the
      *                             default until the implementation is
      *                             exercised under the acceptance suite). */
+    /* Cross-DC async replication — armed when TSDB_DR_REMOTE is set
+     * (e.g. "dc2-coord:28081").  The forwarder runs in its own
+     * background thread and consumes a bounded in-memory ring; drops
+     * surface as qengine_dr_dropped_total on /metrics.  Intentionally
+     * best-effort — ships WRITE_BATCH payloads over a new FED_INGEST
+     * opcode that the remote side applies with local_only=1 so the
+     * cross-DC channel never loops back into the cluster fanout. */
+    tsdb_dr_forwarder_t *dr_fw = NULL;
+    {
+        const char *remote = getenv("TSDB_DR_REMOTE");
+        if (remote && *remote) {
+            int ring_cap = 4096;
+            const char *cap_env = getenv("TSDB_DR_RING_CAP");
+            if (cap_env && *cap_env) { int n = atoi(cap_env); if (n > 0) ring_cap = n; }
+            tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr_for_db(db);
+            if (rmgr) {
+                if (tsdb_dr_forwarder_new(remote, ring_cap, &dr_fw) == TSDB_OK) {
+                    tsdb_replica_mgr_set_dr(rmgr, dr_fw);
+                    printf("[node] DR replication ENABLED → %s (ring=%d)\n",
+                           remote, ring_cap);
+                } else {
+                    fprintf(stderr, "[node] DR forwarder failed to start; continuing without it\n");
+                }
+            }
+        }
+    }
+
     tsdb_raft_t *raft_h = NULL;
     {
         const char *cons = getenv("TSDB_CONSENSUS");

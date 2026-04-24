@@ -39,6 +39,14 @@ tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr);
 /* Free and close all connections. */
 void tsdb_replica_mgr_free(tsdb_replica_mgr_t *rmgr);
 
+/* Install an optional cross-DC async forwarder.  Every batch payload
+ * produced by tsdb_replica_push_row_batch is copied into the
+ * forwarder's ring buffer for async delivery to a remote DC.  Pass
+ * NULL to detach.  See src/federation/dr_forwarder.h. */
+struct tsdb_dr_forwarder;
+void tsdb_replica_mgr_set_dr(tsdb_replica_mgr_t *rmgr,
+                              struct tsdb_dr_forwarder *fw);
+
 /*
  * Replicate a write batch to the given set of replica nodes.
  *
