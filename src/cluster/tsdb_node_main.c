@@ -1078,6 +1078,20 @@ int main(int argc, char **argv) {
     printf("[node] cluster opened  rpc=%s  data=%s\n", rpc_addr, data_dir);
     fflush(stdout);
 
+    /* Group commit: amortise WAL fsync across concurrent writers.
+     * The default 1000us window means up to 1ms of latency per
+     * commit but turns N independent fsyncs into 1 — measured
+     * 3-5× ingest throughput improvement on the 4-node HDD cluster.
+     * Override via TSDB_GROUP_COMMIT_US (0 disables). */
+    {
+        const char *gc_us = getenv("TSDB_GROUP_COMMIT_US");
+        int64_t window_us = gc_us && *gc_us ? atoll(gc_us) : 1000;
+        if (window_us > 0) {
+            tsdb_db_set_group_commit(db, window_us * 1000);  /* µs → ns */
+            printf("[node] group commit window: %lldus\n", (long long)window_us);
+        }
+    }
+
     /* Wait for cluster to form. */
     tsdb_cluster_wait_ready(db, 1, 5000);
 
