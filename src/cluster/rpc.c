@@ -325,69 +325,85 @@ static void *connection_handler(void *arg) {
                         tsdb_table_lock_write(tbl);
                         tsdb_batch_t *batch = NULL;
                         if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
-                            /* Mark as local-only to prevent re-replication loop. */
                             tsdb_batch_set_local_only(batch);
-                            for (int row = 0; row < nrows; row++) {
-                                /* Compute per-col offsets. */
-                                int col_off[TSDB_MAX_COLS];
-                                int off = 0;
-                                for (int c = 0; c < ncols; c++) {
-                                    col_off[c] = off;
-                                    switch (col_types[c]) {
-                                    case TSDB_TYPE_SYMBOL: off += 4 * nrows; break;
-                                    default:               off += 8 * nrows; break;
-                                    }
-                                }
-                                (void)col_off; /* resolved below */
 
-                                /* ts column first. */
-                                int64_t ts_val = 0;
-                                int ts_ci = -1;
-                                for (int c = 0; c < ncols; c++) {
-                                    if (col_types[c] == TSDB_TYPE_TIMESTAMP) {
-                                        ts_ci = c;
-                                        break;
+                            /* Per-column base offset into col_data[0].
+                             * Symbol cols are variable-size: 4 bytes for
+                             * total + per-row [u16 len][bytes].  Build a
+                             * per-row offset table for symbol cols so
+                             * the inner loop is O(1). */
+                            int base[TSDB_MAX_COLS];
+                            uint32_t *sym_row_off[TSDB_MAX_COLS] = {0};
+                            int boff = 0;
+                            int sym_alloc_ok = 1;
+                            for (int c = 0; c < ncols; c++) {
+                                base[c] = boff;
+                                if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                                    uint32_t total = 0;
+                                    memcpy(&total, col_data[0] + boff, 4);
+                                    sym_row_off[c] = malloc((size_t)nrows * sizeof(uint32_t));
+                                    if (!sym_row_off[c]) { sym_alloc_ok = 0; break; }
+                                    int off = boff + 4;
+                                    for (int r = 0; r < nrows; r++) {
+                                        sym_row_off[c][r] = (uint32_t)off;
+                                        uint16_t l16 = 0;
+                                        memcpy(&l16, col_data[0] + off, 2);
+                                        off += 2 + l16;
                                     }
+                                    boff += 4 + (int)total;
+                                } else {
+                                    boff += 8 * nrows;
                                 }
-
-                                /* Calculate offsets for each column. */
-                                int base[TSDB_MAX_COLS];
-                                {
-                                    int boff = 0;
-                                    for (int c = 0; c < ncols; c++) {
-                                        base[c] = boff;
-                                        int w = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
-                                        boff += w * nrows;
-                                    }
-                                }
-
-                                if (ts_ci >= 0) {
-                                    memcpy(&ts_val,
-                                           col_data[0] + base[ts_ci] + row * 8, 8);
-                                }
-                                tsdb_batch_row_ts(batch, ts_val);
-
-                                for (int c = 0; c < ncols; c++) {
-                                    if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
-                                    int stride = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
-                                    uint8_t *ptr = col_data[0] + base[c] + row * stride;
-                                    switch (col_types[c]) {
-                                    case TSDB_TYPE_INT64: {
-                                        int64_t v; memcpy(&v, ptr, 8);
-                                        tsdb_batch_row_i64(batch, c, v);
-                                        break;
-                                    }
-                                    case TSDB_TYPE_FLOAT64: {
-                                        double v; memcpy(&v, ptr, 8);
-                                        tsdb_batch_row_f64(batch, c, v);
-                                        break;
-                                    }
-                                    default: break;
-                                    }
-                                }
-                                tsdb_batch_row_end(batch);
                             }
-                            if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+
+                            int ts_ci = -1;
+                            for (int c = 0; c < ncols; c++) {
+                                if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
+                            }
+
+                            if (sym_alloc_ok) {
+                                for (int row = 0; row < nrows; row++) {
+                                    int64_t ts_val = 0;
+                                    if (ts_ci >= 0) {
+                                        memcpy(&ts_val,
+                                               col_data[0] + base[ts_ci] + row * 8, 8);
+                                    }
+                                    tsdb_batch_row_ts(batch, ts_val);
+
+                                    for (int c = 0; c < ncols; c++) {
+                                        if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
+                                        switch (col_types[c]) {
+                                        case TSDB_TYPE_INT64: {
+                                            int64_t v;
+                                            memcpy(&v, col_data[0] + base[c] + row * 8, 8);
+                                            tsdb_batch_row_i64(batch, c, v); break;
+                                        }
+                                        case TSDB_TYPE_FLOAT64: {
+                                            double v;
+                                            memcpy(&v, col_data[0] + base[c] + row * 8, 8);
+                                            tsdb_batch_row_f64(batch, c, v); break;
+                                        }
+                                        case TSDB_TYPE_SYMBOL: {
+                                            uint32_t off = sym_row_off[c][row];
+                                            uint16_t l16 = 0;
+                                            memcpy(&l16, col_data[0] + off, 2);
+                                            char sbuf[260];
+                                            int len = l16 < 256 ? l16 : 255;
+                                            memcpy(sbuf, col_data[0] + off + 2, len);
+                                            sbuf[len] = '\0';
+                                            tsdb_batch_row_sym(batch, c, sbuf);
+                                            break;
+                                        }
+                                        default: break;
+                                        }
+                                    }
+                                    tsdb_batch_row_end(batch);
+                                }
+                                if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+                            } else {
+                                tsdb_batch_discard(batch);
+                            }
+                            for (int c = 0; c < ncols; c++) free(sym_row_off[c]);
                         }
                         tsdb_table_unlock_write(tbl);
                     }
@@ -427,39 +443,75 @@ static void *connection_handler(void *arg) {
                         tsdb_batch_t *batch = NULL;
                         if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
                             tsdb_batch_set_local_only(batch);
-                            /* Column offsets inside the column-major payload. */
+                            /* Same wire format as WRITE_BATCH — symbol
+                             * cols are length-prefixed strings.  Build
+                             * per-row offsets so the inner loop is O(1). */
                             int base[TSDB_MAX_COLS];
+                            uint32_t *sym_row_off[TSDB_MAX_COLS] = {0};
                             int boff = 0;
+                            int sym_alloc_ok = 1;
                             for (int c = 0; c < ncols; c++) {
                                 base[c] = boff;
-                                boff += ((col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8) * nrows;
+                                if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                                    uint32_t total = 0;
+                                    memcpy(&total, col_data[0] + boff, 4);
+                                    sym_row_off[c] = malloc((size_t)nrows * sizeof(uint32_t));
+                                    if (!sym_row_off[c]) { sym_alloc_ok = 0; break; }
+                                    int off = boff + 4;
+                                    for (int r = 0; r < nrows; r++) {
+                                        sym_row_off[c][r] = (uint32_t)off;
+                                        uint16_t l16 = 0;
+                                        memcpy(&l16, col_data[0] + off, 2);
+                                        off += 2 + l16;
+                                    }
+                                    boff += 4 + (int)total;
+                                } else {
+                                    boff += 8 * nrows;
+                                }
                             }
                             int ts_ci = -1;
                             for (int c = 0; c < ncols; c++)
                                 if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
-                            for (int row = 0; row < nrows; row++) {
-                                int64_t ts_val = 0;
-                                if (ts_ci >= 0) memcpy(&ts_val, col_data[0] + base[ts_ci] + row * 8, 8);
-                                tsdb_batch_row_ts(batch, ts_val);
-                                for (int c = 0; c < ncols; c++) {
-                                    if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
-                                    int stride = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
-                                    uint8_t *ptr = col_data[0] + base[c] + row * stride;
-                                    switch (col_types[c]) {
-                                    case TSDB_TYPE_INT64: {
-                                        int64_t v; memcpy(&v, ptr, 8);
-                                        tsdb_batch_row_i64(batch, c, v); break;
+                            if (sym_alloc_ok) {
+                                for (int row = 0; row < nrows; row++) {
+                                    int64_t ts_val = 0;
+                                    if (ts_ci >= 0)
+                                        memcpy(&ts_val, col_data[0] + base[ts_ci] + row * 8, 8);
+                                    tsdb_batch_row_ts(batch, ts_val);
+                                    for (int c = 0; c < ncols; c++) {
+                                        if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
+                                        switch (col_types[c]) {
+                                        case TSDB_TYPE_INT64: {
+                                            int64_t v;
+                                            memcpy(&v, col_data[0] + base[c] + row * 8, 8);
+                                            tsdb_batch_row_i64(batch, c, v); break;
+                                        }
+                                        case TSDB_TYPE_FLOAT64: {
+                                            double v;
+                                            memcpy(&v, col_data[0] + base[c] + row * 8, 8);
+                                            tsdb_batch_row_f64(batch, c, v); break;
+                                        }
+                                        case TSDB_TYPE_SYMBOL: {
+                                            uint32_t off = sym_row_off[c][row];
+                                            uint16_t l16 = 0;
+                                            memcpy(&l16, col_data[0] + off, 2);
+                                            char sbuf[260];
+                                            int len = l16 < 256 ? l16 : 255;
+                                            memcpy(sbuf, col_data[0] + off + 2, len);
+                                            sbuf[len] = '\0';
+                                            tsdb_batch_row_sym(batch, c, sbuf);
+                                            break;
+                                        }
+                                        default: break;
+                                        }
                                     }
-                                    case TSDB_TYPE_FLOAT64: {
-                                        double v; memcpy(&v, ptr, 8);
-                                        tsdb_batch_row_f64(batch, c, v); break;
-                                    }
-                                    default: break;
-                                    }
+                                    tsdb_batch_row_end(batch);
                                 }
-                                tsdb_batch_row_end(batch);
+                                if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+                            } else {
+                                tsdb_batch_discard(batch);
                             }
-                            if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+                            for (int c = 0; c < ncols; c++) free(sym_row_off[c]);
                         }
                         tsdb_table_unlock_write(tbl);
                     }
@@ -986,14 +1038,27 @@ int tsdb_rpc_encode_write_batch(uint8_t *buf, uint32_t cap,
     CHECK(ncols);
     for (int c = 0; c < ncols; c++) *p++ = (uint8_t)col_types[c];
 
-    /* col data: columnar layout */
+    /* col data: columnar layout.
+     * Symbol columns are length-prefixed strings to survive cross-
+     * node symtab independence; the caller hands us a buffer that
+     * starts with `[u32 total_bytes][u16 len][bytes]…`.  Other types
+     * are still nrows * 8 bytes of raw codes. */
     for (int c = 0; c < ncols; c++) {
-        int stride = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
-        size_t sz = (size_t)nrows * stride;
-        CHECK((int)sz);
-        if (col_data[c]) memcpy(p, col_data[c], sz);
-        else             memset(p, 0, sz);
-        p += sz;
+        if (col_types[c] == TSDB_TYPE_SYMBOL) {
+            uint32_t total = 0;
+            if (col_data[c]) memcpy(&total, col_data[c], 4);
+            size_t sz = 4 + total;
+            CHECK((int)sz);
+            if (col_data[c]) memcpy(p, col_data[c], sz);
+            else             memset(p, 0, 4); /* empty col */
+            p += sz;
+        } else {
+            size_t sz = (size_t)nrows * 8;
+            CHECK((int)sz);
+            if (col_data[c]) memcpy(p, col_data[c], sz);
+            else             memset(p, 0, sz);
+            p += sz;
+        }
     }
 #undef CHECK
 

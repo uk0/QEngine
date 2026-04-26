@@ -571,7 +571,8 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
             &row->nfields, &row->ts);
 
         if (rc != TSDB_OK) {
-            free(scratch);
+            /* `scratch` is an interior pointer into the arena now;
+             * the arena owns the storage and is freed once below. */
             errors++;
             p = line_end + (nl ? 1 : 0);
             continue;

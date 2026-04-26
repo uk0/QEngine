@@ -109,18 +109,68 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
 
     int ncols = schema->ncols;
 
-    /* Build col_types and col_data arrays from schema + memtable. */
+    /* Build col_types[] + col_data[] arrays from schema + memtable.
+     *
+     * Symbol columns can't ship as raw codes — every node has its
+     * own symtab so the receiver's interpretation of a code differs
+     * from the sender's.  Instead we resolve each row's code to the
+     * source string here and pack a wire-friendly buffer:
+     *
+     *   [u32 total_bytes][u16 len_0][bytes_0]…[u16 len_n-1][bytes_n-1]
+     *
+     * The encoder ships this verbatim; the receiver re-interns the
+     * strings into its own symtab.  Buffers are heap-allocated and
+     * freed after cluster_write returns. */
     int col_types[TSDB_MAX_COLS];
     const void *col_data[TSDB_MAX_COLS];
+    void *resolved_buf[TSDB_MAX_COLS] = {0};
 
     for (int c_idx = 0; c_idx < ncols; c_idx++) {
         col_types[c_idx] = (int)schema->cols[c_idx].type;
-        col_data[c_idx]  = tsdb_memtable_col(memtable, c_idx);
+        if (schema->cols[c_idx].type == TSDB_TYPE_SYMBOL) {
+            const uint32_t *codes =
+                (const uint32_t *)tsdb_memtable_col(memtable, c_idx);
+            tsdb_symtab_t *st = schema->cols[c_idx].symtab;
+            /* Pre-size: assume max symbol length 64 bytes in the worst
+             * case; resize if a longer symbol shows up. */
+            size_t cap = 4 + (size_t)nrows * (2 + 32);
+            uint8_t *buf = malloc(cap);
+            if (!buf) goto oom;
+            size_t off = 4;  /* skip u32 total header for now */
+            for (int r = 0; r < nrows; r++) {
+                const char *s = (codes && st)
+                    ? tsdb_symtab_str(st, codes[r]) : NULL;
+                if (!s) s = "";
+                size_t slen = strlen(s);
+                if (slen > 65535) slen = 65535;
+                if (off + 2 + slen > cap) {
+                    cap = (off + 2 + slen) * 2;
+                    uint8_t *nb = realloc(buf, cap);
+                    if (!nb) { free(buf); goto oom; }
+                    buf = nb;
+                }
+                uint16_t l16 = (uint16_t)slen;
+                memcpy(buf + off, &l16, 2);          off += 2;
+                memcpy(buf + off, s,    slen);       off += slen;
+            }
+            uint32_t total = (uint32_t)(off - 4);
+            memcpy(buf, &total, 4);
+            resolved_buf[c_idx] = buf;
+            col_data[c_idx]     = buf;
+        } else {
+            col_data[c_idx] = tsdb_memtable_col(memtable, c_idx);
+        }
     }
 
-    return tsdb_cluster_write(c, table_name,
-                              ncols, col_types,
-                              nrows, col_data);
+    int rc = tsdb_cluster_write(c, table_name, ncols, col_types,
+                                nrows, col_data);
+
+    for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
+    return rc;
+
+oom:
+    for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
+    return TSDB_ERR_NOMEM;
 }
 
 /*
@@ -685,6 +735,17 @@ static int pull_table_delta(tsdb_db_t *db,
             case TSDB_TYPE_FLOAT64:
                 tsdb_batch_row_f64(batch, i, tsdb_result_f64(res, i));
                 break;
+            case TSDB_TYPE_SYMBOL: {
+                /* Resolve the symbol via the source's symtab (already
+                 * decoded in tsdb_result_sym) and re-intern locally.
+                 * Without this case the column would never be set
+                 * and row_end would fail with TSDB_ERR_SCHEMA — every
+                 * pulled row silently dropped on tables that have a
+                 * symbol column (i.e. most IoT / metrics tables). */
+                const char *s = tsdb_result_sym(res, i);
+                tsdb_batch_row_sym(batch, i, s ? s : "");
+                break;
+            }
             default:
                 break;
             }
