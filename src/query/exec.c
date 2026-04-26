@@ -5352,6 +5352,98 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
      * the normal DDL switch. */
     tsdb_raft_t *raft = tsdb_db_raft_for_db(db);
     if (raft && is_catalog_ddl(stmt.kind) && !tsdb_g_inside_raft_apply) {
+        /* Pre-validate before propose so obvious user errors surface
+         * synchronously instead of being swallowed by the apply
+         * callback's silent log line.  These checks read the leader's
+         * current catalog under the same membership the propose will
+         * commit against; a concurrent state change between check and
+         * apply still races (Raft's design is async-apply), but the
+         * common-case ergonomics — DROP missing X, CREATE X under
+         * missing parent — work as users expect. */
+        tsdb_catalog_t *pc = tsdb_db_catalog(db);
+        if (pc) {
+            const char *err_msg = NULL;
+            int err_rc = TSDB_OK;
+            switch (stmt.kind) {
+            case QAST_STMT_CREATE_GROUP: {
+                const char *pdb = stmt.u.create_group.spec.database;
+                if (pdb[0] && !tsdb_database_exists(pc, pdb)) {
+                    err_msg = "ERR: database not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            case QAST_STMT_CREATE_STABLE: {
+                const char *pdb = stmt.u.create_stable.spec.database;
+                const char *pgr = stmt.u.create_stable.spec.group;
+                if (pdb[0] && !tsdb_database_exists(pc, pdb)) {
+                    err_msg = "ERR: database not found"; err_rc = TSDB_ERR_NOTFOUND;
+                } else if (pgr[0]) {
+                    tsdb_group_t gtmp;
+                    if (tsdb_group_get(pc, pgr, &gtmp) != TSDB_OK) {
+                        err_msg = "ERR: group not found"; err_rc = TSDB_ERR_NOTFOUND;
+                    }
+                }
+                break;
+            }
+            case QAST_STMT_CREATE_CHILD_TABLE: {
+                const char *sn = stmt.u.create_child_table.spec.stable_name;
+                if (!tsdb_stable_exists(pc, sn)) {
+                    err_msg = "ERR: stable not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            case QAST_STMT_DROP_DATABASE: {
+                const char *n = stmt.u.drop_database.name;
+                if (strcmp(n, TSDB_SYSDB_NAME) == 0) {
+                    err_msg = "ERR: database is protected (e.g. sysdb) — drop refused";
+                    err_rc = TSDB_ERR_PERMISSION;
+                } else if (!tsdb_database_exists(pc, n)) {
+                    err_msg = "ERR: database not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            case QAST_STMT_DROP_GROUP: {
+                tsdb_group_t gtmp;
+                if (tsdb_group_get(pc, stmt.u.drop_group.name, &gtmp) != TSDB_OK) {
+                    err_msg = "ERR: group not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            case QAST_STMT_DROP_STABLE: {
+                if (!tsdb_stable_exists(pc, stmt.u.drop_stable.name)) {
+                    err_msg = "ERR: stable not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            case QAST_STMT_DROP_TABLE: {
+                /* DROP TABLE accepts both child tables and regular tables.
+                 * Surface NOTFOUND only if neither path knows the name. */
+                tsdb_child_table_t ctmp;
+                int has_child = (tsdb_child_table_get(pc,
+                                    stmt.u.drop_table.name, &ctmp) == TSDB_OK);
+                int has_table = (tsdb_db_find_table(db, stmt.u.drop_table.name) != NULL);
+                if (!has_child && !has_table) {
+                    err_msg = "ERR: table not found"; err_rc = TSDB_ERR_NOTFOUND;
+                }
+                break;
+            }
+            default: break;
+            }
+            if (err_msg) {
+                /* Return TSDB_OK + status-row, mirroring the "ERR: not
+                 * raft leader" path above.  The HTTP /sql provider
+                 * doesn't free the result on rc != 0, so emitting an
+                 * error code here would leak; the status-row form also
+                 * lets the dashboard render the message inline rather
+                 * than flattening it through the HTTP error wrapper. */
+                (void)err_rc;
+                result_status(r, err_msg);
+                *out = r;
+                tsdb_arena_free(&a);
+                return TSDB_OK;
+            }
+        }
+
         tsdb_arena_free(&a);
         tsdb_raft_state_t s = tsdb_raft_state(raft);
         if (s != TSDB_RAFT_LEADER) {
