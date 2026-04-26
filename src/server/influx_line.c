@@ -1004,23 +1004,36 @@ done:
     return NULL;
 }
 
-/* Global HTTP server state. */
+/* Global HTTP server state.
+ *
+ * Multi-accept: N listener sockets, all bound to the same port via
+ * SO_REUSEPORT, each with its own accept thread.  The kernel hashes
+ * incoming SYN packets across the listening sockets so concurrent
+ * clients don't serialize on a single accept queue.  Tunable via
+ * TSDB_INFLUX_ACCEPT_THREADS (default 4, clamped to [1, 32]).
+ *
+ * On Linux SO_REUSEPORT is the load-balancing variant we want; on
+ * macOS the same socket option exists but lacks the kernel-side
+ * hashing, so the extra listeners just share the queue — harmless
+ * but not faster.  Either way the API is stable. */
+#define TSDB_HTTP_MAX_ACCEPT 32
 static volatile int g_http_running = 0;
-static int          g_http_listen_fd = -1;
-static pthread_t    g_http_thread;
+static int          g_http_listen_fds[TSDB_HTTP_MAX_ACCEPT];
+static int          g_http_n_listeners = 0;
+static pthread_t    g_http_threads[TSDB_HTTP_MAX_ACCEPT];
 static tsdb_db_t   *g_http_db = NULL;
 
 static void *http_accept_loop(void *arg) {
-    (void)arg;
+    int my_fd = (int)(intptr_t)arg;
     while (g_http_running) {
-        struct pollfd pfd = { g_http_listen_fd, POLLIN, 0 };
+        struct pollfd pfd = { my_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200);
         if (r <= 0) continue;
         if (!(pfd.revents & POLLIN)) continue;
 
         struct sockaddr_in cli;
         socklen_t clen = sizeof(cli);
-        int cfd = accept(g_http_listen_fd, (struct sockaddr *)&cli, &clen);
+        int cfd = accept(my_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
@@ -1060,45 +1073,84 @@ int tsdb_influx_http_start(const char *bind_addr, tsdb_db_t *db) {
         port = atoi(colon + 1);
     }
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) return -1;
-
-    int opt = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
+    /* TSDB_INFLUX_ACCEPT_THREADS — number of listener sockets bound to
+     * the same port via SO_REUSEPORT, each with its own accept thread.
+     * Default 4; clamp to [1, TSDB_HTTP_MAX_ACCEPT].  Concurrent
+     * clients no longer serialize on a single accept queue. */
+    int n_listeners = 4;
+    {
+        const char *e = getenv("TSDB_INFLUX_ACCEPT_THREADS");
+        if (e && *e) n_listeners = atoi(e);
+        if (n_listeners < 1) n_listeners = 1;
+        if (n_listeners > TSDB_HTTP_MAX_ACCEPT) n_listeners = TSDB_HTTP_MAX_ACCEPT;
+    }
 
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_port   = htons((uint16_t)port);
-    if (inet_aton(host, &sa.sin_addr) == 0) { close(lfd); return -1; }
+    if (inet_aton(host, &sa.sin_addr) == 0) return -1;
 
-    if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(lfd); return -1; }
-    if (listen(lfd, 128) < 0) { close(lfd); return -1; }
-
-    g_http_listen_fd = lfd;
     g_http_db        = db;
     g_http_running   = 1;
+    g_http_n_listeners = 0;
 
-    if (pthread_create(&g_http_thread, NULL, http_accept_loop, NULL) != 0) {
-        close(lfd);
-        g_http_running = 0;
-        return -1;
+    for (int i = 0; i < n_listeners; i++) {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (lfd < 0) goto fail;
+
+        int opt = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            close(lfd);
+            goto fail;
+        }
+        if (listen(lfd, 256) < 0) {
+            close(lfd);
+            goto fail;
+        }
+        g_http_listen_fds[i] = lfd;
+
+        if (pthread_create(&g_http_threads[i], NULL,
+                           http_accept_loop,
+                           (void *)(intptr_t)lfd) != 0) {
+            close(lfd);
+            goto fail;
+        }
+        g_http_n_listeners++;
     }
 
-    fprintf(stderr, "[influx] HTTP write endpoint listening on %s:%d\n", host, port);
+    fprintf(stderr, "[influx] HTTP write endpoint listening on %s:%d (%d accept threads)\n",
+            host, port, g_http_n_listeners);
     return 0;
+
+fail:
+    g_http_running = 0;
+    for (int i = 0; i < g_http_n_listeners; i++) {
+        shutdown(g_http_listen_fds[i], SHUT_RDWR);
+        close(g_http_listen_fds[i]);
+        pthread_join(g_http_threads[i], NULL);
+    }
+    g_http_n_listeners = 0;
+    return -1;
 }
 
 void tsdb_influx_http_stop(void) {
     if (!g_http_running) return;
     g_http_running = 0;
-    if (g_http_listen_fd >= 0) {
-        shutdown(g_http_listen_fd, SHUT_RDWR);
-        close(g_http_listen_fd);
-        g_http_listen_fd = -1;
+    for (int i = 0; i < g_http_n_listeners; i++) {
+        if (g_http_listen_fds[i] >= 0) {
+            shutdown(g_http_listen_fds[i], SHUT_RDWR);
+            close(g_http_listen_fds[i]);
+            g_http_listen_fds[i] = -1;
+        }
     }
-    pthread_join(g_http_thread, NULL);
+    for (int i = 0; i < g_http_n_listeners; i++) {
+        pthread_join(g_http_threads[i], NULL);
+    }
+    g_http_n_listeners = 0;
     g_http_db = NULL;
 }
