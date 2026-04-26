@@ -124,6 +124,23 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                                const char *table_name,
                                int *out_rows_pulled);
 
+/* Phase γ — read-side shard forwarding.
+ *
+ * If TSDB_SHARD_REPLICA_N > 0 and this node is NOT in the owner set
+ * for `table_name`, forwards `qtl` to the first owner via FED_QUERY
+ * and returns the result in *out.  Otherwise leaves *out=NULL and
+ * returns TSDB_OK so the caller proceeds with local execution.
+ * Re-entry on the owner side is guarded by a thread-local so a
+ * forwarded query never re-forwards.
+ *
+ * `table_name` must be the table the query reads from (typically
+ * the FROM clause).  When NULL, the caller is signalling "no shard
+ * decision possible" and forwarding is skipped. */
+int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
+                                       const char *table_name,
+                                       const char *qtl,
+                                       tsdb_result_t **out);
+
 /* Bridges into the cluster layer for modules that live above it
  * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each
  * returns NULL / 0 if the db is in standalone mode. */

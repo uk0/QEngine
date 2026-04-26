@@ -893,3 +893,77 @@ void *tsdb_resync_startup_thread(void *ud) {
             total, n);
     return NULL;
 }
+
+/* ---- Phase γ — read-side forwarding for shard mode --------------------
+ *
+ * When TSDB_SHARD_REPLICA_N is set and this node is NOT in the owner
+ * set for a table, forward the SELECT QTL to the first owner via the
+ * existing FED_QUERY RPC and return the encoded result.  The owner
+ * runs the query locally and ships rows back; the caller stitches the
+ * result into the standard tsdb_result_t pipeline.
+ *
+ * The thread-local guard tsdb_g_inside_shard_forward prevents the
+ * forwarded query from re-entering this code path on the owner side
+ * (which would loop indefinitely if route ever returns the wrong set
+ * — defensive only; the route is idempotent under stable membership).
+ *
+ * Returns:
+ *   TSDB_OK     + *out=NULL → caller continues with local exec
+ *   TSDB_OK     + *out set  → forward succeeded, return *out
+ *   error code              → forward failed, surface the error
+ */
+__thread int tsdb_g_inside_shard_forward = 0;
+
+static int shard_replica_n_cached(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("TSDB_SHARD_REPLICA_N");
+        cached = s && *s ? atoi(s) : 0;
+        if (cached < 0) cached = 0;
+    }
+    return cached;
+}
+
+int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
+                                       const char *table_name,
+                                       const char *qtl,
+                                       tsdb_result_t **out)
+{
+    if (out) *out = NULL;
+    if (!db || !table_name || !qtl || !out) return TSDB_OK;
+
+    /* Re-entry guard: a forwarded query landing here would loop. */
+    if (tsdb_g_inside_shard_forward) return TSDB_OK;
+
+    int n = shard_replica_n_cached();
+    if (n <= 0) return TSDB_OK;  /* shard mode off → run local */
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;
+
+    tsdb_node_id_t owners[TSDB_CLUSTER_MAX_NODES];
+    int got = tsdb_cluster_route(c, table_name, "", n, owners);
+    if (got <= 0) return TSDB_OK;  /* routing failed → fall back to local */
+
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+    for (int i = 0; i < got; i++) {
+        if (owners[i] == self) return TSDB_OK;  /* I'm an owner → run local */
+    }
+
+    /* Self is non-owner.  Pick the first owner and forward.  Future
+     * work: load-balance across owners or fan-out + merge for
+     * partition-pruning gains. */
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return TSDB_OK;
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, owners[0]);
+    if (!conn) return TSDB_ERR_IO;
+
+    tsdb_g_inside_shard_forward = 1;
+    int rc = fedrpc_query(conn, qtl, 5000, out);
+    tsdb_g_inside_shard_forward = 0;
+    if (rc != TSDB_OK) {
+        if (*out) { tsdb_result_free(*out); *out = NULL; }
+        return rc;
+    }
+    return TSDB_OK;
+}

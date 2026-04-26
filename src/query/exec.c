@@ -5310,6 +5310,27 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     r->cur = -1;
 
     if (stmt.kind == QAST_STMT_SELECT) {
+        /* Phase γ — shard read forwarding.  When TSDB_SHARD_REPLICA_N
+         * is set and self is not in the owner set for the FROM table,
+         * ship the QTL to an owner via FED_QUERY and return its result
+         * verbatim.  Inert when shard mode is off or self is owner —
+         * caller continues with the local exec path below. */
+        if (stmt.u.query.from) {
+            tsdb_result_t *forwarded = NULL;
+            int frc = tsdb_cluster_maybe_forward_select(
+                db, stmt.u.query.from, qtl, &forwarded);
+            if (frc != TSDB_OK) {
+                tsdb_result_free(r);
+                tsdb_arena_free(&a);
+                return frc;
+            }
+            if (forwarded) {
+                tsdb_result_free(r);
+                tsdb_arena_free(&a);
+                *out = forwarded;
+                return TSDB_OK;
+            }
+        }
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
