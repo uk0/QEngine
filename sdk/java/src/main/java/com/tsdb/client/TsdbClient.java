@@ -1,5 +1,6 @@
 package com.tsdb.client;
 
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -7,7 +8,9 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.CRC32C;
 
 /**
@@ -192,6 +195,112 @@ public class TsdbClient implements AutoCloseable {
         send(MSG_CREATE_TABLE, (short) 0, payload);
         Frame f = recv();
         if (f.type == MSG_ERROR) throw decodeError(f.payload);
+    }
+
+    /* ----- Columnar WRITE_BATCH ----- */
+
+    /**
+     * One row's column values, indexed by column position (matching the
+     * cols list passed to {@link #writeBatch}).  Only the type-specific
+     * map for each column needs to be populated; missing entries default
+     * to zero / empty string.
+     *
+     * The TS field is the row's timestamp (ns since epoch); it must
+     * agree with whichever column was declared TIMESTAMP at table create.
+     */
+    public static final class Row {
+        public long             ts;
+        public Map<Integer,Long>    i64 = Collections.emptyMap();
+        public Map<Integer,Double>  f64 = Collections.emptyMap();
+        public Map<Integer,String>  sym = Collections.emptyMap();
+    }
+
+    /**
+     * Send a columnar WRITE_BATCH of rows.  All rows must share the
+     * same set of columns.  cols describes ALL columns (including the
+     * timestamp column) in schema order.
+     *
+     * Wire format mirrors the cluster RPC WRITE_BATCH receiver:
+     * fixed-width columns carry n*8 raw bytes; SYMBOL columns carry
+     * `[u32 total_bytes][u16 len][bytes]…`.
+     *
+     * @return number of rows the server confirmed it persisted.
+     */
+    public int writeBatch(String table, List<Column> cols, List<Row> rows) throws IOException {
+        if (rows.isEmpty()) return 0;
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputStream dout = new DataOutputStream(out);
+
+        byte[] tn = table.getBytes("UTF-8");
+        dout.writeByte(tn.length);
+        dout.write(tn);
+
+        // ncols (u16 LE), nrows (u32 LE)
+        dout.writeByte(cols.size() & 0xFF);
+        dout.writeByte((cols.size() >> 8) & 0xFF);
+        int n = rows.size();
+        dout.writeByte( n        & 0xFF);
+        dout.writeByte((n >>  8) & 0xFF);
+        dout.writeByte((n >> 16) & 0xFF);
+        dout.writeByte((n >> 24) & 0xFF);
+
+        for (int ci = 0; ci < cols.size(); ci++) {
+            Column c = cols.get(ci);
+            byte[] cn = c.name.getBytes("UTF-8");
+            dout.writeByte(cn.length);
+            dout.write(cn);
+            dout.writeByte(c.type);
+            dout.writeByte(0); // codec = RAW
+
+            if (c.type == T_SYMBOL) {
+                // Pre-build [u16 len][bytes]… body to know total upfront.
+                ByteArrayOutputStream sym = new ByteArrayOutputStream();
+                for (Row r : rows) {
+                    String s = r.sym.getOrDefault(ci, "");
+                    byte[] sb = s.getBytes("UTF-8");
+                    int slen = Math.min(sb.length, 65535);
+                    sym.write(slen & 0xFF);
+                    sym.write((slen >> 8) & 0xFF);
+                    sym.write(sb, 0, slen);
+                }
+                int total = sym.size();
+                int csz = 4 + total; // [u32 total] + body
+                writeU32LE(dout, csz);
+                writeU32LE(dout, total);
+                dout.write(sym.toByteArray());
+            } else {
+                int csz = n * 8;
+                writeU32LE(dout, csz);
+                for (Row r : rows) {
+                    long bits;
+                    switch (c.type) {
+                        case T_TIMESTAMP: bits = r.ts; break;
+                        case T_INT64:     bits = r.i64.getOrDefault(ci, 0L); break;
+                        case T_FLOAT64:   bits = Double.doubleToRawLongBits(r.f64.getOrDefault(ci, 0.0)); break;
+                        default: throw new IOException("unsupported column type " + c.type);
+                    }
+                    writeU64LE(dout, bits);
+                }
+            }
+        }
+
+        send(MSG_WRITE_BATCH, (short) 0, out.toByteArray());
+        Frame f = recv();
+        if (f.type == MSG_ERROR) throw decodeError(f.payload);
+        if (f.type != MSG_WRITE_ACK) throw new IOException("unexpected WRITE response type=" + f.type);
+        if (f.payload.length < 4) throw new IOException("short WRITE_ACK");
+        return ByteBuffer.wrap(f.payload, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    private static void writeU32LE(DataOutputStream o, int v) throws IOException {
+        o.writeByte(v & 0xFF);
+        o.writeByte((v >>>  8) & 0xFF);
+        o.writeByte((v >>> 16) & 0xFF);
+        o.writeByte((v >>> 24) & 0xFF);
+    }
+    private static void writeU64LE(DataOutputStream o, long v) throws IOException {
+        for (int i = 0; i < 8; i++) o.writeByte((int)(v >>> (i * 8)) & 0xFF);
     }
 
     /* ----- Query ----- */
