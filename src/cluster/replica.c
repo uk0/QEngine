@@ -424,12 +424,30 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
 {
     if (!rmgr || nreplicas == 0) return TSDB_OK;
 
-    /* Encode the WRITE_BATCH payload once. */
-    size_t row_size = 0;
+    /* Encode the WRITE_BATCH payload once.
+     *
+     * Sizing must include the actual SYMBOL byte count: the caller packs
+     * each symbol column as `[u32 total_bytes][u16 len][bytes]…` which is
+     * variable-length, NOT 4 bytes per row.  Underallocating here used to
+     * silently fail tsdb_rpc_encode_write_batch (returns -1 on overrun)
+     * and the whole replication call returned ERR_INTERNAL with no
+     * counter ticking — peers stayed empty for any batch with non-trivial
+     * symbol payloads (e.g. 100-row Influx writes with a host tag). */
+    size_t fixed_per_row = 0;   /* non-symbol columns: 8 bytes each */
+    size_t sym_bytes_total = 0; /* sum of [4 + total] across SYMBOL cols */
     for (int c = 0; c < ncols; c++) {
-        row_size += (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
+        if (col_types[c] == TSDB_TYPE_SYMBOL) {
+            uint32_t total = 0;
+            if (col_data[c]) memcpy(&total, col_data[c], 4);
+            sym_bytes_total += 4 + (size_t)total;
+        } else {
+            fixed_per_row += 8;
+        }
     }
-    size_t payload_cap = 8 + ncols * 2 + (size_t)nrows * row_size + 64;
+    size_t payload_cap = 8 + (size_t)ncols * 2
+                       + (size_t)nrows * fixed_per_row
+                       + sym_bytes_total
+                       + 256;  /* table_name + headers + safety margin */
     uint8_t *payload = malloc(payload_cap);
     if (!payload) return TSDB_ERR_NOMEM;
 
