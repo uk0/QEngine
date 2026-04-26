@@ -344,13 +344,20 @@ static void write_lock_release(write_lock_pool_t *p, const char *table) {
 
 /* ---- Server struct -------------------------------------------------------- */
 
+/* Multi-accept: N listener sockets bound to the same port via
+ * SO_REUSEPORT, each with its own accept thread.  Mirrors the Influx
+ * HTTP path (commit b419c3d) — wire-protocol benches at 8+ concurrent
+ * SDK writers used to saturate a single accept queue at ~186 k r/s. */
+#define TSDB_WIRE_MAX_ACCEPT 32
+
 struct tsdb_server {
-    int                 listen_fd;
+    int                 listen_fds[TSDB_WIRE_MAX_ACCEPT];
+    int                 n_listeners;
     int                 port;
     tsdb_db_t          *db;
     tsdb_server_opts_t  opts;
 
-    pthread_t           accept_thread;
+    pthread_t           accept_threads[TSDB_WIRE_MAX_ACCEPT];
     volatile int        running;
 
     tsdb_sub_list_t     subs;
@@ -1202,18 +1209,26 @@ done:
 
 /* ---- Accept loop --------------------------------------------------------- */
 
+typedef struct {
+    tsdb_server_t *srv;
+    int            fd;
+} accept_arg_t;
+
 static void *accept_loop(void *arg) {
-    tsdb_server_t *srv = (tsdb_server_t *)arg;
+    accept_arg_t *aa = (accept_arg_t *)arg;
+    tsdb_server_t *srv = aa->srv;
+    int my_fd = aa->fd;
+    free(aa);
 
     while (srv->running) {
-        struct pollfd pfd = { srv->listen_fd, POLLIN, 0 };
+        struct pollfd pfd = { my_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200 /* ms */);
         if (r <= 0) continue;
         if (!(pfd.revents & POLLIN)) continue;
 
         struct sockaddr_in cli;
         socklen_t clen = sizeof(cli);
-        int cfd = accept(srv->listen_fd, (struct sockaddr *)&cli, &clen);
+        int cfd = accept(my_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
@@ -1275,42 +1290,60 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
     if (opts->bind_addr)
         parse_addr(opts->bind_addr, host, sizeof(host), &port);
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) return TSDB_ERR_IO;
-
-    int opt = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
+    /* TSDB_WIRE_ACCEPT_THREADS — N listener sockets via SO_REUSEPORT,
+     * each with its own accept thread.  Default 4. */
+    int n_listeners = 4;
+    {
+        const char *e = getenv("TSDB_WIRE_ACCEPT_THREADS");
+        if (e && *e) n_listeners = atoi(e);
+        if (n_listeners < 1) n_listeners = 1;
+        if (n_listeners > TSDB_WIRE_MAX_ACCEPT) n_listeners = TSDB_WIRE_MAX_ACCEPT;
+    }
 
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_port   = htons((uint16_t)port);
-    if (inet_aton(host, &sa.sin_addr) == 0) {
-        close(lfd); return TSDB_ERR_INVAL;
-    }
+    if (inet_aton(host, &sa.sin_addr) == 0) return TSDB_ERR_INVAL;
 
-    if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(lfd); return TSDB_ERR_IO;
-    }
-    if (listen(lfd, 128) < 0) {
-        close(lfd); return TSDB_ERR_IO;
+    int first_lfd = -1;
+    int listen_fds[TSDB_WIRE_MAX_ACCEPT];
+    int nl = 0;
+    for (int i = 0; i < n_listeners; i++) {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (lfd < 0) goto fail_open;
+
+        int opt = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(lfd); goto fail_open; }
+        if (listen(lfd, 256) < 0) { close(lfd); goto fail_open; }
+
+        listen_fds[nl++] = lfd;
+        if (first_lfd < 0) first_lfd = lfd;
+        continue;
+
+    fail_open:
+        for (int j = 0; j < nl; j++) close(listen_fds[j]);
+        return TSDB_ERR_IO;
     }
 
     /* Read back actual port (important when port==0). */
     struct sockaddr_in bound = {0};
     socklen_t blen = sizeof(bound);
-    getsockname(lfd, (struct sockaddr *)&bound, &blen);
+    getsockname(first_lfd, (struct sockaddr *)&bound, &blen);
 
     tsdb_server_t *srv = (tsdb_server_t *)calloc(1, sizeof(*srv));
-    if (!srv) { close(lfd); return TSDB_ERR_NOMEM; }
+    if (!srv) { for (int j = 0; j < nl; j++) close(listen_fds[j]); return TSDB_ERR_NOMEM; }
 
-    srv->listen_fd = lfd;
-    srv->port      = ntohs(bound.sin_port);
-    srv->db        = opts->db;
-    srv->opts      = *opts;
-    srv->running   = 1;
+    for (int i = 0; i < nl; i++) srv->listen_fds[i] = listen_fds[i];
+    srv->n_listeners = nl;
+    srv->port        = ntohs(bound.sin_port);
+    srv->db          = opts->db;
+    srv->opts        = *opts;
+    srv->running     = 1;
 
     atomic_init(&srv->stat_conns, 0);
     atomic_init(&srv->stat_rows_written, 0);
@@ -1331,7 +1364,7 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
                                     opts->tls_ca, &srv->tls_ctx) != 0) {
                 sub_list_destroy(&srv->subs);
                 write_lock_pool_destroy(&srv->write_locks);
-                close(lfd);
+                for (int i = 0; i < srv->n_listeners; i++) close(srv->listen_fds[i]);
                 free(srv);
                 return TSDB_ERR_INTERNAL;
             }
@@ -1341,27 +1374,48 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
         }
     }
 
-    if (pthread_create(&srv->accept_thread, NULL, accept_loop, srv) != 0) {
-        tsdb_tls_free(srv->tls_ctx);
-        sub_list_destroy(&srv->subs);
-        write_lock_pool_destroy(&srv->write_locks);
-        close(lfd);
-        free(srv);
-        return TSDB_ERR_INTERNAL;
+    int spawned = 0;
+    for (int i = 0; i < srv->n_listeners; i++) {
+        accept_arg_t *aa = (accept_arg_t *)malloc(sizeof(*aa));
+        if (!aa) goto fail_spawn;
+        aa->srv = srv; aa->fd = srv->listen_fds[i];
+        if (pthread_create(&srv->accept_threads[i], NULL, accept_loop, aa) != 0) {
+            free(aa);
+            goto fail_spawn;
+        }
+        spawned++;
     }
 
+    fprintf(stderr, "[server] wire endpoint listening on %s:%d (%d accept threads)\n",
+            host, srv->port, srv->n_listeners);
     *out = srv;
     return TSDB_OK;
+
+fail_spawn:
+    srv->running = 0;
+    for (int i = 0; i < spawned; i++) {
+        shutdown(srv->listen_fds[i], SHUT_RDWR);
+        pthread_join(srv->accept_threads[i], NULL);
+    }
+    for (int i = 0; i < srv->n_listeners; i++) close(srv->listen_fds[i]);
+    tsdb_tls_free(srv->tls_ctx);
+    sub_list_destroy(&srv->subs);
+    write_lock_pool_destroy(&srv->write_locks);
+    free(srv);
+    return TSDB_ERR_INTERNAL;
 }
 
 void tsdb_server_stop(tsdb_server_t *s) {
     if (!s) return;
     s->running = 0;
-    /* Interrupt the poll() by closing the listen fd.
-     * The accept loop will see POLLERR/POLLHUP and exit. */
-    shutdown(s->listen_fd, SHUT_RDWR);
-    pthread_join(s->accept_thread, NULL);
-    close(s->listen_fd);
+    /* Interrupt the poll()s by shutting down the listen fds.
+     * Each accept loop will see POLLERR/POLLHUP and exit. */
+    for (int i = 0; i < s->n_listeners; i++)
+        shutdown(s->listen_fds[i], SHUT_RDWR);
+    for (int i = 0; i < s->n_listeners; i++)
+        pthread_join(s->accept_threads[i], NULL);
+    for (int i = 0; i < s->n_listeners; i++)
+        close(s->listen_fds[i]);
     tsdb_tls_free(s->tls_ctx);
     sub_list_destroy(&s->subs);
     write_lock_pool_destroy(&s->write_locks);
