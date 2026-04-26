@@ -1499,6 +1499,33 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return TSDB_ERR_PARSE;
     }
 
+    /* ---- DESCRIBE [STABLE|VTABLE|TABLE] <name> -------------------------
+     * Read-only schema introspection.  Resolves the name against
+     * stables → child tables → regular tables in that order.  Accepts
+     * `describe`, `desc` (the latter is the ORDER BY keyword but on
+     * its own at statement-start it can only mean DESCRIBE), and
+     * either bare-name or with an optional STABLE/VTABLE/TABLE word. */
+    if ((p.tok.kind == QTOK_IDENT && (ident_ci(&p.tok, "describe") || ident_ci(&p.tok, "desc")))
+        || p.tok.kind == QTOK_DESC)
+    {
+        advance(&p);
+        out->kind = QAST_STMT_DESCRIBE;
+        /* Optional STABLE / VTABLE / TABLE / PTABLE qualifier — pure
+         * sugar; resolution is name-based regardless. */
+        if (p.tok.kind == QTOK_STABLE) advance(&p);
+        else if (p.tok.kind == QTOK_TABLE) advance(&p);
+        else if (p.tok.kind == QTOK_IDENT &&
+                 (ident_ci(&p.tok, "vtable") || ident_ci(&p.tok, "ptable")))
+            advance(&p);
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, out->u.describe.name, sizeof(out->u.describe.name));
+        advance(&p);
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
     /* ---- TRUNCATE TABLE <name> ------------------------------------------ */
     if (accept(&p, QTOK_TRUNCATE)) {
         if (!accept(&p, QTOK_TABLE)) {

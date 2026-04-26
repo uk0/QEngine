@@ -193,6 +193,10 @@ typedef enum {
     /* DROP TABLE name — drops any physical table (normal or child/ptable).
      * Cascades to catalog child-table entry if the name is registered as one. */
     QAST_STMT_DROP_TABLE,
+    /* DESCRIBE [STABLE|TABLE] <name> — emits one row per column with
+     * (col_name, type, is_tag, tag_value).  Resolves the name against
+     * stables → child tables → regular tables in that order. */
+    QAST_STMT_DESCRIBE,
     /* ALTER TABLE t ADD COLUMN c TYPE */
     QAST_STMT_ALTER_ADD_COLUMN,
     /* TRUNCATE TABLE t — wipe all rows, keep schema. */
@@ -270,6 +274,8 @@ typedef struct {
         } create_table;
         /* QAST_STMT_DROP_TABLE — drops physical table by name (normal or ptable). */
         struct { char name[64]; }            drop_table;
+        /* QAST_STMT_DESCRIBE — read-only schema introspection. */
+        struct { char name[64]; }            describe;
         /* ALTER TABLE t ADD COLUMN c TYPE */
         struct {
             char         table[64];

@@ -5941,6 +5941,97 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         else result_status(r, "ERR: drop stable failed");
         break;
     }
+    case QAST_STMT_DESCRIBE: {
+        /* Resolve in priority: stable → child table → regular table.
+         * Emits one row per column with (col_name, type, is_tag,
+         * tag_value).  For non-tag columns and stables (which have
+         * no per-value tags) the tag_value field is empty. */
+        const char *nm = stmt.u.describe.name;
+        const char *desc_cols[]  = { "col_name", "type", "is_tag", "tag_value" };
+        const tsdb_type_t desc_types[] = {
+            TSDB_TYPE_SYMBOL, TSDB_TYPE_SYMBOL, TSDB_TYPE_INT64, TSDB_TYPE_SYMBOL };
+        rc = result_init_ddl(r, 4, desc_cols, desc_types);
+        if (rc != TSDB_OK) break;
+
+        /* Try as a stable first. */
+        tsdb_stable_t st;
+        if (tsdb_stable_get(cat, nm, &st) == TSDB_OK) {
+            for (int i = 0; i < st.ncols; i++) {
+                if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+                result_append_sym(r, 0, st.cols[i].name);
+                result_append_sym(r, 1, tsdb_type_name(st.cols[i].type));
+                result_append_i64_val(r, 2, 0);
+                result_append_sym(r, 3, "");
+                result_ddl_end_row(r);
+            }
+            for (int i = 0; i < st.ntag_cols && rc == TSDB_OK; i++) {
+                if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+                result_append_sym(r, 0, st.tag_cols[i].name);
+                result_append_sym(r, 1, tsdb_type_name(st.tag_cols[i].type));
+                result_append_i64_val(r, 2, 1);
+                result_append_sym(r, 3, "");
+                result_ddl_end_row(r);
+            }
+            break;
+        }
+
+        /* Try as a child table. */
+        tsdb_child_table_t ct;
+        if (tsdb_child_table_get(cat, nm, &ct) == TSDB_OK &&
+            tsdb_stable_get(cat, ct.stable_name, &st) == TSDB_OK)
+        {
+            for (int i = 0; i < st.ncols; i++) {
+                if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+                result_append_sym(r, 0, st.cols[i].name);
+                result_append_sym(r, 1, tsdb_type_name(st.cols[i].type));
+                result_append_i64_val(r, 2, 0);
+                result_append_sym(r, 3, "");
+                result_ddl_end_row(r);
+            }
+            for (int i = 0; i < st.ntag_cols && i < ct.ntags && rc == TSDB_OK; i++) {
+                if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+                char tagval[80];
+                switch (ct.tags[i].type) {
+                case TSDB_TYPE_INT64:   snprintf(tagval, sizeof(tagval), "%lld",
+                                                 (long long)ct.tags[i].v.i); break;
+                case TSDB_TYPE_FLOAT64: snprintf(tagval, sizeof(tagval), "%g",
+                                                 ct.tags[i].v.f); break;
+                case TSDB_TYPE_SYMBOL:  snprintf(tagval, sizeof(tagval), "%s",
+                                                 ct.tags[i].v.s); break;
+                default: tagval[0] = '\0';
+                }
+                result_append_sym(r, 0, st.tag_cols[i].name);
+                result_append_sym(r, 1, tsdb_type_name(st.tag_cols[i].type));
+                result_append_i64_val(r, 2, 1);
+                result_append_sym(r, 3, tagval);
+                result_ddl_end_row(r);
+            }
+            break;
+        }
+
+        /* Try as a regular table — open it to inspect the schema. */
+        tsdb_table_t *tbl = NULL;
+        if (tsdb_open_table(db, nm, &tbl) == TSDB_OK && tbl) {
+            tsdb_table_internal_t *ti = tsdb_db_find_table(db, nm);
+            tsdb_schema_t *sch = ti ? tsdb_tbl_schema(ti) : NULL;
+            if (sch) {
+                for (int i = 0; i < sch->ncols; i++) {
+                    if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+                    result_append_sym(r, 0, sch->cols[i].name);
+                    result_append_sym(r, 1, tsdb_type_name(sch->cols[i].type));
+                    result_append_i64_val(r, 2, 0);
+                    result_append_sym(r, 3, "");
+                    result_ddl_end_row(r);
+                }
+                break;
+            }
+        }
+
+        /* Nothing matched. */
+        result_status(r, "ERR: table not found");
+        rc = TSDB_ERR_NOTFOUND;
+        break;
+    }
     case QAST_STMT_DROP_TABLE: {
         const char *tn = stmt.u.drop_table.name;
         /* Cascade: if the name is registered as a child-table in the
@@ -6566,6 +6657,10 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
     case QAST_STMT_LIST_MASTERS:
         *out_priv = TSDB_PRIV_SELECT;
         break;
+    case QAST_STMT_DESCRIBE:
+        *out_priv     = TSDB_PRIV_SELECT;
+        *out_resource = stmt->u.describe.name;
+        break;
 
     /* Raft membership change — admin-only cluster op. */
     case QAST_STMT_ADD_MASTER:
@@ -6672,6 +6767,7 @@ static void stmt_audit_kind(const qast_stmt_t *stmt,
     const char *ev = "QUERY", *act = "SELECT";
     switch (stmt->kind) {
     case QAST_STMT_SELECT:                  ev = "QUERY"; act = "SELECT"; break;
+    case QAST_STMT_DESCRIBE:                ev = "QUERY"; act = "DESCRIBE"; break;
     case QAST_STMT_CREATE_DATABASE:         ev = "DDL"; act = "CREATE DATABASE"; break;
     case QAST_STMT_DROP_DATABASE:           ev = "DDL"; act = "DROP DATABASE"; break;
     case QAST_STMT_LIST_DATABASES:          ev = "QUERY"; act = "LIST DATABASES"; break;
