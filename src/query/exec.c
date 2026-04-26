@@ -3387,6 +3387,77 @@ typedef struct {
     int64_t i_val;
 } stable_tag_pred_t;
 
+/* Returns 1 if every IDENT in `e` is a tag column on `st`, else 0.
+ * Allows any combination of AND/OR/EQ literal-vs-ident; we use this to
+ * decide whether the entire WHERE can be evaluated against each child's
+ * tag tuple (no need to push it down to the per-child scan).
+ *
+ * Conservative: callers fall back to the AND-only stripping path when
+ * we return 0 (some IDENT references a non-tag column or some operator
+ * we don't model below). */
+static int tag_expr_only(const qast_expr_t *e, const tsdb_stable_t *st) {
+    if (!e) return 1;
+    switch (e->kind) {
+    case QAST_AND: case QAST_OR:
+        return tag_expr_only(e->lhs, st) && tag_expr_only(e->rhs, st);
+    case QAST_EQ: case QAST_NE: {
+        const qast_expr_t *id = NULL;
+        const qast_expr_t *lit = NULL;
+        if (e->lhs && e->lhs->kind == QAST_IDENT) { id = e->lhs; lit = e->rhs; }
+        else if (e->rhs && e->rhs->kind == QAST_IDENT) { id = e->rhs; lit = e->lhs; }
+        else return 0;
+        if (!lit) return 0;
+        if (lit->kind != QAST_LIT_STR && lit->kind != QAST_LIT_INT &&
+            lit->kind != QAST_LIT_FLOAT) return 0;
+        for (int i = 0; i < st->ntag_cols; i++) {
+            if (strcasecmp(st->tag_cols[i].name, id->v.s) == 0) return 1;
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* Evaluate `e` against the tag tuple of `ct`.  Returns 1 if the
+ * expression is true (or NULL — vacuously true), else 0.  Caller has
+ * already ensured tag_expr_only(e, st) == 1, so we never see a non-tag
+ * IDENT or unsupported operator. */
+static int tag_expr_eval(const qast_expr_t *e,
+                          const tsdb_child_table_t *ct,
+                          const tsdb_stable_t *st)
+{
+    if (!e) return 1;
+    switch (e->kind) {
+    case QAST_AND:
+        return tag_expr_eval(e->lhs, ct, st) && tag_expr_eval(e->rhs, ct, st);
+    case QAST_OR:
+        return tag_expr_eval(e->lhs, ct, st) || tag_expr_eval(e->rhs, ct, st);
+    case QAST_EQ: case QAST_NE: {
+        const qast_expr_t *id  = (e->lhs && e->lhs->kind == QAST_IDENT) ? e->lhs : e->rhs;
+        const qast_expr_t *lit = (id == e->lhs) ? e->rhs : e->lhs;
+        int ti = -1;
+        for (int i = 0; i < st->ntag_cols; i++) {
+            if (strcasecmp(st->tag_cols[i].name, id->v.s) == 0) { ti = i; break; }
+        }
+        if (ti < 0 || ti >= ct->ntags) return 0;
+        const tsdb_tag_val_t *tv = &ct->tags[ti];
+        int eq = 0;
+        if (lit->kind == QAST_LIT_STR && tv->type == TSDB_TYPE_SYMBOL)
+            eq = (strcmp(tv->v.s, lit->v.s) == 0);
+        else if (lit->kind == QAST_LIT_INT && tv->type == TSDB_TYPE_INT64)
+            eq = (tv->v.i == lit->v.i);
+        else if (lit->kind == QAST_LIT_INT && tv->type == TSDB_TYPE_FLOAT64)
+            eq = (tv->v.f == (double)lit->v.i);
+        else if (lit->kind == QAST_LIT_FLOAT && tv->type == TSDB_TYPE_FLOAT64)
+            eq = (tv->v.f == lit->v.f);
+        return e->kind == QAST_EQ ? eq : !eq;
+    }
+    default:
+        return 0; /* shouldn't happen — tag_expr_only already filtered */
+    }
+}
+
 /* Walk an AND-connected expression tree collecting tag-equality predicates.
  * Nodes whose LHS ident matches a tag col are:
  *   - recorded in preds[0..npreds)
@@ -3653,10 +3724,22 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     tsdb_catalog_t *cat = tsdb_db_catalog(db);
     if (!cat) { eset(err, errcap, "catalog not available"); return TSDB_ERR_INTERNAL; }
 
-    /* Extract tag predicates from WHERE and strip them from the AST. */
+    /* Extract tag predicates from WHERE and strip them from the AST.
+     * Two paths:
+     *   (a) WHERE references ONLY tag columns (any AND/OR combination):
+     *       evaluate the whole expression per child via tag_expr_eval
+     *       and null out the WHERE so the per-child exec_select doesn't
+     *       see it.  This handles `loc='A' OR loc='B'` and similar.
+     *   (b) WHERE mixes tag + non-tag columns: fall back to the
+     *       AND-only stripping path.  Tag-eq nodes get neutralized to
+     *       LIT_INT(1); the surviving non-tag predicates ride along to
+     *       each child's scan as before. */
     stable_tag_pred_t preds[TSDB_STABLE_MAX_TAG_COLS];
     int npreds = 0;
-    if (q->where) {
+    int tag_only_mode = 0;
+    if (q->where && tag_expr_only(q->where, st)) {
+        tag_only_mode = 1;
+    } else if (q->where) {
         npreds = stable_extract_tag_preds(q->where, st, preds, TSDB_STABLE_MAX_TAG_COLS);
     }
 
@@ -3681,11 +3764,27 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
     char child_name[TSDB_STABLE_NAME_MAX + 1];
 
+    /* If we're in tag_only_mode, save the original WHERE so we can
+     * evaluate per-child, then null it out so per-child exec_select
+     * doesn't see tag IDENTs (children's physical schemas have no
+     * tag cols). */
+    qast_expr_t *saved_where = NULL;
+    if (tag_only_mode) {
+        saved_where = q->where;
+        q->where = NULL;
+    }
+
     for (size_t ci = 0; ci < nchildren; ci++) {
         tsdb_child_table_t *ct = &children[ci];
 
-        /* Tag pushdown: skip children that don't match. */
-        if (!stable_child_matches(ct, st, preds, npreds)) continue;
+        /* Tag pushdown: skip children that don't match.  Tag-only
+         * mode runs the saved WHERE per child; AND-only mode uses
+         * the extracted preds vector (legacy fast path). */
+        if (tag_only_mode) {
+            if (!tag_expr_eval(saved_where, ct, st)) continue;
+        } else {
+            if (!stable_child_matches(ct, st, preds, npreds)) continue;
+        }
 
         /* Replace FROM with child name for the duration of exec_select. */
         snprintf(child_name, sizeof(child_name), "%s", ct->name);
@@ -3702,6 +3801,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 q->has_partition_by_tbname = orig_pb_tbname;
+                if (saved_where) q->where = saved_where;
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
@@ -3712,6 +3812,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 q->has_partition_by_tbname = orig_pb_tbname;
+                if (saved_where) q->where = saved_where;
                 free(children);
                 return rc;
             }
@@ -3724,6 +3825,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             rc = exec_select(db, q, &child_r, err, errcap);
             if (rc != TSDB_OK) {
                 q->from = orig_from;
+                if (saved_where) q->where = saved_where;
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
@@ -3756,6 +3858,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             rc = exec_select(db, q, &child_r, err, errcap);
             if (rc != TSDB_OK) {
                 q->from = orig_from;
+                if (saved_where) q->where = saved_where;
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
@@ -3768,6 +3871,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 tsdb_result_free_internal(&child_r);
                 if (rc != TSDB_OK) {
                     q->from = orig_from;
+                    if (saved_where) q->where = saved_where;
                     free(children);
                     return rc;
                 }
@@ -3777,6 +3881,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
     q->from = orig_from;
     q->has_partition_by_tbname = orig_pb_tbname;
+    if (saved_where) q->where = saved_where;
     free(children);
 
     /* If no children matched, return empty result with 0 rows. */
