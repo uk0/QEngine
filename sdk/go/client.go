@@ -136,38 +136,59 @@ func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, er
 		buf.WriteString(col.Name)
 		buf.WriteByte(col.Type)
 		buf.WriteByte(0) // codec = RAW
-		// compressed_size = nrows * width
-		var width int
+
 		switch col.Type {
 		case TypeTimestamp, TypeInt64, TypeFloat64:
-			width = 8
+			// Fixed-width: 8 bytes/row, contiguous.
+			binary.LittleEndian.PutUint32(tmp[0:4], uint32(len(rows)*8))
+			buf.Write(tmp[0:4])
+			for _, r := range rows {
+				switch col.Type {
+				case TypeTimestamp:
+					binary.LittleEndian.PutUint64(tmp[0:8], uint64(r.TS))
+				case TypeInt64:
+					var v int64
+					if r.I64 != nil {
+						v = r.I64[ci]
+					}
+					binary.LittleEndian.PutUint64(tmp[0:8], uint64(v))
+				case TypeFloat64:
+					var v float64
+					if r.F64 != nil {
+						v = r.F64[ci]
+					}
+					binary.LittleEndian.PutUint64(tmp[0:8], math.Float64bits(v))
+				}
+				buf.Write(tmp[0:8])
+			}
+
 		case TypeSymbol:
-			return 0, errors.New("SYMBOL writes not yet supported by Go SDK")
+			// SYMBOL wire format mirrors the cluster RPC WRITE_BATCH:
+			//   [u32 total_bytes] [u16 len_0] [bytes_0] … [u16 len_n-1] [bytes_n-1]
+			// We pre-encode each row's value into a scratch buffer, then
+			// prepend [u32 total] + [u32 col_size_for_NEED_check] in one go.
+			var sym bytes.Buffer
+			for _, r := range rows {
+				var v string
+				if r.Sym != nil {
+					v = r.Sym[ci]
+				}
+				if len(v) > 65535 {
+					v = v[:65535]
+				}
+				binary.LittleEndian.PutUint16(tmp[0:2], uint16(len(v)))
+				sym.Write(tmp[0:2])
+				sym.WriteString(v)
+			}
+			total := uint32(sym.Len())
+			binary.LittleEndian.PutUint32(tmp[0:4], 4+total) // col_size header
+			buf.Write(tmp[0:4])
+			binary.LittleEndian.PutUint32(tmp[0:4], total) // [u32 total]
+			buf.Write(tmp[0:4])
+			buf.Write(sym.Bytes())
+
 		default:
 			return 0, fmt.Errorf("unknown column type %d", col.Type)
-		}
-		binary.LittleEndian.PutUint32(tmp[0:4], uint32(len(rows)*width))
-		buf.Write(tmp[0:4])
-
-		// Write all rows for this column.
-		for _, r := range rows {
-			switch col.Type {
-			case TypeTimestamp:
-				binary.LittleEndian.PutUint64(tmp[0:8], uint64(r.TS))
-			case TypeInt64:
-				var v int64
-				if r.I64 != nil {
-					v = r.I64[ci]
-				}
-				binary.LittleEndian.PutUint64(tmp[0:8], uint64(v))
-			case TypeFloat64:
-				var v float64
-				if r.F64 != nil {
-					v = r.F64[ci]
-				}
-				binary.LittleEndian.PutUint64(tmp[0:8], math.Float64bits(v))
-			}
-			buf.Write(tmp[0:8])
 		}
 	}
 

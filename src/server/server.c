@@ -544,73 +544,73 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
     }
 
-    /* Compute byte-stride for each column (RAW: 8 bytes per value, SYMBOL: 4). */
-    uint32_t stride[TSDB_MAX_COLS];
+    /* Sanity-check column sizes.
+     *
+     * SYMBOL columns now carry a length-prefix wire format that mirrors
+     * the cluster RPC WRITE_BATCH receiver:
+     *
+     *   [u32 total_bytes] [u16 len_0] [bytes_0] … [u16 len_n-1] [bytes_n-1]
+     *
+     * `csz` for a SYMBOL column is `4 + total_bytes`, NOT a stride*nrows
+     * product.  The legacy 4-byte sym-id encoding never worked end-to-end
+     * (the receiver fabricated "sym_%u" strings the client never set),
+     * so this is a clean upgrade — no real client used the old shape.
+     * INT64/FLOAT64/TIMESTAMP keep the 8-byte stride. */
     for (int c = 0; c < ncols; c++) {
-        stride[c] = (col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
-        /* Sanity check size. */
-        if (col_sizes[c] < stride[c] * nrows) {
-            tsdb_batch_discard(batch);
-            write_lock_release(&srv->write_locks, table_name);
-            return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
+        if (col_types[c] == TSDB_TYPE_SYMBOL) {
+            if (col_sizes[c] < 4) {
+                tsdb_batch_discard(batch);
+                write_lock_release(&srv->write_locks, table_name);
+                return send_error(io, req_id, TSDB_ERR_INVAL, "symbol col too short");
+            }
+            uint32_t total = (uint32_t)col_data[c][0]
+                | ((uint32_t)col_data[c][1] <<  8)
+                | ((uint32_t)col_data[c][2] << 16)
+                | ((uint32_t)col_data[c][3] << 24);
+            if (total + 4 > col_sizes[c]) {
+                tsdb_batch_discard(batch);
+                write_lock_release(&srv->write_locks, table_name);
+                return send_error(io, req_id, TSDB_ERR_INVAL, "symbol total > csz");
+            }
+        } else {
+            if (col_sizes[c] < 8 * nrows) {
+                tsdb_batch_discard(batch);
+                write_lock_release(&srv->write_locks, table_name);
+                return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
+            }
         }
     }
 
+    /* Bulk columnar append — same fast path the cluster RPC receiver
+     * uses since b4c1461.  Per-row dispatch is gone; the wire payload
+     * already maps onto memtable_append_bulk's expected layout. */
     int write_err = TSDB_OK;
-    for (uint32_t row = 0; row < nrows; row++) {
-        tsdb_batch_row_ts(batch,
-            (ts_ci >= 0) ? (int64_t)(
-                (uint64_t)col_data[ts_ci][row*8]
-              | ((uint64_t)col_data[ts_ci][row*8+1] << 8)
-              | ((uint64_t)col_data[ts_ci][row*8+2] << 16)
-              | ((uint64_t)col_data[ts_ci][row*8+3] << 24)
-              | ((uint64_t)col_data[ts_ci][row*8+4] << 32)
-              | ((uint64_t)col_data[ts_ci][row*8+5] << 40)
-              | ((uint64_t)col_data[ts_ci][row*8+6] << 48)
-              | ((uint64_t)col_data[ts_ci][row*8+7] << 56)
-            ) : (int64_t)row
-        );
-
+    {
+        const void *col_arrs[TSDB_MAX_COLS];
+        int         col_types_arr[TSDB_MAX_COLS];
+        int         n_data = 0;
         for (int c = 0; c < ncols; c++) {
-            if (col_types[c] == TSDB_TYPE_TIMESTAMP) continue;
-            const uint8_t *ptr = col_data[c] + (size_t)row * stride[c];
-            switch (col_types[c]) {
-            case TSDB_TYPE_INT64: {
-                int64_t v;
-                v = (int64_t)(
-                    (uint64_t)ptr[0]       | ((uint64_t)ptr[1] << 8)
-                  | ((uint64_t)ptr[2]<<16) | ((uint64_t)ptr[3]<<24)
-                  | ((uint64_t)ptr[4]<<32) | ((uint64_t)ptr[5]<<40)
-                  | ((uint64_t)ptr[6]<<48) | ((uint64_t)ptr[7]<<56));
-                tsdb_batch_row_i64(batch, c, v);
-                break;
-            }
-            case TSDB_TYPE_FLOAT64: {
-                double v;
-                memcpy(&v, ptr, 8);
-                tsdb_batch_row_f64(batch, c, v);
-                break;
-            }
-            case TSDB_TYPE_SYMBOL: {
-                /* Symbol ID in 4 bytes LE; resolve via string "sym_%u". */
-                uint32_t sym_id;
-                sym_id = (uint32_t)ptr[0] | ((uint32_t)ptr[1]<<8)
-                       | ((uint32_t)ptr[2]<<16) | ((uint32_t)ptr[3]<<24);
-                char sym_str[32];
-                snprintf(sym_str, sizeof(sym_str), "sym_%u", sym_id);
-                tsdb_batch_row_sym(batch, c, sym_str);
-                break;
-            }
-            default: break;
-            }
+            if (c == ts_ci) continue;
+            col_arrs[n_data]      = col_data[c];
+            col_types_arr[n_data] = col_types[c];
+            n_data++;
         }
-        if ((write_err = tsdb_batch_row_end(batch)) != TSDB_OK) break;
+        const int64_t *ts_arr = (ts_ci >= 0)
+            ? (const int64_t *)col_data[ts_ci]
+            : NULL;
+        int64_t *ts_synth = NULL;
+        if (!ts_arr) ts_synth = calloc(nrows, sizeof(int64_t));
+        write_err = tsdb_batch_append_bulk(batch,
+                                           ts_arr ? ts_arr : ts_synth,
+                                           col_arrs, col_types_arr,
+                                           n_data, (size_t)nrows);
+        free(ts_synth);
     }
 
     if (write_err != TSDB_OK) {
         tsdb_batch_discard(batch);
         write_lock_release(&srv->write_locks, table_name);
-        return send_error(io, req_id, write_err, "row_end failed");
+        return send_error(io, req_id, write_err, "append_bulk failed");
     }
 
     write_err = tsdb_batch_commit(batch);
@@ -626,33 +626,51 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
 
     /* Fan-out subscriptions with structured SUB_EVENT payload.
      *
-     * col_data[c] has stride[c] bytes per row.  For the event we need
-     * exactly 8 bytes per value in every column.  For 8-byte columns
-     * (INT64, FLOAT64, TIMESTAMP) we point directly into col_data.
-     * For 4-byte SYMBOL columns we zero-extend into a scratch buffer.
-     */
+     * SUB_EVENT requires 8 bytes per value in every column.  Fixed-width
+     * cols (INT64, FLOAT64, TIMESTAMP) point directly into col_data.
+     * SYMBOL cols arrive as the variable-length wire format described
+     * above; we walk the per-row records and write the locally-interned
+     * symbol code (resolved against the receiver's symtab) into a
+     * scratch 8-byte buffer.  That code is what subscribers can pass
+     * back to tsdb_symtab_str() if they share the same db handle. */
     {
         fanout_col_t fcols[TSDB_MAX_COLS];
-        /* Scratch buffers for 4→8 byte extension (one per SYMBOL column). */
         uint8_t *sym_scratch[TSDB_MAX_COLS];
         memset(sym_scratch, 0, sizeof(sym_scratch));
         int fanout_ok = 1;
+        tsdb_table_internal_t *ti = tsdb_db_find_table(srv->db, table_name);
+        tsdb_schema_t *sch = ti ? tsdb_tbl_schema(ti) : NULL;
 
         for (int c = 0; c < ncols && fanout_ok; c++) {
             fcols[c].col_name = col_names[c];
             fcols[c].col_type = (uint8_t)col_types[c];
-            if (stride[c] == 8) {
+            if (col_types[c] != TSDB_TYPE_SYMBOL) {
                 fcols[c].data = col_data[c];
-            } else {
-                /* SYMBOL: 4 bytes LE → 8 bytes LE (zero-extended). */
-                sym_scratch[c] = (uint8_t *)calloc(nrows, 8);
-                if (!sym_scratch[c]) { fanout_ok = 0; break; }
-                for (uint32_t r = 0; r < nrows; r++) {
-                    memcpy(sym_scratch[c] + r * 8, col_data[c] + r * 4, 4);
-                    /* High 4 bytes already zero from calloc. */
-                }
-                fcols[c].data = sym_scratch[c];
+                continue;
             }
+            sym_scratch[c] = (uint8_t *)calloc(nrows, 8);
+            if (!sym_scratch[c]) { fanout_ok = 0; break; }
+            const uint8_t *p_sym = col_data[c] + 4;  /* skip [u32 total] */
+            const uint8_t *end_sym = col_data[c] + col_sizes[c];
+            tsdb_symtab_t *st = NULL;
+            if (sch) {
+                int sci = -1;
+                for (int j = 0; j < sch->ncols; j++)
+                    if (strcmp(sch->cols[j].name, col_names[c]) == 0) { sci = j; break; }
+                if (sci >= 0) st = sch->cols[sci].symtab;
+            }
+            for (uint32_t r = 0; r < nrows && p_sym + 2 <= end_sym; r++) {
+                uint16_t l16; memcpy(&l16, p_sym, 2); p_sym += 2;
+                if (p_sym + l16 > end_sym) break;
+                char sbuf[260];
+                int len = l16 < 256 ? l16 : 255;
+                memcpy(sbuf, p_sym, len); sbuf[len] = '\0';
+                p_sym += l16;
+                uint64_t code = 0;
+                if (st) code = (uint64_t)tsdb_symtab_intern(st, sbuf);
+                memcpy(sym_scratch[c] + r * 8, &code, 8);
+            }
+            fcols[c].data = sym_scratch[c];
         }
 
         if (fanout_ok) {
