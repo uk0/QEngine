@@ -528,41 +528,20 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     }
 #undef NEED
 
-    /* Per-table write lock.
-     *
-     * Originally serialised the whole batch_begin → bulk_append →
-     * batch_commit sequence to keep flush_and_clear_ex (which fires
-     * cluster_on_replicate + part_flush_ex) race-free.  As of the
-     * compact_mtx extension that wraps the entire flush body, the
-     * memtable layer is self-serialising, so this lock is redundant
-     * for the WRITE_BATCH wire path that ships only via append_bulk.
-     *
-     * Default-on for safety (legacy row_* callers expect strict
-     * per-table ordering); set TSDB_WIRE_DISABLE_TABLE_LOCK=1 to drop
-     * it and let concurrent SDK writers parallelise across the
-     * memtable's own finer locks.  Bench at 4-32 writers expected to
-     * scale further once the per-table lock is out of the critical
-     * section. */
-    static int cached_no_table_lock = -1;
-    if (cached_no_table_lock < 0) {
-        const char *e = getenv("TSDB_WIRE_DISABLE_TABLE_LOCK");
-        cached_no_table_lock = (e && e[0] && e[0] != '0') ? 1 : 0;
-    }
-    int hold_table_lock = !cached_no_table_lock;
-    if (hold_table_lock) write_lock_acquire(&srv->write_locks, table_name);
+    /* Acquire per-table write lock — tsdb_batch API is not thread-safe
+     * for concurrent writes to the same table. */
+    write_lock_acquire(&srv->write_locks, table_name);
 
-    /* Open the table (under write lock so open + begin are atomic).
-     * tsdb_open_table is db->lock-protected internally so it is
-     * concurrent-safe even when we skip the per-table lock. */
+    /* Open the table (under write lock so open + begin are atomic). */
     tsdb_table_t *tbl = NULL;
     if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
-        if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+        write_lock_release(&srv->write_locks, table_name);
         return send_error(io, req_id, TSDB_ERR_NOTFOUND, "table not found");
     }
 
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
-        if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+        write_lock_release(&srv->write_locks, table_name);
         return send_error(io, req_id, TSDB_ERR_INTERNAL, "batch_begin failed");
     }
 
@@ -588,7 +567,7 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         if (col_types[c] == TSDB_TYPE_SYMBOL) {
             if (col_sizes[c] < 4) {
                 tsdb_batch_discard(batch);
-                if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+                write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "symbol col too short");
             }
             uint32_t total = (uint32_t)col_data[c][0]
@@ -597,13 +576,13 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
                 | ((uint32_t)col_data[c][3] << 24);
             if (total + 4 > col_sizes[c]) {
                 tsdb_batch_discard(batch);
-                if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+                write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "symbol total > csz");
             }
         } else {
             if (col_sizes[c] < 8 * nrows) {
                 tsdb_batch_discard(batch);
-                if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+                write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
             }
         }
@@ -637,12 +616,12 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
 
     if (write_err != TSDB_OK) {
         tsdb_batch_discard(batch);
-        if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+        write_lock_release(&srv->write_locks, table_name);
         return send_error(io, req_id, write_err, "append_bulk failed");
     }
 
     write_err = tsdb_batch_commit(batch);
-    if (hold_table_lock) write_lock_release(&srv->write_locks, table_name);
+    write_lock_release(&srv->write_locks, table_name);
 
     if (write_err != TSDB_OK)
         return send_error(io, req_id, write_err, "batch_commit failed");
