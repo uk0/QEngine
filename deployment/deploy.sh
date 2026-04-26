@@ -110,6 +110,7 @@ docker commit \\
   --change "ENV TSDB_DATA_DIR=/var/lib/tsdb" \\
   --change "ENV TSDB_BIND=0.0.0.0:28090" \\
   --change "ENV TSDB_ROLE=server" \\
+  --change "ENV TSDB_DR_REMOTE=" \\
   --message "tsdb $SHA baked" \\
   qengine-cnode-1 qengine/tsdb:dev
 

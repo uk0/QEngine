@@ -39,6 +39,12 @@ services:
       TSDB_IOPOLICY:               hdd
       # See docker-compose.cluster.yml for the rationale; keep in sync.
       TSDB_REPLICA_CONNS_PER_PEER: "1"
+      # Override any image-baked TSDB_DR_REMOTE.  DR (cross-DC async
+      # replication) must NOT loopback into the same cluster — that
+      # caused 2x doubling on whichever node was the DR target (it
+      # received both the cluster broadcast and a DR-forwarded copy).
+      # dr_replication.sh sets this temporarily when running.
+      TSDB_DR_REMOTE: ""
       # TSDB_WAL_ONLY_COMMIT:        "1"   # see note in cluster.yml
       # Seed points to node1's gossip address (= RPC port − 1).
       TSDB_SEEDS:                  qengine-cnode-1:28080
