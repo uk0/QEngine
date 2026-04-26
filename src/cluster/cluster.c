@@ -181,6 +181,44 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
 
     if (nremote == 0) return TSDB_OK; /* single-node cluster */
 
+    /* Phase β — shard fan-out.  TSDB_SHARD_REPLICA_N=N narrows the
+     * replication target list to the N nodes that own this table per
+     * tsdb_cluster_route().  Default 0 (or N >= cluster_size) keeps
+     * the legacy "broadcast to every alive peer" behaviour.
+     *
+     * Local node always writes (so reads stay correct even on a node
+     * that's outside the owner set).  This pass is a network/CPU
+     * optimisation: a 100-node cluster with N=3 sends 2 RPCs per
+     * write instead of 99.  Phase β.2 will additionally drop the
+     * local write on non-owners (true sharded storage) once the
+     * read path learns to forward / fan-out to owners. */
+    static int cached_shard_n = -1;
+    if (cached_shard_n < 0) {
+        const char *s = getenv("TSDB_SHARD_REPLICA_N");
+        cached_shard_n = s && *s ? atoi(s) : 0;
+        if (cached_shard_n < 0) cached_shard_n = 0;
+    }
+    int total_alive = 1 + nremote;
+    if (cached_shard_n > 0 && cached_shard_n < total_alive) {
+        tsdb_node_id_t owners[TSDB_CLUSTER_MAX_NODES];
+        int got = tsdb_cluster_route(c, table_name, "",
+                                     cached_shard_n, owners);
+        if (got > 0) {
+            tsdb_node_id_t shard_remotes[TSDB_CLUSTER_MAX_NODES];
+            int n_shard_rem = 0;
+            for (int i = 0; i < got; i++) {
+                if (owners[i] == c->local_id) continue;
+                shard_remotes[n_shard_rem++] = owners[i];
+            }
+            memcpy(remote_replicas, shard_remotes,
+                   (size_t)n_shard_rem * sizeof(tsdb_node_id_t));
+            nremote = n_shard_rem;
+            if (nremote == 0) return TSDB_OK; /* self-only owner */
+        }
+        /* got <= 0 → fall through to full broadcast (safer default
+         * than dropping the write entirely on a routing edge case). */
+    }
+
     /* Quorum tunable.  TSDB_REPLICATION_QUORUM env:
      *   1 (default) — wait for ≥1 remote ACK before commit returns.
      *                 Strongest "one peer has it durable" guarantee.
