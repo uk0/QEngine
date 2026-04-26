@@ -1125,18 +1125,86 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
 {
     if (!b) return TSDB_ERR_INVAL;
     if (b->in_row) return TSDB_ERR_INVAL;
-    /* maybe_flush_b would normally fire on a per-row begin to drain a
-     * full memtable; do the same check up front so a batch that would
-     * exceed block_points triggers a clean flush + retry semantic.
-     * Caller in WRITE_BATCH paths splits oversized batches before
-     * reaching us, so this is mostly defensive. */
-    if (tsdb_memtable_is_full(b->tbl->memtable)) {
-        int rc = flush_and_clear_ex(b->tbl, b->local_only);
+    if (n == 0) return TSDB_OK;
+
+    /* Chunk by block_points so a caller can hand us > bp_cap rows and
+     * we transparently flush+continue.  Mirrors what the per-row API
+     * gets implicitly via maybe_flush_b on each row_begin.  Without
+     * this, a single ingest over the cap (default 8192) would return
+     * TSDB_ERR_FULL and the caller would discard the whole batch — the
+     * exact bug that hit Influx /write at N=10000 once we routed it
+     * through bulk_append. */
+    int bp = (b->tbl->schema->block_points > 0 &&
+              b->tbl->schema->block_points <= TSDB_BLOCK_POINTS)
+                ? b->tbl->schema->block_points : TSDB_BLOCK_POINTS;
+
+    size_t consumed = 0;
+    while (consumed < n) {
+        size_t cur_rows = tsdb_memtable_rows(b->tbl->memtable);
+        size_t avail = (cur_rows < (size_t)bp) ? (size_t)bp - cur_rows : 0;
+
+        if (avail == 0) {
+            int rc = flush_and_clear_ex(b->tbl, b->local_only);
+            if (rc != TSDB_OK) return rc;
+            avail = (size_t)bp;
+        }
+
+        size_t chunk = (n - consumed) < avail ? (n - consumed) : avail;
+
+        /* Per-column source pointers slid forward by `consumed` rows.
+         * 8-byte fixed cols just advance by 8 × consumed; SYMBOL cols
+         * are variable-length so we walk the wire format to skip the
+         * already-consumed prefix.  One-time cost per chunk. */
+        const void *col_arrs_off[TSDB_MAX_COLS];
+        for (int d = 0; d < ncols_data; d++) {
+            const uint8_t *p = (const uint8_t *)col_arrs[d];
+            if (col_types[d] == TSDB_TYPE_SYMBOL) {
+                /* Skip [u32 total] header, then walk consumed [u16 len][bytes]. */
+                const uint8_t *cur = p + 4;
+                for (size_t k = 0; k < consumed; k++) {
+                    uint16_t l16;
+                    memcpy(&l16, cur, 2);
+                    cur += 2 + l16;
+                }
+                /* Build a temp [u32 total][rest] view for the chunk.
+                 * Compute new total = sum of [2 + len] for chunk rows. */
+                const uint8_t *chunk_start = cur;
+                size_t chunk_payload = 0;
+                for (size_t k = 0; k < chunk; k++) {
+                    uint16_t l16;
+                    memcpy(&l16, cur, 2);
+                    cur += 2 + l16;
+                    chunk_payload += 2 + l16;
+                }
+                /* memtable_append_bulk expects a [u32 total][...] header.
+                 * Allocate a small wrapper buffer for this chunk. */
+                uint8_t *tmp = malloc(4 + chunk_payload);
+                if (!tmp) return TSDB_ERR_NOMEM;
+                uint32_t t32 = (uint32_t)chunk_payload;
+                memcpy(tmp, &t32, 4);
+                memcpy(tmp + 4, chunk_start, chunk_payload);
+                col_arrs_off[d] = tmp;
+            } else {
+                col_arrs_off[d] = p + consumed * 8;
+            }
+        }
+
+        int rc = tsdb_memtable_append_bulk(b->tbl->memtable,
+                                            ts_arr + consumed,
+                                            col_arrs_off, col_types,
+                                            ncols_data, chunk);
+
+        /* Free the SYMBOL chunk wrappers we malloc'd above. */
+        for (int d = 0; d < ncols_data; d++) {
+            if (col_types[d] == TSDB_TYPE_SYMBOL) {
+                free((void *)col_arrs_off[d]);
+            }
+        }
+
         if (rc != TSDB_OK) return rc;
+        consumed += chunk;
     }
-    return tsdb_memtable_append_bulk(b->tbl->memtable,
-                                     ts_arr, col_arrs, col_types,
-                                     ncols_data, n);
+    return TSDB_OK;
 }
 
 /* ---- Cluster hook registration ----------------------------------------- */

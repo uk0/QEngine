@@ -453,6 +453,10 @@ typedef struct influx_row {
 /*
  * Write a single pre-parsed row into an open batch.
  * Returns TSDB_OK on success.
+ *
+ * Kept for non-bulk callers; the main pass-2 ingest now goes through
+ * write_rows_columnar which packs into the bulk_append wire format
+ * once per measurement instead of N row_begin/end pairs per batch.
  */
 static int write_row_to_batch(tsdb_batch_t *batch, tsdb_schema_t *schema,
                                const influx_row_t *row) {
@@ -483,6 +487,192 @@ static int write_row_to_batch(tsdb_batch_t *batch, tsdb_schema_t *schema,
     }
 
     return tsdb_batch_row_end(batch);
+}
+
+/* --- Bulk pass-2 helper -----------------------------------------------------
+ * Pack every row matching `meas` into columnar wire format and append in one
+ * critical section via tsdb_batch_append_bulk.  Replaces the per-row dispatch
+ * loop on the hot ingest path.
+ *
+ * Marks each consumed row's measurement to NULL so the outer loop skips
+ * already-processed entries.
+ */
+static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
+                                influx_row_t *rows, size_t nrows_total,
+                                const char *meas)
+{
+    int ts_ci   = schema->ts_col_idx;
+    int n_data  = schema->ncols - 1;
+
+    /* Count matching rows up front so we can size buffers exactly. */
+    size_t n = 0;
+    for (size_t j = 0; j < nrows_total; j++) {
+        if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0) n++;
+    }
+    if (n == 0) return TSDB_OK;
+
+    int64_t *ts_arr = (int64_t *)malloc(n * sizeof(int64_t));
+    if (!ts_arr) return TSDB_ERR_NOMEM;
+
+    /* Per-data-col working state.  fixed_buf points to a contiguous
+     * n×8 array for INT64/FLOAT64; sym_buf is a growable [u32 total]
+     * [u16 len][bytes]… buffer for SYMBOL cols. */
+    typedef struct {
+        int      schema_idx;   /* index into schema->cols[] */
+        int      col_type;     /* TSDB_TYPE_* */
+        uint8_t *fixed_buf;    /* INT64 / FLOAT64: n × 8 bytes */
+        uint8_t *sym_buf;      /* SYMBOL: starts with [u32 total], grows */
+        size_t   sym_used;     /* bytes consumed in sym_buf (>=4 for header) */
+        size_t   sym_cap;
+    } col_state_t;
+    col_state_t *cs = (col_state_t *)calloc((size_t)n_data, sizeof(*cs));
+    if (!cs) { free(ts_arr); return TSDB_ERR_NOMEM; }
+
+    int data_idx = 0;
+    for (int c = 0; c < schema->ncols; c++) {
+        if (c == ts_ci) continue;
+        cs[data_idx].schema_idx = c;
+        cs[data_idx].col_type   = (int)schema->cols[c].type;
+        if (cs[data_idx].col_type == TSDB_TYPE_SYMBOL) {
+            cs[data_idx].sym_cap  = 4 + n * (2 + 16);
+            cs[data_idx].sym_buf  = (uint8_t *)malloc(cs[data_idx].sym_cap);
+            cs[data_idx].sym_used = 4;
+            if (!cs[data_idx].sym_buf) {
+                for (int k = 0; k < data_idx; k++) {
+                    free(cs[k].fixed_buf);
+                    free(cs[k].sym_buf);
+                }
+                free(cs); free(ts_arr);
+                return TSDB_ERR_NOMEM;
+            }
+        } else {
+            cs[data_idx].fixed_buf = (uint8_t *)calloc(n, 8);
+            if (!cs[data_idx].fixed_buf) {
+                for (int k = 0; k < data_idx; k++) {
+                    free(cs[k].fixed_buf);
+                    free(cs[k].sym_buf);
+                }
+                free(cs); free(ts_arr);
+                return TSDB_ERR_NOMEM;
+            }
+        }
+        data_idx++;
+    }
+
+    /* Walk rows once.  For each col we scan the row's tag_keys[] then
+     * field_keys[] for the matching name (same lookup write_row_to_batch
+     * did per-cell, just inlined).  Unset cols get default values: 0 for
+     * numeric, empty string for SYMBOL — matches the row-end "all cols
+     * set" check on the per-row path which was actually never enforced
+     * here either (schema_find_col returning -1 was silently skipped). */
+    size_t r = 0;
+    for (size_t j = 0; j < nrows_total; j++) {
+        if (!rows[j].measurement || strcmp(rows[j].measurement, meas) != 0)
+            continue;
+        const influx_row_t *row = &rows[j];
+        ts_arr[r] = (int64_t)row->ts;
+
+        for (int d = 0; d < n_data; d++) {
+            const char *col_name = schema->cols[cs[d].schema_idx].name;
+            if (cs[d].col_type == TSDB_TYPE_SYMBOL) {
+                const char *sval = NULL;
+                for (int t = 0; t < row->ntags; t++) {
+                    if (strcmp(row->tag_keys[t], col_name) == 0) {
+                        sval = row->tag_vals[t]; break;
+                    }
+                }
+                if (!sval) {
+                    for (int f = 0; f < row->nfields; f++) {
+                        if (strcmp(row->field_keys[f], col_name) == 0 &&
+                            row->field_types[f] == TSDB_INFLUX_STRING)
+                        {
+                            sval = row->field_strs[f]; break;
+                        }
+                    }
+                }
+                if (!sval) sval = "";
+                size_t slen = strlen(sval);
+                if (slen > 65535) slen = 65535;
+                if (cs[d].sym_used + 2 + slen > cs[d].sym_cap) {
+                    size_t nc = (cs[d].sym_used + 2 + slen) * 2;
+                    uint8_t *nb = (uint8_t *)realloc(cs[d].sym_buf, nc);
+                    if (!nb) {
+                        for (int k = 0; k < n_data; k++) {
+                            free(cs[k].fixed_buf); free(cs[k].sym_buf);
+                        }
+                        free(cs); free(ts_arr);
+                        return TSDB_ERR_NOMEM;
+                    }
+                    cs[d].sym_buf = nb;
+                    cs[d].sym_cap = nc;
+                }
+                uint16_t l16 = (uint16_t)slen;
+                memcpy(cs[d].sym_buf + cs[d].sym_used, &l16, 2);
+                memcpy(cs[d].sym_buf + cs[d].sym_used + 2, sval, slen);
+                cs[d].sym_used += 2 + slen;
+            } else {
+                int64_t v = 0;
+                double  fv = 0;
+                int found = 0;
+                for (int f = 0; f < row->nfields; f++) {
+                    if (strcmp(row->field_keys[f], col_name) == 0) {
+                        switch (row->field_types[f]) {
+                        case TSDB_INFLUX_FLOAT:
+                            fv = row->field_vals[f].f64;
+                            memcpy(cs[d].fixed_buf + r * 8, &fv, 8);
+                            break;
+                        case TSDB_INFLUX_INT:
+                        case TSDB_INFLUX_BOOL:
+                            v = row->field_vals[f].i64;
+                            memcpy(cs[d].fixed_buf + r * 8, &v, 8);
+                            break;
+                        case TSDB_INFLUX_STRING:
+                            /* Type mismatch — keep default 0. */
+                            break;
+                        }
+                        found = 1; break;
+                    }
+                }
+                if (!found) {
+                    /* Default 0 already from calloc — explicit memset
+                     * just to make the intent obvious for non-Influx
+                     * schemas where col was added later. */
+                    memset(cs[d].fixed_buf + r * 8, 0, 8);
+                }
+            }
+        }
+
+        rows[j].measurement = NULL; /* mark consumed */
+        r++;
+    }
+
+    /* Patch each SYMBOL col's [u32 total] header. */
+    for (int d = 0; d < n_data; d++) {
+        if (cs[d].col_type == TSDB_TYPE_SYMBOL) {
+            uint32_t total = (uint32_t)(cs[d].sym_used - 4);
+            memcpy(cs[d].sym_buf, &total, 4);
+        }
+    }
+
+    /* Hand pointers to the bulk path. */
+    const void *col_arrs[TSDB_MAX_COLS];
+    int         col_types_arr[TSDB_MAX_COLS];
+    for (int d = 0; d < n_data; d++) {
+        col_arrs[d]      = (cs[d].col_type == TSDB_TYPE_SYMBOL)
+                              ? (const void *)cs[d].sym_buf
+                              : (const void *)cs[d].fixed_buf;
+        col_types_arr[d] = cs[d].col_type;
+    }
+    int rc = tsdb_batch_append_bulk(batch, ts_arr, col_arrs, col_types_arr,
+                                     n_data, n);
+
+    for (int d = 0; d < n_data; d++) {
+        free(cs[d].fixed_buf);
+        free(cs[d].sym_buf);
+    }
+    free(cs);
+    free(ts_arr);
+    return rc;
 }
 
 /* ---- Core ingest function ------------------------------------------------ */
@@ -663,17 +853,12 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
             continue;
         }
 
-        /* Write all rows with this measurement into the same batch. */
-        int batch_err = 0;
-        for (size_t j = i; j < nrows; j++) {
-            if (!rows[j].measurement || strcmp(rows[j].measurement, meas) != 0)
-                continue;
-            rc = write_row_to_batch(batch, schema, &rows[j]);
-            rows[j].measurement = NULL; /* mark as processed */
-            if (rc != TSDB_OK) { batch_err = 1; break; }
-        }
-
-        if (batch_err) {
+        /* Bulk-pack every row matching this measurement into columnar
+         * wire format and append in one critical section.  Hot path for
+         * Influx ingest — replaces the per-row begin/setter/end loop
+         * that used to dominate single-writer throughput. */
+        rc = write_rows_columnar(batch, schema, rows, nrows, meas);
+        if (rc != TSDB_OK) {
             tsdb_batch_discard(batch);
             errors++;
         } else {
