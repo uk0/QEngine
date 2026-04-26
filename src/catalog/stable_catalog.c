@@ -224,6 +224,53 @@ static int child_log_write(tsdb_catalog_t *c, char op, const tsdb_child_table_t 
 
 /* ── Replay (called from catalog_open via extern decl) ────────────────── */
 
+/* Compaction: rewrite from post-replay hmap.  Same atomic temp+rename
+ * pattern as compact_databases / compact_groups in catalog.c. */
+#include <unistd.h>
+int tsdb_catalog_compact_stables(tsdb_catalog_t *c, const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *new_log = fopen(tmp, "w");
+    if (!new_log) return TSDB_ERR_IO;
+    FILE *saved = c->stables_log;
+    c->stables_log = new_log;
+    int rc = TSDB_OK;
+    for (size_t i = 0; i < c->stables.cap; i++) {
+        if (!c->stables.buckets[i].key) continue;
+        tsdb_stable_t *s = (tsdb_stable_t *)c->stables.buckets[i].val;
+        if (stable_log_write(c, '+', s) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
+    }
+    fflush(new_log);
+    fsync(fileno(new_log));
+    fclose(new_log);
+    c->stables_log = saved;
+    if (rc != TSDB_OK) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    return TSDB_OK;
+}
+
+int tsdb_catalog_compact_children(tsdb_catalog_t *c, const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *new_log = fopen(tmp, "w");
+    if (!new_log) return TSDB_ERR_IO;
+    FILE *saved = c->children_log;
+    c->children_log = new_log;
+    int rc = TSDB_OK;
+    for (size_t i = 0; i < c->child_tables.cap; i++) {
+        if (!c->child_tables.buckets[i].key) continue;
+        tsdb_child_table_t *ct = (tsdb_child_table_t *)c->child_tables.buckets[i].val;
+        if (child_log_write(c, '+', ct) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
+    }
+    fflush(new_log);
+    fsync(fileno(new_log));
+    fclose(new_log);
+    c->children_log = saved;
+    if (rc != TSDB_OK) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    return TSDB_OK;
+}
+
 int tsdb_catalog_replay_stables(tsdb_catalog_t *c, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return TSDB_OK;

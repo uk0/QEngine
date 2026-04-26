@@ -262,6 +262,42 @@ struct tsdb_catalog {
 /* Forward decls — definitions live further down in this file. */
 static int  split_tab(char *line, char **fields, int max_fields);
 
+/* ---- Catalog log compaction ------------------------------------------- *
+ *
+ * Each catalog log (databases / groups / stables / child_tables) is an
+ * append-only stream of `+create`/`-drop` records.  After enough churn
+ * the file dwarfs the live in-memory state — a heavily-tested cluster
+ * accumulated 75 KB in databases.log for ~5 live DBs in the v5 audit.
+ *
+ * Compaction rewrites the file from the post-replay hmap state in one
+ * pass: open <path>.tmp, write a fresh `+create` line per live entry,
+ * fsync, rename atomically over the original.  No tombstones survive
+ * because the live state already represents net effect.
+ *
+ * Invoked from tsdb_catalog_open after replay completes — so the
+ * append handle that opens immediately afterwards lands on the
+ * already-compacted file.  Triggered when current file size exceeds
+ * a threshold (default 16 KB), keeping the steady-state cost low.
+ *
+ * Atomic recovery: a crash between rename(tmp,path) and the next
+ * fsync is safe — the tmp's fsync committed all live entries before
+ * rename, and rename(2) is atomic on POSIX.  A crash between fopen(tmp)
+ * and rename leaves the tmp orphaned and the original untouched; the
+ * orphan is harmlessly overwritten next compaction. */
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define CATALOG_COMPACT_MIN_BYTES 16384
+
+/* Forward decl — definition lives below the group writer. */
+static int compact_groups(tsdb_catalog_t *c, const char *path);
+
+static off_t file_size_or_zero(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_size;
+}
+
 /* ---- Database log + replay + CRUD ---------------------------------- *
  *
  * databases.log record format (tab-separated, percent-encoded):
@@ -339,6 +375,32 @@ static int replay_databases(tsdb_catalog_t *c, const char *path) {
         }
     }
     fclose(f);
+    return TSDB_OK;
+}
+
+/* Rewrite databases.log from the post-replay hmap.  Caller passes
+ * `path` so this can be invoked at open time before the live append
+ * handle is opened. */
+static int compact_databases(tsdb_catalog_t *c, const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *new_log = fopen(tmp, "w");
+    if (!new_log) return TSDB_ERR_IO;
+
+    FILE *saved = c->databases_log;
+    c->databases_log = new_log;
+    int rc = TSDB_OK;
+    for (size_t i = 0; i < c->databases.cap; i++) {
+        if (!c->databases.buckets[i].key) continue;
+        tsdb_database_t *d = (tsdb_database_t *)c->databases.buckets[i].val;
+        if (log_database(c, '+', d) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
+    }
+    fflush(new_log);
+    fsync(fileno(new_log));
+    fclose(new_log);
+    c->databases_log = saved;
+    if (rc != TSDB_OK) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
     return TSDB_OK;
 }
 
@@ -721,6 +783,24 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     rc = tsdb_catalog_replay_children(c, children_path);
     if (rc != TSDB_OK) { free(c); return rc; }
 
+    /* Compact any log file that's grown beyond the threshold.  Runs
+     * after replay (so the in-memory state already reflects every
+     * surviving entry) and before the live append handles open below
+     * (so they land on the freshly compacted file).  The threshold
+     * keeps fresh installs untouched and only kicks in after enough
+     * churn that bloat is measurable.  Errors are logged-and-ignored:
+     * the original log is still intact via the temp+rename pattern. */
+    extern int tsdb_catalog_compact_stables(tsdb_catalog_t *, const char *);
+    extern int tsdb_catalog_compact_children(tsdb_catalog_t *, const char *);
+    if (file_size_or_zero(databases_path) > CATALOG_COMPACT_MIN_BYTES)
+        (void)compact_databases(c, databases_path);
+    if (file_size_or_zero(groups_path) > CATALOG_COMPACT_MIN_BYTES)
+        (void)compact_groups(c, groups_path);
+    if (file_size_or_zero(stables_path) > CATALOG_COMPACT_MIN_BYTES)
+        (void)tsdb_catalog_compact_stables(c, stables_path);
+    if (file_size_or_zero(children_path) > CATALOG_COMPACT_MIN_BYTES)
+        (void)tsdb_catalog_compact_children(c, children_path);
+
     /* Open logs for appending. */
     c->databases_log = fopen(databases_path, "a");
     if (!c->databases_log) { free(c); return TSDB_ERR_IO; }
@@ -805,6 +885,30 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
 }
 
 /* ---- tsdb_group_* -------------------------------------------------------- */
+
+/* See compact_databases — same atomic rewrite pattern. */
+static int compact_groups(tsdb_catalog_t *c, const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *new_log = fopen(tmp, "w");
+    if (!new_log) return TSDB_ERR_IO;
+
+    FILE *saved = c->groups_log;
+    c->groups_log = new_log;
+    int rc = TSDB_OK;
+    for (size_t i = 0; i < c->groups.cap; i++) {
+        if (!c->groups.buckets[i].key) continue;
+        tsdb_group_t *g = (tsdb_group_t *)c->groups.buckets[i].val;
+        if (log_group(c, '+', g) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
+    }
+    fflush(new_log);
+    fsync(fileno(new_log));
+    fclose(new_log);
+    c->groups_log = saved;
+    if (rc != TSDB_OK) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    return TSDB_OK;
+}
 
 int tsdb_group_create(tsdb_catalog_t *c, const tsdb_group_t *g) {
     if (!c || !g || !g->name[0]) return TSDB_ERR_INVAL;
