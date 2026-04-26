@@ -205,6 +205,27 @@ void tsdb_db_get_raw_block_hook(tsdb_db_t *db,
 void tsdb_batch_set_local_only(tsdb_batch_t *b);
 
 /*
+ * Bulk columnar append on a batch — pushes `n` rows directly via
+ * tsdb_memtable_append_bulk, skipping the per-row begin/end + per-cell
+ * dispatch.  Use from WRITE_BATCH receivers that already have data laid
+ * out in the wire format described on tsdb_memtable_append_bulk.
+ *
+ * Must NOT be interleaved with tsdb_batch_row_* on the same batch
+ * (the per-row API holds the memtable lock for the whole row; the
+ * bulk path takes it once for the whole append).  Call tsdb_batch_commit
+ * after to flush + WAL-sync as usual.
+ *
+ * `col_arrs` and `col_types` exclude the timestamp column (n-1
+ * entries for an n-column schema).
+ */
+int tsdb_batch_append_bulk(tsdb_batch_t *b,
+                            const int64_t *ts_arr,
+                            const void * const *col_arrs,
+                            const int *col_types,
+                            int ncols_data,
+                            size_t n);
+
+/*
  * Create a table without triggering the on_create cluster hook.
  * Used by the RPC SCHEMA_SYNC handler so we don't re-sync endlessly.
  */

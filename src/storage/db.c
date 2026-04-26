@@ -1116,6 +1116,29 @@ void tsdb_batch_set_local_only(tsdb_batch_t *b) {
     if (b) b->local_only = 1;
 }
 
+int tsdb_batch_append_bulk(tsdb_batch_t *b,
+                            const int64_t *ts_arr,
+                            const void * const *col_arrs,
+                            const int *col_types,
+                            int ncols_data,
+                            size_t n)
+{
+    if (!b) return TSDB_ERR_INVAL;
+    if (b->in_row) return TSDB_ERR_INVAL;
+    /* maybe_flush_b would normally fire on a per-row begin to drain a
+     * full memtable; do the same check up front so a batch that would
+     * exceed block_points triggers a clean flush + retry semantic.
+     * Caller in WRITE_BATCH paths splits oversized batches before
+     * reaching us, so this is mostly defensive. */
+    if (tsdb_memtable_is_full(b->tbl->memtable)) {
+        int rc = flush_and_clear_ex(b->tbl, b->local_only);
+        if (rc != TSDB_OK) return rc;
+    }
+    return tsdb_memtable_append_bulk(b->tbl->memtable,
+                                     ts_arr, col_arrs, col_types,
+                                     ncols_data, n);
+}
+
 /* ---- Cluster hook registration ----------------------------------------- */
 
 void tsdb_db_set_hooks(tsdb_db_t *db,

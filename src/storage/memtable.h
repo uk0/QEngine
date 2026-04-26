@@ -103,6 +103,34 @@ int tsdb_memtable_sorted_indices(tsdb_memtable_t *m, size_t *out_idx);
  */
 int tsdb_memtable_is_sorted(tsdb_memtable_t *m);
 
+/*
+ * Bulk columnar append — pushes `n` rows into the memtable in a single
+ * critical section.  Replaces ~3-5 lock acquires per row (begin / end +
+ * skiplist) with a single one for the whole batch, plus per-column
+ * memcpy instead of per-cell scalar writes.  WRITE_BATCH receivers
+ * (cluster RPC, public wire proto, federation ingest) call this on
+ * the hot path; per-row API stays for legacy callers.
+ *
+ *   ts_arr    — n int64 timestamps (in schema's ts column position).
+ *   col_arrs  — one entry per non-ts column in schema order:
+ *                 INT64 / FLOAT64 / TIMESTAMP : n × 8 bytes raw
+ *                 SYMBOL                       : packed wire format
+ *                                                [u32 total][u16 len][bytes]…
+ *   col_types — type per non-ts column (parallel to col_arrs).
+ *   ncols_data — length of col_arrs / col_types (= schema->ncols - 1).
+ *   n         — number of rows to append.
+ *
+ * Returns TSDB_OK on success.  TSDB_ERR_FULL if the resulting nrows
+ * would exceed block_points.  TSDB_ERR_NOMEM on intern failure.  On
+ * any error, no partial rows are visible (atomic-or-nothing).
+ */
+int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
+                               const int64_t *ts_arr,
+                               const void * const *col_arrs,
+                               const int *col_types,
+                               int ncols_data,
+                               size_t n);
+
 #ifdef __cplusplus
 }
 #endif

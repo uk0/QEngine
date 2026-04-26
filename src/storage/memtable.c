@@ -407,6 +407,113 @@ const void *tsdb_memtable_col(tsdb_memtable_t *m, int col) {
     return m->col_bufs[col];
 }
 
+int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
+                               const int64_t *ts_arr,
+                               const void * const *col_arrs,
+                               const int *col_types,
+                               int ncols_data,
+                               size_t n)
+{
+    if (!m || !ts_arr || !col_arrs || !col_types) return TSDB_ERR_INVAL;
+    if (n == 0) return TSDB_OK;
+
+    int bp_cap = (m->schema->block_points > 0 &&
+                  m->schema->block_points <= TSDB_BLOCK_POINTS)
+                    ? m->schema->block_points : TSDB_BLOCK_POINTS;
+
+    pthread_mutex_lock(&m->lock);
+    if (m->in_row) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_ERR_INVAL;
+    }
+    if (m->nrows + n > (size_t)bp_cap) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_ERR_FULL;
+    }
+
+    int ts_ci = m->schema->ts_col_idx;
+    size_t base = m->nrows;
+
+    /* TS column: bulk memcpy.  Always 8-byte. */
+    int64_t *ts_dst = (int64_t *)m->col_bufs[ts_ci];
+    memcpy(ts_dst + base, ts_arr, n * sizeof(int64_t));
+
+    /* Walk schema cols in order, skip ts, consume col_arrs in parallel.
+     * Per-type fast path: 8-byte cols are a single memcpy; SYMBOL cols
+     * iterate the wire format and intern each value (the symtab itself
+     * has its own lock, so we hold m->lock the whole time to keep the
+     * append + skiplist update atomic). */
+    int data_idx = 0;
+    for (int c = 0; c < m->schema->ncols; c++) {
+        if (c == ts_ci) continue;
+        if (data_idx >= ncols_data) {
+            pthread_mutex_unlock(&m->lock);
+            return TSDB_ERR_INVAL;
+        }
+        int t = col_types[data_idx];
+        if (t != (int)m->schema->cols[c].type) {
+            pthread_mutex_unlock(&m->lock);
+            return TSDB_ERR_SCHEMA;
+        }
+        const void *src = col_arrs[data_idx];
+        if (t == TSDB_TYPE_SYMBOL) {
+            uint32_t *col = (uint32_t *)m->col_bufs[c];
+            const uint8_t *p = (const uint8_t *)src;
+            uint32_t total = 0;
+            if (p) memcpy(&total, p, 4);
+            const uint8_t *cur = p ? p + 4 : NULL;
+            const uint8_t *end = p ? p + 4 + total : NULL;
+            tsdb_symtab_t *st = m->schema->cols[c].symtab;
+            for (size_t r = 0; r < n; r++) {
+                if (!cur || cur >= end) {
+                    col[base + r] = 0;
+                    continue;
+                }
+                uint16_t l16;
+                memcpy(&l16, cur, 2); cur += 2;
+                if (cur + l16 > end) {
+                    pthread_mutex_unlock(&m->lock);
+                    return TSDB_ERR_CORRUPT;
+                }
+                char sbuf[260];
+                int len = l16 < 256 ? l16 : 255;
+                memcpy(sbuf, cur, len); sbuf[len] = '\0';
+                cur += l16;
+                uint32_t code = st ? tsdb_symtab_intern(st, sbuf)
+                                   : TSDB_SYMBOL_INVALID;
+                if (code == TSDB_SYMBOL_INVALID) {
+                    pthread_mutex_unlock(&m->lock);
+                    return TSDB_ERR_NOMEM;
+                }
+                col[base + r] = code;
+            }
+        } else {
+            /* INT64 / FLOAT64 / TIMESTAMP — all 8 bytes. */
+            uint8_t *col = (uint8_t *)m->col_bufs[c];
+            if (src) memcpy(col + base * 8, src, n * 8);
+            else     memset(col + base * 8, 0, n * 8);
+        }
+        data_idx++;
+    }
+
+    /* Update skiplist + sortedness tracking in one pass over the new ts. */
+    if (m->sl_ok) {
+        for (size_t r = 0; r < n; r++) {
+            int64_t ts = ts_arr[r];
+            if (sl_insert(&m->sl, ts, (uint32_t)(base + r)) < 0) {
+                m->sl_ok = 0;
+                break;
+            }
+            if (ts < m->last_ts) m->all_sorted = 0;
+            m->last_ts = ts;
+        }
+    }
+
+    m->nrows += n;
+    pthread_mutex_unlock(&m->lock);
+    return TSDB_OK;
+}
+
 int tsdb_memtable_sorted_indices(tsdb_memtable_t *m, size_t *out_idx) {
     if (!m || !out_idx) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&m->lock);
