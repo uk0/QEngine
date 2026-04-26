@@ -255,6 +255,21 @@ struct tsdb_catalog {
     FILE          *devices_log;
     FILE          *stables_log;
     FILE          *children_log;
+
+    /* Background compaction thread — periodically rewrites each
+     * catalog log if it has grown beyond CATALOG_COMPACT_MIN_BYTES.
+     * Startup-time compaction (in tsdb_catalog_open) handles the
+     * post-restart shrink; this thread keeps long-running clusters
+     * from accumulating bloat between restarts.  Stopped on
+     * tsdb_catalog_close. */
+    pthread_t       compact_thread;
+    volatile int    compact_running;
+    /* Stored paths so the bg thread can call the same compactors
+     * the startup path uses. */
+    char            db_path[4096];
+    char            grp_path[4096];
+    char            stb_path[4096];
+    char            chl_path[4096];
 };
 
 /* ---- Log helpers --------------------------------------------------------- */
@@ -401,7 +416,62 @@ static int compact_databases(tsdb_catalog_t *c, const char *path) {
     c->databases_log = saved;
     if (rc != TSDB_OK) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    /* If saved was the live append handle (bg-thread compaction), the
+     * old FILE* now points at an orphaned inode — subsequent fprintfs
+     * would write to a path nobody can read.  Reopen against the
+     * freshly-renamed file so live appends land on the right inode.
+     * At startup, saved is NULL and the regular fopen(... "a") below
+     * runs unaltered. */
+    if (saved) {
+        fclose(saved);
+        c->databases_log = fopen(path, "a");
+    }
     return TSDB_OK;
+}
+
+/* Background compaction sweeper.  Wakes every interval seconds (default
+ * 300 = 5 min, env-tunable via TSDB_CATALOG_COMPACT_INTERVAL_S) and
+ * compacts any catalog log that has crossed the size threshold.
+ *
+ * Compaction holds c->lock just long enough to swap the live FILE*
+ * for the temp + iterate the hmap.  Concurrent CRUD that arrives
+ * mid-compaction blocks on the same lock and lands on the rewritten
+ * file once rename(2) returns.  The loop polls a short timeout so
+ * shutdown doesn't have to wait the full interval. */
+extern int tsdb_catalog_compact_stables(tsdb_catalog_t *c, const char *path);
+extern int tsdb_catalog_compact_children(tsdb_catalog_t *c, const char *path);
+
+static void *catalog_compact_thread(void *arg) {
+    tsdb_catalog_t *c = (tsdb_catalog_t *)arg;
+    int interval_s = 300;
+    {
+        const char *e = getenv("TSDB_CATALOG_COMPACT_INTERVAL_S");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 10 && v <= 86400) interval_s = v;
+        }
+    }
+    int slept = 0;
+    while (c->compact_running) {
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        if (++slept < interval_s) continue;
+        slept = 0;
+
+        /* Re-open + compact under the catalog lock so writes serialise
+         * with the FILE* swap that compact_<table> performs. */
+        pthread_mutex_lock(&c->lock);
+        if (file_size_or_zero(c->db_path)  > CATALOG_COMPACT_MIN_BYTES)
+            (void)compact_databases(c, c->db_path);
+        if (file_size_or_zero(c->grp_path) > CATALOG_COMPACT_MIN_BYTES)
+            (void)compact_groups(c, c->grp_path);
+        if (file_size_or_zero(c->stb_path) > CATALOG_COMPACT_MIN_BYTES)
+            (void)tsdb_catalog_compact_stables(c, c->stb_path);
+        if (file_size_or_zero(c->chl_path) > CATALOG_COMPACT_MIN_BYTES)
+            (void)tsdb_catalog_compact_children(c, c->chl_path);
+        pthread_mutex_unlock(&c->lock);
+    }
+    return NULL;
 }
 
 int tsdb_database_create(tsdb_catalog_t *c, const tsdb_database_t *db) {
@@ -835,12 +905,30 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
         }
     }
 
+    /* Snapshot paths for the bg compaction thread. */
+    snprintf(c->db_path,  sizeof(c->db_path),  "%s", databases_path);
+    snprintf(c->grp_path, sizeof(c->grp_path), "%s", groups_path);
+    snprintf(c->stb_path, sizeof(c->stb_path), "%s", stables_path);
+    snprintf(c->chl_path, sizeof(c->chl_path), "%s", children_path);
+
+    /* Spawn the background compaction sweeper.  Default interval
+     * 5 minutes; tunable via TSDB_CATALOG_COMPACT_INTERVAL_S. */
+    c->compact_running = 1;
+    if (pthread_create(&c->compact_thread, NULL, catalog_compact_thread, c) != 0)
+        c->compact_running = 0;
+
     *out = c;
     return TSDB_OK;
 }
 
 void tsdb_catalog_close(tsdb_catalog_t *c) {
     if (!c) return;
+
+    /* Stop the background compactor before tearing down log handles. */
+    if (c->compact_running) {
+        c->compact_running = 0;
+        pthread_join(c->compact_thread, NULL);
+    }
 
     pthread_mutex_lock(&c->lock);
 
@@ -907,6 +995,7 @@ static int compact_groups(tsdb_catalog_t *c, const char *path) {
     c->groups_log = saved;
     if (rc != TSDB_OK) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    if (saved) { fclose(saved); c->groups_log = fopen(path, "a"); }
     return TSDB_OK;
 }
 

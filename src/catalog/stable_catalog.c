@@ -246,6 +246,7 @@ int tsdb_catalog_compact_stables(tsdb_catalog_t *c, const char *path) {
     c->stables_log = saved;
     if (rc != TSDB_OK) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    if (saved) { fclose(saved); c->stables_log = fopen(path, "a"); }
     return TSDB_OK;
 }
 
@@ -268,6 +269,7 @@ int tsdb_catalog_compact_children(tsdb_catalog_t *c, const char *path) {
     c->children_log = saved;
     if (rc != TSDB_OK) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    if (saved) { fclose(saved); c->children_log = fopen(path, "a"); }
     return TSDB_OK;
 }
 
