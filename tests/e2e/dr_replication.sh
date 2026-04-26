@@ -36,13 +36,18 @@ metric() {
 }
 
 # ── Phase 0: confirm DR forwarder is armed on cnode-1 ──────────────
+# Probe the env var directly — `docker logs --tail N` rolls out startup
+# banners after a long-running cluster sees enough request logging, and
+# the rest of the test then aborts on a false negative.  The env-var
+# check is what actually drives DR (see node_main.c reading TSDB_DR_REMOTE
+# at startup), so this is closer to ground truth anyway.
 say "phase 0: verify DR forwarder armed"
-armed=$($SSH "docker logs --tail 200 qengine-cnode-1 2>&1 | grep -c 'DR replication ENABLED'")
-if [[ "$armed" -ge 1 ]]; then
-  pass "cnode-1 startup log shows DR enabled"
+dr_env=$($SSH "docker exec qengine-cnode-1 sh -c 'printenv TSDB_DR_REMOTE 2>/dev/null'")
+if [[ -n "$dr_env" ]]; then
+  pass "cnode-1 has TSDB_DR_REMOTE=$dr_env"
 else
-  fail "cnode-1 log has no 'DR replication ENABLED' — env var TSDB_DR_REMOTE not set?"
-  echo "    (to skip, rerun tests with DR env applied; see docker-compose.cluster.yml)"
+  fail "cnode-1 missing TSDB_DR_REMOTE env — DR forwarder not wired"
+  echo "    (set TSDB_DR_REMOTE in docker-compose.cluster.yml and recreate)"
   say "────────────────────────────────────────────"
   say "PASS: $PASS  FAIL: $FAIL"
   exit 2
