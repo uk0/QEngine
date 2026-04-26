@@ -5063,7 +5063,8 @@ static int result_ddl_ensure_cap(tsdb_result_t *r) {
 /* Commit a row (increment nrows). */
 static void result_ddl_end_row(tsdb_result_t *r) { r->nrows++; }
 
-static int exec_list_groups(tsdb_catalog_t *cat, tsdb_result_t *r) {
+static int exec_list_groups(tsdb_catalog_t *cat, tsdb_result_t *r,
+                             const char *db_filter) {
     int rc = result_init_ddl(r, LIST_GROUPS_NCOLS,
                               LIST_GROUPS_COLS, LIST_GROUPS_TYPES);
     if (rc != TSDB_OK) return rc;
@@ -5073,9 +5074,11 @@ static int exec_list_groups(tsdb_catalog_t *cat, tsdb_result_t *r) {
     rc = tsdb_group_list(cat, &arr, &n);
     if (rc != TSDB_OK) return rc;
 
+    int has_filter = (db_filter && db_filter[0]);
     for (size_t i = 0; i < n; i++) {
-        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         tsdb_group_t *g = &arr[i];
+        if (has_filter && strcmp(g->database, db_filter) != 0) continue;
+        if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
         char ret_str[32];
         snprintf(ret_str, sizeof(ret_str), "%lld", (long long)g->retention_ns);
 
@@ -5589,7 +5592,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_LIST_GROUPS:
-        rc = exec_list_groups(cat, r);
+        rc = exec_list_groups(cat, r, stmt.u.list_groups.database);
         break;
     case QAST_STMT_CREATE_DEVICE: {
         rc = tsdb_device_create(cat, &stmt.u.create_device.spec);

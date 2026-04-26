@@ -1590,10 +1590,28 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             accept(&p, QTOK_SEMI);
             return TSDB_OK;
         }
-        /* LIST GROUPS  — "groups" lexes as QTOK_IDENT (plural not a keyword) */
+        /* LIST GROUPS [IN DATABASE <db>]  — "groups" lexes as QTOK_IDENT
+         * (plural not a keyword); IN DATABASE filter is optional. */
         if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "groups")) {
             out->kind = QAST_STMT_LIST_GROUPS;
+            out->u.list_groups.database[0] = '\0';
             advance(&p);
+            if (accept(&p, QTOK_IN)) {
+                if (p.tok.kind != QTOK_IDENT ||
+                    !(ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db")))
+                {
+                    perr(&p, "expected DATABASE after IN");
+                    return TSDB_ERR_PARSE;
+                }
+                advance(&p);
+                if (p.tok.kind != QTOK_IDENT) {
+                    perr(&p, "expected database name");
+                    return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, out->u.list_groups.database,
+                         sizeof(out->u.list_groups.database));
+                advance(&p);
+            }
             accept(&p, QTOK_SEMI);
             return TSDB_OK;
         }

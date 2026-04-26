@@ -238,7 +238,8 @@ typedef struct {
         /* LIST_DATABASES has no extra data */
         struct { tsdb_group_t spec; }  create_group;     /* QAST_STMT_CREATE_GROUP */
         struct { char name[64]; }      drop_group;       /* QAST_STMT_DROP_GROUP */
-        /* LIST_GROUPS has no extra data */
+        /* LIST GROUPS [IN DATABASE <db>] — empty `database` = no filter. */
+        struct { char database[64]; }  list_groups;      /* QAST_STMT_LIST_GROUPS */
         struct { tsdb_device_t spec; } create_device;    /* QAST_STMT_CREATE_DEVICE */
         struct { char group[64]; char id[128]; } drop_device;  /* QAST_STMT_DROP_DEVICE */
         struct { char group[64]; }     list_devices;     /* QAST_STMT_LIST_DEVICES; group="" = all */
