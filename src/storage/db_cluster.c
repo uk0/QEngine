@@ -838,7 +838,48 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
 
     if (best == 0) return TSDB_OK; /* already up-to-date */
 
-    int pulled = pull_table_delta(db, c, best, table_name, local_max_ts);
+    /* Gap classification:
+     *
+     *   tail gap   — best_max_ts > local_max_ts.  We missed recent
+     *                writes; pulling everything past local_max_ts
+     *                catches up cheaply.
+     *
+     *   middle gap — best_max_ts == local_max_ts but best_count >
+     *                local_count.  We were down for some interval in
+     *                the middle of the burst (e.g. chaos kill+restart),
+     *                missed those rows, but were back in time to receive
+     *                later batches that include the highest-ts row.
+     *                A tail-only pull (ts > local_max_ts) returns 0 rows
+     *                and the gap stays open forever — observed during
+     *                consistency_audit phase 3.
+     *
+     * For the middle-gap case fall back to a simple but correct
+     * recovery: truncate the local table and pull the entire dataset
+     * from the peer.  This is cheap on the test scale and converges
+     * deterministically; for production-scale tables a partition-level
+     * Merkle is the right answer (tracked separately). */
+    int pulled = 0;
+    if (best_max_ts > local_max_ts) {
+        pulled = pull_table_delta(db, c, best, table_name, local_max_ts);
+    } else {
+        /* Middle gap — tail pull won't catch this.  Reset + full pull. */
+        fprintf(stderr,
+                "[anti-entropy] %s: middle-gap detected "
+                "(local=%llu/peer=%llu, equal max_ts %lld); "
+                "truncate + full re-pull\n",
+                table_name,
+                (unsigned long long)local_count,
+                (unsigned long long)best_count,
+                (long long)local_max_ts);
+        if (tsdb_truncate_table(db, table_name) != TSDB_OK) {
+            return TSDB_ERR_IO;
+        }
+        /* since_ts = 0 catches every row in this DB — nano-second epoch
+         * timestamps are always > 0, so the > 0 predicate is equivalent
+         * to "all rows". */
+        pulled = pull_table_delta(db, c, best, table_name, 0);
+    }
+
     if (pulled < 0) return TSDB_ERR_IO;
     if (out_rows_pulled) *out_rows_pulled = pulled;
     tsdb_metric_add("qengine_antientropy_rows_pulled_total", (uint64_t)pulled);

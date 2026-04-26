@@ -180,11 +180,33 @@ $SSH "
   echo 'cnode-3 started at \$(date +%T)'
 "
 
-# Wait for anti-entropy catch-up.
-sleep 12
+# Wait for anti-entropy catch-up.  Poll up to 90 s — startup AE walks
+# every table in db->tables[], which on a long-lived test cluster can
+# accumulate hundreds of debris tables from prior tests; the per-table
+# resync RPCs (count + max_ts SELECT against each peer) are cheap but
+# add up sequentially.  90 s is generous for the test target table to
+# converge once AE reaches it; production AE will be partition-Merkle.
+say "phase 3: polling for cnode-3 catch-up (max 90s)"
+# Re-login on every node — cnode-3's restart invalidated its session
+# cookie (server boot mints a fresh secret).  Without this, count()
+# against cnode-3 returns 401, the python parser falls back to 0, and
+# we see a phantom "divergence" even when AE caught up correctly.
+$SSH "for p in ${PORTS[@]}; do
+  curl -s -c /tmp/ck_\$p -X POST 'http://127.0.0.1:'\$p'/login' -d 'user=root&pass=123456' -o /dev/null
+done"
 
+deadline=$(( $(date +%s) + 90 ))
 post_count=()
-for p in "${PORTS[@]}"; do post_count+=("$(count $p)"); done
+while (( $(date +%s) < deadline )); do
+  post_count=()
+  for p in "${PORTS[@]}"; do post_count+=("$(count $p)"); done
+  if [[ "${post_count[0]}" == "${post_count[1]}" && \
+        "${post_count[1]}" == "${post_count[2]}" && \
+        "${post_count[2]}" == "${post_count[3]}" ]]; then
+    break
+  fi
+  sleep 3
+done
 
 if [[ "${post_count[0]}" == "${post_count[1]}" && "${post_count[1]}" == "${post_count[2]}" && "${post_count[2]}" == "${post_count[3]}" ]]; then
   ok "post-chaos: all 4 nodes converge to ${post_count[0]} (gain $(( post_count[0] - target_pre )))"
