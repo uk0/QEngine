@@ -61,6 +61,32 @@ tsdb_replica_mgr_t *tsdb_cluster_replica_mgr(tsdb_cluster_t *c);
 /* Return the auto-balance controller (may be NULL if not started). */
 tsdb_autobalance_t *tsdb_cluster_autobalance(tsdb_cluster_t *c);
 
+/* ---- Sharding routing API (Phase α) ---------------------------------
+ *
+ * Computes which N node IDs should own a given shard key.  Used by the
+ * sharded write path (Phase β) and by clients that want to skip the
+ * coordinator hop.  Today the cluster still fan-outs to every node
+ * (full-replica), so this API is read-only — callers can ask "where
+ * WOULD a shard live" without changing where the data actually goes.
+ *
+ *   table_name  — used together with key to derive the shard hash
+ *   key         — partition key (e.g. host tag value, device id);
+ *                 may be empty/NULL → just hash the table name
+ *   replica_n   — how many distinct nodes to return (clamped to ring
+ *                 node count).  Typical values: 2 or 3.
+ *   out_ids     — caller-supplied buffer; filled with up to replica_n
+ *                 unique node IDs in primary-first order.
+ *
+ * Returns the count actually written, 0 on empty ring, negative on
+ * invalid args.  Idempotent: same key always returns the same nodes
+ * until ring membership changes.
+ */
+int tsdb_cluster_route(tsdb_cluster_t *c,
+                       const char *table_name,
+                       const char *key,
+                       int replica_n,
+                       tsdb_node_id_t *out_ids);
+
 /*
  * Called by db.c batch commit when cluster is active.
  *

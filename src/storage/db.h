@@ -25,6 +25,11 @@ extern "C" {
 typedef struct tsdb_table_internal tsdb_table_internal_t;
 
 const char            *tsdb_db_data_dir(tsdb_db_t *db);
+/* Multi-dir striping accessors — count is always >= 1 (a non-striped
+ * setup behaves identically to count=1).  Iterate via index.  See
+ * src/storage/db.c:db_pick_data_dir for the routing rule. */
+int                    tsdb_db_data_dir_count(tsdb_db_t *db);
+const char            *tsdb_db_data_dir_at(tsdb_db_t *db, int i);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 
 /* Snapshot the list of open table names into `out_names` (each a

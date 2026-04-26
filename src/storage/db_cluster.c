@@ -850,17 +850,21 @@ void *tsdb_resync_startup_thread(void *ud) {
                            .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
     nanosleep(&ts, NULL);
 
-    const char *data_dir = tsdb_db_data_dir(db);
-    if (!data_dir) return NULL;
-
-    /* Pre-open every on-disk table so db->tables[] reflects them. */
-    DIR *d = opendir(data_dir);
-    if (d) {
+    /* Pre-open every on-disk table across every striped data dir so
+     * db->tables[] reflects them.  Falls back to a single-dir scan
+     * when striping is disabled.  tsdb_open_table itself routes the
+     * (later) opens to the correct dir via db_resolve_table_dir(). */
+    int ndirs = tsdb_db_data_dir_count(db);
+    for (int di = 0; di < ndirs; di++) {
+        const char *dd = tsdb_db_data_dir_at(db, di);
+        if (!dd) continue;
+        DIR *d = opendir(dd);
+        if (!d) continue;
         struct dirent *de;
         while ((de = readdir(d)) != NULL) {
             if (!resync_is_table_dir(de->d_name)) continue;
             char path[4096];
-            snprintf(path, sizeof(path), "%s/%s", data_dir, de->d_name);
+            snprintf(path, sizeof(path), "%s/%s", dd, de->d_name);
             struct stat st;
             if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
             tsdb_table_t *tbl = NULL;

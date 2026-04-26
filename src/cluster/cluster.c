@@ -221,6 +221,40 @@ int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
                                     nodes, nnodes, TSDB_WRITE_QUORUM);
 }
 
+/* ---- Sharding routing API (Phase α) ------------------------------------- */
+
+int tsdb_cluster_route(tsdb_cluster_t *c,
+                       const char *table_name,
+                       const char *key,
+                       int replica_n,
+                       tsdb_node_id_t *out_ids)
+{
+    if (!c || !table_name || !out_ids || replica_n <= 0) return -1;
+    tsdb_hashring_t *ring = tsdb_node_manager_ring(c->node_mgr);
+    if (!ring) return 0;
+
+    /* Compose a stable hash key: "<table>\1<key>".  The separator is
+     * an explicit byte (not NUL, which would truncate strlen-based
+     * helpers).  The table name acts as a salt so distinct tables
+     * don't share the same primary for an empty user key. */
+    char buf[256];
+    size_t tlen = strnlen(table_name, sizeof(buf) - 2);
+    if (tlen >= sizeof(buf) - 2) return -1;
+    memcpy(buf, table_name, tlen);
+    buf[tlen++] = '\1';
+    size_t klen = key ? strnlen(key, sizeof(buf) - tlen - 1) : 0;
+    if (klen) memcpy(buf + tlen, key, klen);
+    size_t total = tlen + klen;
+
+    /* Cap replica_n to the live ring size so callers don't get
+     * duplicate IDs back when N_node < replica_n. */
+    int rn = tsdb_hashring_node_count(ring);
+    if (replica_n > rn) replica_n = rn;
+    if (replica_n <= 0) return 0;
+
+    return tsdb_hashring_owner(ring, buf, total, replica_n, out_ids);
+}
+
 /* ---- Stats --------------------------------------------------------------- */
 
 int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {

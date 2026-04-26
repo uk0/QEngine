@@ -59,8 +59,20 @@ typedef struct tsdb_table_internal {
  * pointer space per open db. */
 #define TSDB_DB_MAX_TABLES 16384
 
+/* Maximum number of striped data directories.  Bigger than typical
+ * RAID disk counts so an operator can dedicate one TSDB instance
+ * across many SSDs without recompiling. */
+#define TSDB_MAX_DATA_DIRS 16
+
 struct tsdb_db {
-    char             data_dir[4096];
+    char             data_dir[4096];     /* primary — catalog/WAL/audit */
+    /* Extra striping directories.  When TSDB_DATA_DIRS is set the
+     * primary becomes data_dirs[0] and the rest are populated; table
+     * data is routed by hash(table_name) % n_data_dirs.  When unset,
+     * n_data_dirs == 0 and every callsite falls back to data_dir,
+     * preserving single-dir behaviour bit-for-bit. */
+    char             data_dirs[TSDB_MAX_DATA_DIRS][4096];
+    int              n_data_dirs;
     pthread_mutex_t  lock;
 
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
@@ -144,8 +156,56 @@ void tsdb_table_unlock_write(tsdb_table_t *tbl) {
 
 /* ---- Path helpers ------------------------------------------------------- */
 
+/* fnv1a — same hash as src/core/symbol.c.  Used by data-dir routing
+ * because it's branch-free, alloc-free and delivers a clean
+ * distribution on short identifier strings. */
+static uint64_t db_fnv1a(const char *s) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (; *s; s++) { h ^= (uint8_t)*s; h *= 0x100000001b3ULL; }
+    return h;
+}
+
+/* Pick the data directory a brand-new table should live in.  Hash by
+ * name so the same table always routes to the same disk and the
+ * distribution stays even across heterogeneous workloads.  Returns the
+ * primary data_dir when striping is disabled. */
+static const char *db_pick_data_dir(const tsdb_db_t *db, const char *table_name) {
+    if (!db || db->n_data_dirs <= 1) return db->data_dir;
+    uint32_t idx = (uint32_t)(db_fnv1a(table_name) % (uint64_t)db->n_data_dirs);
+    return db->data_dirs[idx];
+}
+
+/* Resolve the dir an EXISTING table currently lives in by probing every
+ * configured data directory.  Falls back to the hash-picked dir when
+ * the table isn't on disk yet (i.e. we're about to create it).  Caller
+ * passes a buffer sized to hold any data_dir + "/" + name + NUL. */
+static const char *db_resolve_table_dir(const tsdb_db_t *db, const char *table_name) {
+    if (!db || db->n_data_dirs <= 1) return db->data_dir;
+    char probe[4200];
+    for (int i = 0; i < db->n_data_dirs; i++) {
+        snprintf(probe, sizeof(probe), "%s/%s", db->data_dirs[i], table_name);
+        struct stat st;
+        if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return db->data_dirs[i];
+        }
+    }
+    /* Not yet on disk — return the slot a new table would land in. */
+    return db_pick_data_dir(db, table_name);
+}
+
+/* table_dir is now a thin wrapper that picks the right base dir.  All
+ * existing callers stay source-compatible because they used to take the
+ * `db->data_dir` string anyway; we just have them go through the
+ * resolver instead. */
 static void table_dir(const char *data_dir, const char *table_name, char *out, size_t cap) {
     snprintf(out, cap, "%s/%s", data_dir, table_name);
+}
+
+/* Convenience wrapper used everywhere we used to write
+ * `table_dir(db->data_dir, name, …)` — picks the right striped dir
+ * automatically. */
+static void table_dir_db(const tsdb_db_t *db, const char *name, char *out, size_t cap) {
+    table_dir(db_resolve_table_dir(db, name), name, out, cap);
 }
 
 /* ---- DB open / close ---------------------------------------------------- */
@@ -160,6 +220,51 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
 
     snprintf(db->data_dir, sizeof(db->data_dir), "%s", data_dir);
     pthread_mutex_init(&db->lock, NULL);
+
+    /* TSDB_DATA_DIRS = "/disk1/tsdb,/disk2/tsdb,/disk3/tsdb"
+     *
+     * When set, the data_dir argument acts as the "primary" (still hosts
+     * the catalog, WAL, audit, etc) AND is added as the first entry
+     * unless already listed.  Tables get distributed across all entries
+     * by hash(name) % N.  Each directory is mkdir -p'd so a fresh
+     * install just works.  When unset n_data_dirs stays 0 and every
+     * code path falls back to the single primary dir (zero behaviour
+     * change for existing deployments). */
+    {
+        const char *dirs_env = getenv("TSDB_DATA_DIRS");
+        if (dirs_env && *dirs_env) {
+            char buf[16384];
+            snprintf(buf, sizeof(buf), "%s", dirs_env);
+            int n = 0;
+            char *save = NULL;
+            /* Reserve slot 0 for the primary so it's always queried first. */
+            snprintf(db->data_dirs[n++], sizeof(db->data_dirs[0]), "%s", db->data_dir);
+            for (char *tok = strtok_r(buf, ",;", &save);
+                 tok && n < TSDB_MAX_DATA_DIRS;
+                 tok = strtok_r(NULL, ",;", &save)) {
+                /* Trim leading whitespace. */
+                while (*tok == ' ' || *tok == '\t') tok++;
+                if (!*tok) continue;
+                /* Skip duplicates of the primary or earlier entries. */
+                int dup = 0;
+                for (int i = 0; i < n; i++)
+                    if (strcmp(db->data_dirs[i], tok) == 0) { dup = 1; break; }
+                if (dup) continue;
+                if (tsdb_mkdir_p(tok) < 0) {
+                    fprintf(stderr, "[db] TSDB_DATA_DIRS: mkdir %s failed (%s) — skipping\n",
+                            tok, strerror(errno));
+                    continue;
+                }
+                snprintf(db->data_dirs[n++], sizeof(db->data_dirs[0]), "%s", tok);
+            }
+            db->n_data_dirs = n;
+            if (n > 1) {
+                fprintf(stderr, "[db] data striping enabled across %d dirs:\n", n);
+                for (int i = 0; i < n; i++)
+                    fprintf(stderr, "      [%d] %s\n", i, db->data_dirs[i]);
+            }
+        }
+    }
 
     /* Opt-in: commit only syncs WAL, memtable flush deferred to is_full(). */
     const char *wc = getenv("TSDB_WAL_ONLY_COMMIT");
@@ -352,7 +457,7 @@ static int create_table_impl(tsdb_db_t *db,
     }
 
     char dir[4096];
-    table_dir(db->data_dir, name, dir, sizeof(dir));
+    table_dir_db(db, name, dir, sizeof(dir));
 
     /* Resolve block_points: explicit arg wins; otherwise fall back to the
      * db-wide default (0 → library default inside schema_create_ex). */
@@ -489,7 +594,7 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     }
 
     char dir[4096];
-    table_dir(db->data_dir, name, dir, sizeof(dir));
+    table_dir_db(db, name, dir, sizeof(dir));
 
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_open(dir, &schema);
@@ -605,7 +710,7 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
 
     /* Remove table directory. */
     char tbl_dir[4096];
-    table_dir(db->data_dir, name, tbl_dir, sizeof(tbl_dir));
+    table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     rm_rf(tbl_dir);
 
     pthread_mutex_unlock(&db->lock);
@@ -647,7 +752,7 @@ int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
     /* Remove every entry under the table dir except schema.bin and *.sym.
      * This kills all partition directories verbatim. */
     char tbl_dir[4096];
-    table_dir(db->data_dir, name, tbl_dir, sizeof(tbl_dir));
+    table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     DIR *d = opendir(tbl_dir);
     if (d) {
         struct dirent *ent;
@@ -719,7 +824,7 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
     pthread_mutex_lock(&t->compact_mtx);
 
     char tbl_dir[4096];
-    table_dir(db->data_dir, name, tbl_dir, sizeof(tbl_dir));
+    table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     DIR *d = opendir(tbl_dir);
     int removed = 0;
     if (d) {
@@ -1041,6 +1146,22 @@ void tsdb_db_get_raw_block_hook(tsdb_db_t *db,
 /* ---- Internal accessors for query module ------------------------------- */
 
 const char *tsdb_db_data_dir(tsdb_db_t *db) { return db ? db->data_dir : NULL; }
+
+/* Number of striped data dirs (>=1; 1 means single-dir setup).
+ * Callers iterate via tsdb_db_data_dir_at(). */
+int tsdb_db_data_dir_count(tsdb_db_t *db) {
+    if (!db) return 0;
+    return db->n_data_dirs > 0 ? db->n_data_dirs : 1;
+}
+
+/* Per-index dir accessor.  i in [0, tsdb_db_data_dir_count()).
+ * Returns NULL on out-of-range so callers can simply break the loop. */
+const char *tsdb_db_data_dir_at(tsdb_db_t *db, int i) {
+    if (!db || i < 0) return NULL;
+    if (db->n_data_dirs <= 1) return i == 0 ? db->data_dir : NULL;
+    if (i >= db->n_data_dirs) return NULL;
+    return db->data_dirs[i];
+}
 
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return NULL;
