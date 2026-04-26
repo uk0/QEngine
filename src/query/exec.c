@@ -5491,9 +5491,35 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 break;
             }
             case QAST_STMT_CREATE_CHILD_TABLE: {
-                const char *sn = stmt.u.create_child_table.spec.stable_name;
-                if (!tsdb_stable_exists(pc, sn)) {
+                const tsdb_child_table_t *ct_in = &stmt.u.create_child_table.spec;
+                tsdb_stable_t st_pre;
+                if (tsdb_stable_get(pc, ct_in->stable_name, &st_pre) != TSDB_OK) {
                     err_msg = "ERR: stable not found"; err_rc = TSDB_ERR_NOTFOUND;
+                    break;
+                }
+                /* Tag count + per-position type — same checks the apply
+                 * path runs, hoisted up so the leader's "OK: committed
+                 * via raft" reply only fires for genuinely valid CREATEs. */
+                static char schema_msg[160];
+                if (ct_in->ntags != st_pre.ntag_cols) {
+                    snprintf(schema_msg, sizeof(schema_msg),
+                             "ERR: tag count mismatch (got %d, stable '%s' expects %d)",
+                             ct_in->ntags, st_pre.name, st_pre.ntag_cols);
+                    err_msg = schema_msg; err_rc = TSDB_ERR_SCHEMA;
+                    break;
+                }
+                for (int ti = 0; ti < ct_in->ntags; ti++) {
+                    tsdb_type_t want = st_pre.tag_cols[ti].type;
+                    tsdb_type_t got  = ct_in->tags[ti].type;
+                    if (want == got) continue;
+                    if (want == TSDB_TYPE_FLOAT64 && got == TSDB_TYPE_INT64) continue;
+                    snprintf(schema_msg, sizeof(schema_msg),
+                             "ERR: tag type mismatch at position %d "
+                             "(tag '%s' expects %s)",
+                             ti, st_pre.tag_cols[ti].name,
+                             tsdb_type_name(st_pre.tag_cols[ti].type));
+                    err_msg = schema_msg; err_rc = TSDB_ERR_SCHEMA;
+                    break;
                 }
                 break;
             }
@@ -5932,6 +5958,44 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             result_status(r, "ERR: stable not found");
             rc = TSDB_ERR_NOTFOUND;
             break;
+        }
+        /* Tag count + type validation against the stable's TAGS schema.
+         * Without this, `CREATE TABLE pt USING st TAGS ('only-one')`
+         * with a 3-tag stable would silently succeed and the missing
+         * tags would default to zeros — confusing the per-tag query
+         * pushdown later. */
+        if (ct_in->ntags != st.ntag_cols) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "ERR: tag count mismatch (got %d, stable '%s' expects %d)",
+                     ct_in->ntags, st.name, st.ntag_cols);
+            result_status(r, msg);
+            rc = TSDB_ERR_SCHEMA;
+            break;
+        }
+        {
+            int type_err = -1;
+            for (int ti = 0; ti < ct_in->ntags; ti++) {
+                tsdb_type_t want = st.tag_cols[ti].type;
+                tsdb_type_t got  = ct_in->tags[ti].type;
+                /* INT64 literals are accepted for FLOAT64 tag slots
+                 * (the parser only emits FLOAT for tokens with a dot);
+                 * everything else must match exactly. */
+                if (want == got) continue;
+                if (want == TSDB_TYPE_FLOAT64 && got == TSDB_TYPE_INT64) continue;
+                type_err = ti; break;
+            }
+            if (type_err >= 0) {
+                char msg[200];
+                snprintf(msg, sizeof(msg),
+                         "ERR: tag type mismatch at position %d "
+                         "(tag '%s' expects %s)",
+                         type_err, st.tag_cols[type_err].name,
+                         tsdb_type_name(st.tag_cols[type_err].type));
+                result_status(r, msg);
+                rc = TSDB_ERR_SCHEMA;
+                break;
+            }
         }
         /* Build col list from stable cols (excluding TIMESTAMP — use as ts_col). */
         tsdb_col_t cols[TSDB_STABLE_MAX_COLS];
@@ -6443,15 +6507,34 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
         *out_admin_only = 1;
         break;
 
-    /* Schema DDL */
+    /* Schema DDL — resource carries the actual entity name so the
+     * audit log shows `object: "auditdb"` instead of the catch-all `*`. */
     case QAST_STMT_CREATE_DATABASE:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.create_database.name;
+        break;
     case QAST_STMT_DROP_DATABASE:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.drop_database.name;
+        break;
     case QAST_STMT_CREATE_GROUP:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.create_group.spec.name;
+        break;
     case QAST_STMT_DROP_GROUP:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.drop_group.name;
+        break;
+    case QAST_STMT_CREATE_STABLE:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.create_stable.spec.name;
+        break;
+    case QAST_STMT_DROP_STABLE:
+        *out_priv = TSDB_PRIV_DDL;
+        *out_resource = stmt->u.drop_stable.name;
+        break;
     case QAST_STMT_CREATE_DEVICE:
     case QAST_STMT_DROP_DEVICE:
-    case QAST_STMT_CREATE_STABLE:
-    case QAST_STMT_DROP_STABLE:
         *out_priv = TSDB_PRIV_DDL;
         break;
     case QAST_STMT_CREATE_CHILD_TABLE:
