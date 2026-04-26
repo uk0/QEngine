@@ -5441,7 +5441,85 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_DROP_DATABASE: {
-        rc = tsdb_database_drop(cat, stmt.u.drop_database.name);
+        const char *dbname = stmt.u.drop_database.name;
+
+        /* Cascade in declared dependency order so a partial failure
+         * leaves the catalog in a coherent intermediate state rather
+         * than orphaned children:
+         *   1. for every group in this db: cascade its stables (which
+         *      drops physical tables + child catalog rows), then
+         *      tsdb_group_drop.
+         *   2. cascade stables attached directly to the db (group == "").
+         *   3. tsdb_database_drop.
+         *
+         * Names are snapshot-copied because the underlying drops
+         * mutate the catalog hmaps we'd otherwise be iterating. */
+        tsdb_group_t *gall = NULL;
+        size_t ngall = 0;
+        if (tsdb_group_list(cat, &gall, &ngall) == TSDB_OK) {
+            char gnames[256][64];
+            int  ng_match = 0;
+            for (size_t i = 0; i < ngall && ng_match < 256; i++) {
+                if (strcmp(gall[i].database, dbname) == 0) {
+                    snprintf(gnames[ng_match++], 64, "%s", gall[i].name);
+                }
+            }
+            tsdb_group_list_free(gall);
+            for (int gi = 0; gi < ng_match; gi++) {
+                /* Cascade stables under this group. */
+                tsdb_stable_t *sall = NULL;
+                size_t nsall = 0;
+                if (tsdb_stable_list(cat, &sall, &nsall) == TSDB_OK) {
+                    char snames[256][64];
+                    int  ns_match = 0;
+                    for (size_t i = 0; i < nsall && ns_match < 256; i++) {
+                        if (strcmp(sall[i].database, dbname) == 0 &&
+                            strcmp(sall[i].group, gnames[gi]) == 0) {
+                            snprintf(snames[ns_match++], 64, "%s", sall[i].name);
+                        }
+                    }
+                    free(sall);
+                    for (int si = 0; si < ns_match; si++) {
+                        tsdb_child_table_t *children = NULL;
+                        size_t nch = 0;
+                        (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
+                        for (size_t ci = 0; ci < nch; ci++)
+                            (void)tsdb_drop_table(db, children[ci].name);
+                        free(children);
+                        (void)tsdb_stable_drop(cat, snames[si]);
+                    }
+                }
+                (void)tsdb_group_drop(cat, gnames[gi]);
+            }
+        }
+
+        /* Cascade stables attached directly to the db (no group). */
+        {
+            tsdb_stable_t *sall = NULL;
+            size_t nsall = 0;
+            if (tsdb_stable_list(cat, &sall, &nsall) == TSDB_OK) {
+                char snames[256][64];
+                int  ns_match = 0;
+                for (size_t i = 0; i < nsall && ns_match < 256; i++) {
+                    if (strcmp(sall[i].database, dbname) == 0 &&
+                        sall[i].group[0] == '\0') {
+                        snprintf(snames[ns_match++], 64, "%s", sall[i].name);
+                    }
+                }
+                free(sall);
+                for (int si = 0; si < ns_match; si++) {
+                    tsdb_child_table_t *children = NULL;
+                    size_t nch = 0;
+                    (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
+                    for (size_t ci = 0; ci < nch; ci++)
+                        (void)tsdb_drop_table(db, children[ci].name);
+                    free(children);
+                    (void)tsdb_stable_drop(cat, snames[si]);
+                }
+            }
+        }
+
+        rc = tsdb_database_drop(cat, dbname);
         if (rc == TSDB_OK)
             rc = result_status(r, "OK: database dropped");
         else if (rc == TSDB_ERR_NOTFOUND) {
@@ -5474,7 +5552,37 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_DROP_GROUP: {
-        rc = tsdb_group_drop(cat, stmt.u.drop_group.name);
+        const char *gname = stmt.u.drop_group.name;
+        /* Cascade: drop every stable that lives in this group along
+         * with its physical child tables, then drop the group itself.
+         * Mirrors DROP DATABASE's per-group block above; tsdb_group_drop
+         * already cascades the device catalog rows but not stables. */
+        tsdb_group_t gmeta;
+        const char *gdb = "";
+        if (tsdb_group_get(cat, gname, &gmeta) == TSDB_OK) gdb = gmeta.database;
+        tsdb_stable_t *sall = NULL;
+        size_t nsall = 0;
+        if (tsdb_stable_list(cat, &sall, &nsall) == TSDB_OK) {
+            char snames[256][64];
+            int  ns_match = 0;
+            for (size_t i = 0; i < nsall && ns_match < 256; i++) {
+                if (strcmp(sall[i].group, gname) == 0 &&
+                    strcmp(sall[i].database, gdb) == 0) {
+                    snprintf(snames[ns_match++], 64, "%s", sall[i].name);
+                }
+            }
+            free(sall);
+            for (int si = 0; si < ns_match; si++) {
+                tsdb_child_table_t *children = NULL;
+                size_t nch = 0;
+                (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
+                for (size_t ci = 0; ci < nch; ci++)
+                    (void)tsdb_drop_table(db, children[ci].name);
+                free(children);
+                (void)tsdb_stable_drop(cat, snames[si]);
+            }
+        }
+        rc = tsdb_group_drop(cat, gname);
         if (rc == TSDB_OK) rc = result_status(r, "OK: group dropped");
         else if (rc == TSDB_ERR_NOTFOUND) { result_status(r, "ERR: group not found"); rc = TSDB_ERR_NOTFOUND; }
         else result_status(r, "ERR: drop group failed");
@@ -6078,6 +6186,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_DROP_STABLE:
     case QAST_STMT_CREATE_CHILD_TABLE:
     case QAST_STMT_CREATE_TABLE:
+    case QAST_STMT_DROP_TABLE:
         try_broadcast_catalog_qtl(db, qtl, rc);
         break;
     default:

@@ -937,13 +937,17 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                 if (p.tok.kind == QTOK_RPAREN) break;
             }
             if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
-            /* Optional trailing "IN DATABASE <db>" / "IN GROUP <grp>"
-             * — either position is accepted so users can write
-             *   CREATE STABLE t (cols) TAGS (...) IN DATABASE prod
-             * the same way a CREATE GROUP can trail the IN clause.
-             * The leading form above still wins; this loop only runs
-             * when the prior block didn't already fill the fields. */
-            for (int clause = 0; clause < 2 && accept(&p, QTOK_IN); clause++) {
+            /* Optional trailing placement clauses — accept BOTH
+             *   IN DATABASE prod IN GROUP gw
+             * (the strict, two-IN form) AND
+             *   IN DATABASE prod GROUP gw
+             * (the bare-second-clause form some users expect from the
+             * "IN DB X GROUP Y" hierarchical mental model).  Each
+             * iteration consumes ONE clause; a leading IN is optional
+             * once we've seen the first one. */
+            for (int clause = 0; clause < 2; clause++) {
+                int saw_in = accept(&p, QTOK_IN);
+                if (!saw_in && clause == 0) break;
                 if (p.tok.kind == QTOK_IDENT &&
                     (ident_ci(&p.tok, "database") || ident_ci(&p.tok, "db"))) {
                     advance(&p);
@@ -966,7 +970,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                     }
                     tok_copy(&p.tok, st->group, sizeof(st->group));
                     advance(&p);
-                } else {
+                } else if (saw_in) {
                     perr(&p, "expected DATABASE or GROUP after IN");
                     return TSDB_ERR_PARSE;
                 }

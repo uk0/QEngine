@@ -104,6 +104,8 @@ export interface TreeVTable {
 export interface TreePTable {
   name: string;
   vtable?: string;
+  database?: string;
+  group?: string;
 }
 export interface TreeTable {
   name: string;
