@@ -92,7 +92,7 @@ $SSH "
     (
       lines=
       for r in \$(seq 1 1000); do
-        lines=\"\$lines\"\"caudit,src=p\$i v=\$ri \$(( base + r*1000 ))
+        lines=\"\$lines\"\"caudit,src=p\$i v=\${r}i \$(( base + r*1000 ))
 \"
       done
       echo \"\$lines\" > /tmp/burst_\$i.txt
