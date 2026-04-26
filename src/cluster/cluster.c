@@ -360,6 +360,25 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
         }
     }
 
+    /* Sharding status block — exposes the configured TSDB_SHARD_REPLICA_N
+     * + the live cluster size so the dashboard can show whether shard
+     * mode is active and what fan-out is in use.  See cluster_write
+     * for the runtime semantics. */
+    {
+        const char *e = getenv("TSDB_SHARD_REPLICA_N");
+        int sn = (e && *e) ? atoi(e) : 0;
+        if (sn < 0) sn = 0;
+        int alive_n = 0;
+        for (int i = 0; i < n; i++)
+            if (snap[i].state == TSDB_NODE_ALIVE) alive_n++;
+        int active = (sn > 0 && sn < alive_n) ? 1 : 0;
+        if ((size_t)written < cap - 64) {
+            written += snprintf(buf + written, cap - written,
+                                ",\"sharding\":{\"replica_n\":%d,\"alive_nodes\":%d,\"active\":%d}",
+                                sn, alive_n, active);
+        }
+    }
+
     if ((size_t)written < cap - 1)
         written += snprintf(buf + written, cap - written, "}");
     return written;

@@ -54,10 +54,21 @@ export interface LocalDisk {
   vn_weight: number;
 }
 
+export interface ShardingInfo {
+  /** TSDB_SHARD_REPLICA_N — owner count per table.  0 = full broadcast. */
+  replica_n: number;
+  /** Cluster size at the moment /cluster_stats was sampled. */
+  alive_nodes: number;
+  /** True iff replica_n > 0 AND replica_n < alive_nodes (i.e. sharding
+   *  actually narrows the fan-out). */
+  active: number;
+}
+
 export interface ClusterInfo {
   local_id: string;
   nodes: ClusterNode[];
   autobalance?: AutobalanceInfo;
+  sharding?: ShardingInfo;
   local?: {
     host: string;
     pid: number;

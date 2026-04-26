@@ -53,10 +53,50 @@ export function ClusterPanel() {
 
       <LocalNodeCard cluster={cluster} raft={raft} />
       <NodesTable cluster={cluster} />
+      <ShardingCard cluster={cluster} />
       <ReplicationCard metrics={metrics} rate={rate} />
       <RaftCard raft={raft} cluster={cluster} />
       <AutobalanceCard cluster={cluster} />
     </>
+  );
+}
+
+/* ── Sharding: TSDB_SHARD_REPLICA_N status ──────────────────────────── */
+function ShardingCard({ cluster }: { cluster: ClusterInfo | null }) {
+  const s = cluster?.sharding;
+  if (!s) {
+    return (
+      <div className="card">
+        <h3 className="card-title">Sharding</h3>
+        <div style={{ opacity: 0.6, fontSize: 13 }}>data unavailable</div>
+      </div>
+    );
+  }
+  const active = s.active === 1;
+  const status = active
+    ? `ACTIVE — N=${s.replica_n} owners per table out of ${s.alive_nodes} alive nodes`
+    : s.replica_n > 0
+      ? `IDLE — N=${s.replica_n} ≥ alive ${s.alive_nodes} (degenerates to full broadcast)`
+      : 'OFF — full broadcast (TSDB_SHARD_REPLICA_N unset / 0)';
+  const dot = active ? 'var(--ok)' : s.replica_n > 0 ? 'var(--warn)' : 'var(--muted)';
+  return (
+    <div className="card">
+      <h3 className="card-title">Sharding (Phase β / γ)</h3>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          width: 10, height: 10, borderRadius: 5,
+          background: dot, display: 'inline-block',
+        }} />
+        <span style={{ fontWeight: 500 }}>{status}</span>
+      </div>
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7, lineHeight: 1.5 }}>
+        Set <code>TSDB_SHARD_REPLICA_N</code> in compose to <code>2..N-1</code>
+        to enable.  Writes fan out to N owners; non-owner nodes skip the
+        local persist (Phase β.2) and forward SELECT queries to an owner
+        (Phase γ).  Default 0 keeps the legacy "broadcast to every alive
+        peer" behaviour bit-for-bit unchanged.
+      </div>
+    </div>
   );
 }
 
