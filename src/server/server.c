@@ -18,6 +18,7 @@
 #include "../../include/tsdb.h"
 #include "../storage/db.h"
 #include "../storage/schema.h"
+#include "../query/result_internal.h"  /* peek+rewind status-row results */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -883,6 +884,42 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     atomic_fetch_add(&srv->stat_queries, 1);
 
     int ncols = tsdb_result_ncols(res);
+
+    /* Status-row pre-check: tsdb_query returns TSDB_OK with a single-row,
+     * single-column "status" SYMBOL result for a class of soft errors:
+     *   - "ERR: not raft leader (...)"
+     *   - "ERR: raft propose failed (timeout or IO)"
+     *   - "ERR: stepped down mid-propose (...)"
+     *   - "ERR: <pre-validation message>" (e.g. "stable not found")
+     *
+     * The status-row form was chosen so the HTTP /sql renderer can show
+     * the message inline without leaking the result on rc != 0.  But the
+     * wire SDK only treats MsgError frames as errors, so a status-row
+     * "ERR:..." comes back to clients (Go SDK, JDBC, bench scripts) as a
+     * SUCCESS — silently swallowing real failures.  Bench evidence:
+     * stress-200m -ptables 5000 saw ~75% of CREATE TABLE statements fail
+     * silently this way under Raft propose pressure.
+     *
+     * Detect the shape, decode the message, and convert to MsgError.
+     * Reaches into tsdb_result_internal to peek+rewind cur because the
+     * public API has no nrows accessor or rewind primitive. */
+    if (ncols == 1 && res->nrows == 1) {
+        const char *cn = tsdb_result_col_name(res, 0);
+        tsdb_type_t ct = tsdb_result_col_type(res, 0);
+        if (cn && strcmp(cn, "status") == 0 && ct == TSDB_TYPE_SYMBOL) {
+            ssize_t saved_cur = res->cur;
+            res->cur = 0;
+            const char *msg = tsdb_result_sym(res, 0);
+            res->cur = saved_cur;
+            if (msg && strncmp(msg, "ERR:", 4) == 0) {
+                tsdb_metric_inc("qengine_query_errors_total");
+                int rc_send = send_error(io, req_id,
+                                          TSDB_ERR_INTERNAL, msg);
+                tsdb_result_free(res);
+                return rc_send;
+            }
+        }
+    }
 
     /* ---- Send QUERY_RESULT_HDR ------------------------------------------ */
     /* Encode: [ncols u16] for each: [name_len u8][name][type u8] */
