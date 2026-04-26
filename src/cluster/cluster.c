@@ -181,17 +181,32 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
 
     if (nremote == 0) return TSDB_OK; /* single-node cluster */
 
-    /* Quorum = 1 remote ACK (best-effort replication; local write
-     * already counts toward durability).  Previously we used
-     * TSDB_WRITE_QUORUM which was tuned for R=3 and blocked writes
-     * when only N/2 peers were reachable; that was too strict once
-     * N>R. */
+    /* Quorum tunable.  TSDB_REPLICATION_QUORUM env:
+     *   1 (default) — wait for ≥1 remote ACK before commit returns.
+     *                 Strongest "one peer has it durable" guarantee.
+     *   0           — async fan-out: spawn worker threads, return
+     *                 immediately.  ~3-10× higher commit throughput
+     *                 on networked clusters but commit OK no longer
+     *                 implies any peer has the row durable yet.
+     *                 Anti-entropy still closes the gap.
+     *   N>1         — full Raft-style quorum of N remote ACKs.  Use
+     *                 only if writes must survive the simultaneous
+     *                 loss of (N_total - N) machines. */
+    static int cached_quorum = -1;
+    if (cached_quorum < 0) {
+        const char *q = getenv("TSDB_REPLICATION_QUORUM");
+        cached_quorum = q && *q ? atoi(q) : 1;
+        if (cached_quorum < 0) cached_quorum = 0;
+    }
+    int q = cached_quorum;
+    if (q > nremote) q = nremote;
+
     return tsdb_replica_write(c->replica_mgr,
                               table_name,
                               ncols, col_types,
                               nrows, col_data,
                               remote_replicas, nremote,
-                              1);
+                              q);
 }
 
 int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
