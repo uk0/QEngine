@@ -90,6 +90,10 @@ static void cluster_remove(tsdb_db_t *db) {
 
 /* ---- Hook implementations ------------------------------------------------ */
 
+/* Forward decl for the Phase γ helper used in cluster_on_replicate's
+ * Phase β.2 owner check (definition is further down in the file). */
+static int shard_replica_n_cached(void);
+
 /*
  * on_replicate: called from flush_and_clear (before each local memtable flush).
  * userdata is the tsdb_cluster_t *.
@@ -166,6 +170,29 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
                                 nrows, col_data);
 
     for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
+
+    /* Phase β.2 — drop the local copy on non-owner nodes once the
+     * owners have ACKed the rows.  Cheap-ish to check (one route
+     * lookup per flush) and turning it into TSDB_SKIP_LOCAL upstream
+     * lets db.c clear the memtable + truncate the WAL instead of
+     * persisting a redundant on-disk shard.  Conservative: only
+     * activates when the cluster_write call returned OK (ownership
+     * verified by the per-peer ACKs that fanout_wait_quorum gates
+     * on); on failure we fall through to local persist so the row
+     * isn't lost on flaky owners. */
+    if (rc == TSDB_OK && shard_replica_n_cached() > 0) {
+        tsdb_node_id_t owners[TSDB_CLUSTER_MAX_NODES];
+        int got = tsdb_cluster_route(c, table_name, "",
+                                     shard_replica_n_cached(), owners);
+        if (got > 0) {
+            tsdb_node_id_t self = tsdb_cluster_local_id(c);
+            int self_is_owner = 0;
+            for (int i = 0; i < got; i++) {
+                if (owners[i] == self) { self_is_owner = 1; break; }
+            }
+            if (!self_is_owner) return TSDB_SKIP_LOCAL;
+        }
+    }
     return rc;
 
 oom:

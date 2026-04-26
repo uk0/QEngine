@@ -43,6 +43,12 @@ typedef enum {
                                    run joint consensus) */
 } tsdb_err_t;
 
+/* Special positive return from on_replicate hooks: the cluster has
+ * accepted the rows on the owner replicas and the local node is NOT
+ * an owner — flush_and_clear_ex should drop the local copy instead
+ * of persisting to disk.  Phase β.2 sharded-storage signal. */
+#define TSDB_SKIP_LOCAL 1
+
 /* Column types */
 typedef enum {
     TSDB_TYPE_TIMESTAMP = 1, /* int64 nanoseconds since epoch */

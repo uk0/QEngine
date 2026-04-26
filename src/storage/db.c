@@ -973,12 +973,26 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
 
     /* Row-level cluster replication: fires BEFORE flush so data still in
      * memtable.  Skipped when raw-block mode is active (on_raw_block != NULL)
-     * to avoid double-replication. */
+     * to avoid double-replication.
+     *
+     * Phase β.2: when shard mode is on and self is a non-owner, the hook
+     * returns TSDB_SKIP_LOCAL after the owners ACK.  We then drop the
+     * local copy entirely (clear memtable, truncate WAL) rather than
+     * persisting a redundant on-disk shard. */
+    int hook_rc = TSDB_OK;
     if (!skip_replicate && t->db && t->db->on_replicate &&
         !t->db->on_raw_block) {
-        t->db->on_replicate(t->db->hook_ud, t->db, t->name,
-                            t->schema, t->memtable);
-        /* Errors are logged by the hook but do not abort the local write. */
+        hook_rc = t->db->on_replicate(t->db->hook_ud, t->db, t->name,
+                                       t->schema, t->memtable);
+        /* Errors other than the skip signal are logged by the hook but
+         * do not abort the local write — falls through to local persist
+         * so the row isn't lost on a flaky owner. */
+    }
+    if (hook_rc == TSDB_SKIP_LOCAL) {
+        tsdb_memtable_clear(t->memtable);
+        if (t->wal) tsdb_wal_truncate(t->wal);
+        tsdb_metric_inc("qengine_shard_local_skipped_total");
+        return TSDB_OK;
     }
 
     /* Raw-block replication is triggered from inside tsdb_part_flush_ex

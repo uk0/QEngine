@@ -139,6 +139,9 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_rows_pulled_total",
       "Rows pulled from a peer via anti-entropy resync (catch-up after downtime)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_shard_local_skipped_total",
+      "Memtable flushes a non-owner skipped because owners ACKed the rows (Phase β.2)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_dr_sent_total",
       "Cross-DC WRITE_BATCH RPCs the forwarder pushed to the remote DC", MT_COUNTER, { .c = { 0 } } },
 
