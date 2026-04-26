@@ -5471,22 +5471,71 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             int err_rc = TSDB_OK;
             switch (stmt.kind) {
             case QAST_STMT_CREATE_GROUP: {
+                const char *gname = stmt.u.create_group.spec.name;
                 const char *pdb = stmt.u.create_group.spec.database;
                 if (pdb[0] && !tsdb_database_exists(pc, pdb)) {
                     err_msg = "ERR: database not found"; err_rc = TSDB_ERR_NOTFOUND;
+                    break;
+                }
+                /* Catalog keys groups globally by name.  If a group with
+                 * this name already exists somewhere, surface a clearer
+                 * EXISTS / namespace-collision message rather than the
+                 * silent "OK: committed via raft" + apply-side EXISTS. */
+                tsdb_group_t g_existing;
+                static char gexist_msg[200];
+                if (tsdb_group_get(pc, gname, &g_existing) == TSDB_OK) {
+                    if (strcmp(g_existing.database, pdb) == 0) {
+                        snprintf(gexist_msg, sizeof(gexist_msg),
+                                 "ERR: group '%s' already exists in database '%s'",
+                                 gname, pdb[0] ? pdb : "(default)");
+                    } else {
+                        snprintf(gexist_msg, sizeof(gexist_msg),
+                                 "ERR: group name '%s' is already used in database '%s' "
+                                 "(group names are globally unique across databases)",
+                                 gname,
+                                 g_existing.database[0] ? g_existing.database : "(default)");
+                    }
+                    err_msg = gexist_msg; err_rc = TSDB_ERR_EXISTS;
                 }
                 break;
             }
             case QAST_STMT_CREATE_STABLE: {
+                const char *sname = stmt.u.create_stable.spec.name;
                 const char *pdb = stmt.u.create_stable.spec.database;
                 const char *pgr = stmt.u.create_stable.spec.group;
                 if (pdb[0] && !tsdb_database_exists(pc, pdb)) {
                     err_msg = "ERR: database not found"; err_rc = TSDB_ERR_NOTFOUND;
-                } else if (pgr[0]) {
+                    break;
+                }
+                if (pgr[0]) {
                     tsdb_group_t gtmp;
                     if (tsdb_group_get(pc, pgr, &gtmp) != TSDB_OK) {
                         err_msg = "ERR: group not found"; err_rc = TSDB_ERR_NOTFOUND;
+                        break;
                     }
+                }
+                tsdb_stable_t st_existing;
+                static char sexist_msg[200];
+                if (tsdb_stable_get(pc, sname, &st_existing) == TSDB_OK) {
+                    if (strcmp(st_existing.database, pdb) == 0 &&
+                        strcmp(st_existing.group, pgr) == 0) {
+                        snprintf(sexist_msg, sizeof(sexist_msg),
+                                 "ERR: stable '%s' already exists at this location", sname);
+                    } else {
+                        snprintf(sexist_msg, sizeof(sexist_msg),
+                                 "ERR: stable name '%s' is already used in database '%s' group '%s' "
+                                 "(stable names are globally unique)",
+                                 sname,
+                                 st_existing.database[0] ? st_existing.database : "(default)",
+                                 st_existing.group[0]    ? st_existing.group    : "(default)");
+                    }
+                    err_msg = sexist_msg; err_rc = TSDB_ERR_EXISTS;
+                }
+                break;
+            }
+            case QAST_STMT_CREATE_DATABASE: {
+                if (tsdb_database_exists(pc, stmt.u.create_database.name)) {
+                    err_msg = "ERR: database already exists"; err_rc = TSDB_ERR_EXISTS;
                 }
                 break;
             }
@@ -5495,6 +5544,23 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 tsdb_stable_t st_pre;
                 if (tsdb_stable_get(pc, ct_in->stable_name, &st_pre) != TSDB_OK) {
                     err_msg = "ERR: stable not found"; err_rc = TSDB_ERR_NOTFOUND;
+                    break;
+                }
+                /* Catalog keys child tables globally by name. */
+                tsdb_child_table_t ct_existing;
+                static char ctexist_msg[200];
+                if (tsdb_child_table_get(pc, ct_in->name, &ct_existing) == TSDB_OK) {
+                    if (strcmp(ct_existing.stable_name, ct_in->stable_name) == 0) {
+                        snprintf(ctexist_msg, sizeof(ctexist_msg),
+                                 "ERR: child table '%s' already exists under stable '%s'",
+                                 ct_in->name, ct_in->stable_name);
+                    } else {
+                        snprintf(ctexist_msg, sizeof(ctexist_msg),
+                                 "ERR: table name '%s' is already used as a child of stable '%s' "
+                                 "(child table names are globally unique)",
+                                 ct_in->name, ct_existing.stable_name);
+                    }
+                    err_msg = ctexist_msg; err_rc = TSDB_ERR_EXISTS;
                     break;
                 }
                 /* Tag count + per-position type — same checks the apply
