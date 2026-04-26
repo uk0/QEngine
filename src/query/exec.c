@@ -5286,6 +5286,7 @@ static int is_catalog_ddl(qast_stmt_kind_t k) {
     case QAST_STMT_DROP_STABLE:
     case QAST_STMT_CREATE_CHILD_TABLE:
     case QAST_STMT_CREATE_TABLE:
+    case QAST_STMT_DROP_TABLE:
         return 1;
     default:
         return 0;
