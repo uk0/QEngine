@@ -646,7 +646,11 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
 
 /* ---- tsdb_drop_table ---------------------------------------------------- */
 
-/* Forward decl: definition below. Needed by tsdb_alter_table_add_column. */
+/* Forward decl: definitions below. Needed by tsdb_alter_table_add_column.
+ * `_locked` variant assumes the caller already holds t->compact_mtx and is
+ * what alter_table / future callers-with-the-lock should use; `_ex` is the
+ * public entry point that takes/releases the lock for callers without it. */
+static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate);
 static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate);
 
 /*
@@ -928,8 +932,10 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
     /* Serialise with compactor and concurrent flushes. */
     pthread_mutex_lock(&t->compact_mtx);
 
-    /* Force memtable to disk so we can safely re-size its column buffers. */
-    int rc = flush_and_clear_ex(t, /*skip_replicate=*/1);
+    /* Force memtable to disk so we can safely re-size its column buffers.
+     * Use the _locked variant since we already hold compact_mtx — calling
+     * the public flush_and_clear_ex here would self-deadlock. */
+    int rc = flush_and_clear_locked(t, /*skip_replicate=*/1);
     if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
 
     /* Persist the schema change first. */
@@ -968,7 +974,14 @@ int tsdb_batch_begin(tsdb_table_t *tbl, tsdb_batch_t **out) {
  * Only flushes if the memtable has at least one row.
  * skip_replicate=1 suppresses the cluster hook (used for replica-received writes).
  */
-static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
+/*
+ * Internal variant: caller MUST hold t->compact_mtx.
+ * Used by alter_table_add_column and by the public flush_and_clear_ex
+ * wrapper.  Splitting the lock acquisition out of the body avoids a
+ * deadlock when the caller already needs the lock for related work
+ * (schema mutation, etc).
+ */
+static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_rows(t->memtable) == 0) return TSDB_OK;
 
     /* Row-level cluster replication: fires BEFORE flush so data still in
@@ -998,19 +1011,29 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     /* Raw-block replication is triggered from inside tsdb_part_flush_ex
      * after each block encode — pass db + table_name so the hook has context.
      * For replica-received writes (skip_replicate=1) pass NULL to suppress. */
-    /* Hold compact_mtx so the compactor cannot swap .col/.idx while
-     * we are appending new blocks to them. */
-    pthread_mutex_lock(&t->compact_mtx);
     int rc = tsdb_part_flush_ex(t->schema, t->memtable,
                                  skip_replicate ? NULL : t->db,
                                  t->name);
-    pthread_mutex_unlock(&t->compact_mtx);
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_flushes_total");
         tsdb_memtable_clear(t->memtable);
         /* Truncate WAL after successful flush. */
         if (t->wal) tsdb_wal_truncate(t->wal);
     }
+    return rc;
+}
+
+/* Public wrapper: serialises concurrent batch_commit calls on the same
+ * table by wrapping the full flush body (replicate + part_flush + clear)
+ * in compact_mtx.  Without this, two callers both pass the rows>0 check,
+ * both fire on_replicate (DOUBLE replication), and both call part_flush_ex
+ * (DOUBLE on-disk write).  The server-side per-table write lock used to
+ * mask this; making the memtable layer self-serialising means the
+ * server-side lock is redundant on the WRITE_BATCH wire path. */
+static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
+    pthread_mutex_lock(&t->compact_mtx);
+    int rc = flush_and_clear_locked(t, skip_replicate);
+    pthread_mutex_unlock(&t->compact_mtx);
     return rc;
 }
 
