@@ -112,6 +112,15 @@ typedef int (*tsdb_pitr_trim_fn)(void *userdata, int64_t target_ns);
 void tsdb_metrics_server_set_pitr_provider(tsdb_pitr_trim_fn fn,
                                              void *userdata);
 
+/* ---- /catalog/check provider hook -------------------------------------- *
+ * Read-only consistency scan over the 4-level catalog.  Writes a JSON
+ * report into buf (capped at cap) listing orphan groups / stables /
+ * children plus on-disk dirs without a catalog row.  Returns bytes
+ * written, or negative on error. */
+typedef int (*tsdb_catalog_check_fn)(void *userdata, char *buf, size_t cap);
+void tsdb_metrics_server_set_catalog_check_provider(
+    tsdb_catalog_check_fn fn, void *userdata);
+
 /* ---- Dashboard login hooks --------------------------------------------- *
  * When configured (TSDB_DASHBOARD_AUTH=1), the server gates every route
  * that isn't in the "always public" set (/health, /metrics, /login,

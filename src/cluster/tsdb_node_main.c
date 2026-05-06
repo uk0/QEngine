@@ -1317,6 +1317,13 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_set_pitr_provider(
         tsdb_node_pitr_trim_trampoline, db);
 
+    /* Catalog consistency check.  GET /catalog/check returns a JSON
+     * report listing orphan groups / stables / children plus on-disk
+     * dirs without a catalog row.  Read-only; useful as a CI/test
+     * diagnostic to catch silent cascade failures. */
+    tsdb_metrics_server_set_catalog_check_provider(
+        (tsdb_catalog_check_fn)tsdb_catalog_check, db);
+
     /* Wire the dashboard auth hooks.  Only armed when
      * TSDB_DASHBOARD_AUTH=1 at process start; otherwise the metrics
      * server no-ops and every route stays public (current default).

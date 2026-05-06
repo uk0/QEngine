@@ -94,6 +94,12 @@ void tsdb_table_unlock_write(tsdb_table_t *tbl);
  * failed to open (non-fatal for pure SELECT workloads). */
 tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
 
+/* Diagnose-only consistency scan over the 4-level catalog.  Writes a
+ * JSON report into buf (capped at cap bytes) listing referential
+ * orphans and on-disk dirs without a catalog row.  Returns bytes
+ * written, or negative on error.  Defined in catalog_check.c. */
+int                    tsdb_catalog_check(tsdb_db_t *db, char *buf, size_t cap);
+
 /* Access the TMQ consumer-group store embedded in the db. Returns NULL if
  * it failed to open (non-fatal for plain workloads). */
 struct tsdb_tmq;

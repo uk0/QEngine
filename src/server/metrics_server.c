@@ -55,6 +55,8 @@ static tsdb_audit_tail_fn   g_audit_tail_fn = NULL;
 static void                *g_audit_tail_ud = NULL;
 static tsdb_pitr_trim_fn    g_pitr_fn       = NULL;
 static void                *g_pitr_ud       = NULL;
+static tsdb_catalog_check_fn g_cat_check_fn = NULL;
+static void                *g_cat_check_ud  = NULL;
 static tsdb_auth_login_fn   g_auth_login_fn = NULL;
 static tsdb_auth_check_fn   g_auth_check_fn = NULL;
 static void                *g_auth_ud       = NULL;
@@ -99,6 +101,13 @@ void tsdb_metrics_server_set_pitr_provider(tsdb_pitr_trim_fn fn,
 {
     g_pitr_fn = fn;
     g_pitr_ud = userdata;
+}
+
+void tsdb_metrics_server_set_catalog_check_provider(
+    tsdb_catalog_check_fn fn, void *userdata)
+{
+    g_cat_check_fn = fn;
+    g_cat_check_ud = userdata;
 }
 
 void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
@@ -393,6 +402,7 @@ static void *handle_connection(void *arg) {
     int route_logout  = 0;
     int route_audit   = 0;
     int route_pitr    = 0;
+    int route_cat_check = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /login", 10) == 0)        route_login = 1;
     else if (strncmp(req, "POST /login", 11) == 0)       route_login = 2; /* 2 = POST */
@@ -407,6 +417,7 @@ static void *handle_connection(void *arg) {
      * applies to a GET probe instead of 404-ing before the gate). */
     else if (strncmp(req, "POST /pitr", 10) == 0 ||
              strncmp(req, "GET /pitr",  9) == 0)          route_pitr    = 1;
+    else if (strncmp(req, "GET /catalog/check", 18) == 0) route_cat_check = 1;
     else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
              strncmp(req, "GET /retention/sweep",  20) == 0)
                                                           route_ret_sweep = 1;
@@ -456,7 +467,8 @@ static void *handle_connection(void *arg) {
     int route_needs_auth = g_auth_enabled &&
         (route_dash || route_cluster || route_tree ||
          route_backup || route_ret_sweep || route_sql ||
-         route_audit || route_pitr || route_static);
+         route_audit || route_pitr || route_cat_check ||
+         route_static);
 
     /* Extract tsdb_auth token from Cookie header (first match wins).
      * HTTP headers are case-insensitive per RFC 7230; most clients use
@@ -1003,6 +1015,31 @@ static void *handle_connection(void *arg) {
             removed >= 0 ? "200 OK" : "503 Service Unavailable", blen);
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body, (size_t)blen);
+    } else if (route_cat_check) {
+        /* Read-only catalog consistency scan.  The provider walks every
+         * catalog row + on-disk dir and produces a JSON report listing
+         * referential orphans and stranded directories. */
+        const size_t CC_CAP = 256 * 1024;
+        char *body = malloc(CC_CAP);
+        if (!body) {
+            const char *oom = "HTTP/1.1 500 Internal Server Error\r\n"
+                              "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            write_all(fd, oom, strlen(oom));
+            goto done;
+        }
+        int blen = -1;
+        if (g_cat_check_fn) blen = g_cat_check_fn(g_cat_check_ud, body, CC_CAP);
+        if (blen <= 0) {
+            const char *fallback = "{\"error\":\"catalog_check provider not registered\"}";
+            blen = snprintf(body, CC_CAP, "%s", fallback);
+        }
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, (size_t)blen);
+        free(body);
     } else if (route_health) {
         /* Minimal liveness payload — kept JSON-only so k8s / curl
          * integrations parse it trivially.  Uptime is seconds since the

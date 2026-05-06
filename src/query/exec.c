@@ -720,6 +720,7 @@ typedef enum {
     PROJ_WIN_DERIVATIVE,  /* derivative(col)   (v[i]-v[i-1])/(ts[i]-ts[i-1])*1e9 */
     PROJ_WIN_CSUM,        /* csum(col)         cumulative sum */
     PROJ_WIN_MAVG,        /* mavg(col, N)      moving average, window N ≤ 64 */
+    PROJ_WIN_LAG,         /* lag(col, N=1)     value N rows back, NaN until n>N */
     PROJ_WIN_INTERP,      /* interp(col,'Xs')  (stub – not yet implemented) */
     PROJ_UDF_SCALAR,      /* user-defined scalar function, per-row call    */
 } proj_kind_t;
@@ -811,6 +812,7 @@ static int is_window_call(qast_expr_t *e) {
            strcasecmp(n, "derivative") == 0 ||
            strcasecmp(n, "csum") == 0       ||
            strcasecmp(n, "mavg") == 0       ||
+           strcasecmp(n, "lag") == 0        ||
            strcasecmp(n, "interp") == 0;
 }
 /* Helper: allocate a fresh tdigest and store into proj; NULLs on failure. */
@@ -988,6 +990,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             else if (strcasecmp(wname, "derivative") == 0) wk = PROJ_WIN_DERIVATIVE;
             else if (strcasecmp(wname, "csum")       == 0) wk = PROJ_WIN_CSUM;
             else if (strcasecmp(wname, "mavg")       == 0) wk = PROJ_WIN_MAVG;
+            else if (strcasecmp(wname, "lag")        == 0) wk = PROJ_WIN_LAG;
             else                                            wk = PROJ_WIN_INTERP;
 
             if (wk == PROJ_WIN_INTERP) {
@@ -1058,6 +1061,28 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                     free(arr); return TSDB_ERR_PARSE;
                 }
                 arr[n].mavg_window = (int)wsize;
+            }
+            /* LAG(col [, N=1]): reuse mavg_buf as a length-N ring of past
+             * values; emit oldest once the ring fills (NaN before that). */
+            if (wk == PROJ_WIN_LAG) {
+                int64_t lag_n_arg = 1;
+                if (e->nargs == 2) {
+                    qast_expr_t *larg = e->args[1];
+                    if      (larg->kind == QAST_LIT_INT)   lag_n_arg = larg->v.i;
+                    else if (larg->kind == QAST_LIT_FLOAT) lag_n_arg = (int64_t)larg->v.f;
+                    else {
+                        eset(err, errcap, "lag() N must be an integer literal");
+                        free(arr); return TSDB_ERR_PARSE;
+                    }
+                } else if (e->nargs > 2) {
+                    eset(err, errcap, "lag() takes 1 or 2 arguments: lag(col [, N])");
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                if (lag_n_arg < 1 || lag_n_arg > MAVG_MAX_WINDOW) {
+                    eset(err, errcap, "lag() N must be 1..%d", MAVG_MAX_WINDOW);
+                    free(arr); return TSDB_ERR_PARSE;
+                }
+                arr[n].mavg_window = (int)lag_n_arg;
             }
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else snprintf(arr[n].name, sizeof(arr[n].name), "%s(%s)", wname, s->cols[c].name);
@@ -4879,6 +4904,25 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                             p->win_has_prev = 1;
                             break;
                         }
+                        case PROJ_WIN_LAG: {
+                            /* mavg_buf is reused as a length-N ring of past
+                             * values.  While it's filling we emit NaN; once
+                             * full the head slot holds the value from N rows
+                             * ago — emit it, then overwrite with cur_v. */
+                            int N = p->mavg_window;
+                            if (p->mavg_n < N) {
+                                int slot = (p->mavg_head + p->mavg_n) % N;
+                                p->mavg_buf[slot] = cur_v;
+                                p->mavg_n++;
+                                out_v = NAN;
+                            } else {
+                                out_v = p->mavg_buf[p->mavg_head];
+                                p->mavg_buf[p->mavg_head] = cur_v;
+                                p->mavg_head = (p->mavg_head + 1) % N;
+                            }
+                            p->win_has_prev = 1;
+                            break;
+                        }
                         default:
                             out_v = NAN;
                             break;
@@ -5774,14 +5818,27 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                     for (int si = 0; si < ns_match; si++) {
                         tsdb_child_table_t *children = NULL;
                         size_t nch = 0;
-                        (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
-                        for (size_t ci = 0; ci < nch; ci++)
-                            (void)tsdb_drop_table(db, children[ci].name);
+                        int lrc = tsdb_child_table_list(cat, snames[si], &children, &nch);
+                        if (lrc != TSDB_OK)
+                            fprintf(stderr, "[cascade] DROP DATABASE %s: list children of stable %s rc=%d\n",
+                                    dbname, snames[si], lrc);
+                        for (size_t ci = 0; ci < nch; ci++) {
+                            int drc = tsdb_drop_table(db, children[ci].name);
+                            if (drc != TSDB_OK && drc != TSDB_ERR_NOTFOUND)
+                                fprintf(stderr, "[cascade] DROP DATABASE %s: drop child %s rc=%d\n",
+                                        dbname, children[ci].name, drc);
+                        }
                         free(children);
-                        (void)tsdb_stable_drop(cat, snames[si]);
+                        int src = tsdb_stable_drop(cat, snames[si]);
+                        if (src != TSDB_OK && src != TSDB_ERR_NOTFOUND)
+                            fprintf(stderr, "[cascade] DROP DATABASE %s: drop stable %s rc=%d\n",
+                                    dbname, snames[si], src);
                     }
                 }
-                (void)tsdb_group_drop(cat, gnames[gi]);
+                int grc = tsdb_group_drop(cat, gnames[gi]);
+                if (grc != TSDB_OK && grc != TSDB_ERR_NOTFOUND)
+                    fprintf(stderr, "[cascade] DROP DATABASE %s: drop group %s rc=%d\n",
+                            dbname, gnames[gi], grc);
             }
         }
 
@@ -5802,11 +5859,21 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 for (int si = 0; si < ns_match; si++) {
                     tsdb_child_table_t *children = NULL;
                     size_t nch = 0;
-                    (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
-                    for (size_t ci = 0; ci < nch; ci++)
-                        (void)tsdb_drop_table(db, children[ci].name);
+                    int lrc = tsdb_child_table_list(cat, snames[si], &children, &nch);
+                    if (lrc != TSDB_OK)
+                        fprintf(stderr, "[cascade] DROP DATABASE %s: list children of stable %s rc=%d\n",
+                                dbname, snames[si], lrc);
+                    for (size_t ci = 0; ci < nch; ci++) {
+                        int drc = tsdb_drop_table(db, children[ci].name);
+                        if (drc != TSDB_OK && drc != TSDB_ERR_NOTFOUND)
+                            fprintf(stderr, "[cascade] DROP DATABASE %s: drop child %s rc=%d\n",
+                                    dbname, children[ci].name, drc);
+                    }
                     free(children);
-                    (void)tsdb_stable_drop(cat, snames[si]);
+                    int src = tsdb_stable_drop(cat, snames[si]);
+                    if (src != TSDB_OK && src != TSDB_ERR_NOTFOUND)
+                        fprintf(stderr, "[cascade] DROP DATABASE %s: drop stable %s rc=%d\n",
+                                dbname, snames[si], src);
                 }
             }
         }
@@ -5867,11 +5934,21 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             for (int si = 0; si < ns_match; si++) {
                 tsdb_child_table_t *children = NULL;
                 size_t nch = 0;
-                (void)tsdb_child_table_list(cat, snames[si], &children, &nch);
-                for (size_t ci = 0; ci < nch; ci++)
-                    (void)tsdb_drop_table(db, children[ci].name);
+                int lrc = tsdb_child_table_list(cat, snames[si], &children, &nch);
+                if (lrc != TSDB_OK)
+                    fprintf(stderr, "[cascade] DROP GROUP %s: list children of stable %s rc=%d\n",
+                            gname, snames[si], lrc);
+                for (size_t ci = 0; ci < nch; ci++) {
+                    int drc = tsdb_drop_table(db, children[ci].name);
+                    if (drc != TSDB_OK && drc != TSDB_ERR_NOTFOUND)
+                        fprintf(stderr, "[cascade] DROP GROUP %s: drop child %s rc=%d\n",
+                                gname, children[ci].name, drc);
+                }
                 free(children);
-                (void)tsdb_stable_drop(cat, snames[si]);
+                int src = tsdb_stable_drop(cat, snames[si]);
+                if (src != TSDB_OK && src != TSDB_ERR_NOTFOUND)
+                    fprintf(stderr, "[cascade] DROP GROUP %s: drop stable %s rc=%d\n",
+                            gname, snames[si], src);
             }
         }
         rc = tsdb_group_drop(cat, gname);
@@ -5927,11 +6004,17 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         tsdb_child_table_t *children = NULL;
         size_t nch = 0;
         if (tsdb_stable_exists(cat, sname)) {
-            (void)tsdb_child_table_list(cat, sname, &children, &nch);
+            int lrc = tsdb_child_table_list(cat, sname, &children, &nch);
+            if (lrc != TSDB_OK)
+                fprintf(stderr, "[cascade] DROP STABLE %s: list children rc=%d\n",
+                        sname, lrc);
         }
         /* Drop physical tables first. */
         for (size_t ci = 0; ci < nch; ci++) {
-            (void)tsdb_drop_table(db, children[ci].name);
+            int drc = tsdb_drop_table(db, children[ci].name);
+            if (drc != TSDB_OK && drc != TSDB_ERR_NOTFOUND)
+                fprintf(stderr, "[cascade] DROP STABLE %s: drop child %s rc=%d\n",
+                        sname, children[ci].name, drc);
         }
         free(children);
         /* Now drop the catalog entries (cascades child table catalog entries). */
