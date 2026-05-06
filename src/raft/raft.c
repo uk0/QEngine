@@ -138,7 +138,28 @@ struct tsdb_raft {
      * observed term-2 SEEDs stuck uncommitted forever after a
      * term-3 leader took over. */
     int                pending_noop;
+
+    /* Per-index apply-outcome ring.
+     *
+     * Pre-fix the apply thread cast apply_fn's rc to void and bumped
+     * last_applied unconditionally — proposers thought every committed
+     * entry succeeded, even when apply silently dropped a catalog
+     * mutation.  Observed under stress-200m burst CREATE TABLE: 33 of
+     * 50 CREATEs went missing without any error returned to the SDK.
+     *
+     * The ring records (index, rc) keyed by index modulo size.  Apply
+     * fills the slot under r->lock BEFORE bumping last_applied; the
+     * proposer reads the slot under the same lock after waking on
+     * commit_cv.  If `slot.index == my_index`, use `slot.rc`; otherwise
+     * the entry got overwritten (in-flight count > ring size) and we
+     * fall back to TSDB_OK — strict improvement over the old behaviour
+     * for the common case (low-to-moderate concurrency). */
+    struct {
+        uint64_t index;
+        int      rc;
+    }                  outcomes[64];
 };
+#define RAFT_OUTCOME_RING_MASK 63u  /* size = 64; must match struct above */
 
 /* Max entries packed into one AppendEntries call.  Keeps the RPC
  * bounded while leaving room for burst replication after a leader
@@ -1709,12 +1730,22 @@ static void *apply_thread_main(void *arg) {
                         }
                     }
                 }
-            } else if (r->apply_fn) {
-                (void)r->apply_fn(r->apply_ud, &e);
+            }
+            /* Capture apply rc so the proposer can see it via the
+             * outcome ring.  CONFIG entries above don't go through
+             * apply_fn — treat as TSDB_OK; they have no semantic
+             * failure path the proposer cares about. */
+            int apply_rc = TSDB_OK;
+            if (e.type != TSDB_RAFT_ENTRY_CONFIG && r->apply_fn) {
+                apply_rc = r->apply_fn(r->apply_ud, &e);
             }
             uint64_t entry_term = e.term;
             free(e.payload);
             pthread_mutex_lock(&r->lock);
+            /* Record outcome BEFORE bumping last_applied so any proposer
+             * that wakes on the same broadcast reads a valid slot. */
+            r->outcomes[idx & RAFT_OUTCOME_RING_MASK].index = idx;
+            r->outcomes[idx & RAFT_OUTCOME_RING_MASK].rc    = apply_rc;
             r->last_applied = idx;
             pthread_cond_broadcast(&r->commit_cv); /* wake proposers */
             pthread_mutex_unlock(&r->lock);
@@ -1796,6 +1827,16 @@ int tsdb_raft_propose(tsdb_raft_t *r,
         if (r->state != TSDB_RAFT_LEADER) { rc = TSDB_ERR_PERMISSION; break; }
         int w = pthread_cond_timedwait(&r->commit_cv, &r->lock, &deadline);
         if (w == ETIMEDOUT) { rc = TSDB_ERR_IO; break; }
+    }
+    /* Surface apply outcome.  Best-effort: if the slot was overwritten
+     * by a later apply (in-flight count > ring size) we conservatively
+     * fall back to OK — strict improvement over the prior behaviour
+     * where every apply was assumed successful regardless. */
+    if (rc == TSDB_OK) {
+        const __typeof__(r->outcomes[0]) *slot =
+            &r->outcomes[my_index & RAFT_OUTCOME_RING_MASK];
+        if (slot->index == my_index && slot->rc != TSDB_OK)
+            rc = slot->rc;
     }
     pthread_mutex_unlock(&r->lock);
     return rc;
