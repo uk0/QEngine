@@ -19,6 +19,7 @@
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../query/result_internal.h"  /* peek+rewind status-row results */
+#include "../query/exec.h"              /* tsdb_query_set_deadline_ns */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -864,10 +865,26 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Per-query deadline.  Pre-fix request_timeout_ns was configured
+     * in opts but nothing read it — runaway SELECTs ran forever and
+     * pinned a connection thread.  Now we set a thread-local deadline
+     * the executor checks at block boundaries, then clear it after
+     * the call.  Save+restore the prior value so nested queries (auth
+     * stack, raft re-entry) don't lose their own deadlines. */
+    int64_t prev_deadline = 0;
+    if (srv->opts.request_timeout_ns > 0) {
+        int64_t deadline = (int64_t)t0.tv_sec * 1000000000LL + t0.tv_nsec
+                         + srv->opts.request_timeout_ns;
+        prev_deadline = tsdb_query_set_deadline_ns(deadline);
+    }
+
     tsdb_result_t *res = NULL;
     int rc = have_token
         ? tsdb_query_auth(srv->db, io->auth_token, qtl, &res)
         : tsdb_query(srv->db, qtl, &res);
+
+    if (srv->opts.request_timeout_ns > 0)
+        tsdb_query_set_deadline_ns(prev_deadline);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed_ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +

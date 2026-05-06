@@ -34,13 +34,19 @@ typedef enum {
     TSDB_ERR_SCHEMA      = -11,
     TSDB_ERR_INTERNAL    = -12,
     TSDB_ERR_PERMISSION  = -13,
-    TSDB_ERR_BUSY        = -14  /* a prior in-flight operation must
+    TSDB_ERR_BUSY        = -14, /* a prior in-flight operation must
                                    commit before this one can start
                                    (e.g. a Raft membership change is
                                    still in the leader's uncommitted
                                    tail — we serialise ADD/REMOVE
                                    MASTER one at a time rather than
                                    run joint consensus) */
+    TSDB_ERR_TIMEOUT     = -15  /* per-query deadline elapsed; the
+                                   executor aborted at a block boundary
+                                   so partial work is discarded.  Set
+                                   via tsdb_query_set_deadline() before
+                                   the call; server.c populates it from
+                                   request_timeout_ns. */
 } tsdb_err_t;
 
 /* Special positive return from on_replicate hooks: the cluster has

@@ -32,6 +32,13 @@ typedef struct {
      * When false (default, legacy), unauthenticated frames run in bypass
      * mode through tsdb_query — matches pre-RBAC behaviour. */
     bool        require_auth;
+    /* Per-query deadline applied to QUERY frames.  0 (default) → no
+     * deadline.  When > 0, handle_query sets a thread-local deadline
+     * = clock_monotonic + this value before calling tsdb_query, and the
+     * executor aborts at the next block boundary with TSDB_ERR_TIMEOUT
+     * once exceeded.  Bounds the runaway-SELECT case so a single bad
+     * query can't pin a connection thread forever. */
+    int64_t     request_timeout_ns;
 } tsdb_server_opts_t;
 
 /*

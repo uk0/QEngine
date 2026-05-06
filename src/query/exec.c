@@ -3932,6 +3932,38 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
 /* ---- Main select execution ------------------------------------------- */
 
+/* ---- Per-query deadline ------------------------------------------------ *
+ *
+ * Pre-fix nothing enforced any deadline.  request_timeout_ns lived in
+ * server config but was only used to time the query for the metric
+ * histogram — a runaway SELECT would happily run forever and pin a
+ * connection thread.  The fix is a thread-local deadline checked at
+ * block boundaries inside hot loops; cheap (clock_gettime once per
+ * 8K-row block) but bounded.
+ *
+ * Tracking per-thread instead of per-query because the executor doesn't
+ * thread a context pointer through every level — too invasive.  Server
+ * code (handle_query) sets it before tsdb_query() and clears it after,
+ * so concurrent connections don't share the deadline. */
+static __thread int64_t g_query_deadline_ns = 0;
+
+static inline int64_t now_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+int64_t tsdb_query_set_deadline_ns(int64_t deadline_monotonic_ns) {
+    int64_t prev = g_query_deadline_ns;
+    g_query_deadline_ns = deadline_monotonic_ns;
+    return prev;
+}
+
+int tsdb_query_deadline_expired(void) {
+    if (g_query_deadline_ns == 0) return 0;
+    return now_monotonic_ns() > g_query_deadline_ns;
+}
+
 /* ORDER BY post-processing.
  *
  * Pre-fix the parser stored q->has_order / q->order_col / q->order_dir
@@ -4410,6 +4442,12 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* Iterate sources. */
     for (size_t si = 0; si < plan.nsrcs && rows_emitted < limit; si++) {
+        /* Per-query deadline check at block boundary — see
+         * tsdb_query_set_deadline_ns().  Fires once per source (block
+         * group) so a runaway scan can be killed without per-row
+         * overhead. */
+        if (tsdb_query_deadline_expired()) { rc = TSDB_ERR_TIMEOUT; goto done; }
+
         scan_src_t *src = &plan.srcs[si];
         size_t n = src->row_count;
 
