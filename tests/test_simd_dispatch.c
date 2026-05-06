@@ -282,6 +282,31 @@ static void test_perf_sum(void) {
         printf("  PERF  1M  f64 sum [%s]: %.2f GB/s  (%.3f ms/call, sum=%.3e)\n",
                tsdb_cpu_level_name(tsdb_cpu_level()), gbps,
                elapsed / REPS * 1000.0, out);
+
+        /* ---- Null-aware variant (~10%% nulls). --------------------------
+         * Pre-fix this path bypassed SIMD entirely (`if (bm) return scalar`),
+         * so any column with a null bitmap aggregated at scalar speed.  A
+         * ratio close to the no-null number tells us the masked SIMD path
+         * is actually being hit. */
+        size_t bmlen = (n + 7) / 8;
+        uint8_t *bm = (uint8_t *)malloc(bmlen);
+        if (bm) {
+            /* All bits valid except every 11th (~9% nulls). */
+            for (size_t b = 0; b < bmlen; b++) bm[b] = 0xFF;
+            for (size_t i = 0; i < n; i += 11)
+                bm[i >> 3] &= (uint8_t)~(1u << (7 - (i & 7)));
+            tsdb_agg_sum_f64(v, n, bm, &out, &cnt); /* warmup */
+            t0 = now_sec();
+            for (int r = 0; r < REPS; r++)
+                tsdb_agg_sum_f64(v, n, bm, &out, &cnt);
+            elapsed = now_sec() - t0;
+            gbps = (double)n * sizeof(double) * REPS / elapsed / 1e9;
+            printf("  PERF  1M  f64 sum [%s] +null bitmap: %.2f GB/s "
+                   "(%.3f ms/call, valid=%llu)\n",
+                   tsdb_cpu_level_name(tsdb_cpu_level()), gbps,
+                   elapsed / REPS * 1000.0, (unsigned long long)cnt);
+            free(bm);
+        }
         free(v);
 skip10m:;
     }
