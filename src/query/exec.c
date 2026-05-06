@@ -3932,6 +3932,108 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
 /* ---- Main select execution ------------------------------------------- */
 
+/* ORDER BY post-processing.
+ *
+ * Pre-fix the parser stored q->has_order / q->order_col / q->order_dir
+ * but the executor never read them — `SELECT … ORDER BY ts DESC LIMIT 5`
+ * returned rows in scan order (verified ASC and DESC produced identical
+ * output).
+ *
+ * Implementation: build a permutation by sorting an index array, then
+ * apply it column-by-column with a scratch buffer.  Runs once at the
+ * end of every exec_select dispatch (plain / GROUP BY / SAMPLE BY /
+ * LATEST ON / window) so every result shape is covered.
+ *
+ * Comparator state is kept in a thread-local struct since qsort lacks
+ * a userdata pointer (qsort_r is non-portable across glibc/BSD).  This
+ * is safe because tsdb_query is single-threaded per call — parallel
+ * scans merge into the same result before we sort. */
+typedef struct {
+    const void  *col_data;
+    tsdb_type_t  type;
+    int          desc;
+} ord_ctx_t;
+
+static __thread ord_ctx_t g_ord_ctx;
+
+static int order_cmp_idx(const void *pa, const void *pb) {
+    size_t ia = *(const size_t *)pa;
+    size_t ib = *(const size_t *)pb;
+    int  c = 0;
+    switch (g_ord_ctx.type) {
+    case TSDB_TYPE_INT64:
+    case TSDB_TYPE_TIMESTAMP: {
+        int64_t va = ((const int64_t *)g_ord_ctx.col_data)[ia];
+        int64_t vb = ((const int64_t *)g_ord_ctx.col_data)[ib];
+        c = (va > vb) - (va < vb);
+        break;
+    }
+    case TSDB_TYPE_FLOAT64: {
+        double va = ((const double *)g_ord_ctx.col_data)[ia];
+        double vb = ((const double *)g_ord_ctx.col_data)[ib];
+        c = (va > vb) - (va < vb);
+        break;
+    }
+    case TSDB_TYPE_SYMBOL: {
+        uint32_t va = ((const uint32_t *)g_ord_ctx.col_data)[ia];
+        uint32_t vb = ((const uint32_t *)g_ord_ctx.col_data)[ib];
+        c = (va > vb) - (va < vb);
+        break;
+    }
+    default:
+        c = 0;
+        break;
+    }
+    return g_ord_ctx.desc ? -c : c;
+}
+
+static int result_apply_order_by(tsdb_result_t *r, qast_query_t *q,
+                                  char *err, size_t errcap) {
+    if (!q || !q->has_order || !q->order_col || !r || r->nrows < 2)
+        return TSDB_OK;
+
+    int oc = -1;
+    for (int i = 0; i < r->ncols; i++) {
+        if (r->col_names[i] && strcmp(r->col_names[i], q->order_col) == 0) {
+            oc = i; break;
+        }
+    }
+    if (oc < 0) {
+        eset(err, errcap, "ORDER BY column '%s' not in result schema",
+             q->order_col);
+        return TSDB_ERR_SCHEMA;
+    }
+
+    size_t n = r->nrows;
+    size_t *idx = (size_t *)malloc(n * sizeof(size_t));
+    if (!idx) return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++) idx[i] = i;
+
+    g_ord_ctx.col_data = r->col_data[oc];
+    g_ord_ctx.type     = r->col_types[oc];
+    g_ord_ctx.desc     = (q->order_dir == QAST_ORDER_DESC);
+    qsort(idx, n, sizeof(size_t), order_cmp_idx);
+
+    /* Permute each column by the index array.  Result columns store
+     * uint32 for SYMBOL and uint64 for everything else (matching how
+     * result_append_cell writes them).  All other shapes default to
+     * 8-byte slots so a single per-column scratch buffer covers them. */
+    for (int c = 0; c < r->ncols; c++) {
+        size_t w = (r->col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
+        uint8_t *src = (uint8_t *)r->col_data[c];
+        if (!src) continue;
+        uint8_t *tmp = (uint8_t *)malloc(n * w);
+        if (!tmp) { free(idx); return TSDB_ERR_NOMEM; }
+        for (size_t i = 0; i < n; i++)
+            memcpy(tmp + i * w, src + idx[i] * w, w);
+        memcpy(src, tmp, n * w);
+        free(tmp);
+    }
+
+    free(idx);
+    return TSDB_OK;
+}
+
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                        char *err, size_t errcap) {
     /* Check if FROM refers to a STable; if so, expand to union over children. */
@@ -5499,6 +5601,12 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             }
         }
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
+        /* Apply ORDER BY post-execution so plain SELECT, GROUP BY,
+         * SAMPLE BY, LATEST ON, and the stable-select union all share
+         * the same sort path.  Must run before arena_free because
+         * q->order_col is arena-allocated. */
+        if (rc == TSDB_OK)
+            rc = result_apply_order_by(r, &stmt.u.query, err, sizeof(err));
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
         *out = r;
