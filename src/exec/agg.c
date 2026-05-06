@@ -304,6 +304,90 @@ static int64_t sum_i64_neon(const int64_t *v, size_t n,
     return s;
 }
 
+/* ARMv8 NEON has no SMIN.D / SMAX.D for 64-bit signed lanes (SMIN tops out
+ * at 32-bit), so emulate with compare-and-select.  Same shape as the
+ * AVX2 i64 min/max emulation below. */
+#if defined(__aarch64__)
+static inline int64x2_t min_s64x2(int64x2_t a, int64x2_t b) {
+    /* mask all-ones where a < b → select a, else b */
+    uint64x2_t lt = vcltq_s64(a, b);
+    return vbslq_s64(lt, a, b);
+}
+static inline int64x2_t max_s64x2(int64x2_t a, int64x2_t b) {
+    uint64x2_t gt = vcgtq_s64(a, b);
+    return vbslq_s64(gt, a, b);
+}
+
+static int64_t min_i64_neon(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MAX;
+    int64x2_t mn = vdupq_n_s64(INT64_MAX);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 1 < n; i += 2) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mn = min_s64x2(mn, vld1q_s64(v + i));
+        }
+    } else {
+        const int64x2_t imax = vdupq_n_s64(INT64_MAX);
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            uint8_t b = bm[i >> 3];
+            int64x2_t v0 = vld1q_s64(v + i + 0);
+            int64x2_t v1 = vld1q_s64(v + i + 2);
+            int64x2_t v2 = vld1q_s64(v + i + 4);
+            int64x2_t v3 = vld1q_s64(v + i + 6);
+            v0 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 6) & 0x3u)), v0, imax);
+            v1 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 4) & 0x3u)), v1, imax);
+            v2 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 2) & 0x3u)), v2, imax);
+            v3 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b      ) & 0x3u)), v3, imax);
+            mn = min_s64x2(mn, min_s64x2(min_s64x2(v0, v1), min_s64x2(v2, v3)));
+        }
+    }
+    int64_t m  = vgetq_lane_s64(mn, 0);
+    int64_t hi = vgetq_lane_s64(mn, 1);
+    if (hi < m) m = hi;
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] < m) m = v[i];
+    }
+    return m;
+}
+
+static int64_t max_i64_neon(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MIN;
+    int64x2_t mx = vdupq_n_s64(INT64_MIN);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 1 < n; i += 2) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mx = max_s64x2(mx, vld1q_s64(v + i));
+        }
+    } else {
+        const int64x2_t imin = vdupq_n_s64(INT64_MIN);
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            uint8_t b = bm[i >> 3];
+            int64x2_t v0 = vld1q_s64(v + i + 0);
+            int64x2_t v1 = vld1q_s64(v + i + 2);
+            int64x2_t v2 = vld1q_s64(v + i + 4);
+            int64x2_t v3 = vld1q_s64(v + i + 6);
+            v0 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 6) & 0x3u)), v0, imin);
+            v1 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 4) & 0x3u)), v1, imin);
+            v2 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b >> 2) & 0x3u)), v2, imin);
+            v3 = vbslq_s64((int64x2_t)neon_pair_mask((uint8_t)((b      ) & 0x3u)), v3, imin);
+            mx = max_s64x2(mx, max_s64x2(max_s64x2(v0, v1), max_s64x2(v2, v3)));
+        }
+    }
+    int64_t m  = vgetq_lane_s64(mx, 0);
+    int64_t hi = vgetq_lane_s64(mx, 1);
+    if (hi > m) m = hi;
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] > m) m = v[i];
+    }
+    return m;
+}
+#define HAS_NEON_I64_MINMAX 1
+#endif /* __aarch64__ */
+
 #define HAS_NEON_KERNELS 1
 #endif /* NEON */
 
@@ -527,6 +611,97 @@ static int64_t sum_i64_avx2(const int64_t *v, size_t n,
     return s;
 }
 
+/* AVX2 lacks _mm256_min_epi64 / _mm256_max_epi64; emulate via cmpgt+blendv.
+ * Same algebra as the NEON helper above, mapped to AVX2 intrinsics. */
+__attribute__((target("avx2")))
+static inline __m256i min_s64_avx2(__m256i a, __m256i b) {
+    /* mask = (a > b) → all-ones lanes where a wins.  We want the smaller,
+     * so where mask set keep b, else keep a. */
+    __m256i gt = _mm256_cmpgt_epi64(a, b);
+    return _mm256_blendv_epi8(a, b, gt);
+}
+__attribute__((target("avx2")))
+static inline __m256i max_s64_avx2(__m256i a, __m256i b) {
+    __m256i gt = _mm256_cmpgt_epi64(a, b);
+    return _mm256_blendv_epi8(b, a, gt);
+}
+
+__attribute__((target("avx2")))
+static int64_t min_i64_avx2(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MAX;
+    __m256i mn = _mm256_set1_epi64x(INT64_MAX);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 3 < n; i += 4) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mn = min_s64_avx2(mn, _mm256_loadu_si256((const __m256i *)(v + i)));
+        }
+    } else {
+        const __m256i imax = _mm256_set1_epi64x(INT64_MAX);
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            uint8_t b = bm[i >> 3];
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(v + i + 0));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(v + i + 4));
+            __m256i m0 = _mm256_load_si256((const __m256i *)avx2_nibble_lut[(b >> 4) & 0xF]);
+            __m256i m1 = _mm256_load_si256((const __m256i *)avx2_nibble_lut[(b     ) & 0xF]);
+            v0 = _mm256_blendv_epi8(imax, v0, m0);
+            v1 = _mm256_blendv_epi8(imax, v1, m1);
+            mn = min_s64_avx2(mn, min_s64_avx2(v0, v1));
+        }
+    }
+    /* Reduce 4 lanes to 1. */
+    __m128i lo = _mm256_castsi256_si128(mn);
+    __m128i hi = _mm256_extracti128_si256(mn, 1);
+    int64_t a = _mm_extract_epi64(lo, 0);
+    int64_t b = _mm_extract_epi64(lo, 1);
+    int64_t c = _mm_extract_epi64(hi, 0);
+    int64_t d = _mm_extract_epi64(hi, 1);
+    int64_t m = a; if (b < m) m = b; if (c < m) m = c; if (d < m) m = d;
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] < m) m = v[i];
+    }
+    return m;
+}
+
+__attribute__((target("avx2")))
+static int64_t max_i64_avx2(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MIN;
+    __m256i mx = _mm256_set1_epi64x(INT64_MIN);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 3 < n; i += 4) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mx = max_s64_avx2(mx, _mm256_loadu_si256((const __m256i *)(v + i)));
+        }
+    } else {
+        const __m256i imin = _mm256_set1_epi64x(INT64_MIN);
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            uint8_t b = bm[i >> 3];
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(v + i + 0));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(v + i + 4));
+            __m256i m0 = _mm256_load_si256((const __m256i *)avx2_nibble_lut[(b >> 4) & 0xF]);
+            __m256i m1 = _mm256_load_si256((const __m256i *)avx2_nibble_lut[(b     ) & 0xF]);
+            v0 = _mm256_blendv_epi8(imin, v0, m0);
+            v1 = _mm256_blendv_epi8(imin, v1, m1);
+            mx = max_s64_avx2(mx, max_s64_avx2(v0, v1));
+        }
+    }
+    __m128i lo = _mm256_castsi256_si128(mx);
+    __m128i hi = _mm256_extracti128_si256(mx, 1);
+    int64_t a = _mm_extract_epi64(lo, 0);
+    int64_t b = _mm_extract_epi64(lo, 1);
+    int64_t c = _mm_extract_epi64(hi, 0);
+    int64_t d = _mm_extract_epi64(hi, 1);
+    int64_t m = a; if (b > m) m = b; if (c > m) m = c; if (d > m) m = d;
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] > m) m = v[i];
+    }
+    return m;
+}
+#define HAS_AVX2_I64_MINMAX 1
+
 /* ---------- AVX-512 (per-function target so the binary stays portable) ---------- */
 
 #if defined(__AVX512F__)
@@ -665,6 +840,56 @@ static int64_t sum_i64_avx512(const int64_t *v, size_t n,
     return s;
 }
 
+/* AVX-512F has native _mm512_min_epi64 / _mm512_max_epi64 + masked variants. */
+__attribute__((target("avx512f")))
+static int64_t min_i64_avx512(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MAX;
+    __m512i mn = _mm512_set1_epi64(INT64_MAX);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mn = _mm512_min_epi64(mn, _mm512_loadu_si512(v + i));
+        }
+    } else {
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            __mmask8 k = (__mmask8)reverse_bits8(bm[i >> 3]);
+            mn = _mm512_mask_min_epi64(mn, k, mn, _mm512_loadu_si512(v + i));
+        }
+    }
+    int64_t m = (int64_t)_mm512_reduce_min_epi64(mn);
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] < m) m = v[i];
+    }
+    return m;
+}
+
+__attribute__((target("avx512f")))
+static int64_t max_i64_avx512(const int64_t *v, size_t n, const uint8_t *bm) {
+    if (n == 0) return INT64_MIN;
+    __m512i mx = _mm512_set1_epi64(INT64_MIN);
+    size_t i = 0;
+    if (!bm) {
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            mx = _mm512_max_epi64(mx, _mm512_loadu_si512(v + i));
+        }
+    } else {
+        for (; i + 7 < n; i += 8) {
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
+            __mmask8 k = (__mmask8)reverse_bits8(bm[i >> 3]);
+            mx = _mm512_mask_max_epi64(mx, k, mx, _mm512_loadu_si512(v + i));
+        }
+    }
+    int64_t m = (int64_t)_mm512_reduce_max_epi64(mx);
+    for (; i < n; i++) {
+        if ((!bm || TSDB_NULL_VALID(bm, i)) && v[i] > m) m = v[i];
+    }
+    return m;
+}
+#define HAS_AVX512_I64_MINMAX 1
+
 #define HAS_AVX512_KERNELS 1
 #endif /* __AVX512F__ */
 
@@ -678,11 +903,14 @@ static int64_t sum_i64_avx512(const int64_t *v, size_t n,
 
 typedef double  (*fn_f64_inner)(const double *, size_t, const uint8_t *);
 typedef int64_t (*fn_i64_inner)(const int64_t *, size_t, const uint8_t *, uint64_t *);
+typedef int64_t (*fn_i64_minmax)(const int64_t *, size_t, const uint8_t *);
 
-static fn_f64_inner g_sum_f64 = NULL;
-static fn_f64_inner g_min_f64 = NULL;
-static fn_f64_inner g_max_f64 = NULL;
-static fn_i64_inner g_sum_i64 = NULL;
+static fn_f64_inner  g_sum_f64 = NULL;
+static fn_f64_inner  g_min_f64 = NULL;
+static fn_f64_inner  g_max_f64 = NULL;
+static fn_i64_inner  g_sum_i64 = NULL;
+static fn_i64_minmax g_min_i64 = NULL;
+static fn_i64_minmax g_max_i64 = NULL;
 
 static pthread_once_t g_agg_once = PTHREAD_ONCE_INIT;
 
@@ -694,6 +922,8 @@ static void agg_init_once(void) {
     g_min_f64 = min_f64_scalar;
     g_max_f64 = max_f64_scalar;
     g_sum_i64 = sum_i64_scalar;
+    g_min_i64 = min_i64_scalar;
+    g_max_i64 = max_i64_scalar;
 
 #if defined(HAS_X86_KERNELS)
     if (lv >= TSDB_CPU_AVX2) {
@@ -701,6 +931,10 @@ static void agg_init_once(void) {
         g_min_f64 = min_f64_avx2;
         g_max_f64 = max_f64_avx2;
         g_sum_i64 = sum_i64_avx2;
+#    if defined(HAS_AVX2_I64_MINMAX)
+        g_min_i64 = min_i64_avx2;
+        g_max_i64 = max_i64_avx2;
+#    endif
     }
 #  if defined(HAS_AVX512_KERNELS)
     if (lv >= TSDB_CPU_AVX512) {
@@ -708,6 +942,10 @@ static void agg_init_once(void) {
         g_min_f64 = min_f64_avx512;
         g_max_f64 = max_f64_avx512;
         g_sum_i64 = sum_i64_avx512;
+#    if defined(HAS_AVX512_I64_MINMAX)
+        g_min_i64 = min_i64_avx512;
+        g_max_i64 = max_i64_avx512;
+#    endif
     }
 #  endif
 #elif defined(HAS_NEON_KERNELS)
@@ -716,6 +954,10 @@ static void agg_init_once(void) {
         g_min_f64 = min_f64_neon;
         g_max_f64 = max_f64_neon;
         g_sum_i64 = sum_i64_neon;
+#    if defined(HAS_NEON_I64_MINMAX)
+        g_min_i64 = min_i64_neon;
+        g_max_i64 = max_i64_neon;
+#    endif
     }
 #endif
     (void)lv;  /* suppress unused-var if no SIMD compiled */
@@ -772,17 +1014,20 @@ int tsdb_agg_sum_i64(const int64_t *v, size_t n, const uint8_t *null_bitmap,
     return TSDB_OK;
 }
 
-/* i64 min/max: AVX2 lacks _mm256_min_epi64; scalar is safe + fast enough */
+/* i64 min/max: SIMD-dispatched per CPU level — AVX2 emulates via cmpgt+blendv,
+ * AVX-512 uses native _mm512_min_epi64, NEON emulates via vcltq_s64+vbslq. */
 int tsdb_agg_min_i64(const int64_t *v, size_t n, const uint8_t *null_bitmap,
                      int64_t *out) {
     if (!v || !out) return TSDB_ERR_INVAL;
-    *out = min_i64_scalar(v, n, null_bitmap);
+    ensure_init();
+    *out = g_min_i64(v, n, null_bitmap);
     return TSDB_OK;
 }
 
 int tsdb_agg_max_i64(const int64_t *v, size_t n, const uint8_t *null_bitmap,
                      int64_t *out) {
     if (!v || !out) return TSDB_ERR_INVAL;
-    *out = max_i64_scalar(v, n, null_bitmap);
+    ensure_init();
+    *out = g_max_i64(v, n, null_bitmap);
     return TSDB_OK;
 }
