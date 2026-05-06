@@ -29,6 +29,7 @@
 #include "../core/types.h"
 #include "../../include/tsdb.h"
 #include "../server/metrics.h"
+#include "../server/proto.h"   /* tsdb_crc32c — block trailer parity with flush path */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -451,7 +452,10 @@ static int compact_column_file(const char *part_dir,
             goto io_err;
         }
 
-        /* Write BlockHeader + compressed data. */
+        /* Write BlockHeader + compressed data + CRC32C trailer.  Mirrors
+         * the flush-path layout in part.c so the reader's CRC verifier
+         * doesn't reject compacted blocks. */
+        blk_flags |= TSDB_BLOCK_FLAG_HAS_CRC;
         uint8_t blk_hdr[BLK_HDR_SZ];
         write_blk_hdr(blk_hdr, (uint8_t)codec_used, blk_flags,
                       (uint32_t)chunk,
@@ -463,6 +467,19 @@ static int compact_column_file(const char *part_dir,
             free(comp_buf);
             goto io_err;
         }
+        {
+            uint32_t crc = tsdb_crc32c(blk_hdr, BLK_HDR_SZ);
+            if ((size_t)comp_bytes > 0)
+                crc = tsdb_crc32c_update(crc, comp_buf, (size_t)comp_bytes);
+            uint8_t trailer[TSDB_BLOCK_CRC_TRAILER_SIZE];
+            trailer[0] = (uint8_t)(crc      );
+            trailer[1] = (uint8_t)(crc >>  8);
+            trailer[2] = (uint8_t)(crc >> 16);
+            trailer[3] = (uint8_t)(crc >> 24);
+            if (safe_write(new_col, trailer, TSDB_BLOCK_CRC_TRAILER_SIZE) < 0) {
+                free(idx_entries); free(comp_buf); goto io_err;
+            }
+        }
 
         /* Accumulate idx entry. */
         uint8_t *ep = idx_entries + new_block_count * IDX_ENTRY_SZ;
@@ -470,7 +487,8 @@ static int compact_column_file(const char *part_dir,
                         (uint32_t)chunk, blk_ts_min, blk_ts_max);
         new_block_count++;
 
-        col_offset    += BLK_HDR_SZ + (uint64_t)comp_bytes;
+        col_offset    += BLK_HDR_SZ + (uint64_t)comp_bytes
+                          + TSDB_BLOCK_CRC_TRAILER_SIZE;
         new_total_rows += chunk;
 
         if (blk_ts_min < file_ts_min) file_ts_min = blk_ts_min;

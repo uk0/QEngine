@@ -7,6 +7,7 @@
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../storage/part.h"
+#include "../server/proto.h"  /* tsdb_crc32c — match flush-side trailer */
 #include "../../include/tsdb.h"
 
 #include <stdio.h>
@@ -319,6 +320,28 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
             fclose(col_fp); return TSDB_ERR_IO;
         }
     }
+
+    /* Match the flush-side CRC trailer when the sender's flags advertise
+     * one — keeps a byte-for-byte copy of the source partition.  Without
+     * this the receiver's reader sees TSDB_BLOCK_FLAG_HAS_CRC set in the
+     * header but no trailer behind the data, and every read fails CORRUPT.
+     * Senders predating the CRC patch leave the flag clear and we skip
+     * the trailer (back-compat). */
+    if (r->flags & TSDB_BLOCK_FLAG_HAS_CRC) {
+        uint32_t crc = tsdb_crc32c(hdr, RAWBLK_HDR_SIZE);
+        if (r->block_bytes_len > 0 && r->block_bytes)
+            crc = tsdb_crc32c_update(crc, r->block_bytes, r->block_bytes_len);
+        uint8_t trailer[TSDB_BLOCK_CRC_TRAILER_SIZE];
+        trailer[0] = (uint8_t)(crc      );
+        trailer[1] = (uint8_t)(crc >>  8);
+        trailer[2] = (uint8_t)(crc >> 16);
+        trailer[3] = (uint8_t)(crc >> 24);
+        if (fwrite(trailer, 1, TSDB_BLOCK_CRC_TRAILER_SIZE, col_fp)
+            != TSDB_BLOCK_CRC_TRAILER_SIZE) {
+            fclose(col_fp); return TSDB_ERR_IO;
+        }
+    }
+
     fclose(col_fp);
 
     /* --- Rewrite .idx (always write v2). Read either v1 or v2 existing. */

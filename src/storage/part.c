@@ -4,6 +4,7 @@
 #include "iopolicy.h"
 #include "../compress/codec.h"
 #include "../core/bits.h"
+#include "../server/proto.h"  /* tsdb_crc32c — block-level integrity check */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -510,6 +511,11 @@ static int col_writer_write_block(col_writer_t *w,
         blk_flags |= TSDB_BF_HAS_BLOOM;
     }
 
+    /* Mark block as carrying a trailing CRC32C — verified at read time
+     * to detect bit-rot, partial writes, or out-of-band corruption.
+     * Old blocks without the flag stay readable (legacy compat). */
+    blk_flags |= TSDB_BLOCK_FLAG_HAS_CRC;
+
     uint8_t hdr[TSDB_BLOCK_HEADER_SIZE];
     write_block_header(hdr, (uint8_t)codec_used, blk_flags,
                        (uint32_t)count, ts_min, ts_max,
@@ -520,6 +526,18 @@ static int col_writer_write_block(col_writer_t *w,
     }
     if ((size_t)comp_bytes > 0 &&
         fwrite(comp_buf, 1, (size_t)comp_bytes, w->col_fp) != (size_t)comp_bytes) {
+        free(comp_buf); return TSDB_ERR_IO;
+    }
+
+    /* Trailing CRC32C: header + compressed data, written little-endian.
+     * Reader reconstructs the same range and rejects on mismatch. */
+    uint32_t crc = tsdb_crc32c(hdr, TSDB_BLOCK_HEADER_SIZE);
+    if ((size_t)comp_bytes > 0)
+        crc = tsdb_crc32c_update(crc, comp_buf, (size_t)comp_bytes);
+    uint8_t crc_le[TSDB_BLOCK_CRC_TRAILER_SIZE];
+    put_u32le(crc_le, crc);
+    if (fwrite(crc_le, 1, TSDB_BLOCK_CRC_TRAILER_SIZE, w->col_fp)
+        != TSDB_BLOCK_CRC_TRAILER_SIZE) {
         free(comp_buf); return TSDB_ERR_IO;
     }
 
@@ -559,7 +577,11 @@ static int col_writer_write_block(col_writer_t *w,
     write_idx_entry(entry, w->col_offset, (uint32_t)comp_bytes,
                     (uint32_t)count, ts_min, ts_max, bloom, &stats);
     w->idx_n++;
-    w->col_offset  += TSDB_BLOCK_HEADER_SIZE + (uint64_t)comp_bytes;
+    w->col_offset  += TSDB_BLOCK_HEADER_SIZE
+                      + (uint64_t)comp_bytes
+                      + TSDB_BLOCK_CRC_TRAILER_SIZE;  /* trailer always present
+                                                         for blocks written by
+                                                         this version */
     w->total_rows  += count;
     w->block_count++;
 
@@ -1135,6 +1157,19 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
 
     const uint8_t *data_ptr = hdr_ptr + TSDB_BLOCK_HEADER_SIZE;
     tsdb_type_t type = p->schema->cols[col_idx].type;
+
+    /* Verify trailing CRC32C when the writer marked it.  Old blocks
+     * without the flag pass through unverified for backward compat. */
+    if (flags & TSDB_BLOCK_FLAG_HAS_CRC) {
+        if (off + TSDB_BLOCK_HEADER_SIZE + data_size + TSDB_BLOCK_CRC_TRAILER_SIZE
+            > map_sz)
+            return TSDB_ERR_CORRUPT;
+        uint32_t expected = tsdb_crc32c(hdr_ptr, TSDB_BLOCK_HEADER_SIZE);
+        if (data_size > 0)
+            expected = tsdb_crc32c_update(expected, data_ptr, data_size);
+        uint32_t stored = get_u32le(data_ptr + data_size);
+        if (expected != stored) return TSDB_ERR_CORRUPT;
+    }
 
     return tsdb_codec_decode_adaptive((tsdb_codec_t)codec, type, flags,
                                       data_ptr, data_size,

@@ -64,6 +64,17 @@ extern "C" {
 /* Block header on-disk size. */
 #define TSDB_BLOCK_HEADER_SIZE  32u
 
+/* Block flag bits (bytes 6..7 of the BlockHeader, little-endian u16).
+ *
+ * Bits 0..2 are owned by the codec layer (TSDB_BF_OUTER_LZ / NOT_NULL /
+ * HAS_BLOOM in compress/codec.h).  Block-layer flags start at bit 3. */
+#define TSDB_BLOCK_FLAG_HAS_CRC   (1u << 3)  /* compressed data is followed by
+                                                4 bytes of CRC32C; reader must
+                                                verify before decoding.  Old
+                                                blocks have flag=0 and no
+                                                trailer (forward-compat). */
+#define TSDB_BLOCK_CRC_TRAILER_SIZE 4u
+
 /* Index header sizes.
  *   V1 = legacy (no zone map)
  *   V2 = adds file-level ts zone map
