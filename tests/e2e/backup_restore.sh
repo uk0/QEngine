@@ -193,20 +193,19 @@ ok "extracted into $RESTORE_HOST/$INNER (top-level $INNER, raft state stripped)"
 # until a full docker rebuild ships it.  cluster-node sees the latest
 # code on every deploy, so use that path until Dockerfile.builder is
 # extended.
-# Use the default bridge network so port-forwards work; bind RPC to
-# 127.0.0.1 inside the container so gossip never reaches the running
-# cluster (sidecar peers see itself as the only master).
-# TSDB_DASHBOARD_AUTH=0 disables the auth gate for the sidecar's
-# /sql endpoint — the verifier compares counts, not credentials,
-# and the image's baked auth env defaults to on.
+# Use the standalone server path now that v0.2.0+ ships tsdb-server
+# with the /sql provider hook (cli/tsdb_server_main.c registers
+# server_main_sql_exec_cb).  Standalone has no Raft replay, no peer
+# gossip, no broadcast — exactly the disaster-recovery shape: read
+# the on-disk bytes back into a fresh process and prove the snapshot
+# survives.  TSDB_DASHBOARD_AUTH=0 because the image bakes auth on
+# from the cluster config; the verifier compares counts, not creds.
 $SSH "docker run -d --rm --name $NAME \
         -v $RESTORE_HOST/$INNER:/var/lib/tsdb \
-        -e TSDB_ROLE=cluster-node \
-        -e TSDB_NODE_ROLE=master \
+        -e TSDB_ROLE=server \
         -e TSDB_DASHBOARD_AUTH=0 \
         -e TSDB_DATA_DIR=/var/lib/tsdb \
         -e TSDB_BIND=0.0.0.0:28090 \
-        -e TSDB_RPC_BIND=127.0.0.1:28081 \
         -e TSDB_METRICS_BIND=0.0.0.0:28094 \
         -p 127.0.0.1:$HOST_PORT_HTTP:28094 \
         -p 127.0.0.1:$HOST_PORT_WIRE:28090 \
