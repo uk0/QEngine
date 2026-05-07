@@ -168,23 +168,65 @@ int tsdb_catalog_dump_apply(const char *data_dir, const uint8_t *buf, size_t len
 /* Public entry point — data-node startup uses this.  Calls into
  * cluster RPC layer to fetch the dump from any alive master, applies
  * it, reloads the in-memory catalog. */
-/* Background thread entry point — sleeps a few seconds to let gossip
- * settle, then runs the pull.  Detached; nothing waits on it. */
+/* Background thread entry point — polls gossip until an alive master
+ * appears, then runs the pull.  Detached; nothing waits on it.
+ *
+ * Pre-fix this slept a fixed 6 s and quit silently if no master had
+ * been discovered yet.  Gossip discovery on lvm1's 4-node cluster
+ * actually takes 10-60 s after a force-recreate (each node mints a
+ * fresh node_id and the others don't trust it until enough heartbeats
+ * land), so the one-shot pull always saw alive_nodes=1 and bailed
+ * with no log line.  Now the thread polls every 2 s for up to 60 s. */
 void *catalog_sync_thread_main(void *ud) {
     tsdb_db_t *db = (tsdb_db_t *)ud;
     if (!db) return NULL;
-    /* Honour the same env knob the data anti-entropy uses for grace
-     * period — bigger value gives gossip more time to mark masters
-     * ALIVE before the pull dials. */
-    int delay_ms = 6000;
+
+    int initial_delay_ms = 4000;  /* let socket binds settle */
+    int total_budget_ms  = 60000; /* hard cap so a stuck cluster doesn't pin
+                                     this thread forever */
+    int poll_interval_ms = 2000;
+
     const char *envd = getenv("TSDB_ANTIENTROPY_DELAY_MS");
-    if (envd && *envd) delay_ms = atoi(envd);
-    struct timespec ts = { .tv_sec = delay_ms / 1000,
-                           .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
+    if (envd && *envd) initial_delay_ms = atoi(envd);
+
+    struct timespec ts = { .tv_sec = initial_delay_ms / 1000,
+                           .tv_nsec = (long)(initial_delay_ms % 1000) * 1000000 };
     nanosleep(&ts, NULL);
-    int rc = tsdb_catalog_pull_from_master(db);
-    if (rc != TSDB_OK)
-        fprintf(stderr, "[catalog-sync] thread rc=%d\n", rc);
+
+    int waited = initial_delay_ms;
+    while (waited < total_budget_ms) {
+        /* Probe gossip for an alive master.  tsdb_catalog_pull_from_master
+         * itself returns OK when no master is found (treats as no-op),
+         * so we loop until the pull observably succeeds — the function
+         * logs `[catalog-sync] applied N log files` on success. */
+        struct tsdb_cluster *c = tsdb_db_cluster(db);
+        if (c) {
+            tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+            int nn = tsdb_node_manager_snapshot(tsdb_cluster_node_mgr(c),
+                                                 snap, TSDB_CLUSTER_MAX_NODES);
+            tsdb_node_id_t self = tsdb_cluster_local_id(c);
+            int found_master = 0;
+            for (int i = 0; i < nn; i++) {
+                if (snap[i].id == self)                continue;
+                if (snap[i].state != TSDB_NODE_ALIVE)  continue;
+                if (snap[i].role  != TSDB_ROLE_MASTER) continue;
+                found_master = 1;
+                break;
+            }
+            if (found_master) {
+                int rc = tsdb_catalog_pull_from_master(db);
+                if (rc == TSDB_OK) return NULL;  /* done — pull ran */
+                fprintf(stderr, "[catalog-sync] retry: pull rc=%d\n", rc);
+            }
+        }
+        struct timespec p = { .tv_sec = poll_interval_ms / 1000,
+                              .tv_nsec = (long)(poll_interval_ms % 1000) * 1000000 };
+        nanosleep(&p, NULL);
+        waited += poll_interval_ms;
+    }
+    fprintf(stderr,
+            "[catalog-sync] gave up after %d ms — no alive master found\n",
+            waited);
     return NULL;
 }
 
