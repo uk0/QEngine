@@ -174,16 +174,39 @@ if [[ -z "$INNER" ]]; then
   echo "PASS: $PASS  FAIL: $FAIL"; exit 1
 fi
 $SSH "tar xzf $RESTORE_HOST/backup.tgz -C $RESTORE_HOST"
-ok "extracted into $RESTORE_HOST/$INNER (top-level $INNER)"
+# Drop the raft/ subtree from the restored data: the sidecar would
+# otherwise replay every committed log entry, including historic DROP
+# TABLE statements from earlier test runs that delete the very rows
+# we're about to verify.  In production the operator would restore
+# into a node fresh-joining a cluster (Raft fast-forwards via
+# InstallSnapshot from a peer); here we want the sidecar to start
+# clean and just trust the on-disk catalog/partitions.
+$SSH "rm -rf $RESTORE_HOST/$INNER/raft"
+ok "extracted into $RESTORE_HOST/$INNER (top-level $INNER, raft state stripped)"
 
-# Boot the sidecar in standalone mode.  TSDB_ROLE=server (default) reads
-# the catalog and partitions exactly as the source did.  No cluster
-# bind, no auth — the metrics port is open for /sql.
+# Boot the sidecar in cluster-node mode against an isolated network so
+# it bootstraps as a single-node cluster (no seeds — becomes its own
+# master, opens raft, exposes /sql).  Standalone-mode (TSDB_ROLE=server)
+# would also work, but the docker image only ships the tsdb-node binary
+# (deployment/Dockerfile.builder builds cluster_node only); tsdb-server
+# is from the image's original build and lacks the /sql provider hook
+# until a full docker rebuild ships it.  cluster-node sees the latest
+# code on every deploy, so use that path until Dockerfile.builder is
+# extended.
+# Use the default bridge network so port-forwards work; bind RPC to
+# 127.0.0.1 inside the container so gossip never reaches the running
+# cluster (sidecar peers see itself as the only master).
+# TSDB_DASHBOARD_AUTH=0 disables the auth gate for the sidecar's
+# /sql endpoint — the verifier compares counts, not credentials,
+# and the image's baked auth env defaults to on.
 $SSH "docker run -d --rm --name $NAME \
         -v $RESTORE_HOST/$INNER:/var/lib/tsdb \
-        -e TSDB_ROLE=server \
+        -e TSDB_ROLE=cluster-node \
+        -e TSDB_NODE_ROLE=master \
+        -e TSDB_DASHBOARD_AUTH=0 \
         -e TSDB_DATA_DIR=/var/lib/tsdb \
         -e TSDB_BIND=0.0.0.0:28090 \
+        -e TSDB_RPC_BIND=127.0.0.1:28081 \
         -e TSDB_METRICS_BIND=0.0.0.0:28094 \
         -p 127.0.0.1:$HOST_PORT_HTTP:28094 \
         -p 127.0.0.1:$HOST_PORT_WIRE:28090 \
