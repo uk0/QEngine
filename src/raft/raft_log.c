@@ -247,6 +247,18 @@ static int log_rebuild_offsets(tsdb_raft_log_t *rl) {
         rl->last_term  = term;
         (void)type;
     }
+    /* Snapshot guard: if the on-disk log is empty (or only contains
+     * pre-snapshot stragglers from older buggy compacts) the scan
+     * leaves last_index == 0 even though snap_meta says we're past
+     * snap_index.  Restore the invariant `last_index >= snap_index`
+     * so the next append computes idx = max(last_index, snap_index)+1
+     * and doesn't reuse subsumed slots.  snap_meta_load() runs before
+     * this rebuild, so rl->snap_index is already populated. */
+    if (rl->last_index < rl->snap_index) {
+        rl->last_index = rl->snap_index;
+        rl->last_term  = rl->snap_term;
+        rl->first_index = rl->snap_index + 1;  /* empty surviving range */
+    }
     return 0;
 }
 
@@ -600,8 +612,20 @@ int tsdb_raft_log_compact(tsdb_raft_log_t *rl,
     rl->offsets_cap  = nkept;
     rl->first_index  = snap_idx + 1;
     if (nkept == 0) {
-        rl->last_index = 0;  /* entire log subsumed */
-        rl->last_term  = 0;
+        /* Entire log subsumed by the snapshot.  last_index must NOT
+         * drop to 0 — Raft index space is monotonic and the snapshot
+         * tip is the highest known index.  Pre-fix this was set to 0,
+         * so the next append computed idx = last_index + 1 = 1, which
+         * landed on slots already covered by the snapshot.  Replicate
+         * + advance both broke (peers reject indices <= their own
+         * snap_index; maybe_advance_commit_locked's `for N > commit_index`
+         * loop never enters because last (=tiny) < commit (=snap_idx))
+         * and tsdb_raft_propose returned OK without ever applying.
+         * Observed on lvm1 cnode-1: CREATE DATABASE / CREATE TABLE
+         * silently no-oped with "OK: committed via raft" but the
+         * catalog never updated. */
+        rl->last_index = snap_idx;
+        rl->last_term  = snap_term;
     } else {
         rl->last_index = snap_idx + nkept;
         rl->last_term  = new_last_term;

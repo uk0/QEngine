@@ -251,6 +251,90 @@ static void t_snapshot_compact(const char *dir) {
     PASS("compact drops prefix, marker answers term_at, survives reopen");
 }
 
+/* Scenario 7: snapshot compact subsumes the ENTIRE log (nkept == 0).
+ *
+ * Pre-fix this case reset rl->last_index to 0, so the next append
+ * computed idx = 0 + 1 = 1 — colliding with slots already covered by
+ * the snapshot.  Replicate-to-peers rejected those (peer's snap_index
+ * already past the new entry's idx) and maybe_advance_commit_locked's
+ * `for N > commit_index` loop never entered because last (1..N) was
+ * less than commit_index (= snap_idx).  tsdb_raft_propose nevertheless
+ * returned OK because last_applied >= my_index, and the apply hook
+ * never fired.  Observed on lvm1 cnode-1 as silently-failing
+ * CREATE DATABASE / CREATE TABLE.
+ *
+ * After the fix: last_index == snap_idx, first append picks
+ * snap_idx + 1, the apply path runs.  Survives reopen. */
+static void t_snapshot_compact_empty_tail(const char *dir) {
+    printf("\n[7] snapshot compact subsumes entire log + reopen + append\n");
+    rm_rf(dir);
+    tsdb_raft_log_t *rl = tsdb_raft_log_open(dir);
+
+    /* Append 5 entries at term 7. */
+    for (int i = 0; i < 5; i++) {
+        char body[8] = "p";
+        tsdb_raft_entry_t e = { .term = 7, .type = 1,
+                                 .payload_len = 1, .payload = body };
+        assert(tsdb_raft_log_append(rl, &e) == 0);
+    }
+    assert(tsdb_raft_log_last_index(rl) == 5);
+
+    /* Compact through index 5 — covers ALL existing entries. */
+    assert(tsdb_raft_log_compact(rl, 5, 7) == 0);
+    assert(tsdb_raft_log_snapshot_index(rl) == 5);
+    assert(tsdb_raft_log_snapshot_term(rl)  == 7);
+    /* Critical invariant: last_index follows snap_index, NOT 0. */
+    assert(tsdb_raft_log_last_index(rl) == 5);
+    /* term_at(snap_index) still answers from the marker. */
+    assert(tsdb_raft_log_term_at(rl, 5) == 7);
+
+    /* Append a new entry — must land at idx 6, not 1. */
+    char body2[8] = "q";
+    tsdb_raft_entry_t e2 = { .term = 8, .type = 1,
+                              .payload_len = 1, .payload = body2 };
+    assert(tsdb_raft_log_append(rl, &e2) == 0);
+    assert(e2.index == 6);
+    assert(tsdb_raft_log_last_index(rl) == 6);
+    /* term_at(6) reads the freshly-appended entry. */
+    assert(tsdb_raft_log_term_at(rl, 6) == 8);
+
+    tsdb_raft_log_close(rl);
+
+    /* Reopen — log_rebuild_offsets must restore last_index >= snap_index
+     * even when the on-disk log file holds nothing past the snapshot
+     * (or only stragglers from a pre-fix compact).  Here entry 6 is
+     * present so we expect last_index == 6. */
+    rl = tsdb_raft_log_open(dir);
+    assert(tsdb_raft_log_snapshot_index(rl) == 5);
+    assert(tsdb_raft_log_last_index(rl) == 6);
+    assert(tsdb_raft_log_term_at(rl, 6) == 8);
+    tsdb_raft_log_close(rl);
+
+    /* Force the "empty surviving log after restart" case: wipe seg.bin
+     * (simulating a pre-fix compact that left the file empty) but keep
+     * snap_meta.bin.  Open should still treat snap_idx as last_index. */
+    char seg_path[4128];
+    snprintf(seg_path, sizeof(seg_path), "%s/raft/log/seg.bin", dir);
+    FILE *fp = fopen(seg_path, "wb"); /* truncate to 0 bytes */
+    assert(fp != NULL);
+    fclose(fp);
+
+    rl = tsdb_raft_log_open(dir);
+    assert(tsdb_raft_log_snapshot_index(rl) == 5);
+    /* Pre-fix: 0.  Post-fix: snap_index. */
+    assert(tsdb_raft_log_last_index(rl) == 5);
+    /* Append after recovering from the wipe — must skip past the
+     * subsumed range. */
+    char body3[8] = "r";
+    tsdb_raft_entry_t e3 = { .term = 9, .type = 1,
+                              .payload_len = 1, .payload = body3 };
+    assert(tsdb_raft_log_append(rl, &e3) == 0);
+    assert(e3.index == 6);
+    tsdb_raft_log_close(rl);
+
+    PASS("compact-with-empty-tail keeps last_index = snap_index, append picks snap+1");
+}
+
 int main(void) {
     const char *dir = "/tmp/tsdb-raft-log-test";
     rm_rf(dir);
@@ -261,6 +345,7 @@ int main(void) {
     t_truncate(dir);
     t_torn_tail(dir);
     t_snapshot_compact(dir);
+    t_snapshot_compact_empty_tail(dir);
 
     rm_rf(dir);
     printf("\n=== all raft_log tests passed ===\n");
