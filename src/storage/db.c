@@ -1299,6 +1299,35 @@ tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name) {
     return t;
 }
 
+/* Flush every open table's memtable to its on-disk partition.  Used
+ * by /backup to capture an on-disk-consistent snapshot — pre-fix the
+ * tarball missed any rows still buffered in memtable, so a 100-row
+ * SELECT returned 0 on a freshly-restored sidecar.  Best-effort: a
+ * single table's flush failure logs but doesn't abort the whole
+ * sweep.  skip_replicate=1 because the local-flush-for-snapshot path
+ * is not a write event peers should observe. */
+int tsdb_db_flush_all(tsdb_db_t *db) {
+    if (!db) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&db->lock);
+    /* Snapshot the table-pointer array so we can drop db->lock before
+     * calling flush_and_clear_ex (which takes per-table mutexes that
+     * would otherwise re-enter under db->lock). */
+    int n = db->ntables;
+    tsdb_table_internal_t **tabs = malloc((size_t)n * sizeof(*tabs));
+    if (!tabs) { pthread_mutex_unlock(&db->lock); return TSDB_ERR_NOMEM; }
+    for (int i = 0; i < n; i++) tabs[i] = db->tables[i];
+    pthread_mutex_unlock(&db->lock);
+
+    for (int i = 0; i < n; i++) {
+        if (!tabs[i]) continue;
+        int rc = flush_and_clear_ex(tabs[i], /*skip_replicate=*/1);
+        if (rc != TSDB_OK)
+            fprintf(stderr, "[flush_all] %s rc=%d\n", tabs[i]->name, rc);
+    }
+    free(tabs);
+    return TSDB_OK;
+}
+
 int tsdb_db_list_table_names(tsdb_db_t *db, char (*out_names)[64], int max) {
     if (!db || !out_names || max <= 0) return 0;
     pthread_mutex_lock(&db->lock);

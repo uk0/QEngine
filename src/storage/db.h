@@ -108,6 +108,12 @@ int                    tsdb_backup_write_manifest_json(tsdb_db_t *db,
 int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
                                                      const char *data_dir);
 
+/* Flush every open table's memtable to its on-disk partition so a
+ * subsequent on-disk snapshot (e.g. /backup tar) captures all rows.
+ * Best-effort: per-table failures log but don't abort.  Defined in
+ * db.c. */
+int                    tsdb_db_flush_all(tsdb_db_t *db);
+
 /* Access the TMQ consumer-group store embedded in the db. Returns NULL if
  * it failed to open (non-fatal for plain workloads). */
 struct tsdb_tmq;

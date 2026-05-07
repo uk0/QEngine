@@ -123,6 +123,14 @@ int tsdb_backup_write_manifest_json(tsdb_db_t *db, char *buf, size_t cap) {
  * a verification aid, not a hard prereq. */
 int tsdb_backup_emit_manifest_file(tsdb_db_t *db, const char *data_dir) {
     if (!db || !data_dir || !data_dir[0]) return -1;
+
+    /* Flush every memtable to disk first.  Otherwise the subsequent
+     * tar misses any rows still buffered in RAM — a /backup taken
+     * during light ingest would silently drop the tail.  Caught by
+     * tests/e2e/backup_restore.sh phase 7: 100-row seed showed 0 on
+     * a freshly-restored sidecar before this flush call. */
+    (void)tsdb_db_flush_all(db);
+
     char path[4096];
     snprintf(path, sizeof(path), "%s/_backup_manifest.json", data_dir);
 
