@@ -43,24 +43,26 @@ die() { printf "\e[31m[deploy] %s\e[0m\n" "$*" >&2; exit 1; }
 # 1. Local build
 # ────────────────────────────────────────────────────────────────────
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-  say "cross-building linux/amd64 tsdb_node …"
+  say "cross-building linux/amd64 binaries (cluster + standalone) …"
   rm -rf out && mkdir out
   docker buildx build --platform=linux/amd64 \
     -f deployment/Dockerfile.builder \
     --output type=local,dest=./out . >/dev/null
-  [[ -x out/tsdb_node ]] || die "builder produced no binary"
+  [[ -x out/tsdb_node ]]    || die "builder produced no tsdb_node"
+  [[ -x out/tsdb-server ]]  || die "builder produced no tsdb-server"
 
   say "building dashboard/dist …"
   (cd dashboard && npm run build --silent)
   [[ -f dashboard/dist/index.html ]] || die "dashboard build failed"
 else
   say "SKIP_BUILD=1 — reusing existing artefacts"
-  [[ -x out/tsdb_node ]]          || die "out/tsdb_node missing"
+  [[ -x out/tsdb_node ]]            || die "out/tsdb_node missing"
+  [[ -x out/tsdb-server ]]          || die "out/tsdb-server missing"
   [[ -f dashboard/dist/index.html ]] || die "dashboard/dist missing"
 fi
 
 say "local artefacts:"
-ls -la out/tsdb_node dashboard/dist/index.html
+ls -la out/tsdb_node out/tsdb-server dashboard/dist/index.html
 
 if [[ "${SKIP_DEPLOY:-0}" == "1" ]]; then
   say "SKIP_DEPLOY=1 — stopping before remote stage"
@@ -79,7 +81,8 @@ rsync -az --delete \
   --exclude='out' --exclude='docs' \
   "$ROOT/" "$REMOTE_HOST:$REMOTE_SRC/"
 
-scp -q out/tsdb_node "$REMOTE_HOST:/tmp/tsdb_node.new"
+scp -q out/tsdb_node    "$REMOTE_HOST:/tmp/tsdb_node.new"
+scp -q out/tsdb-server  "$REMOTE_HOST:/tmp/tsdb-server.new"
 scp -q /tmp/dashboard-dist.tgz "$REMOTE_HOST:/tmp/"
 
 # ────────────────────────────────────────────────────────────────────
@@ -95,9 +98,13 @@ mkdir -p deployment/dashboard-dist
 rm -rf deployment/dashboard-dist/*
 tar -xzf /tmp/dashboard-dist.tgz --strip-components=1 -C deployment/dashboard-dist
 
-# 3b. docker cp binary into every running node (fast local swap).
+# 3b. docker cp binaries into every running node (fast local swap).
+# Both binaries get refreshed: tsdb-node serves the cluster path,
+# tsdb-server serves the standalone path used by the backup_restore
+# verifier sidecar + by single-node test deployments.
 for c in ${NODES[@]}; do
-  docker cp /tmp/tsdb_node.new \$c:/usr/local/bin/tsdb-node
+  docker cp /tmp/tsdb_node.new   \$c:/usr/local/bin/tsdb-node
+  docker cp /tmp/tsdb-server.new \$c:/usr/local/bin/tsdb-server
 done
 
 # 3c. Bake the new binary into qengine/tsdb:dev.  Keep the previous

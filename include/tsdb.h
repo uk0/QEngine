@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define TSDB_VERSION_MAJOR 0
-#define TSDB_VERSION_MINOR 1
+#define TSDB_VERSION_MINOR 2
 #define TSDB_VERSION_PATCH 0
 
 /* Error codes. 0 == success. Negative on error. */
