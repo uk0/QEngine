@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* Maximum tables we list in the manifest.  Above this we emit a
  * "tables_truncated" hint so operators don't trust an incomplete
@@ -40,6 +42,29 @@ typedef struct {
     int      ok;       /* 0 = SELECT failed; manifest still emits the entry */
 } mf_row_t;
 
+/* Same heuristic catalog_check.c uses: filter system dirs out of the
+ * data_dir scan so partition listings don't leak as "tables". */
+static int mf_is_table_dir(const char *name) {
+    if (!name || name[0] == '.' || name[0] == '_') return 0;
+    if (strcmp(name, "catalog") == 0 ||
+        strcmp(name, "wal")     == 0 ||
+        strcmp(name, "raft")    == 0) return 0;
+    return 1;
+}
+
+/* Append `name` to `names` if not already present.  Returns the new
+ * count or unchanged if the name was a duplicate.  Linear scan is
+ * fine — typical clusters have ≤ thousands of tables, and this
+ * runs once per /backup call. */
+static int mf_add_unique(char (*names)[64], int n, int max, const char *name) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(names[i], name) == 0) return n;
+    }
+    if (n >= max) return n;
+    snprintf(names[n], 64, "%s", name);
+    return n + 1;
+}
+
 static int mf_compare(const void *pa, const void *pb) {
     const mf_row_t *a = (const mf_row_t *)pa;
     const mf_row_t *b = (const mf_row_t *)pb;
@@ -54,8 +79,39 @@ int tsdb_backup_write_manifest_json(tsdb_db_t *db, char *buf, size_t cap) {
 
     char (*names)[64] = (char (*)[64])calloc(MANIFEST_MAX_TABLES, sizeof(*names));
     if (!names) return -1;
+
+    /* Source 1: open table list.  Catches every table the in-process
+     * db handle knows about — what tsdb_query / SELECT would resolve. */
     int n = tsdb_db_list_table_names(db, names, MANIFEST_MAX_TABLES);
     if (n < 0) n = 0;
+
+    /* Source 2: data_dir scan across every striped dir.  Catches tables
+     * whose physical dir exists on disk but is somehow not in db->tables
+     * (e.g. cluster mode where a recently-CREATEd table hasn't been
+     * locally written-to yet).  The tarball will include these dirs, so
+     * the manifest must too — otherwise the verifier reports "missing
+     * from manifest" while the bytes are right there in the snapshot. */
+    int ndirs = tsdb_db_data_dir_count(db);
+    if (ndirs <= 0) ndirs = 1;
+    for (int di = 0; di < ndirs; di++) {
+        const char *dd = tsdb_db_data_dir_at(db, di);
+        if (!dd || !dd[0]) {
+            if (di == 0) dd = tsdb_db_data_dir(db);
+            if (!dd) continue;
+        }
+        DIR *d = opendir(dd);
+        if (!d) continue;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!mf_is_table_dir(de->d_name)) continue;
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", dd, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            n = mf_add_unique(names, n, MANIFEST_MAX_TABLES, de->d_name);
+        }
+        closedir(d);
+    }
 
     mf_row_t *rows = (mf_row_t *)calloc((size_t)(n > 0 ? n : 1), sizeof(*rows));
     if (!rows) { free(names); return -1; }
