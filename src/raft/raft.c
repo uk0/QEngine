@@ -1438,6 +1438,23 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
     /* config==NULL is OK; the module falls back to gossip-derived
      * quorum counts so existing clusters keep functioning. */
 
+    /* Snapshot recovery — seed commit_index/last_applied from the
+     * snapshot tip so the apply thread doesn't try to read subsumed
+     * entries (raft_log returns -1 for any idx < first_index, which
+     * after compact is snap_index + 1).  Without this the apply loop
+     * blocks at last_applied = 0 forever, even though commit_index
+     * advances normally; tsdb_raft_propose's wait timed out and the
+     * client got "ERR: raft propose failed" on every DDL.
+     *
+     * on_install_snapshot does the same advance after a follower-side
+     * restore (raft.c:759-762), but for a leader's own restart the
+     * recovery is purely local. */
+    {
+        uint64_t snap_idx = tsdb_raft_log_snapshot_index(r->log);
+        if (r->last_applied < snap_idx) r->last_applied = snap_idx;
+        if (r->commit_index < snap_idx) r->commit_index = snap_idx;
+    }
+
     r->startup_grace_until_ns = now_ns() + ms_to_ns(RAFT_STARTUP_GRACE_MS);
     /* Treat bootstrap as "just heard from a leader" so a fresh node
      * doesn't immediately grant PreVotes to a storm of candidates. */
