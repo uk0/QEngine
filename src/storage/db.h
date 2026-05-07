@@ -100,6 +100,14 @@ tsdb_catalog_t        *tsdb_db_catalog(tsdb_db_t *db);
  * written, or negative on error.  Defined in catalog_check.c. */
 int                    tsdb_catalog_check(tsdb_db_t *db, char *buf, size_t cap);
 
+/* Backup manifest: per-table (count, max_ts) snapshot used by /backup
+ * + restore tooling to verify the round-trip preserved every row.
+ * Defined in backup.c. */
+int                    tsdb_backup_write_manifest_json(tsdb_db_t *db,
+                                                       char *buf, size_t cap);
+int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
+                                                     const char *data_dir);
+
 /* Access the TMQ consumer-group store embedded in the db. Returns NULL if
  * it failed to open (non-fatal for plain workloads). */
 struct tsdb_tmq;

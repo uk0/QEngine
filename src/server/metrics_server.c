@@ -57,6 +57,8 @@ static tsdb_pitr_trim_fn    g_pitr_fn       = NULL;
 static void                *g_pitr_ud       = NULL;
 static tsdb_catalog_check_fn g_cat_check_fn = NULL;
 static void                *g_cat_check_ud  = NULL;
+static tsdb_backup_manifest_fn g_backup_manifest_fn = NULL;
+static void                  *g_backup_manifest_ud = NULL;
 static tsdb_auth_login_fn   g_auth_login_fn = NULL;
 static tsdb_auth_check_fn   g_auth_check_fn = NULL;
 static void                *g_auth_ud       = NULL;
@@ -108,6 +110,13 @@ void tsdb_metrics_server_set_catalog_check_provider(
 {
     g_cat_check_fn = fn;
     g_cat_check_ud = userdata;
+}
+
+void tsdb_metrics_server_set_backup_manifest_provider(
+    tsdb_backup_manifest_fn fn, void *userdata)
+{
+    g_backup_manifest_fn = fn;
+    g_backup_manifest_ud = userdata;
 }
 
 void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
@@ -843,8 +852,19 @@ static void *handle_connection(void *arg) {
          *     as /metrics and /sql, rely on network isolation.
          * Restore: stop node, extract the tarball into the node's
          * data_dir, restart.  The anti-entropy thread will close any
-         * remaining gap against live peers automatically. */
+         * remaining gap against live peers automatically.
+         * The tarball includes _backup_manifest.json with per-table
+         * (count, max_ts) so a verifier can prove the restore preserved
+         * every row — see tests/e2e/backup_restore.sh. */
         tsdb_metric_inc("qengine_backup_requests_total");
+
+        /* Best-effort manifest emit before tar runs.  Failures here
+         * don't abort the backup — operators still get the bytes,
+         * just without the verify aid. */
+        if (g_backup_manifest_fn && g_data_dir[0]) {
+            (void)g_backup_manifest_fn(g_backup_manifest_ud, g_data_dir);
+        }
+
         if (!g_data_dir[0]) {
             const char *err = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\nConnection: close\r\n\r\ndata_dir not configured";
             write_all(fd, err, strlen(err));

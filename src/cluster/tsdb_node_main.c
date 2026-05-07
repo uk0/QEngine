@@ -1356,6 +1356,12 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_set_catalog_check_provider(
         (tsdb_catalog_check_fn)tsdb_catalog_check, db);
 
+    /* Backup-manifest provider: writes _backup_manifest.json into the
+     * data_dir before /backup tars it, so a restored copy can be
+     * verified row-for-row against the source.  See backup.c. */
+    tsdb_metrics_server_set_backup_manifest_provider(
+        (tsdb_backup_manifest_fn)tsdb_backup_emit_manifest_file, db);
+
     /* Wire the dashboard auth hooks.  Only armed when
      * TSDB_DASHBOARD_AUTH=1 at process start; otherwise the metrics
      * server no-ops and every route stays public (current default).

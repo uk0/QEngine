@@ -121,6 +121,15 @@ typedef int (*tsdb_catalog_check_fn)(void *userdata, char *buf, size_t cap);
 void tsdb_metrics_server_set_catalog_check_provider(
     tsdb_catalog_check_fn fn, void *userdata);
 
+/* ---- backup-manifest provider hook ------------------------------------- *
+ * Emits _backup_manifest.json into <data_dir> just before /backup tars
+ * the directory.  Captures per-table (count, max_ts) for round-trip
+ * verification.  Returns 0 on success, negative on error.  Failure is
+ * non-fatal for /backup — the tarball still ships without the manifest. */
+typedef int (*tsdb_backup_manifest_fn)(void *userdata, const char *data_dir);
+void tsdb_metrics_server_set_backup_manifest_provider(
+    tsdb_backup_manifest_fn fn, void *userdata);
+
 /* ---- Dashboard login hooks --------------------------------------------- *
  * When configured (TSDB_DASHBOARD_AUTH=1), the server gates every route
  * that isn't in the "always public" set (/health, /metrics, /login,
