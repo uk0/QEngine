@@ -271,7 +271,39 @@ static int raft_apply_cb(void *ud, const tsdb_raft_entry_t *e) {
      * EXISTS, skip the broadcast — we don't want to propagate a
      * partial/failed state machine transition to observers. */
     if (qrc == TSDB_OK || qrc == TSDB_ERR_EXISTS) {
-        (void)tsdb_cluster_broadcast_catalog_qtl_to_data(db, qtl, NULL, NULL);
+        int acked = 0, total = 0;
+        int brc = tsdb_cluster_broadcast_catalog_qtl_to_data(db, qtl,
+                                                              &acked, &total);
+        /* Pre-fix the rc + acked/total were (void)-discarded: a data
+         * peer that missed the broadcast (transient RPC error, mid-
+         * restart, etc.) silently diverged from the masters' view.
+         * Observed during stress-200m -ptables 50: cnode-3 had 50 pt_
+         * dirs on disk (from the data-broadcast WRITE_BATCH path) but
+         * 0 catalog rows — the CREATE TABLE applied on masters but
+         * never reached cnode-3.
+         *
+         * Retry once after a short backoff to close transient gaps.
+         * Receive side returns EXISTS for already-applied entries
+         * (logged + treated as success), so re-broadcasting is safe.
+         * If the second pass still misses peers, log loudly — closing
+         * the residual gap needs catalog-level anti-entropy (pull from
+         * master at data-node startup), tracked separately. */
+        if (brc != TSDB_OK || (total > 0 && acked < total)) {
+            fprintf(stderr,
+                "[catalog-broadcast] partial ack rc=%d acked=%d total=%d "
+                "— retrying once\n", brc, acked, total);
+            struct timespec backoff = { .tv_sec = 0, .tv_nsec = 200 * 1000000 };
+            nanosleep(&backoff, NULL);
+            int acked2 = 0, total2 = 0;
+            int brc2 = tsdb_cluster_broadcast_catalog_qtl_to_data(
+                db, qtl, &acked2, &total2);
+            if (brc2 != TSDB_OK || (total2 > 0 && acked2 < total2)) {
+                fprintf(stderr,
+                    "[catalog-broadcast] FAILED after retry: rc=%d "
+                    "acked=%d total=%d qtl=%s\n",
+                    brc2, acked2, total2, qtl);
+            }
+        }
     }
     free(qtl);
     return 0;
