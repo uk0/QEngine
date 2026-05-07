@@ -114,6 +114,12 @@ int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
  * db.c. */
 int                    tsdb_db_flush_all(tsdb_db_t *db);
 
+/* Catalog self-heal: pull the master's catalog log files via
+ * TSDB_RPC_CATALOG_DUMP and replay them locally.  Used by data
+ * nodes at startup to recover from broadcast misses (crash window
+ * during cluster CREATE storms).  Defined in catalog_sync.c. */
+int                    tsdb_catalog_pull_from_master(tsdb_db_t *db);
+
 /* Access the TMQ consumer-group store embedded in the db. Returns NULL if
  * it failed to open (non-fatal for plain workloads). */
 struct tsdb_tmq;

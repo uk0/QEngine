@@ -633,6 +633,36 @@ static void *connection_handler(void *arg) {
             }
             break;
 
+        case TSDB_RPC_CATALOG_DUMP: {
+            /* Master serves a snapshot of its catalog log files so a
+             * data peer that missed earlier broadcasts (typical after
+             * a crash recovery window) can self-heal at startup.
+             * Defined in src/storage/catalog_sync.c. */
+            extern int tsdb_catalog_dump_serialize(const char *data_dir,
+                                                    uint8_t *out, size_t cap);
+            extern const char *tsdb_db_data_dir(tsdb_db_t *db);
+            if (!db) {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            const char *dd = tsdb_db_data_dir(db);
+            size_t cap = 32 * 1024 * 1024;
+            uint8_t *body = (uint8_t *)malloc(cap);
+            if (!body) {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            int n = tsdb_catalog_dump_serialize(dd, body, cap);
+            if (n < 0) {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                free(body);
+                break;
+            }
+            send_reply(fd, TSDB_RPC_ACK, msg.req_id, body, (uint32_t)n);
+            free(body);
+            break;
+        }
+
         case TSDB_RPC_RAFT_REQUEST_VOTE: {
             /* Raft candidate requesting a vote — hand off to the raft
              * state machine via the registered handler.  If no raft is

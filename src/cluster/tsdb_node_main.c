@@ -1281,6 +1281,34 @@ int main(int argc, char **argv) {
         pthread_attr_destroy(&attr);
     }
 
+    /* Catalog self-heal for data nodes: pull master's catalog log
+     * files via TSDB_RPC_CATALOG_DUMP and replay locally.  Closes the
+     * recurring 'cnode-3 missing 50 catalog rows' divergence — caused
+     * by a crash window during a CREATE storm where the data peer
+     * missed the broadcast for an early VTable, then every later
+     * CREATE TABLE that referenced it returned ERR on this peer and
+     * the master gave up after 3 retries.
+     *
+     * Master nodes don't need this — their Raft state machine is the
+     * authoritative source.  Standalone (no cluster) is a no-op
+     * because tsdb_db_cluster returns NULL.
+     *
+     * Runs after a 6 s grace period to let gossip discover an alive
+     * master peer; tsdb_catalog_pull_from_master itself returns OK
+     * immediately if no master is reachable. */
+    if (strcmp(g_local_role, "data") == 0) {
+        pthread_t cat_thr;
+        pthread_attr_t cattr;
+        pthread_attr_init(&cattr);
+        pthread_attr_setdetachstate(&cattr, PTHREAD_CREATE_DETACHED);
+        extern void *catalog_sync_thread_main(void *ud);
+        if (pthread_create(&cat_thr, &cattr,
+                           catalog_sync_thread_main, db) == 0) {
+            printf("[node] catalog self-heal armed\n");
+        }
+        pthread_attr_destroy(&cattr);
+    }
+
     /* Retention GC sweeper.  retention.conf (if present at
      * <data_dir>/retention.conf) defines per-table retention windows
      * via fnmatch patterns; partitions older than the window are

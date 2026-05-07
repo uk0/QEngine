@@ -60,6 +60,12 @@ static tsdb_cluster_t *cluster_get(tsdb_db_t *db) {
     return NULL;
 }
 
+/* Public accessor — modules outside db_cluster.c (e.g. catalog_sync)
+ * need the cluster handle to enumerate peers / pick a master. */
+struct tsdb_cluster *tsdb_db_cluster(tsdb_db_t *db) {
+    return cluster_get(db);
+}
+
 static void cluster_set(tsdb_db_t *db, tsdb_cluster_t *cluster) {
     pthread_mutex_lock(&g_cluster_lock);
     for (int i = 0; i < g_nentries; i++) {
