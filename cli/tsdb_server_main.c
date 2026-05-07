@@ -41,6 +41,132 @@ static volatile sig_atomic_t g_reload  = 0;
 static tsdb_server_t        *g_srv     = NULL;
 static char                  g_cfg_path[TSDB_CFG_MAX_PATH];
 
+/* ─── /sql provider (standalone) ────────────────────────────────────────
+ *
+ * Pre-fix the standalone tsdb-server didn't register a SQL provider,
+ * so /sql returned "sql provider not installed".  Cluster mode wires
+ * its own callback in tsdb_node_main.c with proxy-to-master logic
+ * that doesn't apply here — write a minimal per-query callback
+ * focused on the standalone path: execute, JSON-format, return.
+ *
+ * Caught by tests/e2e/backup_restore.sh phase 7 — the sidecar that
+ * boots on a /backup tarball is a standalone tsdb-server, and every
+ * SELECT count(*) returned the provider-missing error. */
+
+static int srv_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int)(ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL);
+}
+
+/* Minimal JSON-string escape — enough for column names + error
+ * messages.  Caller sizes `out` to ≥ 4× `s` length to be safe. */
+static void srv_json_escape(char *out, size_t cap, const char *s) {
+    size_t w = 0;
+    for (const char *p = s; *p && w + 8 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') { out[w++] = '\\'; out[w++] = (char)c; }
+        else if (c == '\n')        { out[w++] = '\\'; out[w++] = 'n'; }
+        else if (c == '\t')        { out[w++] = '\\'; out[w++] = 't'; }
+        else if (c < 0x20)         { w += snprintf(out + w, cap - w, "\\u%04x", c); }
+        else                       { out[w++] = (char)c; }
+    }
+    if (w < cap) out[w] = '\0';
+    else if (cap > 0) out[cap - 1] = '\0';
+}
+
+static const char *srv_type_name(tsdb_type_t t) {
+    switch (t) {
+    case TSDB_TYPE_TIMESTAMP: return "TIMESTAMP";
+    case TSDB_TYPE_INT64:     return "INT64";
+    case TSDB_TYPE_FLOAT64:   return "FLOAT64";
+    case TSDB_TYPE_SYMBOL:    return "SYMBOL";
+    default:                  return "UNKNOWN";
+    }
+}
+
+static int server_main_sql_exec_cb(void *ud, const char *q, size_t qlen,
+                                    const char *token, char *buf, size_t cap)
+{
+    (void)token;  /* standalone bypasses RBAC unless require_auth is wired
+                   * via the wire path; the metrics-server /sql route is
+                   * protected by the dashboard cookie when enabled. */
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return snprintf(buf, cap, "{\"error\":\"db not ready\"}");
+
+    char *stmt = (char *)malloc(qlen + 1);
+    if (!stmt) return snprintf(buf, cap, "{\"error\":\"oom\"}");
+    memcpy(stmt, q, qlen);
+    stmt[qlen] = '\0';
+
+    int t0 = srv_now_ms();
+    tsdb_result_t *res = NULL;
+    int rc = tsdb_query(db, stmt, &res);
+    free(stmt);
+    if (rc != 0 || !res) {
+        const char *e = tsdb_errstr(rc);
+        char esc[256]; srv_json_escape(esc, sizeof(esc), e ? e : "unknown");
+        int w = snprintf(buf, cap,
+                         "{\"error\":\"%s\",\"ms\":%d}",
+                         esc, srv_now_ms() - t0);
+        return w;
+    }
+
+    int ncols = tsdb_result_ncols(res);
+    int w = snprintf(buf, cap, "{\"cols\":[");
+    for (int c = 0; c < ncols && (size_t)w < cap - 128; c++) {
+        const char *n = tsdb_result_col_name(res, c);
+        char esc[128]; srv_json_escape(esc, sizeof(esc), n ? n : "");
+        w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                      c > 0 ? "," : "", esc);
+    }
+    w += snprintf(buf + w, cap - (size_t)w, "],\"types\":[");
+    for (int c = 0; c < ncols && (size_t)w < cap - 64; c++) {
+        w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                      c > 0 ? "," : "", srv_type_name(tsdb_result_col_type(res, c)));
+    }
+    w += snprintf(buf + w, cap - (size_t)w, "],\"rows\":[");
+    int nrows = 0, truncated = 0;
+    while (tsdb_result_next(res) > 0) {
+        if ((size_t)w > cap - 4096) { truncated = 1; break; }
+        w += snprintf(buf + w, cap - (size_t)w, "%s[", nrows == 0 ? "" : ",");
+        for (int c = 0; c < ncols && (size_t)w < cap - 256; c++) {
+            tsdb_type_t t = tsdb_result_col_type(res, c);
+            switch (t) {
+            case TSDB_TYPE_TIMESTAMP:
+                w += snprintf(buf + w, cap - (size_t)w, "%s%lld",
+                              c > 0 ? "," : "", (long long)tsdb_result_ts(res, c));
+                break;
+            case TSDB_TYPE_INT64:
+                w += snprintf(buf + w, cap - (size_t)w, "%s%lld",
+                              c > 0 ? "," : "", (long long)tsdb_result_i64(res, c));
+                break;
+            case TSDB_TYPE_FLOAT64:
+                w += snprintf(buf + w, cap - (size_t)w, "%s%g",
+                              c > 0 ? "," : "", tsdb_result_f64(res, c));
+                break;
+            case TSDB_TYPE_SYMBOL: {
+                const char *s = tsdb_result_sym(res, c);
+                char esc[256]; srv_json_escape(esc, sizeof(esc), s ? s : "");
+                w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                              c > 0 ? "," : "", esc);
+                break;
+            }
+            default:
+                w += snprintf(buf + w, cap - (size_t)w, "%snull", c > 0 ? "," : "");
+                break;
+            }
+        }
+        w += snprintf(buf + w, cap - (size_t)w, "]");
+        nrows++;
+    }
+    tsdb_result_free(res);
+    w += snprintf(buf + w, cap - (size_t)w,
+                  "],\"nrows\":%d,\"truncated\":%s,\"ms\":%d}",
+                  nrows, truncated ? "true" : "false", srv_now_ms() - t0);
+    return w;
+}
+
 static void on_signal(int sig) {
     if (sig == SIGHUP) g_reload = 1;
     else               g_quit   = 1;
@@ -220,6 +346,12 @@ int main(int argc, char **argv) {
          * standalone fallback can report disk capacity + auto-derived
          * weighted-hashring vn count. */
         tsdb_metrics_server_set_data_dir(cfg.data_dir);
+        /* Wire the SQL provider so the dashboard's /sql endpoint works
+         * in standalone mode too.  Pre-fix only the cluster-node main
+         * registered it, so a tsdb-server running TSDB_ROLE=server (or
+         * a backup_restore.sh sidecar) returned "sql provider not
+         * installed" for every /sql POST. */
+        tsdb_metrics_server_set_sql_provider(server_main_sql_exec_cb, db);
         rc = tsdb_metrics_server_start(cfg.metrics_bind, &ms);
         if (rc != 0) {
             TSDB_LOG_ERROR("main", "metrics server start(%s) failed", cfg.metrics_bind);

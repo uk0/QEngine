@@ -216,7 +216,10 @@ side_total=0
 side_skipped=0
 while IFS=$'\t' read -r tbl mcount; do
   side_total=$((side_total+1))
-  resp=$($SSH "curl -s -X POST http://127.0.0.1:$HOST_PORT_HTTP/sql \
+  # ssh -n: detach stdin so the remote curl doesn't gobble the rest of
+  # the while-read pipe.  Without this, only the first manifest entry
+  # actually gets queried — the second iteration sees EOF.
+  resp=$(ssh -n root@10.88.51.102 "curl -s -X POST http://127.0.0.1:$HOST_PORT_HTTP/sql \
                -H 'Content-Type: application/json' \
                --data-binary '{\"q\":\"SELECT count(*) FROM $tbl\"}'")
   side_count=$(echo "$resp" | python3 -c '
