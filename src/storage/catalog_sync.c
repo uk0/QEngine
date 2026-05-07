@@ -249,12 +249,20 @@ int tsdb_catalog_pull_from_master(tsdb_db_t *db) {
         break;
     }
     if (target == 0) {
-        fprintf(stderr, "[catalog-sync] no alive master peer; skipping\n");
-        return TSDB_OK;
+        /* BUSY (not OK) so the polling caller keeps retrying — gossip
+         * may discover a master in a later poll.  Pre-fix this returned
+         * TSDB_OK and the polling loop exited as if the pull had run. */
+        fprintf(stderr, "[catalog-sync] no alive master peer yet — will retry\n");
+        return TSDB_ERR_BUSY;
     }
 
     tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
-    if (!rmgr) return TSDB_OK;
+    if (!rmgr) {
+        /* Same silent-OK trap: replica mgr can be momentarily NULL
+         * during early startup before the cluster wires it up. */
+        fprintf(stderr, "[catalog-sync] replica mgr not ready — will retry\n");
+        return TSDB_ERR_BUSY;
+    }
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, target);
     if (!conn) {
         fprintf(stderr, "[catalog-sync] failed to dial master\n");
