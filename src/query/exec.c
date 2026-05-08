@@ -2534,6 +2534,49 @@ static gb_slot_t *gb_upsert(gb_slot_t *tbl, size_t cap,
     }
 }
 
+/* Single-key fast path.  When ngroup_by == 1 (a very common shape:
+ * GROUP BY host, GROUP BY symbol, …) the generic gb_upsert pays for
+ * a memcpy + memcmp on an 8-byte tuple — the compiler can't fold
+ * those into a register compare because nk is a runtime value.  This
+ * specialised version takes the key as a plain uint64_t, removing
+ * three memcpy/memcmp calls and a load of `nk` per probe step.
+ *
+ * Same probing semantics as gb_upsert (linear probe, hash early-out
+ * via s->key_hash equality, full key compare on hash match).  Tested
+ * by tests/test_group_by_golden.c scenario [1] (10 K distinct keys)
+ * and [3] (empty-string symbol stays distinct). */
+static gb_slot_t *gb_upsert_1k(gb_slot_t *tbl, size_t cap,
+                                uint64_t key, uint64_t hash,
+                                int nprojs, const proj_t *master_projs,
+                                size_t *nused)
+{
+    size_t mask = cap - 1;
+    size_t i = (size_t)hash & mask;
+    for (;;) {
+        gb_slot_t *s = &tbl[i];
+        if (!s->occupied) {
+            s->occupied = 1;
+            s->key_hash = hash;
+            s->n_key    = 1;
+            s->key_tuple[0] = key;
+            s->state = malloc((size_t)nprojs * sizeof(proj_t));
+            if (!s->state) return NULL;
+            memcpy(s->state, master_projs, (size_t)nprojs * sizeof(proj_t));
+            for (int p = 0; p < nprojs; p++) {
+                if (master_projs[p].tdigest) {
+                    s->state[p].tdigest = NULL;
+                    tsdb_tdigest_clone(master_projs[p].tdigest, &s->state[p].tdigest);
+                }
+            }
+            (*nused)++;
+            return s;
+        }
+        /* Hash early-out + direct uint64 equality, no memcmp. */
+        if (s->key_hash == hash && s->key_tuple[0] == key) return s;
+        i = (i + 1) & mask;
+    }
+}
+
 /* Grow the hash table 2× when load factor exceeds 0.5. */
 static int gb_grow(gb_slot_t **tbl, size_t *cap, size_t nused, int nprojs) {
     (void)nused; (void)nprojs;
@@ -2799,23 +2842,44 @@ static void tsdb_gbpar_scan_task(void *arg) {
         void    *one_bufs[TSDB_MAX_COLS];
         memset(one_bufs, 0, sizeof(one_bufs));
 
+        /* Precompute per-key-column stride helpers so the per-row loop
+         * doesn't redo width / type lookups.  In the single-key fast
+         * path (most common shape: GROUP BY hostname etc.) this lets
+         * us pull the value with one indexed load and skip the tuple
+         * array build + memcmp chain entirely. */
+        const int single_key = (t->ngroup_by == 1);
+        const int sk_col   = single_key ? t->gkey_cols[0] : -1;
+        const size_t sk_w  = single_key ? tsdb_type_width(s->cols[sk_col].type) : 0;
+        const void  *sk_buf = single_key ? bufs[sk_col] : NULL;
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
             int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
-            for (int g = 0; g < t->ngroup_by; g++) {
-                int c = t->gkey_cols[g];
-                size_t w = tsdb_type_width(s->cols[c].type);
-                uint64_t val = 0;
-                if (w == 8) val = ((const uint64_t *)bufs[c])[row];
-                else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
-                key_tuple[g] = val;
+            uint64_t single_key_val = 0;
+            if (single_key) {
+                if (sk_w == 8)      single_key_val = ((const uint64_t *)sk_buf)[row];
+                else if (sk_w == 4) single_key_val = (uint64_t)((const uint32_t *)sk_buf)[row];
+            } else {
+                for (int g = 0; g < t->ngroup_by; g++) {
+                    int c = t->gkey_cols[g];
+                    size_t w = tsdb_type_width(s->cols[c].type);
+                    uint64_t val = 0;
+                    if (w == 8) val = ((const uint64_t *)bufs[c])[row];
+                    else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
+                    key_tuple[g] = val;
+                }
             }
             int64_t t1 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
-            uint64_t hash = gb_hash((const uint8_t *)key_tuple,
-                                      (size_t)t->ngroup_by * sizeof(uint64_t));
+            uint64_t hash;
+            if (single_key) {
+                hash = gb_hash((const uint8_t *)&single_key_val, sizeof(uint64_t));
+            } else {
+                hash = gb_hash((const uint8_t *)key_tuple,
+                                (size_t)t->ngroup_by * sizeof(uint64_t));
+            }
             int64_t t2 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             if (t->ht_nused * 2 >= t->ht_cap) {
@@ -2825,9 +2889,15 @@ static void tsdb_gbpar_scan_task(void *arg) {
                 }
             }
 
-            gb_slot_t *slot = gb_upsert(t->ht, t->ht_cap, key_tuple,
-                                         t->ngroup_by, hash, nprojs,
-                                         t->master_projs, &t->ht_nused);
+            gb_slot_t *slot;
+            if (single_key) {
+                slot = gb_upsert_1k(t->ht, t->ht_cap, single_key_val, hash,
+                                    nprojs, t->master_projs, &t->ht_nused);
+            } else {
+                slot = gb_upsert(t->ht, t->ht_cap, key_tuple,
+                                  t->ngroup_by, hash, nprojs,
+                                  t->master_projs, &t->ht_nused);
+            }
             if (!slot) { t->rc = TSDB_ERR_NOMEM; break; }
 
             for (int p = 0; p < nprojs; p++) {
@@ -3193,23 +3263,39 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         void    *one_bufs[TSDB_MAX_COLS];
         memset(one_bufs, 0, sizeof(one_bufs));
 
+        const int single_key = (q->ngroup_by == 1);
+        const int sk_col   = single_key ? gkey_cols[0] : -1;
+        const size_t sk_w  = single_key ? tsdb_type_width(s->cols[sk_col].type) : 0;
+        const void  *sk_buf = single_key ? bufs[sk_col] : NULL;
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
             int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
-            for (int g = 0; g < q->ngroup_by; g++) {
-                int c = gkey_cols[g];
-                size_t w = tsdb_type_width(s->cols[c].type);
-                uint64_t val = 0;
-                if (w == 8) val = ((const uint64_t *)bufs[c])[row];
-                else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
-                key_tuple[g] = val;
+            uint64_t single_key_val = 0;
+            if (single_key) {
+                if (sk_w == 8)      single_key_val = ((const uint64_t *)sk_buf)[row];
+                else if (sk_w == 4) single_key_val = (uint64_t)((const uint32_t *)sk_buf)[row];
+            } else {
+                for (int g = 0; g < q->ngroup_by; g++) {
+                    int c = gkey_cols[g];
+                    size_t w = tsdb_type_width(s->cols[c].type);
+                    uint64_t val = 0;
+                    if (w == 8) val = ((const uint64_t *)bufs[c])[row];
+                    else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
+                    key_tuple[g] = val;
+                }
             }
             int64_t t1 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
-            uint64_t hash = gb_hash((const uint8_t *)key_tuple,
-                                      (size_t)q->ngroup_by * sizeof(uint64_t));
+            uint64_t hash;
+            if (single_key) {
+                hash = gb_hash((const uint8_t *)&single_key_val, sizeof(uint64_t));
+            } else {
+                hash = gb_hash((const uint8_t *)key_tuple,
+                                (size_t)q->ngroup_by * sizeof(uint64_t));
+            }
             int64_t t2 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             if (nused * 2 >= cap) {
@@ -3218,8 +3304,14 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 }
             }
 
-            gb_slot_t *slot = gb_upsert(ht, cap, key_tuple, q->ngroup_by,
-                                         hash, nprojs, projs, &nused);
+            gb_slot_t *slot;
+            if (single_key) {
+                slot = gb_upsert_1k(ht, cap, single_key_val, hash,
+                                    nprojs, projs, &nused);
+            } else {
+                slot = gb_upsert(ht, cap, key_tuple, q->ngroup_by,
+                                  hash, nprojs, projs, &nused);
+            }
             if (!slot) { rc = TSDB_ERR_NOMEM; break; }
 
             /* For each agg projection in this slot, update with this one row. */
