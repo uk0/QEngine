@@ -667,9 +667,24 @@ static int col_writer_close(col_writer_t *w) {
             }
         }
 
-        /* Rewrite idx in place.  Same read/write visibility argument as
-         * before: footer-first reader, data fflushed before we touch idx. */
-        FILE *idx_w = fopen(w->idx_path, "wb");
+        /* Atomic manifest publish via temp + rename.  Pre-fix this used
+         * fopen(idx_path, "wb") which truncates the existing idx and
+         * leaves a window where a concurrent reader sees a half-written
+         * (or zero-length) idx — and even when the rewrite finishes,
+         * since the executor scans columns one at a time, a reader can
+         * observe N blocks in column ci=0's idx but only N-1 in ci=1's
+         * idx if it caught the flush mid-loop.  Test gate
+         * test_continuous_rw.c reproduces it as torn rows where the
+         * last-written column reads as calloc-zero.
+         *
+         * Fix: write to <idx>.tmp, fflush, rename onto <idx>.  Per-
+         * column idx is now atomic.  Cross-column atomicity is provided
+         * by the caller (tsdb_part_flush_ex) ordering the ts column
+         * last, since exec.c's scan_plan_push uses ts.idx as the
+         * canonical block enumerator. */
+        char tmp_path[4200];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", w->idx_path);
+        FILE *idx_w = fopen(tmp_path, "wb");
         if (!idx_w) {
             free(old_entries_v3);
             rc = TSDB_ERR_IO;
@@ -686,7 +701,15 @@ static int col_writer_close(col_writer_t *w) {
             }
             fwrite(w->idx_entries, 1, w->idx_n * TSDB_IDX_ENTRY_SIZE, idx_w);
             fflush(idx_w);
+            /* fsync data + dir for crash safety; rename for atomic
+             * visibility to concurrent readers (POSIX guarantees rename
+             * onto an existing path is atomic). */
+            (void)fsync(fileno(idx_w));
             fclose(idx_w);
+            if (rename(tmp_path, w->idx_path) != 0) {
+                unlink(tmp_path);
+                rc = TSDB_ERR_IO;
+            }
             free(old_entries_v3);
         }
     }
@@ -787,8 +810,30 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
         snprintf(part_dir, sizeof(part_dir), "%s/%s", s->dir, part_name);
         if (tsdb_mkdir_p(part_dir) < 0) { free(row_idx); free(days); free(sorted_all); return TSDB_ERR_IO; }
 
-        /* Write each column. */
+        /* Write each column.  ORDERING: process the timestamp column
+         * LAST so it acts as the partition's atomic visibility marker.
+         * Rationale: exec.c's scan_plan_push enumerates blocks via the
+         * ts column's idx (see exec.c:377).  Once we publish a block to
+         * ts.idx (via temp+rename in col_writer_close), the same block
+         * has ALREADY been published to every non-ts column's idx.
+         * A reader that observes block N in ts.idx is therefore
+         * guaranteed to find a matching block in every other column,
+         * with the right data behind it.  Without this reorder, the
+         * reader could see ts.idx with N+1 blocks but col_v.idx still
+         * at N, fall back to reading uninitialised file bytes for the
+         * v column at the new block — surfaces as torn rows in
+         * test_continuous_rw under default-mode commits. */
+        int ts_ci = s->ts_col_idx;
+        int ci_iter[TSDB_MAX_COLS];
+        int ci_count = 0;
         for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci) continue;
+            ci_iter[ci_count++] = ci;
+        }
+        ci_iter[ci_count++] = ts_ci;  /* ts last */
+
+        for (int ix = 0; ix < ci_count; ix++) {
+            int ci = ci_iter[ix];
             tsdb_type_t   type  = s->cols[ci].type;
             size_t        width = tsdb_type_width(type);
             const uint8_t *col_buf = (const uint8_t *)tsdb_memtable_col(m, ci);

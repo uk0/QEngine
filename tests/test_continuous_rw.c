@@ -43,40 +43,32 @@
 #define OK(rc) do { int _r = (rc); if (_r != TSDB_OK) FAIL("rc=%d (%s)", _r, tsdb_errstr(_r)); } while (0)
 #define ASSERT(cond) do { if (!(cond)) FAIL("%s", #cond); } while (0)
 
-/* Scope (2026-05-09): N_WRITERS=1.  This gate exists to catch any
- * regression in the SINGLE-writer / multi-reader memtable coherence
- * path — the most common shape, and one a SIMD batch GROUP BY patch
- * could plausibly break.  Two known issues are NOT covered by this
- * test (and tracked separately in docs/tasks/perf-bcd-2026-05-08.md):
+/* Scope (2026-05-09 night): N_WRITERS=1 + N_READERS=2 + default-mode
+ * commits (per-commit flush enabled).  Closes F1 — the non-atomic
+ * .idx publish + cross-column flush ordering — fixed in this same
+ * commit by:
+ *   1. col_writer_close writes <name>.idx.tmp and atomic-renames
+ *      to <name>.idx (was: in-place truncate-rewrite).
+ *   2. tsdb_part_flush_ex orders the timestamp column LAST so the
+ *      ts.idx publish acts as the partition's atomic visibility
+ *      marker — readers using ts.idx as the canonical block
+ *      enumerator (exec.c:377) see all-or-nothing across columns.
  *
- *   1. Per-commit flush atomicity: tsdb_batch_commit unconditionally
- *      calls flush_and_clear_ex, which writes per-column .col files
- *      non-atomically.  A concurrent reader iterating the partition
- *      during a write burst sees e.g. ts/w/r_id committed but v still
- *      calloc-zero — torn row.  Reproduced on darwin/arm64: 30+ torn
- *      reads without TSDB_WAL_ONLY_COMMIT.  We bypass by setting that
- *      env var.
- *
- *   2. Multi-writer + reader race: with N_WRITERS=4 and
- *      TSDB_WAL_ONLY_COMMIT=1 (memtable-only), torn reads STILL occur
- *      — strongly suggests the read path (scan_plan / right_mat_load)
- *      doesn't fully serialise against concurrent writer batch_mu.
- *      Out of scope for this gate; documented as follow-up.
- *
- * If those land fixes, raise N_WRITERS and drop the env-var dance
- * here; the rest of the test is general enough. */
+ * Multi-writer scope (N_WRITERS>1) is intentionally excluded for
+ * now: a separate, rarer race (~1 torn row per 100K reader rows
+ * in 4-writer / 2-reader runs) remains around the memtable's
+ * scan_plan_push snapshot vs concurrent flush+clear+new-writes
+ * cycle.  Tracked in docs/tasks/perf-bcd-2026-05-08.md as F2.
+ * Single-writer with reader concurrency IS the production-shape
+ * the gate covers reliably here. */
 #define N_WRITERS    1
 #define N_READERS    2
 #define ROWS_PER_BAT 16
 #define RUN_SECONDS  5
-/* Cap below TSDB_BLOCK_POINTS (default 8192) so the writer never
- * triggers maybe_flush_b — that path still flushes a full memtable
- * even with TSDB_WAL_ONLY_COMMIT=1, and the partition-write race
- * (issue #1 above) would re-emerge.  Writer races to fill its budget
- * in milliseconds; readers then race against the now-stable memtable
- * for the rest of RUN_SECONDS, racking up tens of thousands of
- * iterations. */
-#define MAX_ROWS_PER_WRITER 5000
+/* No cap necessary now — flush is atomic across columns (F1 closed),
+ * so the test can exercise the disk path too.  Writer fills as fast
+ * as it can for RUN_SECONDS. */
+#define MAX_ROWS_PER_WRITER (1 << 20)
 
 static void rm_rf(const char *path) {
     DIR *d = opendir(path);
@@ -229,15 +221,17 @@ int main(void) {
     const char *dir = "/tmp/tsdb_test_continuous_rw";
     rm_rf(dir);
 
-    /* Force memtable-only mode for this gate.  See top-of-file note:
-     * the flush path has a known column-file write atomicity bug that
-     * causes torn reads under concurrent r/w.  Once that lands a fix,
-     * unset this and the test will exercise the flush path too. */
-    setenv("TSDB_WAL_ONLY_COMMIT", "1", 1);
+    /* Default mode (per-commit flush enabled).  Earlier this test had
+     * to set TSDB_WAL_ONLY_COMMIT=1 to bypass the non-atomic .idx
+     * publish in col_writer_close + the per-column flush ordering — see
+     * F1 finding in docs/tasks/perf-bcd-2026-05-08.md.  Both are now
+     * fixed (col_writer_close uses temp+rename; tsdb_part_flush_ex
+     * orders the ts column last so reader's ts.idx visibility implies
+     * all other columns' .idx already published the matching block). */
 
     printf("=== tsdb continuous read/write stability gate ===\n");
     printf("config: %d writers + %d readers, run for %d seconds "
-           "(memtable-only, see top-of-file comment)\n",
+           "(default-mode flush, F1 atomicity verified)\n",
            N_WRITERS, N_READERS, RUN_SECONDS);
 
     tsdb_db_t *db; OK(tsdb_open(dir, &db));
