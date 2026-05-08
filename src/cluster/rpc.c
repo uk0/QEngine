@@ -220,12 +220,30 @@ static int recv_frame(int fd, uint8_t *hdr_buf, uint8_t **payload_out,
     return 0;
 }
 
-/* Send a simple ACK or ERR response. */
+/* Send a simple ACK or ERR response.
+ *
+ * Pre-fix this used a fixed 64-byte stack body cap.  Most RPCs reply
+ * with no body or a tiny ack, so 64 was fine in practice — until
+ * TSDB_RPC_CATALOG_DUMP (rpc id 19) started replying with the
+ * verbatim contents of the master's catalog log files (tens of KB).
+ * tsdb_rpc_encode returned -1 on the size mismatch, write_full never
+ * fired, the master closed the connection without sending anything,
+ * and the data peer's tsdb_rpc_call_recv saw a 0-byte read and
+ * returned TSDB_ERR_IO (-3).  Observed end-to-end as cnode-3
+ * cold-boot self-heal looping forever on `rpc rc=-3`.
+ *
+ * Heap-allocate when the body doesn't fit the stack buffer; fall back
+ * to a silent no-op on malloc failure so a memory-pressured master
+ * doesn't double-fault writing a partial frame. */
 static void send_reply(int fd, tsdb_rpc_type_t type, uint32_t req_id,
                        const uint8_t *body, uint32_t body_len) {
-    uint8_t buf[TSDB_RPC_HDR_SIZE + 64];
-    int n = tsdb_rpc_encode(buf, sizeof(buf), type, req_id, body, body_len);
+    uint8_t small[TSDB_RPC_HDR_SIZE + 64];
+    size_t  cap = TSDB_RPC_HDR_SIZE + body_len;
+    uint8_t *buf = (cap <= sizeof(small)) ? small : malloc(cap);
+    if (!buf) return;
+    int n = tsdb_rpc_encode(buf, cap, type, req_id, body, body_len);
     if (n > 0) write_full(fd, buf, (size_t)n);
+    if (buf != small) free(buf);
 }
 
 /* Server handler args. */
