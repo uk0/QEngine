@@ -23,11 +23,23 @@
  *   ... v2 fields ...
  *   [block_points u32]              -- per-table block size; v1/v2 → 8192
  *
- * Readers accept all three; older writers always emitted 8192 so v1/v2 files
- * resolve unambiguously.
+ * v4 (2026-05):
+ *   ... v3 fields ...
+ *   [sort_by_tag_col i32]           -- (d) block-layout reorder column;
+ *                                      -1 = off (legacy sort).  A v4 file
+ *                                      is ONLY emitted when the table opts
+ *                                      in to tag-sort (sort_by_tag_col>=0);
+ *                                      tables with the flag at -1 keep
+ *                                      writing at v3, so existing
+ *                                      deployments roll back cleanly to
+ *                                      v3-aware binaries.
+ *
+ * Readers accept all four; older writers always emitted 8192 so v1/v2
+ * files resolve unambiguously.
  */
 #define SCHEMA_MAGIC   0x53434D41u  /* "SCMA" */
-#define SCHEMA_VERSION 3
+#define SCHEMA_VERSION_V3 3
+#define SCHEMA_VERSION_V4 4
 
 static int clamp_block_points(int bp) {
     if (bp <= 0) return TSDB_BLOCK_POINTS;
@@ -74,8 +86,12 @@ static int schema_save(tsdb_schema_t *s) {
     FILE *f = fopen(path, "wb");
     if (!f) return TSDB_ERR_IO;
 
+    /* Conditionally bump on-disk version: v4 only when the table opts in
+     * to (d) block-layout reorder.  Default tables stay at v3 so they
+     * remain readable by v3-aware binaries on rollback. */
+    int      emit_v4 = (s->sort_by_tag_col >= 0);
     uint32_t magic   = SCHEMA_MAGIC;
-    uint16_t version = SCHEMA_VERSION;
+    uint16_t version = emit_v4 ? SCHEMA_VERSION_V4 : SCHEMA_VERSION_V3;
     uint16_t ncols   = (uint16_t)s->ncols;
     uint32_t ts_idx  = (uint32_t)s->ts_col_idx;
 
@@ -107,6 +123,11 @@ static int schema_save(tsdb_schema_t *s) {
     {
         uint32_t bp = (uint32_t)s->block_points;
         WR(&bp, 4);
+    }
+    /* v4 tail: sort_by_tag_col i32.  Only emitted on opt-in tables. */
+    if (emit_v4) {
+        int32_t sc = (int32_t)s->sort_by_tag_col;
+        WR(&sc, 4);
     }
 #undef WR
 
@@ -167,11 +188,12 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
     if (!s) return TSDB_ERR_NOMEM;
 
     strncpy(s->name, name, TSDB_MAX_NAME);
-    s->ncols          = ncols;
-    s->ts_col_idx     = ts_idx;
-    s->partition_unit = partition_unit;
-    s->block_points   = clamp_block_points(block_points);
-    s->dir            = strdup(dir);
+    s->ncols           = ncols;
+    s->ts_col_idx      = ts_idx;
+    s->partition_unit  = partition_unit;
+    s->block_points    = clamp_block_points(block_points);
+    s->sort_by_tag_col = -1;             /* off by default; opt-in via setter */
+    s->dir             = strdup(dir);
     if (!s->dir) { free(s); return TSDB_ERR_NOMEM; }
 
     s->cols = calloc((size_t)ncols, sizeof(tsdb_col_info_t));
@@ -269,8 +291,8 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     RD(&magic,    4);
     if (magic != SCHEMA_MAGIC) { fclose(f); return TSDB_ERR_CORRUPT; }
     RD(&version, 2);
-    /* Accept v1, v2, v3. Higher versions are unknown. */
-    if (version != 1 && version != 2 && version != 3) {
+    /* Accept v1..v4. Higher versions are unknown. */
+    if (version < 1 || version > SCHEMA_VERSION_V4) {
         fclose(f); return TSDB_ERR_UNSUPPORTED;
     }
     RD(&ncols_raw, 2);
@@ -290,6 +312,7 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     s->ts_col_idx     = (int)ts_idx;
     s->partition_unit = TSDB_PARTITION_DAY;   /* v1 default; v2+ overrides below */
     s->block_points   = TSDB_BLOCK_POINTS;    /* v1/v2 default; v3 overrides below */
+    s->sort_by_tag_col = -1;                  /* v1..v3 default; v4 overrides below */
     s->dir            = strdup(dir);
     if (!s->dir) { free(s); fclose(f); return TSDB_ERR_NOMEM; }
 
@@ -324,6 +347,22 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
         uint32_t bp = 0;
         RD(&bp, 4);
         if (rc == TSDB_OK) s->block_points = clamp_block_points((int)bp);
+    }
+    /* v4 tail: sort_by_tag_col i32. Absent on v1..v3 — keep -1 (off). */
+    if (rc == TSDB_OK && version >= 4) {
+        int32_t sc = -1;
+        RD(&sc, 4);
+        if (rc == TSDB_OK) {
+            /* Validate: -1 (off) or a column index that exists and is SYMBOL. */
+            if (sc == -1) {
+                s->sort_by_tag_col = -1;
+            } else if (sc >= 0 && sc < s->ncols
+                       && s->cols[sc].type == TSDB_TYPE_SYMBOL) {
+                s->sort_by_tag_col = sc;
+            } else {
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
     }
 #undef RD
     fclose(f);

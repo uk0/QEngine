@@ -41,6 +41,17 @@ typedef struct {
      * flush loop.  Valid range: [1024, TSDB_BLOCK_POINTS].  Defaults to
      * TSDB_BLOCK_POINTS for legacy (v1/v2) schemas. */
     int                    block_points;
+    /* (d) Block-layout reorder: index of the SYMBOL column whose value
+     * pre-sorts each block before encoding.  -1 = off (legacy / default
+     * ts-only sort).  >= 0 = on; flush re-permutes the block's row indices
+     * by (cols[sort_by_tag_col].value, ts) so per-host runs are contiguous,
+     * giving Gorilla / Chimp longer correlated runs at encode time.  Set
+     * via _ex2-style entry point or programmatic setter; persisted in the
+     * v4 tail of schema.bin (only emitted when value is >= 0, so default
+     * tables stay v3 on disk and roll back cleanly to v3-aware binaries).
+     * Read path is unchanged — scanners predicate per-row, no within-block
+     * ts-monotonicity assumption. */
+    int                    sort_by_tag_col;
 } tsdb_schema_t;
 
 /*
