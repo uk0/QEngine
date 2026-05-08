@@ -2641,12 +2641,34 @@ typedef struct {
     char           err[256];
 } gbpar_task_t;
 
+/* Optional in-loop profiling — gated by env TSDB_GB_PROFILE.  Tracks
+ * which of (key gather, hash, upsert+agg) dominates the per-row cost
+ * so the planned SIMD batching effort can target the right segment.
+ * Zero overhead when off (single load + branch per worker invocation). */
+static __thread struct {
+    int      enabled;
+    int64_t  ns_keygather;
+    int64_t  ns_hash;
+    int64_t  ns_upsert_agg;
+    int64_t  rows;
+} gb_prof = {0};
+
+static int64_t gb_prof_now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
 static void tsdb_gbpar_scan_task(void *arg) {
     gbpar_task_t *t = (gbpar_task_t *)arg;
     t->rc = TSDB_OK;
 
     tsdb_schema_t *s = t->schema;
     int nprojs = t->nprojs;
+
+    {
+        const char *e = getenv("TSDB_GB_PROFILE");
+        gb_prof.enabled = (e && *e == '1');
+    }
 
     void *agg_scratch = aligned_alloc(32, (size_t)TSDB_BLOCK_POINTS * 8);
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
@@ -2725,6 +2747,7 @@ static void tsdb_gbpar_scan_task(void *arg) {
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
+            int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
             for (int g = 0; g < t->ngroup_by; g++) {
                 int c = t->gkey_cols[g];
@@ -2734,9 +2757,11 @@ static void tsdb_gbpar_scan_task(void *arg) {
                 else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
                 key_tuple[g] = val;
             }
+            int64_t t1 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             uint64_t hash = gb_hash((const uint8_t *)key_tuple,
                                       (size_t)t->ngroup_by * sizeof(uint64_t));
+            int64_t t2 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             if (t->ht_nused * 2 >= t->ht_cap) {
                 if (gb_grow(&t->ht, &t->ht_cap, t->ht_nused, nprojs) != TSDB_OK) {
@@ -2769,6 +2794,13 @@ static void tsdb_gbpar_scan_task(void *arg) {
                 }
                 agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
             }
+            if (gb_prof.enabled) {
+                int64_t t3 = gb_prof_now_ns();
+                gb_prof.ns_keygather  += (t1 - t0);
+                gb_prof.ns_hash       += (t2 - t1);
+                gb_prof.ns_upsert_agg += (t3 - t2);
+                gb_prof.rows++;
+            }
             if (t->rc != TSDB_OK) break;
         }
 
@@ -2779,6 +2811,23 @@ static void tsdb_gbpar_scan_task(void *arg) {
         if (t->rc != TSDB_OK) break;
     }
     free(agg_scratch);
+
+    if (gb_prof.enabled && gb_prof.rows > 0) {
+        int64_t total = gb_prof.ns_keygather + gb_prof.ns_hash + gb_prof.ns_upsert_agg;
+        fprintf(stderr,
+            "[gb-profile] rows=%lld total=%.2fms  "
+            "key=%.2fms (%.0f%%)  hash=%.2fms (%.0f%%)  upsert+agg=%.2fms (%.0f%%)\n",
+            (long long)gb_prof.rows, total / 1e6,
+            gb_prof.ns_keygather  / 1e6,
+            total ? 100.0 * gb_prof.ns_keygather  / (double)total : 0.0,
+            gb_prof.ns_hash       / 1e6,
+            total ? 100.0 * gb_prof.ns_hash       / (double)total : 0.0,
+            gb_prof.ns_upsert_agg / 1e6,
+            total ? 100.0 * gb_prof.ns_upsert_agg / (double)total : 0.0);
+        /* Reset for next worker invocation in this thread. */
+        gb_prof.ns_keygather = gb_prof.ns_hash = gb_prof.ns_upsert_agg = 0;
+        gb_prof.rows = 0;
+    }
 }
 
 static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
@@ -3071,9 +3120,14 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         }
 
         /* Per-row: compute key tuple, upsert, update aggregates. */
+        {
+            const char *e = getenv("TSDB_GB_PROFILE");
+            gb_prof.enabled = (e && *e == '1');
+        }
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
+            int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
             for (int g = 0; g < q->ngroup_by; g++) {
                 int c = gkey_cols[g];
@@ -3083,9 +3137,11 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 else if (w == 4) val = (uint64_t)((const uint32_t *)bufs[c])[row];
                 key_tuple[g] = val;
             }
+            int64_t t1 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             uint64_t hash = gb_hash((const uint8_t *)key_tuple,
                                       (size_t)q->ngroup_by * sizeof(uint64_t));
+            int64_t t2 = gb_prof.enabled ? gb_prof_now_ns() : 0;
 
             if (nused * 2 >= cap) {
                 if (gb_grow(&ht, &cap, nused, nprojs) != TSDB_OK) {
@@ -3119,6 +3175,28 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 }
                 agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
             }
+            if (gb_prof.enabled) {
+                int64_t t3 = gb_prof_now_ns();
+                gb_prof.ns_keygather  += (t1 - t0);
+                gb_prof.ns_hash       += (t2 - t1);
+                gb_prof.ns_upsert_agg += (t3 - t2);
+                gb_prof.rows++;
+            }
+        }
+        if (gb_prof.enabled && gb_prof.rows > 0) {
+            int64_t total = gb_prof.ns_keygather + gb_prof.ns_hash + gb_prof.ns_upsert_agg;
+            fprintf(stderr,
+                "[gb-profile/seq] rows=%lld total=%.2fms  "
+                "key=%.2fms (%.0f%%)  hash=%.2fms (%.0f%%)  upsert+agg=%.2fms (%.0f%%)\n",
+                (long long)gb_prof.rows, total / 1e6,
+                gb_prof.ns_keygather  / 1e6,
+                total ? 100.0 * gb_prof.ns_keygather  / (double)total : 0.0,
+                gb_prof.ns_hash       / 1e6,
+                total ? 100.0 * gb_prof.ns_hash       / (double)total : 0.0,
+                gb_prof.ns_upsert_agg / 1e6,
+                total ? 100.0 * gb_prof.ns_upsert_agg / (double)total : 0.0);
+            gb_prof.ns_keygather = gb_prof.ns_hash = gb_prof.ns_upsert_agg = 0;
+            gb_prof.rows = 0;
         }
         free(bm);
         for (int c = 0; c < s->ncols; c++)
