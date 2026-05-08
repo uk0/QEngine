@@ -144,6 +144,11 @@ struct tsdb_batch {
 
 /* ---- Public per-table batch lock --------------------------------------- */
 
+tsdb_schema_t *tsdb_table_get_schema(tsdb_table_t *tbl) {
+    if (!tbl) return NULL;
+    return ((tsdb_table_internal_t *)tbl)->schema;
+}
+
 void tsdb_table_lock_write(tsdb_table_t *tbl) {
     if (!tbl) return;
     pthread_mutex_lock(&((tsdb_table_internal_t *)tbl)->batch_mu);

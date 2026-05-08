@@ -283,6 +283,12 @@ int tsdb_create_table_local_ex(tsdb_db_t *db,
                                 int block_points,
                                 int sort_by_tag_col);
 
+/* Return the underlying schema for a table handle.  Used by code that
+ * needs to read schema metadata (column types, tag-sort flag) or apply
+ * a setter (tsdb_schema_set_sort_by_tag_col).  The returned pointer is
+ * owned by the table; do not free.  Returns NULL on bad input. */
+tsdb_schema_t *tsdb_table_get_schema(tsdb_table_t *t);
+
 /*
  * Enable group-commit for the database.  All subsequent tsdb_batch_commit()
  * calls will route WAL fsync through the group-commit batcher instead of

@@ -786,6 +786,71 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
         for (size_t i = 0; i < nrows; i++) sorted_all[i] = i;
     }
 
+    /* (d) Block-layout reorder: when sort_by_tag_col is set, re-permute
+     * sorted_all so rows are tag-major, ts-minor.  Counting-sort by
+     * SYMBOL dict code gives O(n + S) and is inherently stable — within
+     * each tag group, rows preserve their incoming ts-ascending order
+     * (because we iterate sorted_all in that order and append to each
+     * bucket in arrival order).  The downstream day-bucket extraction
+     * loop carries this ordering forward into every emitted block.
+     *
+     * Why tag-major helps Gorilla / Chimp: TSBS row order interleaves
+     * different hosts' uncorrelated random walks at every timestamp, so
+     * adjacent floats in a column buffer XOR to high-entropy values and
+     * leading-zero matchers underperform.  Tag-sort makes each host's
+     * run contiguous, so adjacent floats are correlated → 1.5-2 B/value
+     * instead of 7.3.
+     *
+     * Block-level ts_min/ts_max remains tight (TSBS hosts ingest at the
+     * same ts ranges); only within-block ts ordering changes.  Scanners
+     * predicate per-row after zone-map cull, no monotonicity assumption.
+     */
+    if (s->sort_by_tag_col >= 0
+        && s->sort_by_tag_col < s->ncols
+        && s->cols[s->sort_by_tag_col].type == TSDB_TYPE_SYMBOL
+        && nrows > 1) {
+        const uint32_t *sym_buf =
+            (const uint32_t *)tsdb_memtable_col(m, s->sort_by_tag_col);
+        if (sym_buf) {
+            uint32_t max_sym = 0;
+            for (size_t k = 0; k < nrows; k++) {
+                uint32_t sid = sym_buf[sorted_all[k]];
+                if (sid > max_sym) max_sym = sid;
+            }
+            size_t nbuckets = (size_t)max_sym + 1;
+            size_t *bucket_pos = calloc(nbuckets, sizeof(size_t));
+            size_t *sorted_new = malloc(nrows * sizeof(size_t));
+            if (bucket_pos && sorted_new) {
+                /* counting pass */
+                for (size_t k = 0; k < nrows; k++) {
+                    bucket_pos[sym_buf[sorted_all[k]]]++;
+                }
+                /* exclusive prefix sum → bucket start offsets */
+                size_t cum = 0;
+                for (size_t i = 0; i < nbuckets; i++) {
+                    size_t cnt = bucket_pos[i];
+                    bucket_pos[i] = cum;
+                    cum += cnt;
+                }
+                /* stable scatter */
+                for (size_t k = 0; k < nrows; k++) {
+                    size_t r = sorted_all[k];
+                    uint32_t sid = sym_buf[r];
+                    sorted_new[bucket_pos[sid]++] = r;
+                }
+                free(sorted_all);
+                sorted_all = sorted_new;
+                sorted_new = NULL;
+            }
+            free(bucket_pos);
+            free(sorted_new);  /* NULL on success path; non-NULL only on alloc-fail half-state */
+            /* Allocation failure: silently fall back to ts-sort.  No row
+             * is lost; only the encoder benefit is forgone for this
+             * flush.  An OOM here would already have nuked larger
+             * allocations downstream. */
+        }
+    }
+
     for (int d = 0; d < ndays; d++) {
         int64_t bucket = days[d];
 

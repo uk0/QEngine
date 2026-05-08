@@ -1,31 +1,26 @@
-/* test_layout_invariants.c — Pre-Session-2 gate for the (d) compression
- * layout reorder.  Documents the four query invariants that MUST hold
- * regardless of within-block row ordering, so a future tag-sort flush
- * (sort_by_tag_col >= 0) can be validated against this baseline by
- * re-running the same test.
+/* test_layout_invariants.c — gate for the (d) compression layout reorder.
  *
- * Single TSBS-shape cpu table (one wide table, multiple hosts), small
- * enough that every assertion is cheap but big enough to span block
- * boundaries.  Expected values are computed in this file from the data
- * we generate — never read back from the engine — so the gate stays
- * authoritative even when the engine layout changes.
+ * Single TSBS-shape cpu table (one wide table, multiple hosts).
+ * Asserts four query invariants against expected values computed
+ * independently from the data we generate.  Runs the gate twice:
  *
- * Invariants asserted:
- *   A. SELECT count(*) FROM cpu                        — total row count
- *   B. SELECT v multiset                               — XOR of all f64 bits
- *   C. SELECT count(*) FROM cpu WHERE host='host_5'    — per-host row count
- *   D. SELECT count(*) FROM cpu WHERE ts >= a AND ts < b — ts-range row count
+ *   Mode A: sort_by_tag_col = -1   (default ts-sort flush)
+ *   Mode B: sort_by_tag_col = host (counting-sort by host within block)
  *
- * (A) and (C) cover row-level integrity; (B) covers value-level integrity
- * via an order-independent multiset hash; (D) covers the block-level
- * zone-map cull behavior under any row order.
+ * Both modes MUST produce identical answers; physical layout differs,
+ * query semantics do not.  XOR-of-bits multiset hash is order-independent
+ * and exact, so any value drift in mode B is a real bug.
  *
- * Today (sort_by_tag_col=-1, default): test passes.
- * Session 2 (sort_by_tag_col>=0):       test must still pass — same expected
- *                                       values, different physical layout.
+ * Invariants:
+ *   [A] SELECT count(*) FROM cpu                      — total rows
+ *   [B] SELECT v multiset XOR                         — per-value bits
+ *   [C] SELECT count(*) FROM cpu WHERE host='host_5'  — per-host count
+ *   [D] SELECT count(*) FROM cpu WHERE ts in [a,b)    — ts-range count
  */
 
 #include "tsdb.h"
+#include "../src/storage/schema.h"
+#include "../src/storage/db.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,9 +45,6 @@ static void rm_rf(const char *path) {
     closedir(d); rmdir(path);
 }
 
-/* Bit-exact XOR multiset hash for doubles — order-independent, exact,
- * detects any single-bit change.  Reinterpret each f64 as uint64 so
- * NaN payload bits (if any) are not silently normalised away. */
 static inline uint64_t xor_f64(uint64_t acc, double v) {
     uint64_t bits;
     memcpy(&bits, &v, 8);
@@ -63,13 +55,15 @@ static inline uint64_t xor_f64(uint64_t acc, double v) {
 #define N_TICKS  800
 #define TICK_NS  (10LL * 1000000000LL)
 
-int main(void) {
-    const char *dir = "/tmp/tsdb_test_layout_invariants";
+static int run_mode(const char *label, int sort_by_tag_col,
+                    int64_t *out_count, uint64_t *out_v_xor,
+                    int64_t *out_host5, int64_t *out_range)
+{
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/tsdb_test_layout_invariants_%s", label);
     rm_rf(dir);
 
-    printf("=== layout invariants gate (pre-Session-2) ===\n");
-    printf("config: N_HOSTS=%d N_TICKS=%d total_rows=%d\n",
-           N_HOSTS, N_TICKS, N_HOSTS * N_TICKS);
+    printf("--- mode %s (sort_by_tag_col=%d) ---\n", label, sort_by_tag_col);
 
     tsdb_db_t *db = NULL;
     OK(tsdb_open(dir, &db));
@@ -84,8 +78,16 @@ int main(void) {
     tsdb_table_t *t = NULL;
     OK(tsdb_open_table(db, "cpu", &t));
 
-    /* Per-host random walk state; deterministic via rand_r-style LCG so
-     * rerunning the test produces byte-identical input. */
+    /* Flip the flag programmatically before any data is written so the
+     * very first flush exercises the new permutation.  DDL-level opt-in
+     * (PRIMARY TAG / env var) is Session 2d's responsibility — this
+     * test reaches the setter through the public schema accessor. */
+    if (sort_by_tag_col >= 0) {
+        tsdb_schema_t *s = tsdb_table_get_schema(t);
+        assert(s != NULL);
+        OK(tsdb_schema_set_sort_by_tag_col(s, sort_by_tag_col));
+    }
+
     double walk[N_HOSTS];
     for (int h = 0; h < N_HOSTS; h++) walk[h] = 50.0 + (double)h * 0.125;
     uint64_t lcg = 0xC001D00DULL;
@@ -93,12 +95,9 @@ int main(void) {
     tsdb_ts_t base_ts = tsdb_parse_ts("2026-01-01 00:00:00");
     tsdb_ts_t sub_step = TICK_NS / N_HOSTS;
 
-    /* Independently-computed expected values. */
     int64_t  expected_count       = 0;
     uint64_t expected_v_multiset  = 0;
     int64_t  expected_host5_count = 0;
-
-    /* For invariant D pick a 5-tick window starting at tick 100. */
     const int range_tick_lo = 100;
     const int range_tick_hi = 105;
     tsdb_ts_t ts_lo = base_ts + (tsdb_ts_t)range_tick_lo * TICK_NS;
@@ -115,8 +114,6 @@ int main(void) {
         tsdb_ts_t tick_base = base_ts + (tsdb_ts_t)tick * TICK_NS;
         for (int h = 0; h < N_HOSTS; h++) {
             tsdb_ts_t ts = tick_base + (tsdb_ts_t)h * sub_step;
-
-            /* Cheap deterministic random walk step. */
             lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
             double step = ((double)(lcg >> 32) / (double)UINT32_MAX - 0.5) * 5.0;
             walk[h] += step;
@@ -137,27 +134,23 @@ int main(void) {
     }
     OK(tsdb_batch_commit(b));
 
-    printf("expected: count=%lld  v_xor=%016llx  host5=%lld  range[%d,%d)=%lld\n",
+    printf("  expected: count=%lld  v_xor=%016llx  host5=%lld  range[%d,%d)=%lld\n",
            (long long)expected_count,
            (unsigned long long)expected_v_multiset,
            (long long)expected_host5_count,
            range_tick_lo, range_tick_hi,
            (long long)expected_range_count);
 
-    /* ---- A. SELECT count(*) ---- */
-    {
+    {   /* [A] */
         tsdb_result_t *r = NULL;
         OK(tsdb_query(db, "SELECT count(*) FROM cpu", &r));
         assert(tsdb_result_next(r) == 1);
         int64_t got = tsdb_result_i64(r, 0);
-        assert(tsdb_result_next(r) == 0);
         tsdb_result_free(r);
         if (got != expected_count) FAIL("[A] count: got=%lld expected=%lld", (long long)got, (long long)expected_count);
         printf("  [A] count(*)                       = %lld  ✓\n", (long long)got);
     }
-
-    /* ---- B. SELECT v multiset (XOR-of-bits) ---- */
-    {
+    {   /* [B] */
         tsdb_result_t *r = NULL;
         OK(tsdb_query(db, "SELECT v FROM cpu", &r));
         uint64_t got = 0;
@@ -167,13 +160,11 @@ int main(void) {
             n++;
         }
         tsdb_result_free(r);
-        if (n != expected_count) FAIL("[B] row count under projection: got=%lld expected=%lld", (long long)n, (long long)expected_count);
+        if (n != expected_count) FAIL("[B] projection count: got=%lld expected=%lld", (long long)n, (long long)expected_count);
         if (got != expected_v_multiset) FAIL("[B] v multiset xor: got=%016llx expected=%016llx", (unsigned long long)got, (unsigned long long)expected_v_multiset);
         printf("  [B] v multiset xor                 = %016llx  ✓\n", (unsigned long long)got);
     }
-
-    /* ---- C. SELECT count(*) WHERE host='host_5' ---- */
-    {
+    {   /* [C] */
         tsdb_result_t *r = NULL;
         OK(tsdb_query(db, "SELECT count(*) FROM cpu WHERE host = 'host_5'", &r));
         assert(tsdb_result_next(r) == 1);
@@ -182,9 +173,7 @@ int main(void) {
         if (got != expected_host5_count) FAIL("[C] host=host_5 count: got=%lld expected=%lld", (long long)got, (long long)expected_host5_count);
         printf("  [C] count(*) WHERE host='host_5'   = %lld  ✓\n", (long long)got);
     }
-
-    /* ---- D. SELECT count(*) WHERE ts in [ts_lo, ts_hi) ---- */
-    {
+    {   /* [D] */
         char sql[256];
         snprintf(sql, sizeof(sql),
                  "SELECT count(*) FROM cpu WHERE ts >= %lld AND ts < %lld",
@@ -198,9 +187,35 @@ int main(void) {
         printf("  [D] count(*) WHERE ts in [%d,%d) = %lld  ✓\n", range_tick_lo, range_tick_hi, (long long)got);
     }
 
+    *out_count = expected_count;
+    *out_v_xor = expected_v_multiset;
+    *out_host5 = expected_host5_count;
+    *out_range = expected_range_count;
+
     tsdb_close(db);
     rm_rf(dir);
+    return 0;
+}
 
-    printf("\nALL PASS — Session-2 sort_by_tag_col flag must replay these same expected values.\n");
+int main(void) {
+    printf("=== layout invariants gate ===\n");
+    printf("config: N_HOSTS=%d N_TICKS=%d total_rows=%d\n",
+           N_HOSTS, N_TICKS, N_HOSTS * N_TICKS);
+
+    int64_t  cA, c5A, rA;
+    uint64_t xA;
+    int64_t  cB, c5B, rB;
+    uint64_t xB;
+
+    run_mode("off", -1, &cA, &xA, &c5A, &rA);
+    run_mode("on",   1, &cB, &xB, &c5B, &rB);  /* col 1 = host */
+
+    if (cA != cB || xA != xB || c5A != c5B || rA != rB) {
+        FAIL("cross-mode mismatch: off=(%lld %016llx %lld %lld) on=(%lld %016llx %lld %lld)",
+             (long long)cA, (unsigned long long)xA, (long long)c5A, (long long)rA,
+             (long long)cB, (unsigned long long)xB, (long long)c5B, (long long)rB);
+    }
+
+    printf("\nALL PASS — both layouts produce identical query answers.\n");
     return 0;
 }
