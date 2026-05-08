@@ -124,8 +124,12 @@ int tsdb_memtable_is_sorted(tsdb_memtable_t *m);
  * would exceed block_points.  TSDB_ERR_NOMEM on intern failure.  On
  * any error, no partial rows are visible (atomic-or-nothing).
  */
+/* ts_arr is `const void *` so the caller can pass a possibly-misaligned
+ * pointer (e.g. wire-protocol slice after a 4-byte header).  We memcpy
+ * out int64 values internally; the casts at the callsite are no longer
+ * UB on strict-alignment ABIs.  See UBSAN finding 2026-05-08. */
 int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
-                               const int64_t *ts_arr,
+                               const void *ts_arr,
                                const void * const *col_arrs,
                                const int *col_types,
                                int ncols_data,

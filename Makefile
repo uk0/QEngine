@@ -116,7 +116,7 @@ build/libtsdb.a: $(OBJS)
 	@$(CC) $(CFLAGS) -c -o $@ $<
 	@echo "CC  $<"
 
-debug: CFLAGS = $(STD) -O0 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined $(ARCH) $(INC)
+debug: CFLAGS = $(STD) -O0 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined $(ARCH) $(INC) $(TLS_DEF) $(TLS_FLAGS)
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: all
 

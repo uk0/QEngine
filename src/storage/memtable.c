@@ -408,7 +408,7 @@ const void *tsdb_memtable_col(tsdb_memtable_t *m, int col) {
 }
 
 int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
-                               const int64_t *ts_arr,
+                               const void *ts_arr,
                                const void * const *col_arrs,
                                const int *col_types,
                                int ncols_data,
@@ -482,7 +482,9 @@ int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
 
     size_t base = m->nrows;
 
-    /* TS column: bulk memcpy. */
+    /* TS column: bulk memcpy.  ts_arr is `const void *` so we don't
+     * trigger UB even if the caller's int64 buffer isn't 8-aligned
+     * (e.g. wire-protocol payload after a 4-byte header). */
     int64_t *ts_dst = (int64_t *)m->col_bufs[ts_ci];
     memcpy(ts_dst + base, ts_arr, n * sizeof(int64_t));
 
@@ -501,10 +503,14 @@ int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
         }
     }
 
-    /* Update skiplist + sortedness tracking in one pass over the new ts. */
+    /* Update skiplist + sortedness tracking in one pass over the new ts.
+     * memcpy out each ts value so a misaligned caller pointer doesn't
+     * trip UBSAN's alignment check on the int64 load. */
     if (m->sl_ok) {
+        const uint8_t *ts_bytes = (const uint8_t *)ts_arr;
         for (size_t r = 0; r < n; r++) {
-            int64_t ts = ts_arr[r];
+            int64_t ts;
+            memcpy(&ts, ts_bytes + r * sizeof(int64_t), sizeof(int64_t));
             if (sl_insert(&m->sl, ts, (uint32_t)(base + r)) < 0) {
                 m->sl_ok = 0;
                 break;

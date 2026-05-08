@@ -377,7 +377,14 @@ int tsdb_pfor_encode_i64(const int64_t *in, size_t n,
         int fits_u32 = 1;
 
         for (unsigned k = 0; k < count; k++) {
-            int64_t delta = in[i + k] - prev;
+            /* Subtract via uint64_t to avoid the int64 overflow UB that
+             * UBSAN catches when adversarial inputs span the signed
+             * range (e.g. ts ≈ +7.2e18 vs prev ≈ −6.6e18 in the test
+             * suite).  Two's-complement wrap-around through unsigned
+             * arithmetic produces the same bit pattern that the
+             * subsequent zigzag encode treats as the signed delta —
+             * portable & defined. */
+            int64_t delta = (int64_t)((uint64_t)in[i + k] - (uint64_t)prev);
             uint64_t zz = tsdb_zigzag_enc(delta);
             i64_abs[k] = in[i + k];
             if (zz > 0xFFFFFFFFu) {

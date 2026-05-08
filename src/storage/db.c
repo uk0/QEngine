@@ -1140,7 +1140,7 @@ void tsdb_batch_set_local_only(tsdb_batch_t *b) {
 }
 
 int tsdb_batch_append_bulk(tsdb_batch_t *b,
-                            const int64_t *ts_arr,
+                            const void *ts_arr,
                             const void * const *col_arrs,
                             const int *col_types,
                             int ncols_data,
@@ -1149,6 +1149,10 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
     if (!b) return TSDB_ERR_INVAL;
     if (b->in_row) return TSDB_ERR_INVAL;
     if (n == 0) return TSDB_OK;
+    /* Treat ts_arr as raw bytes to preserve byte-level pointer
+     * arithmetic (consumed rows × 8 bytes) without ever forming a
+     * misaligned int64_t* — that's the cast UBSAN was flagging. */
+    const uint8_t *ts_bytes = (const uint8_t *)ts_arr;
 
     /* Chunk by block_points so a caller can hand us > bp_cap rows and
      * we transparently flush+continue.  Mirrors what the per-row API
@@ -1213,7 +1217,7 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
         }
 
         int rc = tsdb_memtable_append_bulk(b->tbl->memtable,
-                                            ts_arr + consumed,
+                                            ts_bytes + consumed * sizeof(int64_t),
                                             col_arrs_off, col_types,
                                             ncols_data, chunk);
 

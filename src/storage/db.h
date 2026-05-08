@@ -244,8 +244,12 @@ void tsdb_batch_set_local_only(tsdb_batch_t *b);
  * `col_arrs` and `col_types` exclude the timestamp column (n-1
  * entries for an n-column schema).
  */
+/* ts_arr is `const void *` so wire-protocol callers (RPC WRITE_BATCH
+ * receivers, server bulk path) can pass a possibly-misaligned int64
+ * slice without tripping UBSAN's alignment check.  Internally memcpy'd
+ * out 8 bytes at a time. */
 int tsdb_batch_append_bulk(tsdb_batch_t *b,
-                            const int64_t *ts_arr,
+                            const void *ts_arr,
                             const void * const *col_arrs,
                             const int *col_types,
                             int ncols_data,
