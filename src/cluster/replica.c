@@ -475,6 +475,8 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                               const char *table_name,
                               int ncols, const char **col_names,
                               const int *col_types, int ts_col_idx,
+                              int partition_unit, int block_points,
+                              int sort_by_tag_col,
                               const tsdb_node_id_t *nodes, int nnodes,
                               int quorum)
 {
@@ -483,7 +485,9 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
     uint8_t stack_buf[2048];
     int plen = tsdb_rpc_encode_schema(stack_buf, sizeof(stack_buf),
                                       table_name, ncols, col_names,
-                                      col_types, ts_col_idx);
+                                      col_types, ts_col_idx,
+                                      partition_unit, block_points,
+                                      sort_by_tag_col);
     if (plen < 0) return TSDB_ERR_INTERNAL;
 
     /* Move onto heap so fan-out can own it past this call's return. */

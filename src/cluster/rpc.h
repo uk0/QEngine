@@ -197,27 +197,51 @@ int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,
 /* ---- Schema-sync payload helpers ---------------------------------------- */
 
 /*
- * Encode a SCHEMA_SYNC payload:
- *   table_name_len  u8
- *   table_name      [...]
- *   ncols           u8
- *   ts_col_idx      u8
- *   per-col:
- *     name_len u8
- *     name     [...]
- *     type     u8
+ * Encode a SCHEMA_SYNC payload.
+ *
+ * v1 wire (legacy):
+ *   table_name_len u8
+ *   table_name     [...]
+ *   ncols          u8
+ *   ts_col_idx     u8
+ *   per-col: name_len u8, name [...], type u8
+ *
+ * v2 wire tail (2026-05; written by encoder, optional on decode):
+ *   partition_unit  u8     (TSDB_PARTITION_DAY=0 / HOUR=1)
+ *   block_points    u32    (per-table block size; 0 → engine default)
+ *   sort_by_tag_col i32    (-1 = off; >=0 = column index)
+ *
+ * The v2 tail closes a latent replication gap: pre-tail receivers
+ * silently used (DAY, default block_points, sort_by_tag_col=-1) even
+ * if the leader's schema diverged.  New encoders emit the tail
+ * unconditionally; new decoders treat its absence as the legacy
+ * defaults so old senders remain compatible.  Old receivers ignore
+ * the trailing bytes (loop terminates after the per-col block, p<end
+ * is not validated), so new senders also remain compatible with old
+ * receivers.
+ *
  * Returns bytes written, or -1.
  */
 int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
                            const char *table_name,
                            int ncols, const char **col_names,
-                           const int *col_types, int ts_col_idx);
+                           const int *col_types, int ts_col_idx,
+                           int partition_unit, int block_points,
+                           int sort_by_tag_col);
 
-/* Decode SCHEMA_SYNC payload. Returns 0 on success. */
+/* Decode SCHEMA_SYNC payload.
+ *
+ * out_partition_unit / out_block_points / out_sort_by_tag_col may be
+ * NULL if caller doesn't care; defaults are filled when the payload
+ * has no v2 tail (DAY / 0 / -1).
+ *
+ * Returns 0 on success. */
 int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
                            char *out_table, int table_cap,
                            int *out_ncols, char out_col_names[][64],
-                           int *out_col_types, int *out_ts_col_idx);
+                           int *out_col_types, int *out_ts_col_idx,
+                           int *out_partition_unit, int *out_block_points,
+                           int *out_sort_by_tag_col);
 
 /* ---- Apply-truncate / apply-delete-range payload helpers ----------------
  *

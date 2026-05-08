@@ -99,6 +99,25 @@ void tsdb_schema_free(tsdb_schema_t *s);
 int tsdb_schema_col_idx(tsdb_schema_t *s, const char *name);
 
 /*
+ * (d) Block-layout reorder: opt this table in to tag-sorted block flush.
+ *
+ *   col == -1               → off (default, ts-sort only)
+ *   col >=0, col < ncols    → sort each block by (cols[col].sym_value, ts)
+ *                              before encoding.  cols[col].type MUST be
+ *                              TSDB_TYPE_SYMBOL — anything else returns
+ *                              TSDB_ERR_INVAL.
+ *
+ * Persists by re-saving schema.bin (atomic write).  Affects only NEW
+ * blocks emitted after the call returns; existing on-disk blocks keep
+ * their original ts-sorted layout.  Reader is layout-agnostic so mixed
+ * old+new blocks coexist without engine change.
+ *
+ * Only callable when the table has no row in flight; callers should
+ * hold the table-level write lock if other writers may be active.
+ */
+int tsdb_schema_set_sort_by_tag_col(tsdb_schema_t *s, int col);
+
+/*
  * Append a column to an existing schema in place, and re-persist schema.bin.
  *
  * The new column is added at index s->ncols (the previous end) and becomes

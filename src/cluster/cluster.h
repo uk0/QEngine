@@ -116,11 +116,17 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
  * Called from tsdb_create_table when cluster is active.
  * nodes / nnodes: target node IDs (all ALIVE peers if NULL is passed —
  * implementation picks all ALIVE nodes automatically).
+ *
+ * partition_unit / block_points / sort_by_tag_col travel in the
+ * SCHEMA_SYNC v2 payload tail.  Pass the leader's actual schema
+ * values so the follower's local schema matches exactly.
  */
 int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
                              const char *table_name,
                              int ncols, const char **col_names,
                              const int *col_types, int ts_col_idx,
+                             int partition_unit, int block_points,
+                             int sort_by_tag_col,
                              const tsdb_node_id_t *nodes, int nnodes);
 
 /*

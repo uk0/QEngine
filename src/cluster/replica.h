@@ -72,11 +72,16 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
 /*
  * Sync schema (SCHEMA_SYNC RPC) to all given nodes.
  * Returns TSDB_OK when at least (quorum-1) remote nodes ACK.
+ *
+ * partition_unit / block_points / sort_by_tag_col travel in the v2
+ * payload tail so leader-side schema choices replicate verbatim.
  */
 int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                              const char *table_name,
                              int ncols, const char **col_names,
                              const int *col_types, int ts_col_idx,
+                             int partition_unit, int block_points,
+                             int sort_by_tag_col,
                              const tsdb_node_id_t *nodes, int nnodes,
                              int quorum);
 

@@ -265,6 +265,25 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              const char *ts_col);
 
 /*
+ * Same as tsdb_create_table_local, but threads through the schema's
+ * partition_unit / block_points / sort_by_tag_col so leader-side schema
+ * choices (e.g. PRIMARY TAG sort) replicate to followers via the RPC
+ * SCHEMA_SYNC v2-tail payload.  Pre-tail (legacy) senders pass
+ * (DAY, 0, -1) which collapses to today's behavior.
+ *
+ *   partition_unit_int  — TSDB_PARTITION_DAY=0 / HOUR=1
+ *   block_points        — 0 means "engine default"
+ *   sort_by_tag_col     — -1 = off; >=0 = column index (must be SYMBOL)
+ */
+int tsdb_create_table_local_ex(tsdb_db_t *db,
+                                const char *name,
+                                const tsdb_col_t *cols, size_t ncols,
+                                const char *ts_col,
+                                int partition_unit_int,
+                                int block_points,
+                                int sort_by_tag_col);
+
+/*
  * Enable group-commit for the database.  All subsequent tsdb_batch_commit()
  * calls will route WAL fsync through the group-commit batcher instead of
  * calling fsync() directly.

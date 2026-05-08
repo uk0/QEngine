@@ -251,11 +251,14 @@ int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
                               const char *table_name,
                               int ncols, const char **col_names,
                               const int *col_types, int ts_col_idx,
+                              int partition_unit, int block_points,
+                              int sort_by_tag_col,
                               const tsdb_node_id_t *nodes, int nnodes)
 {
     if (!c) return TSDB_OK;
     return tsdb_replica_sync_schema(c->replica_mgr,
                                     table_name, ncols, col_names, col_types, ts_col_idx,
+                                    partition_unit, block_points, sort_by_tag_col,
                                     nodes, nnodes, TSDB_WRITE_QUORUM);
 }
 

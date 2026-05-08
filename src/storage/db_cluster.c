@@ -248,6 +248,9 @@ static int cluster_on_create(void *ud, tsdb_db_t *db,
 
     return tsdb_cluster_sync_schema(c, table_name,
                                     ncols, col_names, col_types, ts_col_idx,
+                                    (int)schema->partition_unit,
+                                    schema->block_points,
+                                    schema->sort_by_tag_col,
                                     target_ids, ntargets);
 }
 

@@ -291,10 +291,12 @@ static void *connection_handler(void *arg) {
                  * (types) is well under the default 8 MiB pthread stack. */
                 char col_names[TSDB_MAX_COLS][64];
                 int col_types[TSDB_MAX_COLS];
+                int part_unit = 0, block_points = 0, sort_by_tag_col = -1;
 
                 int rc = tsdb_rpc_decode_schema(msg.payload, msg.payload_len,
                                                 table_name, sizeof(table_name),
-                                                &ncols, col_names, col_types, &ts_col_idx);
+                                                &ncols, col_names, col_types, &ts_col_idx,
+                                                &part_unit, &block_points, &sort_by_tag_col);
                 if (rc == 0 && ncols > 0 && ncols <= TSDB_MAX_COLS) {
                     tsdb_col_t cols[TSDB_MAX_COLS];
                     for (int i = 0; i < ncols; i++) {
@@ -303,8 +305,13 @@ static void *connection_handler(void *arg) {
                     }
                     const char *ts_name = (ts_col_idx >= 0 && ts_col_idx < ncols)
                                          ? col_names[ts_col_idx] : col_names[0];
-                    /* Use _local variant to avoid re-syncing to other nodes. */
-                    tsdb_create_table_local(db, table_name, cols, ncols, ts_name);
+                    /* Use _local_ex variant: avoids re-syncing AND threads
+                     * partition_unit / block_points / sort_by_tag_col so the
+                     * follower's local schema matches the leader's choice
+                     * exactly.  Pre-tail (legacy) senders feed the defaults
+                     * (DAY, 0, -1) which collapses to today's behavior. */
+                    tsdb_create_table_local_ex(db, table_name, cols, ncols, ts_name,
+                                                part_unit, block_points, sort_by_tag_col);
                 }
                 send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             } else {
@@ -1117,7 +1124,9 @@ int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,
 int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
                            const char *table_name,
                            int ncols, const char **col_names,
-                           const int *col_types, int ts_col_idx)
+                           const int *col_types, int ts_col_idx,
+                           int partition_unit, int block_points,
+                           int sort_by_tag_col)
 {
     if (!buf || !table_name || !col_names || !col_types) return -1;
 
@@ -1140,6 +1149,21 @@ int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
         if (nlen > 0) { memcpy(p, col_names[c], nlen); p += nlen; }
         *p++ = (uint8_t)col_types[c];
     }
+
+    /* v2 wire tail: partition_unit + block_points + sort_by_tag_col.
+     * Always emitted by new encoders.  Old decoders ignore trailing
+     * bytes after the per-col loop, so the addition is wire-safe. */
+    CHECK(1 + 4 + 4);
+    *p++ = (uint8_t)partition_unit;
+    {
+        uint32_t bp = (uint32_t)(block_points > 0 ? block_points : 0);
+        memcpy(p, &bp, 4); p += 4;
+    }
+    {
+        int32_t sc = (int32_t)sort_by_tag_col;
+        memcpy(p, &sc, 4); p += 4;
+    }
+
 #undef CHECK
     return (int)(p - buf);
 }
@@ -1147,10 +1171,17 @@ int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
 int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
                            char *out_table, int table_cap,
                            int *out_ncols, char out_col_names[][64],
-                           int *out_col_types, int *out_ts_col_idx)
+                           int *out_col_types, int *out_ts_col_idx,
+                           int *out_partition_unit, int *out_block_points,
+                           int *out_sort_by_tag_col)
 {
     const uint8_t *p = buf;
     const uint8_t *end = buf + len;
+
+    /* v2 tail defaults — applied if the payload has no tail (legacy sender). */
+    if (out_partition_unit)  *out_partition_unit  = 0;   /* TSDB_PARTITION_DAY */
+    if (out_block_points)    *out_block_points    = 0;   /* engine default */
+    if (out_sort_by_tag_col) *out_sort_by_tag_col = -1;  /* off */
 
 #define NEED(n) if (p + (n) > end) return -1
 
@@ -1177,6 +1208,18 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
         out_col_names[c][cn] = '\0';
         p += nlen;
         out_col_types[c] = *p++;
+    }
+
+    /* v2 tail: present iff at least 9 bytes remain. */
+    if ((size_t)(end - p) >= 1 + 4 + 4) {
+        uint8_t pu = *p++;
+        if (out_partition_unit) *out_partition_unit = (int)pu;
+        uint32_t bp = 0;
+        memcpy(&bp, p, 4); p += 4;
+        if (out_block_points) *out_block_points = (int)bp;
+        int32_t sc = -1;
+        memcpy(&sc, p, 4); p += 4;
+        if (out_sort_by_tag_col) *out_sort_by_tag_col = (int)sc;
     }
 #undef NEED
     return 0;

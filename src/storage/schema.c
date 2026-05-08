@@ -144,6 +144,17 @@ static int schema_save(tsdb_schema_t *s) {
     return rc;
 }
 
+/* ---- tsdb_schema_set_sort_by_tag_col ----------------------------------- */
+
+int tsdb_schema_set_sort_by_tag_col(tsdb_schema_t *s, int col) {
+    if (!s) return TSDB_ERR_INVAL;
+    if (col < -1 || col >= s->ncols) return TSDB_ERR_INVAL;
+    if (col >= 0 && s->cols[col].type != TSDB_TYPE_SYMBOL) return TSDB_ERR_INVAL;
+    if (s->sort_by_tag_col == col) return TSDB_OK;
+    s->sort_by_tag_col = col;
+    return schema_save(s);
+}
+
 /* ---- tsdb_schema_create ------------------------------------------------ */
 
 int tsdb_schema_create(const char *dir, const char *name,

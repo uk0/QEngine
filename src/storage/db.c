@@ -573,6 +573,35 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              /*suppress_hook*/ 1);
 }
 
+int tsdb_create_table_local_ex(tsdb_db_t *db,
+                                const char *name,
+                                const tsdb_col_t *cols, size_t ncols,
+                                const char *ts_col,
+                                int partition_unit_int,
+                                int block_points,
+                                int sort_by_tag_col)
+{
+    tsdb_partition_unit_t unit = (partition_unit_int == (int)TSDB_PARTITION_HOUR)
+                                  ? TSDB_PARTITION_HOUR
+                                  : TSDB_PARTITION_DAY;
+    int rc = create_table_impl(db, name, cols, ncols, ts_col, unit,
+                               block_points,
+                               /*suppress_hook*/ 1);
+    if (rc != TSDB_OK) return rc;
+    if (sort_by_tag_col >= 0) {
+        /* Apply the leader's tag-sort choice to the freshly-created
+         * follower schema.  Failures here would mean the follower picked
+         * up the table at the wrong layout — surface them so the SCHEMA_SYNC
+         * caller can mark this peer as schema-divergent. */
+        tsdb_table_t *t = NULL;
+        if (tsdb_open_table(db, name, &t) != TSDB_OK || !t) return TSDB_ERR_INTERNAL;
+        tsdb_schema_t *s = ((tsdb_table_internal_t *)t)->schema;
+        if (!s) return TSDB_ERR_INTERNAL;
+        rc = tsdb_schema_set_sort_by_tag_col(s, sort_by_tag_col);
+    }
+    return rc;
+}
+
 /* ---- tsdb_open_table ---------------------------------------------------- */
 
 int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
