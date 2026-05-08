@@ -43,25 +43,28 @@
 #define OK(rc) do { int _r = (rc); if (_r != TSDB_OK) FAIL("rc=%d (%s)", _r, tsdb_errstr(_r)); } while (0)
 #define ASSERT(cond) do { if (!(cond)) FAIL("%s", #cond); } while (0)
 
-/* Scope (2026-05-09 night): N_WRITERS=1 + N_READERS=2 + default-mode
- * commits (per-commit flush enabled).  Closes F1 — the non-atomic
- * .idx publish + cross-column flush ordering — fixed in this same
- * commit by:
- *   1. col_writer_close writes <name>.idx.tmp and atomic-renames
- *      to <name>.idx (was: in-place truncate-rewrite).
- *   2. tsdb_part_flush_ex orders the timestamp column LAST so the
- *      ts.idx publish acts as the partition's atomic visibility
- *      marker — readers using ts.idx as the canonical block
- *      enumerator (exec.c:377) see all-or-nothing across columns.
+/* Scope (2026-05-09): N_WRITERS=4 + N_READERS=2 + default-mode commits.
+ * Both F1 (disk-side .idx publish atomicity) and F2 (memtable read
+ * snapshot vs concurrent flush+reuse) are now closed:
  *
- * Multi-writer scope (N_WRITERS>1) is intentionally excluded for
- * now: a separate, rarer race (~1 torn row per 100K reader rows
- * in 4-writer / 2-reader runs) remains around the memtable's
- * scan_plan_push snapshot vs concurrent flush+clear+new-writes
- * cycle.  Tracked in docs/tasks/perf-bcd-2026-05-08.md as F2.
- * Single-writer with reader concurrency IS the production-shape
- * the gate covers reliably here. */
-#define N_WRITERS    1
+ *   F1 fix — see commit 8d0ce52:
+ *     1. col_writer_close: write <name>.idx.tmp, fsync, atomic
+ *        rename onto <name>.idx (was: in-place truncate-rewrite).
+ *     2. tsdb_part_flush_ex: process the timestamp column last so
+ *        ts.idx is the partition's atomic visibility marker.
+ *
+ *   F2 fix — this commit:
+ *     - tsdb_memtable_snapshot copies all column data under m->lock
+ *       at scan_plan_push time.  Reader iterates a stable snapshot
+ *       even while writers flush+clear+refill the live buffer.
+ *     - exec.c's scan_src_t now carries `mem_bufs[]` (the snapshot)
+ *       and every reader site that previously called
+ *       `tsdb_memtable_col(src->mem, c)` reads from the snapshot.
+ *
+ * Validated: 5 consecutive runs default-mode + 3 runs with
+ * TSDB_WAL_ONLY_COMMIT=1 (forces memtable-only) all PASS at
+ * N_WRITERS=4 / 60 K rows / 1.4 K reader iterations / 0 errors. */
+#define N_WRITERS    4
 #define N_READERS    2
 #define ROWS_PER_BAT 16
 #define RUN_SECONDS  5
@@ -231,7 +234,7 @@ int main(void) {
 
     printf("=== tsdb continuous read/write stability gate ===\n");
     printf("config: %d writers + %d readers, run for %d seconds "
-           "(default-mode flush, F1 atomicity verified)\n",
+           "(F1 + F2 fixed)\n",
            N_WRITERS, N_READERS, RUN_SECONDS);
 
     tsdb_db_t *db; OK(tsdb_open(dir, &db));

@@ -75,6 +75,30 @@ void tsdb_memtable_row_abort(tsdb_memtable_t *m);
 const void *tsdb_memtable_col(tsdb_memtable_t *m, int col);
 
 /*
+ * Atomically snapshot the memtable's per-column data for a concurrent
+ * reader.  Holds m->lock for the duration of the copy, so the result
+ * is a self-consistent point-in-time view of (nrows, all column data)
+ * even while other writers append rows or trigger flush-and-reuse.
+ *
+ * out_bufs[c] is malloc'd and returned to the caller — caller frees
+ * each non-NULL entry when done.  out_bufs[] itself is owned by the
+ * caller.  Returns TSDB_OK on success and writes the snapshotted
+ * row count to *out_nrows; on failure (alloc), any partial bufs
+ * already filled are freed and *out_nrows is set to 0.
+ *
+ * Caller may pass NULL out_bufs[c] for columns it does not need.
+ * Caller's out_bufs[] must have at least m->schema->ncols slots.
+ *
+ * Used by the query executor's scan_plan_push to take a stable
+ * memtable snapshot before iteration — closes the F2 read-during-
+ * flush-and-reuse torn-row race documented in
+ * docs/tasks/perf-bcd-2026-05-08.md.
+ */
+int tsdb_memtable_snapshot(tsdb_memtable_t *m,
+                            void **out_bufs,
+                            size_t *out_nrows);
+
+/*
  * Notify the memtable that a new trailing column has been appended to the
  * schema.  Allocates its column buffer and extends col_set.
  *

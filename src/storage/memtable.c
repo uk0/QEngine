@@ -403,8 +403,49 @@ void tsdb_memtable_row_abort(tsdb_memtable_t *m) {
 
 const void *tsdb_memtable_col(tsdb_memtable_t *m, int col) {
     if (!m || col < 0 || col >= m->schema->ncols) return NULL;
-    /* No lock needed for read after flush (caller responsibility). */
+    /* No lock needed for read after flush (caller responsibility).
+     * Concurrent readers should use tsdb_memtable_snapshot instead — this
+     * raw pointer is unsafe across writer flush+reuse. */
     return m->col_bufs[col];
+}
+
+int tsdb_memtable_snapshot(tsdb_memtable_t *m,
+                            void **out_bufs,
+                            size_t *out_nrows)
+{
+    if (!m || !out_bufs || !out_nrows) return TSDB_ERR_INVAL;
+    *out_nrows = 0;
+    pthread_mutex_lock(&m->lock);
+    size_t n = m->nrows;
+    int ncols = m->schema->ncols;
+
+    /* Empty memtable: nothing to copy.  Caller can short-circuit. */
+    if (n == 0) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_OK;
+    }
+
+    for (int c = 0; c < ncols; c++) {
+        size_t w = tsdb_type_width(m->schema->cols[c].type);
+        if (w == 0) { out_bufs[c] = NULL; continue; }
+        void *dst = malloc(n * w);
+        if (!dst) {
+            /* Roll back any partial copies the caller would otherwise
+             * leak — keep the failure point easy to reason about. */
+            for (int j = 0; j < c; j++) {
+                free(out_bufs[j]);
+                out_bufs[j] = NULL;
+            }
+            pthread_mutex_unlock(&m->lock);
+            return TSDB_ERR_NOMEM;
+        }
+        memcpy(dst, m->col_bufs[c], n * w);
+        out_bufs[c] = dst;
+    }
+
+    pthread_mutex_unlock(&m->lock);
+    *out_nrows = n;
+    return TSDB_OK;
 }
 
 int tsdb_memtable_append_bulk(tsdb_memtable_t *m,

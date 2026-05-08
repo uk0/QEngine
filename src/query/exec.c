@@ -213,6 +213,15 @@ static int result_set_col(tsdb_result_t *r, int i, const char *name, tsdb_type_t
 struct scan_src {
     /* Per source: either a memtable or a (part, block-index) */
     tsdb_memtable_t  *mem;             /* NULL if from disk */
+    /* Per-column snapshot of the memtable taken under m->lock at
+     * scan_plan_push time.  Closes F2: without the snapshot, a
+     * concurrent flush+clear+new-write cycle could overwrite the
+     * memtable's column buffers between the reader's nrows sample
+     * and its iteration, producing torn rows.  Owned by the scan
+     * plan; freed in scan_plan_free.  NULL when sc is not from
+     * memtable.  Indexed by schema column index. */
+    void            **mem_bufs;
+    int               mem_nbufs;       /* schema->ncols at snapshot time */
     tsdb_part_t      *part;            /* NULL if from memtable */
     tsdb_block_meta_t meta;            /* only valid when part != NULL */
     size_t            row_count;       /* rows in this source segment */
@@ -276,6 +285,17 @@ typedef struct {
 static void scan_plan_free(scan_plan_t *p) {
     for (size_t i = 0; i < p->nparts; i++) tsdb_part_close(p->parts[i]);
     free(p->parts);
+    /* Free per-source memtable snapshots — those buffers were malloc'd
+     * by tsdb_memtable_snapshot under m->lock when this plan was
+     * built. */
+    for (size_t i = 0; i < p->nsrcs; i++) {
+        scan_src_t *sc = &p->srcs[i];
+        if (sc->mem_bufs) {
+            for (int c = 0; c < sc->mem_nbufs; c++) free(sc->mem_bufs[c]);
+            free(sc->mem_bufs);
+            sc->mem_bufs = NULL;
+        }
+    }
     free(p->srcs);
 }
 
@@ -391,21 +411,41 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
     }
     free(dirs);
 
-    /* Then memtable (newest data). */
+    /* Then memtable (newest data).
+     *
+     * Take a per-column snapshot under m->lock so the reader's view is
+     * a consistent point-in-time slice — concurrent writers can keep
+     * filling the memtable, trigger flush+clear, and reuse the column
+     * buffers without ever corrupting THIS reader's iteration.  See
+     * F2 in docs/tasks/perf-bcd-2026-05-08.md. */
     tsdb_memtable_t *mem = tsdb_tbl_memtable(t);
-    size_t nr = mem ? tsdb_memtable_rows(mem) : 0;
-    if (nr > 0) {
-        const int64_t *tscol = (const int64_t *)tsdb_memtable_col(mem, ts_col);
-        scan_src_t sc = {0};
-        sc.mem = mem;
-        sc.row_count = nr;
-        sc.ts_min = tscol[0];
-        sc.ts_max = tscol[nr - 1];
-        for (size_t i = 0; i < nr; i++) {
-            if (tscol[i] < sc.ts_min) sc.ts_min = tscol[i];
-            if (tscol[i] > sc.ts_max) sc.ts_max = tscol[i];
+    if (mem) {
+        tsdb_schema_t *ms = tsdb_tbl_schema(t);
+        int ncols = ms->ncols;
+        void **mem_bufs = calloc((size_t)ncols, sizeof(void *));
+        if (!mem_bufs) return TSDB_ERR_NOMEM;
+        size_t nr = 0;
+        int rc = tsdb_memtable_snapshot(mem, mem_bufs, &nr);
+        if (rc != TSDB_OK) { free(mem_bufs); return rc; }
+        if (nr > 0) {
+            const int64_t *tscol = (const int64_t *)mem_bufs[ts_col];
+            scan_src_t sc = {0};
+            sc.mem      = mem;
+            sc.mem_bufs = mem_bufs;
+            sc.mem_nbufs = ncols;
+            sc.row_count = nr;
+            sc.ts_min = tscol[0];
+            sc.ts_max = tscol[nr - 1];
+            for (size_t i = 0; i < nr; i++) {
+                if (tscol[i] < sc.ts_min) sc.ts_min = tscol[i];
+                if (tscol[i] > sc.ts_max) sc.ts_max = tscol[i];
+            }
+            scan_plan_push(p, sc);
+        } else {
+            /* Empty memtable: snapshot returned no buffers, just
+             * release the array we allocated. */
+            free(mem_bufs);
         }
-        scan_plan_push(p, sc);
     }
     return TSDB_OK;
 }
@@ -1727,7 +1767,7 @@ void tsdb_par_scan_task(void *arg) {
             syms[c] = t->schema->cols[c].symtab;
             size_t w = tsdb_type_width(t->schema->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { load_rc = TSDB_ERR_NOMEM; break; }
@@ -1868,7 +1908,7 @@ static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
             syms[c] = s->cols[c].symtab;
             size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { lrc = TSDB_ERR_NOMEM; break; }
@@ -2012,7 +2052,7 @@ static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs
     for (size_t c = 0; c < m->ncols; c++) {
         size_t w = tsdb_type_width(rs->cols[c].type);
         if (src->mem) {
-            memcpy((char *)m->col_bufs[c] + off * w, tsdb_memtable_col(src->mem, (int)c), n * w);
+            memcpy((char *)m->col_bufs[c] + off * w, src->mem_bufs[c], n * w);
         } else {
             tsdb_block_meta_t *metas = NULL; size_t nb = 0;
             int rc = tsdb_part_col_blocks(src->part, (int)c, &metas, &nb);
@@ -2288,7 +2328,7 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
             if (!need_lcol[c]) continue;
             size_t w = tsdb_type_width(ls->cols[c].type);
             if (src->mem) {
-                lbufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                lbufs[c] = src->mem_bufs[c];
             } else {
                 lbufs[c] = malloc(w * ln);
                 if (!lbufs[c]) { lrc = TSDB_ERR_NOMEM; break; }
@@ -2688,7 +2728,7 @@ static void tsdb_gbpar_scan_task(void *arg) {
             syms[c] = s->cols[c].symtab;
             size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { local_rc = TSDB_ERR_NOMEM; break; }
@@ -3088,7 +3128,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             syms[c] = s->cols[c].symtab;
             size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { rc = TSDB_ERR_NOMEM; break; }
@@ -3372,7 +3412,7 @@ static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             syms[c] = s->cols[c].symtab;
             size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { src_rc = TSDB_ERR_NOMEM; break; }
@@ -4662,7 +4702,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             syms[c] = s->cols[c].symtab;
             size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
-                bufs[c] = (void *)tsdb_memtable_col(src->mem, c);
+                bufs[c] = src->mem_bufs[c];
             } else {
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { rc = TSDB_ERR_NOMEM; break; }
