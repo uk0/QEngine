@@ -512,6 +512,44 @@ static int create_table_impl(tsdb_db_t *db,
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
 
+    /* (d) Tag-sort opt-in via TSDB_BLOCK_SORT_BY_TAG env var.  Applied
+     * here BEFORE the cluster on_create hook fires, so the resulting
+     * sort_by_tag_col travels in the SCHEMA_SYNC v2 payload tail to all
+     * followers — they create their local tables with the same flag
+     * without re-reading the env var.  Suppress_hook=1 paths (SCHEMA_SYNC
+     * receivers, raft replay) skip this lookup; they already received an
+     * explicit sort_by_tag_col from the leader and must not override it. */
+    if (!suppress_hook) {
+        const char *sort_col_name = getenv("TSDB_BLOCK_SORT_BY_TAG");
+        if (sort_col_name && sort_col_name[0]) {
+            int found = -1;
+            for (int i = 0; i < schema->ncols; i++) {
+                if (strcmp(schema->cols[i].name, sort_col_name) == 0
+                    && schema->cols[i].type == TSDB_TYPE_SYMBOL) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                /* schema_save inside the setter is best-effort here.
+                 * If it fails the in-memory flag still reflects the
+                 * intent and writes still tag-sort, but rolling restart
+                 * may lose the setting — the setter logs nothing yet, so
+                 * surface the rc via stderr for diagnosability. */
+                int rc2 = tsdb_schema_set_sort_by_tag_col(schema, found);
+                if (rc2 != TSDB_OK) {
+                    fprintf(stderr,
+                            "[tsdb] TSDB_BLOCK_SORT_BY_TAG=%s: schema_save failed for table %s: rc=%d\n",
+                            sort_col_name, name, rc2);
+                }
+            }
+            /* If the named column is missing or not SYMBOL, silently
+             * stay at sort_by_tag_col=-1.  This is an opt-in hint, not
+             * a hard requirement, so a global env var pointing at a
+             * column that doesn't exist on every table is not fatal. */
+        }
+    }
+
     /* Snapshot hook pointers under lock, then call after unlock to avoid
      * deadlock if the hook re-enters any db operation. */
     tsdb_on_create_fn on_create = suppress_hook ? NULL : db->on_create;

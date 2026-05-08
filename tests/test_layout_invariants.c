@@ -55,7 +55,12 @@ static inline uint64_t xor_f64(uint64_t acc, double v) {
 #define N_TICKS  800
 #define TICK_NS  (10LL * 1000000000LL)
 
-static int run_mode(const char *label, int sort_by_tag_col,
+/* trigger ∈ {"explicit-setter", "env-var", "off"} selects how the flag
+ * gets onto the schema; sort_by_tag_col in [-1, ncols) is the value the
+ * test expects to find on the schema after the trigger fires. */
+static int run_mode(const char *label,
+                    const char *trigger,
+                    int sort_by_tag_col,
                     int64_t *out_count, uint64_t *out_v_xor,
                     int64_t *out_host5, int64_t *out_range)
 {
@@ -63,7 +68,14 @@ static int run_mode(const char *label, int sort_by_tag_col,
     snprintf(dir, sizeof(dir), "/tmp/tsdb_test_layout_invariants_%s", label);
     rm_rf(dir);
 
-    printf("--- mode %s (sort_by_tag_col=%d) ---\n", label, sort_by_tag_col);
+    printf("--- mode %s (trigger=%s sort_by_tag_col=%d) ---\n",
+           label, trigger, sort_by_tag_col);
+
+    if (strcmp(trigger, "env-var") == 0 && sort_by_tag_col >= 0) {
+        setenv("TSDB_BLOCK_SORT_BY_TAG", "host", 1);
+    } else {
+        unsetenv("TSDB_BLOCK_SORT_BY_TAG");
+    }
 
     tsdb_db_t *db = NULL;
     OK(tsdb_open(dir, &db));
@@ -78,14 +90,25 @@ static int run_mode(const char *label, int sort_by_tag_col,
     tsdb_table_t *t = NULL;
     OK(tsdb_open_table(db, "cpu", &t));
 
-    /* Flip the flag programmatically before any data is written so the
-     * very first flush exercises the new permutation.  DDL-level opt-in
-     * (PRIMARY TAG / env var) is Session 2d's responsibility — this
-     * test reaches the setter through the public schema accessor. */
-    if (sort_by_tag_col >= 0) {
-        tsdb_schema_t *s = tsdb_table_get_schema(t);
-        assert(s != NULL);
+    /* Trigger paths:
+     *   "explicit-setter": white-box — call the setter directly.  Used
+     *                      to prove the engine-level invariants.
+     *   "env-var":         opt-in — TSDB_BLOCK_SORT_BY_TAG=host was set
+     *                      before tsdb_create_table, so the schema must
+     *                      already reflect sort_by_tag_col after the
+     *                      DDL returns.  Verify that, then write data.
+     *   "off":             nothing set; flag remains -1.
+     */
+    tsdb_schema_t *s = tsdb_table_get_schema(t);
+    assert(s != NULL);
+
+    if (strcmp(trigger, "explicit-setter") == 0 && sort_by_tag_col >= 0) {
         OK(tsdb_schema_set_sort_by_tag_col(s, sort_by_tag_col));
+    } else if (strcmp(trigger, "env-var") == 0) {
+        if (s->sort_by_tag_col != sort_by_tag_col)
+            FAIL("env-var trigger: expected schema flag=%d got=%d",
+                 sort_by_tag_col, s->sort_by_tag_col);
+        unsetenv("TSDB_BLOCK_SORT_BY_TAG");  /* don't leak to next mode */
     }
 
     double walk[N_HOSTS];
@@ -202,20 +225,25 @@ int main(void) {
     printf("config: N_HOSTS=%d N_TICKS=%d total_rows=%d\n",
            N_HOSTS, N_TICKS, N_HOSTS * N_TICKS);
 
-    int64_t  cA, c5A, rA;
-    uint64_t xA;
-    int64_t  cB, c5B, rB;
-    uint64_t xB;
+    int64_t  cA, c5A, rA, cB, c5B, rB, cC, c5C, rC;
+    uint64_t xA, xB, xC;
 
-    run_mode("off", -1, &cA, &xA, &c5A, &rA);
-    run_mode("on",   1, &cB, &xB, &c5B, &rB);  /* col 1 = host */
+    run_mode("off",     "off",              -1, &cA, &xA, &c5A, &rA);
+    run_mode("on",      "explicit-setter",   1, &cB, &xB, &c5B, &rB);
+    run_mode("env-var", "env-var",           1, &cC, &xC, &c5C, &rC);
 
-    if (cA != cB || xA != xB || c5A != c5B || rA != rB) {
-        FAIL("cross-mode mismatch: off=(%lld %016llx %lld %lld) on=(%lld %016llx %lld %lld)",
+    if (cA != cB || xA != xB || c5A != c5B || rA != rB
+     || cA != cC || xA != xC || c5A != c5C || rA != rC) {
+        FAIL("cross-mode mismatch:\n"
+             "  off   (%lld %016llx %lld %lld)\n"
+             "  on    (%lld %016llx %lld %lld)\n"
+             "  envvar(%lld %016llx %lld %lld)",
              (long long)cA, (unsigned long long)xA, (long long)c5A, (long long)rA,
-             (long long)cB, (unsigned long long)xB, (long long)c5B, (long long)rB);
+             (long long)cB, (unsigned long long)xB, (long long)c5B, (long long)rB,
+             (long long)cC, (unsigned long long)xC, (long long)c5C, (long long)rC);
     }
 
-    printf("\nALL PASS — both layouts produce identical query answers.\n");
+    printf("\nALL PASS — all three triggers (off / explicit-setter / env-var) "
+           "produce identical query answers.\n");
     return 0;
 }
