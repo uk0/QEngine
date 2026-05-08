@@ -2743,7 +2743,22 @@ static void tsdb_gbpar_scan_task(void *arg) {
             }
         }
 
-        /* Per-row hash-aggregate into the worker's private hash table. */
+        /* Per-row hash-aggregate into the worker's private hash table.
+         *
+         * Hot-loop optimisation (informed by [gb-profile] data showing
+         * upsert+agg = 60-89 % of total): hoist the 256-byte
+         * one_bufs[] memset and the constant one_bm/one_n out of the
+         * inner per-projection loop.  agg_update only READS bufs[],
+         * never writes; we set the at-most-2 indices it actually
+         * consults per call, then null them back so the next
+         * iteration starts clean.  Removes ~512 B/(row × proj) of
+         * memset traffic — for a 4-agg query × 8.6 M rows that's
+         * ~17 GB of zeroing erased from the steady-state path. */
+        uint64_t one_bm = 1;
+        size_t   one_n  = 1;
+        void    *one_bufs[TSDB_MAX_COLS];
+        memset(one_bufs, 0, sizeof(one_bufs));
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
@@ -2778,21 +2793,24 @@ static void tsdb_gbpar_scan_task(void *arg) {
             for (int p = 0; p < nprojs; p++) {
                 proj_t *gp = &slot->state[p];
                 if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
-                uint64_t one_bm = 1;
-                size_t   one_n  = 1;
-                void    *one_bufs[TSDB_MAX_COLS];
-                memset(one_bufs, 0, sizeof(one_bufs));
+                int set_col = -1, set_tsc = -1;
                 if (gp->col >= 0) {
                     size_t w = tsdb_type_width(s->cols[gp->col].type);
                     if (w == 8)      one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 8;
                     else if (w == 4) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 4;
+                    set_col = gp->col;
                 }
                 if (gp->kind >= PROJ_AGG_TS_KIND_FIRST) {
                     int tsc = s->ts_col_idx;
                     if (bufs[tsc])
                         one_bufs[tsc] = (uint8_t *)bufs[tsc] + row * 8;
+                    set_tsc = tsc;
                 }
                 agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
+                /* Restore null so next (row, proj) sees a clean slate
+                 * exactly as if we'd memset.  Two stores instead of 64. */
+                if (set_col >= 0) one_bufs[set_col] = NULL;
+                if (set_tsc >= 0) one_bufs[set_tsc] = NULL;
             }
             if (gb_prof.enabled) {
                 int64_t t3 = gb_prof_now_ns();
@@ -3119,11 +3137,22 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             }
         }
 
-        /* Per-row: compute key tuple, upsert, update aggregates. */
+        /* Per-row: compute key tuple, upsert, update aggregates.
+         *
+         * Same hoist-the-memset optimisation as the parallel path:
+         * one_bufs[] / one_bm / one_n live OUTSIDE the per-row loop;
+         * we set the at-most-2 indices agg_update reads, then null
+         * them again.  See parallel-path comment above for why this
+         * is profile-justified. */
         {
             const char *e = getenv("TSDB_GB_PROFILE");
             gb_prof.enabled = (e && *e == '1');
         }
+        uint64_t one_bm = 1;
+        size_t   one_n  = 1;
+        void    *one_bufs[TSDB_MAX_COLS];
+        memset(one_bufs, 0, sizeof(one_bufs));
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
 
@@ -3157,23 +3186,23 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             for (int p = 0; p < nprojs; p++) {
                 proj_t *gp = &slot->state[p];
                 if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
-                /* Single-row bitmap. */
-                uint64_t one_bm = 1;
-                size_t   one_n  = 1;
-                void    *one_bufs[TSDB_MAX_COLS];
-                memset(one_bufs, 0, sizeof(one_bufs));
+                int set_col = -1, set_tsc = -1;
                 if (gp->col >= 0) {
                     size_t w = tsdb_type_width(s->cols[gp->col].type);
                     if (w == 8) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 8;
                     else if (w == 4) one_bufs[gp->col] = (uint8_t *)bufs[gp->col] + row * 4;
+                    set_col = gp->col;
                 }
                 /* TS agg functions also need the ts column pointer. */
                 if (gp->kind >= PROJ_AGG_TS_KIND_FIRST) {
                     int tsc = s->ts_col_idx;
                     if (bufs[tsc])
                         one_bufs[tsc] = (uint8_t *)bufs[tsc] + row * 8;
+                    set_tsc = tsc;
                 }
                 agg_update(gp, s, one_bufs, one_n, &one_bm, agg_scratch);
+                if (set_col >= 0) one_bufs[set_col] = NULL;
+                if (set_tsc >= 0) one_bufs[set_tsc] = NULL;
             }
             if (gb_prof.enabled) {
                 int64_t t3 = gb_prof_now_ns();
