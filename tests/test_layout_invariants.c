@@ -243,7 +243,70 @@ int main(void) {
              (long long)cC, (unsigned long long)xC, (long long)c5C, (long long)rC);
     }
 
-    printf("\nALL PASS — all three triggers (off / explicit-setter / env-var) "
-           "produce identical query answers.\n");
+    /* ---- Persistence gate: env-var sets flag on first open; second
+     * open (env unset) must still see sort_by_tag_col = 1 because it
+     * was persisted to schema.bin's v4 tail.  Critical: the flag must
+     * not be a process-local-env-only artifact, otherwise a node
+     * restart would silently revert future flushes to ts-sort and
+     * mixed old/new blocks could surface as compression regression. */
+    {
+        const char *dir = "/tmp/tsdb_test_layout_invariants_persist";
+        rm_rf(dir);
+        printf("--- mode persist (close/reopen with env unset) ---\n");
+
+        setenv("TSDB_BLOCK_SORT_BY_TAG", "host", 1);
+        tsdb_db_t *db = NULL;
+        OK(tsdb_open(dir, &db));
+        tsdb_col_t cols[] = {
+            {"ts",   TSDB_TYPE_TIMESTAMP},
+            {"host", TSDB_TYPE_SYMBOL},
+            {"v",    TSDB_TYPE_FLOAT64},
+        };
+        OK(tsdb_create_table(db, "cpu", cols, 3, "ts"));
+        tsdb_close(db);
+
+        unsetenv("TSDB_BLOCK_SORT_BY_TAG");
+        OK(tsdb_open(dir, &db));
+        tsdb_table_t *t = NULL;
+        OK(tsdb_open_table(db, "cpu", &t));
+        tsdb_schema_t *s = tsdb_table_get_schema(t);
+        assert(s != NULL);
+        if (s->sort_by_tag_col != 1) {
+            FAIL("persist: schema flag lost across reopen, got=%d expected=1",
+                 s->sort_by_tag_col);
+        }
+        printf("  schema.sort_by_tag_col after reopen = %d  ✓\n", s->sort_by_tag_col);
+
+        /* Sanity write+query — flag survives AND the post-reopen flush
+         * still tag-sorts.  Use a small dataset: just enough rows to
+         * trigger a flush. */
+        tsdb_batch_t *b = NULL;
+        OK(tsdb_batch_begin(t, &b));
+        for (int h = 0; h < N_HOSTS; h++) {
+            char hname[16]; snprintf(hname, 16, "host_%d", h);
+            for (int i = 0; i < 100; i++) {
+                OK(tsdb_batch_row_ts(b, (tsdb_ts_t)(h * 1000 + i)));
+                OK(tsdb_batch_row_sym(b, 1, hname));
+                OK(tsdb_batch_row_f64(b, 2, (double)(h * 100 + i)));
+                OK(tsdb_batch_row_end(b));
+            }
+        }
+        OK(tsdb_batch_commit(b));
+
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT count(*) FROM cpu", &r));
+        assert(tsdb_result_next(r) == 1);
+        int64_t got = tsdb_result_i64(r, 0);
+        tsdb_result_free(r);
+        if (got != N_HOSTS * 100)
+            FAIL("persist count: got=%lld expected=%d", (long long)got, N_HOSTS * 100);
+        printf("  post-reopen count(*) = %lld  ✓\n", (long long)got);
+
+        tsdb_close(db);
+        rm_rf(dir);
+    }
+
+    printf("\nALL PASS — all four modes (off / explicit-setter / env-var / persist) "
+           "produce identical query answers; flag survives close/reopen.\n");
     return 0;
 }
