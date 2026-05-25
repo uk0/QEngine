@@ -609,10 +609,42 @@ static void *handle_connection(void *arg) {
                 "Connection: close\r\n\r\n", tok);
             write_all(fd, hdr, (size_t)hlen);
         } else {
-            const char *r =
-                "HTTP/1.1 302 Found\r\nLocation: /login?bad=1\r\n"
-                "Content-Length: 0\r\nConnection: close\r\n\r\n";
-            write_all(fd, r, strlen(r));
+            /* Bad password / unknown user.  Two response shapes:
+             *
+             *  - Direct-browser form POST (Accept: text/html, …) keeps the
+             *    legacy 302 → /login?bad=1 so the visual form re-renders
+             *    with the inline error block (.err.on).
+             *
+             *  - Dashboard / API fetch (no text/html in Accept) gets
+             *    401 + {"error":"invalid credentials"} so the dashboard's
+             *    `if (status >= 400) throw …` branch fires correctly.
+             *    Pre-fix, fetch used redirect:"manual" which collapsed
+             *    302 to status=0 — indistinguishable from success — so a
+             *    user who typed the wrong password silently appeared
+             *    "logged in" and bounced on the next protected call.
+             *
+             * Sniffing Accept: text/html instead of Content-Type because
+             * both flows submit application/x-www-form-urlencoded.
+             */
+            int html_client = (strstr(req, "Accept: text/html") != NULL)
+                           || (strstr(req, "accept: text/html") != NULL);
+            if (html_client) {
+                const char *r =
+                    "HTTP/1.1 302 Found\r\nLocation: /login?bad=1\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                write_all(fd, r, strlen(r));
+            } else {
+                static const char BODY[] = "{\"error\":\"invalid credentials\"}";
+                char hdr[160];
+                int hlen = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Type: application/json\r\n"
+                    "WWW-Authenticate: FormBased realm=\"tsdb\"\r\n"
+                    "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                    sizeof(BODY) - 1);
+                write_all(fd, hdr, (size_t)hlen);
+                write_all(fd, BODY, sizeof(BODY) - 1);
+            }
         }
         goto done;
     }
