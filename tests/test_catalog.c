@@ -3,6 +3,8 @@
 #include "../include/tsdb.h"
 #include "../src/catalog/group.h"
 #include "../src/catalog/device.h"
+#include "../src/catalog/database.h"
+#include "../src/catalog/stable.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -600,6 +602,69 @@ static void test_reload_catalog(void) {
 
 /* ---- Main --------------------------------------------------------------- */
 
+/* DROP DATABASE must cascade ALL stables of the database — including a
+ * stable whose group record is already missing (the orphan-prone state a
+ * chaos / partial-failure window can produce).  Pre-fix the cascade walked
+ * group-by-group and only also swept group=="" stables, so a stable under
+ * a non-existent group survived as an orphan_stable.  This injects exactly
+ * that state via the catalog API and asserts DROP DATABASE leaves nothing. */
+static void test_drop_database_cascade_orphan_group(void) {
+    printf("test_drop_database_cascade_orphan_group\n");
+    setup();
+
+    tsdb_db_t *db = NULL;
+    CHECK_OK(tsdb_open(TEST_DIR, &db), "db_open");
+    tsdb_catalog_t *c = tsdb_db_catalog(db);
+    CHECK(c != NULL, "db_catalog");
+
+    tsdb_database_t d = {0};
+    snprintf(d.name, sizeof(d.name), "casc_db");
+    CHECK_OK(tsdb_database_create(c, &d), "database_create");
+
+    /* Stable A: group record exists. */
+    tsdb_group_t g = {0};
+    snprintf(g.name, sizeof(g.name), "g_real");
+    snprintf(g.database, sizeof(g.database), "casc_db");
+    CHECK_OK(tsdb_group_create(c, &g), "group_create");
+
+    tsdb_stable_t sa = {0};
+    snprintf(sa.name, sizeof(sa.name), "st_real");
+    snprintf(sa.database, sizeof(sa.database), "casc_db");
+    snprintf(sa.group, sizeof(sa.group), "g_real");
+    sa.ncols = 1; sa.ts_col_idx = 0;
+    snprintf(sa.cols[0].name, sizeof(sa.cols[0].name), "ts");
+    sa.cols[0].type = TSDB_TYPE_TIMESTAMP;
+    CHECK_OK(tsdb_stable_create(c, &sa), "stable_real_create");
+
+    /* Stable B: group "g_ghost" is NEVER created as a record — exactly the
+     * orphan-prone case the old group-gated cascade missed. */
+    tsdb_stable_t sb = {0};
+    snprintf(sb.name, sizeof(sb.name), "st_ghost");
+    snprintf(sb.database, sizeof(sb.database), "casc_db");
+    snprintf(sb.group, sizeof(sb.group), "g_ghost");
+    sb.ncols = 1; sb.ts_col_idx = 0;
+    snprintf(sb.cols[0].name, sizeof(sb.cols[0].name), "ts");
+    sb.cols[0].type = TSDB_TYPE_TIMESTAMP;
+    CHECK_OK(tsdb_stable_create(c, &sb), "stable_ghost_create");
+
+    CHECK(tsdb_stable_exists(c, "st_real") == 1, "st_real exists pre-drop");
+    CHECK(tsdb_stable_exists(c, "st_ghost") == 1, "st_ghost exists pre-drop");
+
+    /* DROP DATABASE via the QTL path (exercises the exec.c cascade). */
+    tsdb_result_t *r = NULL;
+    int rc = tsdb_query(db, "DROP DATABASE casc_db", &r);
+    CHECK_OK(rc, "drop database casc_db");
+    if (r) { tsdb_result_free(r); r = NULL; }
+
+    /* Both stables must be gone — no orphan survives. */
+    CHECK(tsdb_stable_exists(c, "st_real") == 0, "st_real cascaded");
+    CHECK(tsdb_stable_exists(c, "st_ghost") == 0, "st_ghost cascaded (orphan-group)");
+    CHECK(tsdb_database_exists(c, "casc_db") == 0, "casc_db dropped");
+
+    tsdb_close(db);
+    rmrf(TEST_DIR);
+}
+
 int main(void) {
     printf("=== test_catalog ===\n");
 
@@ -611,6 +676,7 @@ int main(void) {
     test_update_last_seen();
     test_qtl_ddl();
     test_cascade_drop_via_qtl();
+    test_drop_database_cascade_orphan_group();
     test_reload_catalog();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

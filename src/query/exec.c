@@ -6182,78 +6182,29 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         /* Cascade in declared dependency order so a partial failure
          * leaves the catalog in a coherent intermediate state rather
          * than orphaned children:
-         *   1. for every group in this db: cascade its stables (which
-         *      drops physical tables + child catalog rows), then
-         *      tsdb_group_drop.
-         *   2. cascade stables attached directly to the db (group == "").
+         *   1. drop EVERY stable whose database == dbname (children first),
+         *      enumerated by database DIRECTLY — not gated on the group
+         *      list.  A stable whose group record is already missing
+         *      (e.g. a chaos / partial-failure window dropped the group
+         *      but not the stable) would otherwise slip past a
+         *      group-by-group walk and survive as an orphan_stable.  This
+         *      is the bug behind orphan_stables seen after DROP DATABASE
+         *      following node-restart chaos.
+         *   2. drop every group whose database == dbname.
          *   3. tsdb_database_drop.
          *
-         * Names are snapshot-copied because the underlying drops
-         * mutate the catalog hmaps we'd otherwise be iterating. */
-        tsdb_group_t *gall = NULL;
-        size_t ngall = 0;
-        if (tsdb_group_list(cat, &gall, &ngall) == TSDB_OK) {
-            char gnames[256][64];
-            int  ng_match = 0;
-            for (size_t i = 0; i < ngall && ng_match < 256; i++) {
-                if (strcmp(gall[i].database, dbname) == 0) {
-                    snprintf(gnames[ng_match++], 64, "%s", gall[i].name);
-                }
-            }
-            tsdb_group_list_free(gall);
-            for (int gi = 0; gi < ng_match; gi++) {
-                /* Cascade stables under this group. */
-                tsdb_stable_t *sall = NULL;
-                size_t nsall = 0;
-                if (tsdb_stable_list(cat, &sall, &nsall) == TSDB_OK) {
-                    char snames[256][64];
-                    int  ns_match = 0;
-                    for (size_t i = 0; i < nsall && ns_match < 256; i++) {
-                        if (strcmp(sall[i].database, dbname) == 0 &&
-                            strcmp(sall[i].group, gnames[gi]) == 0) {
-                            snprintf(snames[ns_match++], 64, "%s", sall[i].name);
-                        }
-                    }
-                    free(sall);
-                    for (int si = 0; si < ns_match; si++) {
-                        tsdb_child_table_t *children = NULL;
-                        size_t nch = 0;
-                        int lrc = tsdb_child_table_list(cat, snames[si], &children, &nch);
-                        if (lrc != TSDB_OK)
-                            fprintf(stderr, "[cascade] DROP DATABASE %s: list children of stable %s rc=%d\n",
-                                    dbname, snames[si], lrc);
-                        for (size_t ci = 0; ci < nch; ci++) {
-                            int drc = tsdb_drop_table(db, children[ci].name);
-                            if (drc != TSDB_OK && drc != TSDB_ERR_NOTFOUND)
-                                fprintf(stderr, "[cascade] DROP DATABASE %s: drop child %s rc=%d\n",
-                                        dbname, children[ci].name, drc);
-                        }
-                        free(children);
-                        int src = tsdb_stable_drop(cat, snames[si]);
-                        if (src != TSDB_OK && src != TSDB_ERR_NOTFOUND)
-                            fprintf(stderr, "[cascade] DROP DATABASE %s: drop stable %s rc=%d\n",
-                                    dbname, snames[si], src);
-                    }
-                }
-                int grc = tsdb_group_drop(cat, gnames[gi]);
-                if (grc != TSDB_OK && grc != TSDB_ERR_NOTFOUND)
-                    fprintf(stderr, "[cascade] DROP DATABASE %s: drop group %s rc=%d\n",
-                            dbname, gnames[gi], grc);
-            }
-        }
-
-        /* Cascade stables attached directly to the db (no group). */
+         * Names are snapshot-copied (heap, dynamically sized — no 256 cap)
+         * because the underlying drops mutate the catalog hmaps we'd
+         * otherwise be iterating. */
         {
             tsdb_stable_t *sall = NULL;
             size_t nsall = 0;
             if (tsdb_stable_list(cat, &sall, &nsall) == TSDB_OK) {
-                char snames[256][64];
-                int  ns_match = 0;
-                for (size_t i = 0; i < nsall && ns_match < 256; i++) {
-                    if (strcmp(sall[i].database, dbname) == 0 &&
-                        sall[i].group[0] == '\0') {
+                char (*snames)[64] = nsall ? malloc(nsall * 64) : NULL;
+                int ns_match = 0;
+                for (size_t i = 0; i < nsall && snames; i++) {
+                    if (strcmp(sall[i].database, dbname) == 0)
                         snprintf(snames[ns_match++], 64, "%s", sall[i].name);
-                    }
                 }
                 free(sall);
                 for (int si = 0; si < ns_match; si++) {
@@ -6275,6 +6226,29 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                         fprintf(stderr, "[cascade] DROP DATABASE %s: drop stable %s rc=%d\n",
                                 dbname, snames[si], src);
                 }
+                free(snames);
+            }
+        }
+
+        /* Drop every group attached to this database (now stable-free). */
+        {
+            tsdb_group_t *gall = NULL;
+            size_t ngall = 0;
+            if (tsdb_group_list(cat, &gall, &ngall) == TSDB_OK) {
+                char (*gnames)[64] = ngall ? malloc(ngall * 64) : NULL;
+                int ng_match = 0;
+                for (size_t i = 0; i < ngall && gnames; i++) {
+                    if (strcmp(gall[i].database, dbname) == 0)
+                        snprintf(gnames[ng_match++], 64, "%s", gall[i].name);
+                }
+                tsdb_group_list_free(gall);
+                for (int gi = 0; gi < ng_match; gi++) {
+                    int grc = tsdb_group_drop(cat, gnames[gi]);
+                    if (grc != TSDB_OK && grc != TSDB_ERR_NOTFOUND)
+                        fprintf(stderr, "[cascade] DROP DATABASE %s: drop group %s rc=%d\n",
+                                dbname, gnames[gi], grc);
+                }
+                free(gnames);
             }
         }
 
