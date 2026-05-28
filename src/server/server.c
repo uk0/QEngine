@@ -786,6 +786,73 @@ static int handle_drop_table(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
  */
 #define QUERY_CHUNK_ROWS 4096
 
+/*
+ * Emit one QUERY_RESULT_ROWS chunk.
+ *
+ * Wire layout (per chunk):
+ *   [nrows u32] [ncols u16]
+ *   per column c, by ColType[c] (reader already has types from HDR):
+ *     fixed (TS/INT64/FLOAT64): nrows * 8 bytes        (8-byte stride)
+ *     SYMBOL:                   [u32 blocklen]          (length-prefixed
+ *                               [u16 len][bytes] * nrows   variable block)
+ *
+ * Numeric columns keep the original fixed-stride encoding byte-for-byte;
+ * only SYMBOL columns switch to the length-prefixed form.  Pre-2026-05 the
+ * SYMBOL path wrote strlen() into an 8-byte cell (a never-finished stub —
+ * see git history), so binary-wire clients only ever saw a symbol's *length*
+ * in query results.  This carries the actual string.
+ */
+static int emit_query_chunk(tsdb_io_t *io, uint64_t req_id, int fin,
+                            int ncols, const uint8_t *coltype,
+                            uint8_t **numbuf,
+                            uint8_t **symbuf, const size_t *symused,
+                            int chunk_rows)
+{
+    size_t csz = 6;
+    for (int c = 0; c < ncols; c++) {
+        if (coltype[c] == TSDB_TYPE_SYMBOL) csz += 4 + symused[c];
+        else                                csz += (size_t)chunk_rows * 8;
+    }
+    uint8_t *body = (uint8_t *)malloc(csz);
+    if (!body) return TSDB_ERR_NOMEM;
+    uint8_t *cp = body;
+    uint32_t cr32 = (uint32_t)chunk_rows; memcpy(cp, &cr32, 4); cp += 4;
+    uint16_t nc16 = (uint16_t)ncols;      memcpy(cp, &nc16, 2); cp += 2;
+    for (int c = 0; c < ncols; c++) {
+        if (coltype[c] == TSDB_TYPE_SYMBOL) {
+            uint32_t bl = (uint32_t)symused[c];
+            memcpy(cp, &bl, 4); cp += 4;
+            if (bl) { memcpy(cp, symbuf[c], bl); cp += bl; }
+        } else {
+            if (chunk_rows > 0) memcpy(cp, numbuf[c], (size_t)chunk_rows * 8);
+            cp += (size_t)chunk_rows * 8;
+        }
+    }
+    int rc = tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS,
+                                fin ? TSDB_FLAG_FIN : 0, req_id, body, csz);
+    free(body);
+    return rc;
+}
+
+/* Append one symbol string to a growable per-column buffer as [u16 len][bytes].
+ * Returns 0 on success, -1 on OOM.  Strings longer than 65535 are truncated. */
+static int sym_append(uint8_t **buf, size_t *used, size_t *cap, const char *s) {
+    size_t slen = s ? strlen(s) : 0;
+    if (slen > 65535) slen = 65535;
+    size_t need = *used + 2 + slen;
+    if (need > *cap) {
+        size_t ncap = *cap ? *cap * 2 : 4096;
+        while (ncap < need) ncap *= 2;
+        uint8_t *nb = (uint8_t *)realloc(*buf, ncap);
+        if (!nb) return -1;
+        *buf = nb; *cap = ncap;
+    }
+    uint16_t l16 = (uint16_t)slen;
+    memcpy(*buf + *used, &l16, 2); *used += 2;
+    if (slen) { memcpy(*buf + *used, s, slen); *used += slen; }
+    return 0;
+}
+
 /* ---- AUTH_LOGIN handler -------------------------------------------------- */
 /*
  * Payload: [u8 ulen][user bytes][u8 plen][password bytes]
@@ -966,19 +1033,33 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     }
 
     /* ---- Stream rows in chunks ------------------------------------------ */
-    /* Build columnar buffers for one chunk at a time. */
-    /* Allocate per-column buffers (8 bytes per value for numeric, 8 for ts). */
+    /* Per-column scratch: numeric cols use a fixed 8-byte-stride buffer;
+     * SYMBOL cols accumulate a growable length-prefixed block.  Reader
+     * disambiguates by ColType (already sent in the HDR). */
     size_t col_buf_cap = (size_t)QUERY_CHUNK_ROWS * 8;
-    uint8_t **cbuf = (uint8_t **)calloc((size_t)ncols, sizeof(uint8_t *));
-    if (!cbuf && ncols > 0) { tsdb_result_free(res); return TSDB_ERR_NOMEM; }
+    uint8_t  *coltype  = (uint8_t *)calloc((size_t)ncols ? (size_t)ncols : 1, 1);
+    uint8_t **cbuf     = (uint8_t **)calloc((size_t)ncols ? (size_t)ncols : 1, sizeof(uint8_t *));
+    uint8_t **symbuf   = (uint8_t **)calloc((size_t)ncols ? (size_t)ncols : 1, sizeof(uint8_t *));
+    size_t   *symused  = (size_t *)calloc((size_t)ncols ? (size_t)ncols : 1, sizeof(size_t));
+    size_t   *symcap   = (size_t *)calloc((size_t)ncols ? (size_t)ncols : 1, sizeof(size_t));
+    if (!coltype || !cbuf || !symbuf || !symused || !symcap) {
+        free(coltype); free(cbuf); free(symbuf); free(symused); free(symcap);
+        tsdb_result_free(res);
+        return TSDB_ERR_NOMEM;
+    }
+    int alloc_ok = 1;
     for (int i = 0; i < ncols; i++) {
-        cbuf[i] = (uint8_t *)malloc(col_buf_cap);
-        if (!cbuf[i]) {
-            for (int j = 0; j < i; j++) free(cbuf[j]);
-            free(cbuf);
-            tsdb_result_free(res);
-            return TSDB_ERR_NOMEM;
+        coltype[i] = (uint8_t)tsdb_result_col_type(res, i);
+        if (coltype[i] != TSDB_TYPE_SYMBOL) {
+            cbuf[i] = (uint8_t *)malloc(col_buf_cap);
+            if (!cbuf[i]) { alloc_ok = 0; break; }
         }
+    }
+    if (!alloc_ok) {
+        for (int j = 0; j < ncols; j++) { free(cbuf[j]); free(symbuf[j]); }
+        free(coltype); free(cbuf); free(symbuf); free(symused); free(symcap);
+        tsdb_result_free(res);
+        return TSDB_ERR_NOMEM;
     }
 
     int chunk_rows = 0;
@@ -988,79 +1069,46 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     while ((row_rc = tsdb_result_next(res)) == 1) {
         any_rows = 1;
         for (int c = 0; c < ncols; c++) {
-            uint8_t *dst = cbuf[c] + (size_t)chunk_rows * 8;
-            switch (tsdb_result_col_type(res, c)) {
+            switch (coltype[c]) {
             case TSDB_TYPE_TIMESTAMP: {
                 int64_t v = tsdb_result_ts(res, c);
-                memcpy(dst, &v, 8); break;
+                memcpy(cbuf[c] + (size_t)chunk_rows * 8, &v, 8); break;
             }
             case TSDB_TYPE_INT64: {
                 int64_t v = tsdb_result_i64(res, c);
-                memcpy(dst, &v, 8); break;
+                memcpy(cbuf[c] + (size_t)chunk_rows * 8, &v, 8); break;
             }
             case TSDB_TYPE_FLOAT64: {
                 double v = tsdb_result_f64(res, c);
-                memcpy(dst, &v, 8); break;
+                memcpy(cbuf[c] + (size_t)chunk_rows * 8, &v, 8); break;
             }
             case TSDB_TYPE_SYMBOL: {
                 const char *s = tsdb_result_sym(res, c);
-                int64_t v = s ? (int64_t)strlen(s) : 0;
-                memcpy(dst, &v, 8); break;  /* encode as length for now */
+                if (sym_append(&symbuf[c], &symused[c], &symcap[c], s) != 0) {
+                    row_rc = -1;  /* OOM — bail the stream loop */
+                }
+                break;
             }
             }
         }
+        if (row_rc < 0) break;
         chunk_rows++;
 
         if (chunk_rows == QUERY_CHUNK_ROWS) {
-            /* Encode chunk: [nrows u32] [ncols u16] col data... */
-            size_t csz = 6 + (size_t)ncols * (size_t)chunk_rows * 8;
-            uint8_t *cbody = (uint8_t *)malloc(csz);
-            if (!cbody) break;
-            uint8_t *cp = cbody;
-            memcpy(cp, &chunk_rows, 4); cp += 4;
-            uint16_t nc16 = (uint16_t)ncols;
-            memcpy(cp, &nc16, 2); cp += 2;
-            for (int c = 0; c < ncols; c++) {
-                memcpy(cp, cbuf[c], (size_t)chunk_rows * 8);
-                cp += (size_t)chunk_rows * 8;
-            }
-            rc = tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, 0, req_id,
-                                 cbody, csz);
-            free(cbody);
+            rc = emit_query_chunk(io, req_id, /*fin*/0, ncols, coltype,
+                                  cbuf, symbuf, symused, chunk_rows);
             if (rc != TSDB_OK) break;
             chunk_rows = 0;
+            for (int c = 0; c < ncols; c++) symused[c] = 0;
         }
     }
 
-    /* Flush final partial chunk (or empty-result chunk with FIN). */
-    {
-        size_t csz = 6 + (size_t)ncols * (size_t)chunk_rows * 8;
-        uint8_t *cbody = (uint8_t *)malloc(csz + 1);
-        if (cbody) {
-            uint8_t *cp = cbody;
-            uint32_t cr32 = (uint32_t)chunk_rows;
-            memcpy(cp, &cr32, 4); cp += 4;
-            uint16_t nc16 = (uint16_t)ncols;
-            memcpy(cp, &nc16, 2); cp += 2;
-            for (int c = 0; c < ncols; c++) {
-                if (chunk_rows > 0) {
-                    memcpy(cp, cbuf[c], (size_t)chunk_rows * 8);
-                }
-                cp += (size_t)chunk_rows * 8;
-            }
-            tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
-                            req_id, cbody, csz);
-            free(cbody);
-        } else if (!any_rows) {
-            /* Zero rows: send FIN on empty ROWS frame. */
-            uint8_t zbuf[6] = {0,0,0,0,0,0};
-            tsdb_proto_send_io(io, TSDB_MT_QUERY_RESULT_ROWS, TSDB_FLAG_FIN,
-                            req_id, zbuf, 6);
-        }
-    }
+    /* Final chunk carries FIN (covers the partial-chunk and zero-row cases). */
+    emit_query_chunk(io, req_id, /*fin*/1, ncols, coltype,
+                     cbuf, symbuf, symused, chunk_rows);
 
-    for (int i = 0; i < ncols; i++) free(cbuf[i]);
-    free(cbuf);
+    for (int i = 0; i < ncols; i++) { free(cbuf[i]); free(symbuf[i]); }
+    free(coltype); free(cbuf); free(symbuf); free(symused); free(symcap);
     tsdb_result_free(res);
     (void)any_rows;
     return TSDB_OK;

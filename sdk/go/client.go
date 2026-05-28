@@ -301,26 +301,57 @@ func parseRowsChunk(qr *QueryResult, p []byte) error {
 		return fmt.Errorf("column count mismatch hdr=%d chunk=%d",
 			len(qr.ColNames), ncols)
 	}
-	colLen := nrows * 8
-	if len(p) < ncols*colLen {
-		return errors.New("short column data")
+	// Columns are laid out sequentially.  Fixed columns occupy nrows*8
+	// bytes (8-byte stride); SYMBOL columns carry a [u32 blocklen] header
+	// followed by nrows × [u16 len][bytes] records.  Decode per column,
+	// then transpose into rows.
+	colVals := make([][]interface{}, ncols)
+	for ci := 0; ci < ncols; ci++ {
+		colVals[ci] = make([]interface{}, nrows)
+		if qr.ColTypes[ci] == TypeSymbol {
+			if len(p) < 4 {
+				return errors.New("short symbol block header")
+			}
+			blockLen := int(binary.LittleEndian.Uint32(p[0:4]))
+			p = p[4:]
+			if len(p) < blockLen {
+				return errors.New("short symbol block data")
+			}
+			sp := p[:blockLen]
+			for ri := 0; ri < nrows; ri++ {
+				if len(sp) < 2 {
+					return errors.New("truncated symbol len")
+				}
+				l := int(binary.LittleEndian.Uint16(sp[0:2]))
+				sp = sp[2:]
+				if len(sp) < l {
+					return errors.New("truncated symbol bytes")
+				}
+				colVals[ci][ri] = string(sp[:l])
+				sp = sp[l:]
+			}
+			p = p[blockLen:]
+		} else {
+			need := nrows * 8
+			if len(p) < need {
+				return errors.New("short column data")
+			}
+			for ri := 0; ri < nrows; ri++ {
+				raw := binary.LittleEndian.Uint64(p[ri*8 : ri*8+8])
+				switch qr.ColTypes[ci] {
+				case TypeTimestamp, TypeInt64:
+					colVals[ci][ri] = int64(raw)
+				case TypeFloat64:
+					colVals[ci][ri] = math.Float64frombits(raw)
+				}
+			}
+			p = p[need:]
+		}
 	}
-	// Emit rows interleaving column pulls.
 	for ri := 0; ri < nrows; ri++ {
 		row := make([]interface{}, ncols)
 		for ci := 0; ci < ncols; ci++ {
-			off := ci*colLen + ri*8
-			raw := binary.LittleEndian.Uint64(p[off : off+8])
-			switch qr.ColTypes[ci] {
-			case TypeTimestamp:
-				row[ci] = int64(raw)
-			case TypeInt64:
-				row[ci] = int64(raw)
-			case TypeFloat64:
-				row[ci] = math.Float64frombits(raw)
-			case TypeSymbol:
-				row[ci] = uint32(raw)
-			}
+			row[ci] = colVals[ci][ri]
 		}
 		qr.Rows = append(qr.Rows, row)
 	}
