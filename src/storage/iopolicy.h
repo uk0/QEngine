@@ -4,17 +4,28 @@
  * kernel's readahead behaviour and the page-cache locality characteristics
  * differ markedly between spinning media (HDD) and solid-state media (SSD).
  *
- *   HDD  — seek-bound.  Favour large, contiguous I/O + aggressive readahead
- *          so the platter rotates past a whole block while we decompress.
- *          madvise(MADV_SEQUENTIAL) + bigger stdio write buffer (setvbuf).
  *   SSD  — bandwidth-bound, no seek penalty.  Readahead beyond one page is
  *          usually neutral or counterproductive (wastes DRAM on data we
  *          already decode quickly).  Stick with the kernel default.
+ *   SATA — rotational consumer/nearline HDD.  Seek-bound: favour large,
+ *          contiguous I/O + aggressive readahead so the platter rotates
+ *          past a whole block while we decompress.  madvise(MADV_SEQUENTIAL)
+ *          + large (256 KiB) stdio write buffer.
+ *   SAS  — rotational enterprise HDD (10k/15k RPM).  Seek-bound too, but
+ *          lower latency than SATA — intermediate readahead / write buffer
+ *          (128 KiB) so we don't over-prefetch on faster spindles.
  *
  * Detection order:
- *   1. TSDB_IOPOLICY env var  (ssd|hdd|auto — explicit override)
- *   2. /sys/block/<dev>/queue/rotational on Linux (0=SSD, 1=HDD)
+ *   1. TSDB_DISK_ENGINE env var (ssd|sata|sas|hdd|auto) — preferred; or
+ *      legacy TSDB_IOPOLICY (ssd|hdd|auto).  Explicit class wins.
+ *   2. /sys/block/<dev>/queue/rotational on Linux (0 → SSD).  Rotational
+ *      devices are probed for a SCSI SAS transport (sas_address present →
+ *      SAS, else SATA); the rotational flag alone cannot tell SATA from
+ *      SAS, so the transport probe is best-effort and falls back to SATA.
  *   3. Default SSD on other platforms (macOS desktops, cloud VMs).
+ *
+ * This is an I/O *tuning profile*, not a separate storage engine — the
+ * on-disk format is identical across classes; only access hints differ.
  *
  * Thread-safe; values are cached per data directory after first query.
  */
@@ -30,8 +41,13 @@ extern "C" {
 
 typedef enum {
     TSDB_IOPOLICY_SSD = 0,
-    TSDB_IOPOLICY_HDD = 1,
+    TSDB_IOPOLICY_HDD = 1,   /* rotational SATA — canonical name SATA below */
+    TSDB_IOPOLICY_SAS = 2,   /* rotational SAS enterprise HDD              */
 } tsdb_iopolicy_t;
+
+/* SATA is the canonical name for the rotational consumer-HDD class; HDD
+ * stays as a back-compat alias so existing callers keep compiling. */
+#define TSDB_IOPOLICY_SATA TSDB_IOPOLICY_HDD
 
 /* Return the best-guess policy for <path>.  Reads TSDB_IOPOLICY env var
  * first; otherwise probes the block device on Linux; otherwise defaults

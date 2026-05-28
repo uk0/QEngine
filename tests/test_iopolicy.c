@@ -41,7 +41,7 @@ int main(void) {
     CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SSD,
           "TSDB_IOPOLICY=ssd forces SSD");
 
-    /* 3. hdd override. */
+    /* 3. hdd override (legacy alias → SATA). */
     setenv("TSDB_IOPOLICY", "hdd", 1);
     CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_HDD,
           "TSDB_IOPOLICY=hdd forces HDD");
@@ -50,6 +50,34 @@ int main(void) {
     setenv("TSDB_IOPOLICY", "HDD", 1);
     CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_HDD,
           "case insensitive");
+
+    /* 3b. SATA / SAS classes + TSDB_DISK_ENGINE preferred env. */
+    unsetenv("TSDB_IOPOLICY");
+    setenv("TSDB_DISK_ENGINE", "sata", 1);
+    CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SATA,
+          "TSDB_DISK_ENGINE=sata forces SATA");
+    CHECK(TSDB_IOPOLICY_SATA == TSDB_IOPOLICY_HDD, "SATA aliases HDD");
+    setenv("TSDB_DISK_ENGINE", "sas", 1);
+    CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SAS,
+          "TSDB_DISK_ENGINE=sas forces SAS");
+    setenv("TSDB_DISK_ENGINE", "SAS", 1);
+    CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SAS,
+          "TSDB_DISK_ENGINE case insensitive");
+    setenv("TSDB_DISK_ENGINE", "ssd", 1);
+    CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SSD,
+          "TSDB_DISK_ENGINE=ssd forces SSD");
+    /* DISK_ENGINE takes precedence over legacy IOPOLICY. */
+    setenv("TSDB_DISK_ENGINE", "sas", 1);
+    setenv("TSDB_IOPOLICY", "ssd", 1);
+    CHECK(tsdb_iopolicy_detect("/tmp") == TSDB_IOPOLICY_SAS,
+          "TSDB_DISK_ENGINE wins over TSDB_IOPOLICY");
+    unsetenv("TSDB_DISK_ENGINE");
+    unsetenv("TSDB_IOPOLICY");
+
+    /* names */
+    CHECK(strcmp(tsdb_iopolicy_name(TSDB_IOPOLICY_SSD),  "ssd")  == 0, "name ssd");
+    CHECK(strcmp(tsdb_iopolicy_name(TSDB_IOPOLICY_SATA), "sata") == 0, "name sata");
+    CHECK(strcmp(tsdb_iopolicy_name(TSDB_IOPOLICY_SAS),  "sas")  == 0, "name sas");
 
     /* 4. auto falls through. */
     setenv("TSDB_IOPOLICY", "auto", 1);
@@ -64,11 +92,16 @@ int main(void) {
     /* Reset for subsequent tests. */
     unsetenv("TSDB_IOPOLICY");
 
-    /* 5. write buffer sizing. */
+    /* 5. write buffer sizing per class. */
     CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_SSD) == 0,
           "SSD write buffer recommendation is 0 (stdio default)");
-    CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_HDD) >= 64u * 1024u,
-          "HDD write buffer recommendation is >= 64 KiB");
+    CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_SATA) >= 64u * 1024u,
+          "SATA write buffer recommendation is >= 64 KiB");
+    CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_SAS) >= 64u * 1024u,
+          "SAS write buffer recommendation is >= 64 KiB");
+    CHECK(tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_SAS)
+            < tsdb_iopolicy_write_buf_bytes(TSDB_IOPOLICY_SATA),
+          "SAS write buffer < SATA (faster spindles)");
 
     /* 7. advise_seq_fd — no crash on any combination of (policy, fd). */
     {
@@ -81,9 +114,10 @@ int main(void) {
             (void)write(fd, data, sizeof(data));
             lseek(fd, 0, SEEK_SET);
             tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_SSD, fd);
-            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_HDD, fd);
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_SATA, fd);
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_SAS, fd);
             /* Invalid fd → silent no-op. */
-            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_HDD, -1);
+            tsdb_iopolicy_advise_seq_fd(TSDB_IOPOLICY_SAS, -1);
             close(fd);
             unlink(path);
             CHECK(1, "advise_seq_fd handled both policies + bad fd");
@@ -97,9 +131,10 @@ int main(void) {
     CHECK(region != MAP_FAILED, "mmap scratch region");
     if (region != MAP_FAILED) {
         tsdb_iopolicy_advise_read(TSDB_IOPOLICY_SSD, region, pg * 4);
-        tsdb_iopolicy_advise_read(TSDB_IOPOLICY_HDD, region, pg * 4);
+        tsdb_iopolicy_advise_read(TSDB_IOPOLICY_SATA, region, pg * 4);
+        tsdb_iopolicy_advise_read(TSDB_IOPOLICY_SAS, region, pg * 4);
         tsdb_iopolicy_advise_read(TSDB_IOPOLICY_SSD, NULL, 0);  /* no-op guard */
-        tsdb_iopolicy_advise_read(TSDB_IOPOLICY_HDD, region, 0); /* no-op guard */
+        tsdb_iopolicy_advise_read(TSDB_IOPOLICY_SAS, region, 0); /* no-op guard */
         munmap(region, pg * 4);
         CHECK(1, "advise_read + guards did not crash");
     }

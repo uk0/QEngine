@@ -73,8 +73,28 @@ static char *base_device_name(const char *dev) {
     return out;
 }
 
-/* Probe the block device that backs <path> and return rotational state.
- * Returns 0 (SSD), 1 (HDD), or -1 on failure. */
+/* Does the block device <base> sit on a SCSI SAS transport?  SAS disks
+ * expose a sas_address node under their device dir; SATA disks do not.
+ * Best-effort: returns 1 (SAS), 0 (not SAS / unknown). */
+static int device_is_sas(const char *base) {
+    char path[320];
+    struct stat st;
+    /* Direct: /sys/block/<base>/device/sas_address (some HBAs). */
+    snprintf(path, sizeof(path), "/sys/block/%s/device/sas_address", base);
+    if (stat(path, &st) == 0) return 1;
+    /* Common: device dir is an end_device under a SAS expander/host. */
+    char link[512];
+    snprintf(path, sizeof(path), "/sys/block/%s/device", base);
+    ssize_t n = readlink(path, link, sizeof(link) - 1);
+    if (n > 0) {
+        link[n] = '\0';
+        if (strstr(link, "end_device-") || strstr(link, "/sas_")) return 1;
+    }
+    return 0;
+}
+
+/* Probe the block device that backs <path>.
+ * Returns: 0 = SSD, 1 = SATA(rotational), 2 = SAS(rotational), -1 = unknown. */
 static int probe_linux(const char *path) {
     struct stat st;
     if (stat(path, &st) < 0) return -1;
@@ -97,12 +117,17 @@ static int probe_linux(const char *path) {
             continue;
         if (mj == major && mn == minor) {
             char *base = base_device_name(name);
-            rc = read_rotational(base);
-            free(base);
-            if (rc < 0) {
-                /* The partition itself may expose rotational directly. */
-                rc = read_rotational(name);
+            int rot = read_rotational(base);
+            if (rot < 0) rot = read_rotational(name);  /* partition may expose it */
+            if (rot == 0) {
+                rc = 0;  /* SSD */
+            } else if (rot == 1) {
+                /* rotational: distinguish SAS from SATA by transport. */
+                rc = (device_is_sas(base) || device_is_sas(name)) ? 2 : 1;
+            } else {
+                rc = -1;
             }
+            free(base);
             break;
         }
     }
@@ -114,13 +139,24 @@ static int probe_linux(const char *path) {
 
 /* ---- Public API --------------------------------------------------------- */
 
+/* Parse an explicit class name; -1 means "auto"/unknown → detect. */
+static int parse_class_name(const char *env) {
+    if (!env || !*env) return -1;
+    if (!strcasecmp(env, "ssd"))  return TSDB_IOPOLICY_SSD;
+    if (!strcasecmp(env, "sata")) return TSDB_IOPOLICY_SATA;  /* == HDD */
+    if (!strcasecmp(env, "hdd"))  return TSDB_IOPOLICY_HDD;
+    if (!strcasecmp(env, "sas"))  return TSDB_IOPOLICY_SAS;
+    return -1;  /* "auto" or anything else */
+}
+
 static int parse_env_override(tsdb_iopolicy_t *out) {
-    const char *env = getenv("TSDB_IOPOLICY");
-    if (!env || !*env) return 0;
-    if (!strcasecmp(env, "ssd")) { *out = TSDB_IOPOLICY_SSD; return 1; }
-    if (!strcasecmp(env, "hdd")) { *out = TSDB_IOPOLICY_HDD; return 1; }
-    /* "auto" or anything else → fall through to detection */
-    return 0;
+    /* TSDB_DISK_ENGINE is the preferred name; TSDB_IOPOLICY stays for
+     * back-compat.  First explicit class found wins. */
+    int c = parse_class_name(getenv("TSDB_DISK_ENGINE"));
+    if (c < 0) c = parse_class_name(getenv("TSDB_IOPOLICY"));
+    if (c < 0) return 0;
+    *out = (tsdb_iopolicy_t)c;
+    return 1;
 }
 
 tsdb_iopolicy_t tsdb_iopolicy_detect(const char *path) {
@@ -131,7 +167,8 @@ tsdb_iopolicy_t tsdb_iopolicy_detect(const char *path) {
     if (path) {
         int rot = probe_linux(path);
         if (rot == 0) return TSDB_IOPOLICY_SSD;
-        if (rot == 1) return TSDB_IOPOLICY_HDD;
+        if (rot == 1) return TSDB_IOPOLICY_SATA;
+        if (rot == 2) return TSDB_IOPOLICY_SAS;
     }
 #else
     (void)path;
@@ -143,7 +180,8 @@ tsdb_iopolicy_t tsdb_iopolicy_detect(const char *path) {
 void tsdb_iopolicy_advise_read(tsdb_iopolicy_t p, void *addr, size_t len) {
     if (!addr || len == 0) return;
 #if defined(MADV_SEQUENTIAL) && defined(MADV_WILLNEED)
-    int advice = (p == TSDB_IOPOLICY_HDD) ? MADV_SEQUENTIAL : MADV_WILLNEED;
+    /* Rotational media (SATA/SAS) → sequential prefetch; SSD → WILLNEED. */
+    int advice = (p != TSDB_IOPOLICY_SSD) ? MADV_SEQUENTIAL : MADV_WILLNEED;
     (void)madvise(addr, len, advice);
 #else
     (void)p;
@@ -154,7 +192,7 @@ void tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_t p, int fd) {
     if (fd < 0) return;
     /* SSD: kernel default readahead is already tuned well.  Avoid hints
      * that could displace hot pages in the page cache. */
-    if (p != TSDB_IOPOLICY_HDD) return;
+    if (p == TSDB_IOPOLICY_SSD) return;
 #if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
     /* Tell the kernel to read ahead aggressively + evict pages behind us
      * once read, and to prefetch the whole range into the page cache
@@ -175,12 +213,21 @@ void tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_t p, int fd) {
 }
 
 size_t tsdb_iopolicy_write_buf_bytes(tsdb_iopolicy_t p) {
-    /* HDD: 256 KiB — amortises seek latency over many block headers+data.
-     * SSD: 0 — let stdio pick (typically 4–8 KiB), the syscall cost is
-     *          negligible compared to the media. */
-    return (p == TSDB_IOPOLICY_HDD) ? (size_t)(256u * 1024u) : 0u;
+    /* SATA: 256 KiB — amortises seek latency over many block headers+data.
+     * SAS : 128 KiB — faster spindles, smaller coalescing window suffices.
+     * SSD : 0       — let stdio pick (~4-8 KiB); syscall cost is negligible
+     *                 next to the media. */
+    switch (p) {
+    case TSDB_IOPOLICY_SATA: return (size_t)(256u * 1024u);
+    case TSDB_IOPOLICY_SAS:  return (size_t)(128u * 1024u);
+    default:                 return 0u;
+    }
 }
 
 const char *tsdb_iopolicy_name(tsdb_iopolicy_t p) {
-    return (p == TSDB_IOPOLICY_HDD) ? "hdd" : "ssd";
+    switch (p) {
+    case TSDB_IOPOLICY_SATA: return "sata";
+    case TSDB_IOPOLICY_SAS:  return "sas";
+    default:                 return "ssd";
+    }
 }
