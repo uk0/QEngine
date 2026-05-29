@@ -37,6 +37,10 @@ services:
       TSDB_AUTH_SEED_BANNER:       "1"
       TSDB_DASHBOARD_DIR:          /etc/tsdb/dashboard/dist
       TSDB_IOPOLICY:               hdd
+      # Background compaction (opt-in) — keep in sync with cluster.yml.
+      TSDB_COMPACTION:             "1"
+      TSDB_COMPACTION_MIN_BLOCKS:  "16"
+      TSDB_COMPACTION_INTERVAL_MS: "10000"
       # See docker-compose.cluster.yml for the rationale; keep in sync.
       TSDB_REPLICA_CONNS_PER_PEER: "1"
       # Override any image-baked TSDB_DR_REMOTE.  DR (cross-DC async

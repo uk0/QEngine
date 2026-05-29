@@ -1428,6 +1428,7 @@ int main(int argc, char **argv) {
                        copts.worker_threads ? copts.worker_threads : 1);
             else
                 fprintf(stderr, "[node] compaction start failed; continuing without\n");
+            fflush(stdout);
         }
     }
 

@@ -77,6 +77,13 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-1:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
+      # Background compaction (opt-in): merge size-tiered flush blocks into
+      # larger cold blocks for better dict/symbol compression.  Safe under
+      # anti-entropy (reconciles on count(*)/max(ts), invariant under
+      # compaction); a partition's column swaps are atomic vs concurrent reads.
+      TSDB_COMPACTION:             "1"
+      TSDB_COMPACTION_MIN_BLOCKS:  "16"
+      TSDB_COMPACTION_INTERVAL_MS: "10000"
       # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
       # UAF under sustained failure (slot eviction vs in-flight rpc_call
       # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
@@ -132,6 +139,13 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-2:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
+      # Background compaction (opt-in): merge size-tiered flush blocks into
+      # larger cold blocks for better dict/symbol compression.  Safe under
+      # anti-entropy (reconciles on count(*)/max(ts), invariant under
+      # compaction); a partition's column swaps are atomic vs concurrent reads.
+      TSDB_COMPACTION:             "1"
+      TSDB_COMPACTION_MIN_BLOCKS:  "16"
+      TSDB_COMPACTION_INTERVAL_MS: "10000"
       # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
       # UAF under sustained failure (slot eviction vs in-flight rpc_call
       # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
@@ -188,6 +202,13 @@ services:
       TSDB_RPC_BIND:               qengine-cnode-3:28081
       TSDB_METRICS_BIND:           0.0.0.0:28094
       TSDB_IOPOLICY:               hdd
+      # Background compaction (opt-in): merge size-tiered flush blocks into
+      # larger cold blocks for better dict/symbol compression.  Safe under
+      # anti-entropy (reconciles on count(*)/max(ts), invariant under
+      # compaction); a partition's column swaps are atomic vs concurrent reads.
+      TSDB_COMPACTION:             "1"
+      TSDB_COMPACTION_MIN_BLOCKS:  "16"
+      TSDB_COMPACTION_INTERVAL_MS: "10000"
       # TSDB_REPLICA_CONNS_PER_PEER >1 is opt-in and currently has a known
       # UAF under sustained failure (slot eviction vs in-flight rpc_call
       # race).  Default 1 is measured stable at 3.3 M rows/s on the lvm1
