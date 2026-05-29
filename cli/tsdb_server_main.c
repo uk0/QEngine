@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../src/server/server.h"
+#include "../src/storage/db.h"   /* tsdb_db_set_group_commit */
 #include "../src/server/config.h"
 #include "../src/server/log.h"
 #include "../src/server/influx_line.h"
@@ -309,6 +310,20 @@ int main(int argc, char **argv) {
         /* Deployment-level knob: subsequently-created tables inherit this
          * block size.  Clamped internally into [1024, 8192]. */
         tsdb_db_set_default_block_points(db, cfg.block_points);
+    }
+    /* Group-commit: coalesce N independent WAL fsyncs into one (3-5x small-
+     * batch ingest on spinning disks).  Standalone is single-node with no
+     * replica to recover an un-fsync'd tail from, so — unlike the cluster
+     * node, which defaults it ON because replication covers the window — we
+     * default it OFF here to preserve strict per-commit durability.  Opt in
+     * with TSDB_GROUP_COMMIT_US=<window-us> (e.g. 1000 for a 1ms window). */
+    if (rc == TSDB_OK && db) {
+        const char *gc_us = getenv("TSDB_GROUP_COMMIT_US");
+        int64_t window_us = (gc_us && *gc_us) ? atoll(gc_us) : 0;
+        if (window_us > 0) {
+            tsdb_db_set_group_commit(db, window_us * 1000);  /* us -> ns */
+            TSDB_LOG_INFO("main", "group commit window: %lldus", (long long)window_us);
+        }
     }
     if (rc != TSDB_OK) {
         TSDB_LOG_ERROR("main", "tsdb_open(%s) failed: %s",
