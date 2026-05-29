@@ -283,6 +283,22 @@ static int compact_column_file(const char *part_dir,
         return TSDB_OK;
     }
 
+    /* Already compacted: re-compacting a partition whose block count is
+     * already at (or below) what a fresh compaction would produce just
+     * re-encodes the same rows and reacquires the swap lock on every scan —
+     * an infinite re-compaction loop (observed burning a core and churning
+     * files on a steady-state cluster).  ceil(total_rows / COMPACT_BLOCK_POINTS)
+     * is the post-compaction block count; skip once we are already there. */
+    if (total_rows > 0) {
+        uint64_t expected = (total_rows + COMPACT_BLOCK_POINTS - 1)
+                            / (uint64_t)COMPACT_BLOCK_POINTS;
+        if ((uint64_t)block_count <= expected) {
+            fclose(idx_f);
+            munmap(col_map, map_len);
+            return TSDB_OK;
+        }
+    }
+
     /* Decide header / entry sizes based on on-disk version. */
     int    hdr_sz   = (idx_ver == 1) ? (int)IDX_HDR_SZ_V1
                     : (idx_ver == 2) ? (int)IDX_HDR_SZ_V2

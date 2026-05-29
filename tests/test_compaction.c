@@ -401,6 +401,21 @@ int main(void) {
     tsdb_compactor_stats_t stats;
     tsdb_compactor_stats(cpt, &stats);
 
+    /* 5b. Loop guard: a partition already at its post-compaction block count
+     * must NOT be re-compacted.  Re-backdate (so the 60s cold gate isn't what
+     * stops it) and run again — compactions_done must not advance.  Without
+     * the "already compacted" skip this loops forever, re-encoding the same
+     * data and burning CPU (observed on the live cluster). */
+    backdate_partitions(table_dir);
+    uint64_t done_before_rerun = stats.compactions_done;
+    ASSERT_OK(tsdb_compactor_run_once(cpt));
+    tsdb_compactor_stats_t stats_rerun;
+    tsdb_compactor_stats(cpt, &stats_rerun);
+    printf("  re-compaction guard: done before=%llu after=%llu (must be equal)\n",
+           (unsigned long long)done_before_rerun,
+           (unsigned long long)stats_rerun.compactions_done);
+    ASSERT(stats_rerun.compactions_done == done_before_rerun);
+
     tsdb_compactor_stop(cpt);
 
     /* 6. Record post-compaction block count. */
