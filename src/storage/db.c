@@ -1040,7 +1040,16 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
     int rc = flush_and_clear_locked(t, /*skip_replicate=*/1);
     if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
 
-    /* Persist the schema change first. */
+    /* Persist the schema change first.
+     *
+     * KNOWN RACE (not yet fixed — tracked): tsdb_schema_add_column reallocs
+     * t->schema->cols, but a concurrent SELECT iterates that array by raw
+     * pointer without a per-schema guard (scan_acquire only blocks DROP-free,
+     * not this realloc).  The window is the sub-microsecond cols memcpy and
+     * requires a concurrent ALTER+SELECT on the SAME table, so it is rare; a
+     * correct fix is a copy-on-write schema swap (build a new schema, pin the
+     * old via scan_refs, atomic-swap t->schema) — a larger refactor than this
+     * stability pass.  compact_mtx here already excludes the compactor/flush. */
     rc = tsdb_schema_add_column(t->schema, col_name, col_type);
     if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
 

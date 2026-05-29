@@ -5907,6 +5907,12 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
          * tsdb_drop_table waits for scan_refs to reach 0. */
         tsdb_table_internal_t *qtbl = stmt.u.query.from
             ? tsdb_db_scan_acquire(db, stmt.u.query.from) : NULL;
+        /* ASOF JOIN materialises the right table and keeps raw pointers into
+         * its schema/symtab (rm.col_syms) live through the whole join loop, so
+         * the right table needs the same DROP-guard as the left. */
+        tsdb_table_internal_t *qtbl2 = (stmt.u.query.has_asof_join &&
+                                        stmt.u.query.asof_table)
+            ? tsdb_db_scan_acquire(db, stmt.u.query.asof_table) : NULL;
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
         /* Apply ORDER BY post-execution so plain SELECT, GROUP BY,
          * SAMPLE BY, LATEST ON, and the stable-select union all share
@@ -5914,6 +5920,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
          * q->order_col is arena-allocated. */
         if (rc == TSDB_OK)
             rc = result_apply_order_by(r, &stmt.u.query, err, sizeof(err));
+        if (qtbl2) tsdb_db_scan_release(db, qtbl2);
         if (qtbl) tsdb_db_scan_release(db, qtbl);
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
@@ -6784,8 +6791,10 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_EXPORT_PARQUET: {
         const char *tname   = stmt.u.export_parquet.table;
         const char *out_dir = stmt.u.export_parquet.out_dir;
-        /* Locate the table + schema. */
-        tsdb_table_internal_t *ti = tsdb_db_find_table(db, tname);
+        /* Locate the table + schema.  scan_acquire (not find_table) so a
+         * concurrent DROP TABLE waits until the export finishes before freeing
+         * the schema we hold across the partition loop (tsdb_part_open(s,...)). */
+        tsdb_table_internal_t *ti = tsdb_db_scan_acquire(db, tname);
         if (!ti) {
             result_status(r, "ERR: table not found");
             rc = TSDB_ERR_NOTFOUND;
@@ -6797,6 +6806,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         if (tsdb_mkdir_p(out_dir) != TSDB_OK) {
             result_status(r, "ERR: cannot create output dir");
             rc = TSDB_ERR_IO;
+            tsdb_db_scan_release(db, ti);
             break;
         }
         /* Enumerate partition subdirs (YYYYMMDD / YYYYMMDDHH). */
@@ -6804,6 +6814,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         if (!d) {
             result_status(r, "ERR: table dir unreadable");
             rc = TSDB_ERR_IO;
+            tsdb_db_scan_release(db, ti);
             break;
         }
         int nfiles = 0;
@@ -6830,6 +6841,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             nfiles++;
         }
         closedir(d);
+        tsdb_db_scan_release(db, ti);
         if (export_rc != TSDB_OK) {
             result_status(r, "ERR: parquet export failed");
             rc = export_rc;
