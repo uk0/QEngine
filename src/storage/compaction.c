@@ -230,14 +230,14 @@ static int compact_column_file(const char *part_dir,
                                const char *col_name,
                                tsdb_type_t col_type,
                                int         threshold,
-                               lock_fn_t   lock_fn,
-                               lock_fn_t   unlock_fn,
-                               void       *lock_ud,
                                uint64_t   *out_bytes_written,
-                               uint64_t   *out_bytes_saved)
+                               uint64_t   *out_bytes_saved,
+                               int        *out_produced)
 {
     char col_path[4096], idx_path[4096];
     char col_tmp[4096],  idx_tmp[4096];
+
+    if (out_produced) *out_produced = 0;
 
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
@@ -559,26 +559,17 @@ static int compact_column_file(const char *part_dir,
     free(raw_buf);
     free(infos);
 
-    /* ---- 6. Atomic swap: acquire lock → rename both tmp → live → release -- */
-
-    if (lock_fn) lock_fn(lock_ud);
-
-    {
-        int r1 = rename(col_tmp, col_path);
-        int r2 = rename(idx_tmp, idx_path);
-        if (lock_fn) unlock_fn(lock_ud);
-        if (r1 != 0 || r2 != 0) {
-            /* Cleanup orphaned .tmp on failure. */
-            remove(col_tmp);
-            remove(idx_tmp);
-            return TSDB_ERR_IO;
-        }
-    }
-
-    /* Update caller statistics. */
+    /* ---- 6. Leave .col.tmp / .idx.tmp on disk for the caller to swap -------
+     * The rename is NOT done here.  compact_partition swaps every column of
+     * the partition together, under one hold of the compact lock, so a
+     * concurrent reader (which takes the same lock around tsdb_part_open)
+     * never observes a partition with some columns compacted (large blocks)
+     * and others not — a mix that breaks the scan's cross-column block
+     * alignment and yields wrong results. */
     if (out_bytes_written) *out_bytes_written += col_offset;
     if (out_bytes_saved)   *out_bytes_saved   += (col_offset < old_bytes)
                                                   ? (old_bytes - col_offset) : 0;
+    if (out_produced) *out_produced = 1;
     return TSDB_OK;
 
 io_err:
@@ -615,15 +606,23 @@ static int compact_partition(tsdb_schema_t   *schema,
 {
     int any_compacted = 0;
 
+    int *produced = calloc((size_t)schema->ncols, sizeof(int));
+    if (!produced) return TSDB_ERR_NOMEM;
+
+    /* Phase 1 — re-encode each eligible column to .col.tmp/.idx.tmp.  No lock:
+     * this only reads the live files and writes new .tmp files.  This is the
+     * expensive step (decode + best-of-N re-encode) and is deliberately kept
+     * off the compact lock so readers are never blocked during it. */
     for (int ci = 0; ci < schema->ncols; ci++) {
         uint64_t bw = 0, bs = 0;
+        int prod = 0;
         int rc = compact_column_file(part_dir,
                                      schema->cols[ci].name,
                                      schema->cols[ci].type,
                                      threshold,
-                                     lock_fn, unlock_fn, lock_ud,
-                                     &bw, &bs);
-        if (rc == TSDB_OK && bw > 0) {
+                                     &bw, &bs, &prod);
+        if (rc == TSDB_OK && prod) {
+            produced[ci] = 1;
             any_compacted = 1;
             tsdb_metric_inc("qengine_compactions_total");
             if (stats) {
@@ -632,9 +631,44 @@ static int compact_partition(tsdb_schema_t   *schema,
                 stats->compactions_done++;
             }
         }
-        /* Non-fatal errors: continue with next column. */
+        /* Non-fatal errors: continue with next column (its .tmp, if any, was
+         * already removed by compact_column_file). */
     }
 
+    /* Phase 2 — swap EVERY produced column atomically under one lock hold, so
+     * a concurrent reader (taking the same lock around tsdb_part_open) sees
+     * the partition as either entirely pre- or entirely post-compaction.
+     * Doing this per-column would expose a window where the ts (enumerator)
+     * column is compacted but a value column is not, misaligning block
+     * boundaries and corrupting the scan's results. */
+    if (any_compacted) {
+        if (lock_fn) lock_fn(lock_ud);
+        for (int ci = 0; ci < schema->ncols; ci++) {
+            if (!produced[ci]) continue;
+            char col_path[4096], idx_path[4096], col_tmp[4096], idx_tmp[4096];
+            snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, schema->cols[ci].name);
+            snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, schema->cols[ci].name);
+            snprintf(col_tmp,  sizeof(col_tmp),  "%s/%s.col.tmp", part_dir, schema->cols[ci].name);
+            snprintf(idx_tmp,  sizeof(idx_tmp),  "%s/%s.idx.tmp", part_dir, schema->cols[ci].name);
+            /* Test-only: widen the in-swap window (some columns already
+             * renamed, others not) so the concurrent-read test deterministically
+             * stresses the reader-blocking path.  Under the lock → readers wait
+             * and never observe the mixed state.  Never set in production. */
+            const char *rd = getenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS");
+            if (rd && *rd) {
+                int ms = atoi(rd);
+                if (ms > 0) {
+                    struct timespec dts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+                    nanosleep(&dts, NULL);
+                }
+            }
+            rename(col_tmp, col_path);
+            rename(idx_tmp, idx_path);
+        }
+        if (unlock_fn) unlock_fn(lock_ud);
+    }
+
+    free(produced);
     if (any_compacted && stats) {
         stats->parts_merged++;
     }

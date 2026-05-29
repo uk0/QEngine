@@ -17,6 +17,7 @@
 #include "../storage/retention.h"
 #include "../catalog/audit.h"
 #include "../storage/db.h"
+#include "../storage/compaction.h"
 #include "../raft/raft.h"
 #include "../federation/dr_forwarder.h"
 #include "replica.h"
@@ -1401,6 +1402,35 @@ int main(int argc, char **argv) {
         db);
     fflush(stdout);
 
+    /* Background compaction: merge size-tiered flush blocks into larger cold
+     * blocks (better dict/symbol ratios, fewer files per column).  OFF by
+     * default — enable per-deployment with TSDB_COMPACTION=1.  Safe under the
+     * cluster's anti-entropy, which reconciles replicas on count(*)/max(ts)
+     * (both invariant under compaction — it re-encodes the same rows into
+     * different block boundaries); the merkle block-sync path is not wired.
+     * The compactor only rewrites partitions idle for >60s. */
+    tsdb_compactor_t *cpt = NULL;
+    {
+        const char *en = getenv("TSDB_COMPACTION");
+        if (en && en[0] == '1') {
+            const char *mb = getenv("TSDB_COMPACTION_MIN_BLOCKS");
+            const char *iv = getenv("TSDB_COMPACTION_INTERVAL_MS");
+            const char *wt = getenv("TSDB_COMPACTION_THREADS");
+            tsdb_compactor_opts_t copts;
+            memset(&copts, 0, sizeof(copts));
+            copts.min_blocks_to_compact = (mb && *mb) ? atoi(mb) : 0; /* 0 → 16 */
+            copts.interval_ns = (iv && *iv) ? (int64_t)atoll(iv) * 1000000LL : 0; /* 0 → 5s */
+            copts.worker_threads = (wt && *wt) ? atoi(wt) : 0; /* 0 → 1 */
+            if (tsdb_compactor_start(db, &copts, &cpt) == TSDB_OK)
+                printf("[node] compaction enabled (min_blocks=%d interval_ms=%s threads=%d)\n",
+                       copts.min_blocks_to_compact ? copts.min_blocks_to_compact : 16,
+                       (iv && *iv) ? iv : "5000",
+                       copts.worker_threads ? copts.worker_threads : 1);
+            else
+                fprintf(stderr, "[node] compaction start failed; continuing without\n");
+        }
+    }
+
     /* Main loop: optionally print stats every 5s (gated by env). */
     int verbose = getenv("TSDB_VERBOSE") != NULL;
     int tick = 0;
@@ -1415,6 +1445,7 @@ int main(int argc, char **argv) {
     }
 
     printf("[node] shutting down...\n");
+    if (cpt) tsdb_compactor_stop(cpt);   /* join workers before closing db */
     if (ms)  tsdb_metrics_server_stop(ms);
     if (srv) tsdb_server_stop(srv);
     tsdb_close(db);

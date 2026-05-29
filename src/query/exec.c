@@ -375,9 +375,19 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
     char **dirs = NULL; size_t nd = 0;
     int rc = list_partitions(dir, &dirs, &nd);
     if (rc != TSDB_OK) return rc;
+    /* Compaction swaps a partition's .col then .idx under this per-table lock
+     * (two non-atomic renames).  tsdb_part_open reads idx then col lock-free;
+     * without coordination a reader landing mid-swap pairs an old idx with a
+     * freshly-compacted col (different block layout) and reads the wrong
+     * column or a CRC failure.  Hold the lock only across the open (idx read +
+     * col mmap); once mapped, the fds pin their inodes and the scan proceeds
+     * lock-free.  Uncontended when compaction is disabled. */
+    pthread_mutex_t *cmtx = tsdb_tbl_compact_mtx(t);
     for (size_t i = 0; i < nd; i++) {
         tsdb_part_t *part = NULL;
+        if (cmtx) pthread_mutex_lock(cmtx);
         rc = tsdb_part_open(s, dirs[i], &part);
+        if (cmtx) pthread_mutex_unlock(cmtx);
         if (rc != TSDB_OK) { free(dirs[i]); continue; }
 
         /* File-level zone-map prune: if the whole partition's [ts_min, ts_max]

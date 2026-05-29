@@ -20,6 +20,7 @@
 
 #include "../src/server/server.h"
 #include "../src/storage/db.h"   /* tsdb_db_set_group_commit */
+#include "../src/storage/compaction.h"
 #include "../src/server/config.h"
 #include "../src/server/log.h"
 #include "../src/server/influx_line.h"
@@ -395,6 +396,31 @@ int main(int argc, char **argv) {
     sigaction(SIGHUP,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Background compaction: OFF by default; enable with TSDB_COMPACTION=1.
+     * Merges size-tiered flush blocks into larger cold blocks (better
+     * dict/symbol ratios, fewer files).  Only touches partitions idle >60s;
+     * preserves every row, so count/sum/scan results are unchanged. */
+    tsdb_compactor_t *cpt = NULL;
+    {
+        const char *en = getenv("TSDB_COMPACTION");
+        if (en && en[0] == '1') {
+            const char *mb = getenv("TSDB_COMPACTION_MIN_BLOCKS");
+            const char *iv = getenv("TSDB_COMPACTION_INTERVAL_MS");
+            const char *wt = getenv("TSDB_COMPACTION_THREADS");
+            tsdb_compactor_opts_t copts;
+            memset(&copts, 0, sizeof(copts));
+            copts.min_blocks_to_compact = (mb && *mb) ? atoi(mb) : 0; /* 0 → 16 */
+            copts.interval_ns = (iv && *iv) ? (int64_t)atoll(iv) * 1000000LL : 0; /* 0 → 5s */
+            copts.worker_threads = (wt && *wt) ? atoi(wt) : 0; /* 0 → 1 */
+            if (tsdb_compactor_start(db, &copts, &cpt) == TSDB_OK)
+                TSDB_LOG_INFO("main", "compaction enabled (min_blocks=%d threads=%d)",
+                              copts.min_blocks_to_compact ? copts.min_blocks_to_compact : 16,
+                              copts.worker_threads ? copts.worker_threads : 1);
+            else
+                TSDB_LOG_ERROR("main", "compaction start failed; continuing without");
+        }
+    }
+
     /* 7. Main loop. */
     while (!g_quit) {
         if (g_reload) {
@@ -414,6 +440,7 @@ int main(int argc, char **argv) {
 
     /* 8. Graceful shutdown. */
     TSDB_LOG_INFO("main", "shutting down");
+    if (cpt) tsdb_compactor_stop(cpt);   /* join workers before closing db */
     if (ms) tsdb_metrics_server_stop(ms);
     tsdb_influx_http_stop();
     tsdb_server_stop(g_srv);
