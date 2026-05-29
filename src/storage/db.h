@@ -32,6 +32,12 @@ int                    tsdb_db_data_dir_count(tsdb_db_t *db);
 const char            *tsdb_db_data_dir_at(tsdb_db_t *db, int i);
 tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 
+/* Compactor lifetime guard: acquire marks the table `compacting` (so a
+ * concurrent tsdb_drop_table waits before freeing it); release clears it.
+ * Bracket every compaction pass that uses the raw table pointer. */
+tsdb_table_internal_t *tsdb_db_compact_acquire(tsdb_db_t *db, const char *name);
+void                   tsdb_db_compact_release(tsdb_db_t *db, tsdb_table_internal_t *t);
+
 /* Snapshot the list of open table names into `out_names` (each a
  * NUL-terminated copy, at most name_cap bytes).  Returns the number of
  * names written (≤ max).  Used by anti-entropy resync to iterate

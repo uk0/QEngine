@@ -756,19 +756,22 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
         struct stat tst;
         if (stat(tbl_dir, &tst) < 0 || !S_ISDIR(tst.st_mode)) continue;
 
-        /* Look up the table internally to get schema + compact_mtx. */
-        tsdb_table_internal_t *tbl = tsdb_db_find_table(db, de->d_name);
+        /* Acquire the table for compaction: marks it `compacting` so a
+         * concurrent DROP TABLE waits before freeing it (we use its raw
+         * schema/compact_mtx pointers lock-free below).  Must be released on
+         * every path out of this iteration. */
+        tsdb_table_internal_t *tbl = tsdb_db_compact_acquire(db, de->d_name);
         if (!tbl) continue;   /* table not currently open — skip */
 
         tsdb_schema_t *schema = tsdb_tbl_schema(tbl);
-        if (!schema) continue;
+        if (!schema) { tsdb_db_compact_release(db, tbl); continue; }
 
         /* Retrieve the per-table compact mutex. */
         pthread_mutex_t *cmtx = tsdb_tbl_compact_mtx(tbl);
 
         /* Enumerate partition subdirs under the table dir. */
         DIR *td = opendir(tbl_dir);
-        if (!td) continue;
+        if (!td) { tsdb_db_compact_release(db, tbl); continue; }
 
         struct dirent *pe;
         while ((pe = readdir(td)) != NULL) {
@@ -807,6 +810,7 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
             if (c->quit) break;
         }
         closedir(td);
+        tsdb_db_compact_release(db, tbl);
         if (c->quit) break;
     }
     closedir(dd);

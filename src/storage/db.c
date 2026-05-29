@@ -47,6 +47,10 @@ typedef struct tsdb_table_internal {
      * on the same memtable, producing torn rows and (with pool>1 peer
      * connections) heap corruption in the replay path. */
     pthread_mutex_t      batch_mu;
+    /* Set by the background compactor (under db->lock) for the duration of a
+     * compaction pass on this table; tsdb_drop_table waits for it to clear
+     * before freeing, since the compactor uses schema/compact_mtx lock-free. */
+    volatile int         compacting;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -762,6 +766,24 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         }
     }
 
+    /* Wait for any in-flight compaction pass on this table to finish before
+     * freeing it — the compactor uses t->schema / t->compact_mtx lock-free, so
+     * freeing underneath it is a use-after-free.  The compactor sets/clears
+     * `compacting` under db->lock, so once we observe 0 while holding the lock
+     * it cannot restart (it would need the lock we hold to re-acquire). */
+    while (idx >= 0 && db->tables[idx]->compacting) {
+        pthread_mutex_unlock(&db->lock);
+        usleep(2000);
+        pthread_mutex_lock(&db->lock);
+        idx = -1;
+        for (int i = 0; i < db->ntables; i++) {
+            if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
     if (idx >= 0) {
         tsdb_table_internal_t *t = db->tables[idx];
         /* Stop group-commit bg thread before closing WAL. */
@@ -1373,6 +1395,28 @@ tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name) {
     tsdb_table_internal_t *t = db_find_table(db, name);
     pthread_mutex_unlock(&db->lock);
     return t;
+}
+
+/* Compactor lifetime guard.  The background compactor holds the returned raw
+ * table pointer (and uses its schema + compact_mtx lock-free) for an entire
+ * compaction pass.  Marking the table `compacting` under db->lock makes a
+ * concurrent tsdb_drop_table wait until the pass ends before freeing it —
+ * closing a use-after-free / double-free seen under drop+compaction stress.
+ * Returns NULL (no guard set) if the table is gone. */
+tsdb_table_internal_t *tsdb_db_compact_acquire(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return NULL;
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = db_find_table(db, name);
+    if (t) t->compacting = 1;
+    pthread_mutex_unlock(&db->lock);
+    return t;
+}
+
+void tsdb_db_compact_release(tsdb_db_t *db, tsdb_table_internal_t *t) {
+    if (!db || !t) return;
+    pthread_mutex_lock(&db->lock);
+    t->compacting = 0;   /* t is still alive: drop waits while compacting==1 */
+    pthread_mutex_unlock(&db->lock);
 }
 
 /* Flush every open table's memtable to its on-disk partition.  Used

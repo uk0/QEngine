@@ -283,6 +283,71 @@ static void test_concurrent_read_during_compaction(void) {
     printf("[PASS] concurrent read during compaction\n");
 }
 
+/* ---- T3: DROP TABLE during an active compaction pass --------------------
+ * The background compactor holds a raw table pointer (schema + compact_mtx)
+ * lock-free for a whole pass.  A concurrent DROP TABLE that frees the table
+ * underneath it is a use-after-free / double-free (observed crashing a node
+ * under drop+compaction stress).  tsdb_drop_table must wait for the pass to
+ * finish.  The rename window is widened so the compactor is reliably mid-pass
+ * when the drop arrives; under ASan this must complete with no UAF. */
+static void test_drop_during_compaction(void) {
+    printf("\n[TEST] DROP TABLE during active compaction (lifetime race)\n");
+    const char *DIR3 = "/tmp/tsdb_test_compaction_dc";
+    rm_rf(DIR3);
+
+    tsdb_db_t *db = NULL;
+    ASSERT_OK(tsdb_open(DIR3, &db));
+    ASSERT_OK(tsdb_create_table(db, "dctbl", COLS, (size_t)NCOLS, "ts"));
+    tsdb_table_t *tbl = NULL;
+    ASSERT_OK(tsdb_open_table(db, "dctbl", &tbl));
+
+    int64_t gr = 0;
+    for (int b = 0; b < 12; b++) {          /* 12 blocks > min_blocks 4 */
+        tsdb_batch_t *batch = NULL;
+        ASSERT_OK(tsdb_batch_begin(tbl, &batch));
+        for (int r = 0; r < BATCH_ROWS; r++) {
+            ASSERT_OK(tsdb_batch_row_ts(batch, BASE_TS_NS + gr * TS_STEP_NS));
+            ASSERT_OK(tsdb_batch_row_f64(batch, 1, 1.0));
+            ASSERT_OK(tsdb_batch_row_i64(batch, 2, gr % 7));
+            ASSERT_OK(tsdb_batch_row_end(batch));
+            gr++;
+        }
+        ASSERT_OK(tsdb_batch_commit(batch));
+    }
+    char tdir[4096];
+    snprintf(tdir, sizeof(tdir), "%s/%s", DIR3, "dctbl");
+    backdate_partitions(tdir);
+
+    /* Wide swap window so the worker is mid-pass (compacting=1) at drop time. */
+    setenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS", "300", 1);
+    tsdb_compactor_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.min_blocks_to_compact = 4;
+    opts.interval_ns = 10000000LL;   /* 10ms — worker runs almost immediately */
+    opts.worker_threads = 1;
+    tsdb_compactor_t *cpt = NULL;
+    ASSERT_OK(tsdb_compactor_start(db, &opts, &cpt));
+
+    usleep(100000);   /* 100ms: worker is now inside dctbl's compaction pass */
+    /* Without the lifetime guard this frees the table under the compactor and
+     * ASan reports a use-after-free / double-free; with it, drop blocks until
+     * the pass ends, then frees cleanly. */
+    ASSERT_OK(tsdb_drop_table(db, "dctbl"));
+
+    unsetenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS");
+    tsdb_compactor_stop(cpt);
+
+    /* Table is gone — a query either errors or returns nothing, never crashes. */
+    tsdb_result_t *r = NULL;
+    int qrc = tsdb_query(db, "SELECT count(*) FROM dctbl", &r);
+    printf("  post-drop query rc=%d (table dropped)\n", qrc);
+    if (r) tsdb_result_free(r);
+
+    tsdb_close(db);
+    rm_rf(DIR3);
+    printf("[PASS] DROP during compaction (no use-after-free)\n");
+}
+
 int main(void) {
     printf("[TEST] compaction: 32-block → merge via run_once\n");
 
@@ -400,23 +465,25 @@ int main(void) {
 
     tsdb_compactor_stats_t stats;
     tsdb_compactor_stats(cpt, &stats);
+    tsdb_compactor_stop(cpt);
 
     /* 5b. Loop guard: a partition already at its post-compaction block count
-     * must NOT be re-compacted.  Re-backdate (so the 60s cold gate isn't what
-     * stops it) and run again — compactions_done must not advance.  Without
-     * the "already compacted" skip this loops forever, re-encoding the same
-     * data and burning CPU (observed on the live cluster). */
+     * (ceil(rows / COMPACT_BLOCK_POINTS)) must NOT be re-compacted — doing so
+     * is a no-op that loops forever, re-encoding the same data and burning CPU
+     * (observed on the live cluster).  Re-cool the partition, then start a
+     * FRESH compactor (counter from 0, so we don't race the first one's worker)
+     * and confirm it performs ZERO compactions on the already-compacted table. */
     backdate_partitions(table_dir);
-    uint64_t done_before_rerun = stats.compactions_done;
-    ASSERT_OK(tsdb_compactor_run_once(cpt));
-    tsdb_compactor_stats_t stats_rerun;
-    tsdb_compactor_stats(cpt, &stats_rerun);
-    printf("  re-compaction guard: done before=%llu after=%llu (must be equal)\n",
-           (unsigned long long)done_before_rerun,
-           (unsigned long long)stats_rerun.compactions_done);
-    ASSERT(stats_rerun.compactions_done == done_before_rerun);
-
-    tsdb_compactor_stop(cpt);
+    tsdb_compactor_opts_t opts2 = opts;
+    tsdb_compactor_t *cpt2 = NULL;
+    ASSERT_OK(tsdb_compactor_start(db, &opts2, &cpt2));
+    sleep(1);   /* let cpt2's worker scan the cold, already-compacted table */
+    tsdb_compactor_stats_t guard;
+    tsdb_compactor_stats(cpt2, &guard);
+    printf("  re-compaction guard: fresh compactor did %llu compactions (must be 0)\n",
+           (unsigned long long)guard.compactions_done);
+    ASSERT(guard.compactions_done == 0);
+    tsdb_compactor_stop(cpt2);
 
     /* 6. Record post-compaction block count. */
     uint32_t post_ts    = max_block_count_for_col(table_dir, "ts");
@@ -529,6 +596,9 @@ int main(void) {
 
     /* T2: concurrent read while the compactor swaps files underneath. */
     test_concurrent_read_during_compaction();
+
+    /* T3: DROP TABLE while the compactor is actively compacting it. */
+    test_drop_during_compaction();
 
     return 0;
 }
