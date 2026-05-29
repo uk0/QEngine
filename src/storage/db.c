@@ -51,6 +51,12 @@ typedef struct tsdb_table_internal {
      * compaction pass on this table; tsdb_drop_table waits for it to clear
      * before freeing, since the compactor uses schema/compact_mtx lock-free. */
     volatile int         compacting;
+    /* In-flight query/scan count (under db->lock).  A SELECT holds a raw
+     * pointer to this table's schema across exec + its parallel scan workers;
+     * tsdb_drop_table waits for this to reach 0 before freeing the schema, or
+     * a concurrent DROP is a use-after-free (caught by ASan in agg_write /
+     * tsdb_part_col_blocks). */
+    volatile int         scan_refs;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -766,12 +772,14 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         }
     }
 
-    /* Wait for any in-flight compaction pass on this table to finish before
-     * freeing it — the compactor uses t->schema / t->compact_mtx lock-free, so
-     * freeing underneath it is a use-after-free.  The compactor sets/clears
-     * `compacting` under db->lock, so once we observe 0 while holding the lock
-     * it cannot restart (it would need the lock we hold to re-acquire). */
-    while (idx >= 0 && db->tables[idx]->compacting) {
+    /* Wait for any in-flight compaction pass OR query/scan on this table to
+     * finish before freeing it — both hold t->schema (and compact_mtx) by raw
+     * pointer with no lock, so freeing underneath them is a use-after-free.
+     * Both flags are set/cleared under db->lock, so once we observe them 0
+     * while holding the lock they cannot restart (they'd need the lock we
+     * hold to re-acquire). */
+    while (idx >= 0 && (db->tables[idx]->compacting ||
+                        db->tables[idx]->scan_refs > 0)) {
         pthread_mutex_unlock(&db->lock);
         usleep(2000);
         pthread_mutex_lock(&db->lock);
@@ -1416,6 +1424,28 @@ void tsdb_db_compact_release(tsdb_db_t *db, tsdb_table_internal_t *t) {
     if (!db || !t) return;
     pthread_mutex_lock(&db->lock);
     t->compacting = 0;   /* t is still alive: drop waits while compacting==1 */
+    pthread_mutex_unlock(&db->lock);
+}
+
+/* Query/scan lifetime guard.  A SELECT (and its parallel scan workers) holds a
+ * raw pointer to the table's schema for the duration of execution; marking the
+ * table in-use under db->lock makes a concurrent tsdb_drop_table wait until the
+ * query finishes before freeing the schema — closing a use-after-free seen in
+ * agg_write / tsdb_part_col_blocks under concurrent query+drop.  Find+increment
+ * under one lock so it can't race the drop's check+free.  NULL if table gone. */
+tsdb_table_internal_t *tsdb_db_scan_acquire(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return NULL;
+    pthread_mutex_lock(&db->lock);
+    tsdb_table_internal_t *t = db_find_table(db, name);
+    if (t) t->scan_refs++;
+    pthread_mutex_unlock(&db->lock);
+    return t;
+}
+
+void tsdb_db_scan_release(tsdb_db_t *db, tsdb_table_internal_t *t) {
+    if (!db || !t) return;
+    pthread_mutex_lock(&db->lock);
+    if (t->scan_refs > 0) t->scan_refs--;
     pthread_mutex_unlock(&db->lock);
 }
 

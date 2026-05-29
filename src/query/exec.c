@@ -5901,6 +5901,12 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 return TSDB_OK;
             }
         }
+        /* Hold the FROM table in-use across exec (and its parallel scan
+         * workers) so a concurrent DROP TABLE can't free the schema mid-query
+         * — the worker threads and agg path dereference it by raw pointer.
+         * tsdb_drop_table waits for scan_refs to reach 0. */
+        tsdb_table_internal_t *qtbl = stmt.u.query.from
+            ? tsdb_db_scan_acquire(db, stmt.u.query.from) : NULL;
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
         /* Apply ORDER BY post-execution so plain SELECT, GROUP BY,
          * SAMPLE BY, LATEST ON, and the stable-select union all share
@@ -5908,6 +5914,7 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
          * q->order_col is arena-allocated. */
         if (rc == TSDB_OK)
             rc = result_apply_order_by(r, &stmt.u.query, err, sizeof(err));
+        if (qtbl) tsdb_db_scan_release(db, qtbl);
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
         *out = r;

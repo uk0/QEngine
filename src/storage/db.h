@@ -38,6 +38,12 @@ tsdb_table_internal_t *tsdb_db_find_table(tsdb_db_t *db, const char *name);
 tsdb_table_internal_t *tsdb_db_compact_acquire(tsdb_db_t *db, const char *name);
 void                   tsdb_db_compact_release(tsdb_db_t *db, tsdb_table_internal_t *t);
 
+/* Query/scan lifetime guard: acquire marks the table in-use (so a concurrent
+ * tsdb_drop_table waits before freeing its schema); release clears it.  Bracket
+ * a SELECT's execution (incl. its parallel scan workers) with these. */
+tsdb_table_internal_t *tsdb_db_scan_acquire(tsdb_db_t *db, const char *name);
+void                   tsdb_db_scan_release(tsdb_db_t *db, tsdb_table_internal_t *t);
+
 /* Snapshot the list of open table names into `out_names` (each a
  * NUL-terminated copy, at most name_cap bytes).  Returns the number of
  * names written (≤ max).  Used by anti-entropy resync to iterate
