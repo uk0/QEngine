@@ -20,6 +20,7 @@
 
 #include "bp128.h"
 #include "../exec/simd.h"
+#include "../exec/cpuid.h"
 #include "../../include/tsdb.h"
 #include <string.h>
 #include <stdint.h>
@@ -34,7 +35,11 @@
  * Compiled only when no SIMD path is active (avoids unused-function warning).
  * =========================================================================*/
 
-#if !defined(TSDB_SIMD_NEON) && !defined(TSDB_SIMD_AVX2)
+/* Scalar reference is compiled on every non-NEON build: on x86 it is the
+ * runtime fallback when the CPU lacks AVX2 (the AVX2 kernels are selected
+ * at runtime, mirroring agg.c).  On ARM the NEON kernels cover everything,
+ * so the scalar is omitted there to avoid an unused-function warning. */
+#if !defined(TSDB_SIMD_NEON)
 static void pack4_scalar(const uint32_t *src, uint32_t *dst, unsigned b)
 {
     const uint64_t mask = (b == 32) ? 0xFFFFFFFFULL : ((1ULL << b) - 1ULL);
@@ -92,7 +97,12 @@ static void unpack4_scalar(const uint32_t *src, uint32_t *dst, unsigned b)
         bits -= b;
     }
 }
-#endif /* !TSDB_SIMD_NEON && !TSDB_SIMD_AVX2 */
+#endif /* !TSDB_SIMD_NEON */
+
+/* Dispatch-table function-pointer types — shared by the NEON and AVX2
+ * kernel tables below, so they must live outside both SIMD #if blocks. */
+typedef void (*pack_fn)(const uint32_t *, uint32_t *);
+typedef void (*unpack_fn)(const uint32_t *, uint32_t *);
 
 /* =========================================================================
  * NEON specialized kernels — macro-expanded for b=1..32.
@@ -306,9 +316,6 @@ DEF_UNPACK_NEON_IMPL(28)  DEF_UNPACK_NEON_IMPL(29)  DEF_UNPACK_NEON_IMPL(30)
 DEF_UNPACK_NEON_IMPL(31)  DEF_UNPACK_NEON_IMPL(32)
 
 /* Dispatch tables (index = b, b=1..32). */
-typedef void (*pack_fn)(const uint32_t *, uint32_t *);
-typedef void (*unpack_fn)(const uint32_t *, uint32_t *);
-
 static const pack_fn neon_pack_tbl[33] = {
     NULL, /* b=0 invalid */
     pack_neon_impl_1,  pack_neon_impl_2,  pack_neon_impl_3,
@@ -345,26 +352,88 @@ static const unpack_fn neon_unpack_tbl[33] = {
  * AVX2 scaffold (body falls back to scalar; structure present for future).
  * =========================================================================*/
 
-#if TSDB_SIMD_AVX2
+/* AVX2 kernels are compiled on ALL x86 builds (not gated by -mavx2) using
+ * per-function target("avx2"), then selected at RUNTIME via tsdb_cpu_level()
+ * — identical to agg.c.  This activates the acceleration on AVX2-capable
+ * hardware without a global -mavx2 build flag (so the blast radius is exactly
+ * these functions, nothing else), and falls back to the scalar reference on
+ * non-AVX2 CPUs. */
+#if defined(__x86_64__) || defined(__i386__)
+#define TSDB_BP128_X86_AVX2 1
 #include <immintrin.h>
 
-/* Placeholder: AVX2 pack/unpack — same algorithm as scalar but with
- * __m256i 8-lane accumulators. Currently calls scalar for correctness;
- * replace inner body with _mm256_or_si256 / _mm256_sllv_epi32 etc.
- * when AVX2 specialization is needed. */
+/* AVX2 specialization.  BP128 packs 4 interleaved lanes of 32 values each;
+ * the scalar reference keeps a uint64 accumulator PER LANE (acc[4]).  One
+ * __m256i holds exactly 4x uint64, so the whole 4-lane accumulator maps to
+ * a single register and the per-lane work vectorizes with no cross-lane
+ * dependency:
+ *   - load the 4 lane values for group i (4x u32) and zero-extend to 4x u64
+ *     via _mm256_cvtepu32_epi64;
+ *   - the running `bits` shift is identical for all lanes (uniform), so a
+ *     single _mm256_sll_epi64 / _mm256_srli_epi64 covers all four;
+ *   - mask / OR are plain _mm256_and_si256 / _mm256_or_si256.
+ * Output rows are the low 32 bits of each of the 4 u64 lanes, written
+ * contiguously — gathered with a permutevar8x32 (pick even dwords).
+ *
+ * Correctness is pinned by test_bp128: every kernel's packed bytes must be
+ * BIT-IDENTICAL to the independent scalar reference for all b=1..32. */
 
-#define DEF_PACK_AVX2(B)                                                  \
-static void pack_avx2_##B(const uint32_t *src, uint32_t *dst)             \
-{                                                                          \
-    /* TODO: replace with _mm256_* 8-way parallel implementation. */      \
-    pack4_scalar(src, dst, (B));                                           \
+/* Store the low 32 bits of each of the 4 u64 lanes of `acc` to dst[0..3]. */
+__attribute__((target("avx2")))
+static inline void bp_store_lo32x4(uint32_t *dst, __m256i acc) {
+    /* acc as 8x u32: [l0lo l0hi l1lo l1hi l2lo l2hi l3lo l3hi];
+     * gather the even dwords (the per-lane low 32 bits) into the low half. */
+    const __m256i idx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    __m256i perm = _mm256_permutevar8x32_epi32(acc, idx);
+    _mm_storeu_si128((__m128i *)dst, _mm256_castsi256_si128(perm));
 }
 
-#define DEF_UNPACK_AVX2(B)                                                \
-static void unpack_avx2_##B(const uint32_t *src, uint32_t *dst)           \
-{                                                                          \
-    /* TODO: replace with _mm256_* 8-way parallel implementation. */      \
-    unpack4_scalar(src, dst, (B));                                         \
+#define DEF_PACK_AVX2(B)                                                       \
+__attribute__((target("avx2")))                                               \
+static void pack_avx2_##B(const uint32_t *src, uint32_t *dst)                  \
+{                                                                              \
+    const __m256i mask = _mm256_set1_epi64x(                                   \
+        (B) == 32 ? (long long)0xFFFFFFFFLL : (long long)(((1ULL<<(B))-1ULL)));\
+    __m256i acc = _mm256_setzero_si256();                                      \
+    unsigned bits = 0, oidx = 0;                                               \
+    for (unsigned i = 0; i < 32; i++) {                                        \
+        __m256i v = _mm256_cvtepu32_epi64(                                     \
+            _mm_loadu_si128((const __m128i *)(src + i*4)));                    \
+        v = _mm256_and_si256(v, mask);                                         \
+        v = _mm256_sll_epi64(v, _mm_cvtsi32_si128((int)bits));                 \
+        acc = _mm256_or_si256(acc, v);                                         \
+        bits += (B);                                                           \
+        while (bits >= 32) {                                                   \
+            bp_store_lo32x4(dst + oidx*4, acc);                                \
+            oidx++;                                                            \
+            acc = _mm256_srli_epi64(acc, 32);                                  \
+            bits -= 32;                                                        \
+        }                                                                      \
+    }                                                                          \
+    if (bits > 0) bp_store_lo32x4(dst + oidx*4, acc);                          \
+}
+
+#define DEF_UNPACK_AVX2(B)                                                     \
+__attribute__((target("avx2")))                                               \
+static void unpack_avx2_##B(const uint32_t *src, uint32_t *dst)               \
+{                                                                              \
+    const __m256i mask = _mm256_set1_epi64x(                                   \
+        (B) == 32 ? (long long)0xFFFFFFFFLL : (long long)(((1ULL<<(B))-1ULL)));\
+    __m256i acc = _mm256_setzero_si256();                                      \
+    unsigned bits = 0, iidx = 0;                                               \
+    for (unsigned i = 0; i < 32; i++) {                                        \
+        while (bits < (B)) {                                                   \
+            __m256i v = _mm256_cvtepu32_epi64(                                 \
+                _mm_loadu_si128((const __m128i *)(src + iidx*4)));             \
+            v = _mm256_sll_epi64(v, _mm_cvtsi32_si128((int)bits));             \
+            acc = _mm256_or_si256(acc, v);                                     \
+            iidx++;                                                            \
+            bits += 32;                                                        \
+        }                                                                      \
+        bp_store_lo32x4(dst + i*4, _mm256_and_si256(acc, mask));               \
+        acc = _mm256_srli_epi64(acc, (B));                                     \
+        bits -= (B);                                                           \
+    }                                                                          \
 }
 
 DEF_PACK_AVX2(1)  DEF_PACK_AVX2(2)  DEF_PACK_AVX2(3)  DEF_PACK_AVX2(4)
@@ -409,7 +478,7 @@ static const unpack_fn avx2_unpack_tbl[33] = {
     unpack_avx2_29, unpack_avx2_30, unpack_avx2_31, unpack_avx2_32
 };
 
-#endif /* TSDB_SIMD_AVX2 */
+#endif /* __x86_64__ || __i386__ */
 
 /* =========================================================================
  * Public API
@@ -423,10 +492,11 @@ int tsdb_bp128_pack(const uint32_t *src, uint32_t *dst, unsigned b)
     /* Zero output: b * 16 bytes. */
     memset(dst, 0, (size_t)b * 16);
 
-#if defined(TSDB_SIMD_AVX2)
-    avx2_pack_tbl[b](src, dst);
-#elif defined(TSDB_SIMD_NEON)
+#if defined(TSDB_SIMD_NEON)
     neon_pack_tbl[b](src, dst);
+#elif defined(TSDB_BP128_X86_AVX2)
+    if (tsdb_cpu_level() >= TSDB_CPU_AVX2) avx2_pack_tbl[b](src, dst);
+    else                                   pack4_scalar(src, dst, b);
 #else
     pack4_scalar(src, dst, b);
 #endif
@@ -439,10 +509,11 @@ int tsdb_bp128_unpack(const uint32_t *src, uint32_t *dst, unsigned b)
     if (!src || !dst) return TSDB_ERR_INVAL;
     if (b == 0 || b > 32) return TSDB_ERR_INVAL;
 
-#if defined(TSDB_SIMD_AVX2)
-    avx2_unpack_tbl[b](src, dst);
-#elif defined(TSDB_SIMD_NEON)
+#if defined(TSDB_SIMD_NEON)
     neon_unpack_tbl[b](src, dst);
+#elif defined(TSDB_BP128_X86_AVX2)
+    if (tsdb_cpu_level() >= TSDB_CPU_AVX2) avx2_unpack_tbl[b](src, dst);
+    else                                   unpack4_scalar(src, dst, b);
 #else
     unpack4_scalar(src, dst, b);
 #endif
