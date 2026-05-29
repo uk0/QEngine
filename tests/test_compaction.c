@@ -155,6 +155,11 @@ int main(void) {
     int64_t  expected_count = (int64_t)N_BATCHES * BATCH_ROWS;
     double   expected_value_sum = 0.0;
     int64_t  expected_tag_sum   = 0;
+    /* References for a partial-filter aggregate (tag >= 128) — exercises the
+     * gather-into-scratch path over the post-compaction 32768-row blocks. */
+    int64_t  expected_count_filt = 0;
+    int64_t  expected_tag_sum_filt = 0;
+    double   expected_value_sum_filt = 0.0;
 
     for (int b = 0; b < N_BATCHES; b++) {
         tsdb_batch_t *batch = NULL;
@@ -172,6 +177,11 @@ int main(void) {
 
             expected_value_sum += val;
             expected_tag_sum   += tag;
+            if (tag >= 128) {
+                expected_count_filt++;
+                expected_tag_sum_filt   += tag;
+                expected_value_sum_filt += val;
+            }
             global_row++;
         }
 
@@ -285,6 +295,38 @@ int main(void) {
         ASSERT(rel_err < expected_value_sum * 0.001 + 1e-3);
     }
     ASSERT(got_tsum == expected_tag_sum);
+
+    /* 7b. Partial-filter aggregate over the 32768-row compacted blocks.
+     * A WHERE that selects a SUBSET (popcnt != block row-count) forces the
+     * aggregate gather-into-scratch path.  Post-compaction blocks hold 32768
+     * rows — 4x the legacy 8192-element scratch — so a scratch sized to the
+     * compile-time TSDB_BLOCK_POINTS overflows here.  Data integrity is
+     * paramount: the filtered result must be exact. */
+    tsdb_result_t *res2 = NULL;
+    int qrc2 = tsdb_query(db,
+        "SELECT count(ts), sum(tag), sum(value) FROM metrics WHERE tag >= 128",
+        &res2);
+    ASSERT_OK(qrc2);
+    ASSERT(tsdb_result_next(res2) == 1);
+    int64_t f_count = tsdb_result_i64(res2, 0);
+    int64_t f_tsum  = tsdb_result_i64(res2, 1);
+    double  f_vsum  = tsdb_result_f64(res2, 2);
+    tsdb_result_free(res2);
+
+    printf("  [filter tag>=128] count    : expected=%lld  got=%lld\n",
+           (long long)expected_count_filt, (long long)f_count);
+    printf("  [filter tag>=128] tag_sum  : expected=%lld  got=%lld\n",
+           (long long)expected_tag_sum_filt, (long long)f_tsum);
+    printf("  [filter tag>=128] value_sum: expected=%.4f  got=%.4f\n",
+           expected_value_sum_filt, f_vsum);
+
+    ASSERT(f_count == expected_count_filt);
+    ASSERT(f_tsum  == expected_tag_sum_filt);
+    {
+        double rel_err = f_vsum - expected_value_sum_filt;
+        if (rel_err < 0) rel_err = -rel_err;
+        ASSERT(rel_err < expected_value_sum_filt * 0.001 + 1e-3);
+    }
 
     /* 8. Print stats. */
     printf("  compactions_done : %llu\n", (unsigned long long)stats.compactions_done);
