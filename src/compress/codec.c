@@ -258,7 +258,20 @@ int tsdb_codec_encode_adaptive(tsdb_type_t type,
                                tsdb_codec_t *out_codec,
                                uint16_t *out_flags)
 {
+    return tsdb_codec_encode_adaptive_ex(type, in, in_count, out, out_cap,
+                                         out_codec, out_flags,
+                                         OUTER_LZ_MIN_GAIN);
+}
+
+int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
+                                  const void *in, size_t in_count,
+                                  uint8_t *out, size_t out_cap,
+                                  tsdb_codec_t *out_codec,
+                                  uint16_t *out_flags,
+                                  int min_gain)
+{
     if (!out_codec || !out_flags) return TSDB_ERR_INVAL;
+    if (min_gain <= 0) min_gain = 1;  /* a 0/negative-gain wrap is never worth it */
 
     /* Step 1: domain-codec selection (existing logic). */
     tsdb_codec_t codec = TSDB_CODEC_NONE;
@@ -284,7 +297,7 @@ int tsdb_codec_encode_adaptive(tsdb_type_t type,
     if (lz_rc >= 0) {
         size_t wrapped_bytes = 4 + lz_bytes;
         int gain = (int)domain_bytes - (int)wrapped_bytes;
-        if (gain >= OUTER_LZ_MIN_GAIN && wrapped_bytes <= out_cap) {
+        if (gain >= min_gain && wrapped_bytes <= out_cap) {
             /* Write the 4-byte orig_size header then lz bytes into out. */
             uint32_t orig_u32 = (uint32_t)domain_bytes;
             out[0] = (uint8_t)(orig_u32 & 0xFF);

@@ -763,6 +763,65 @@ static void test_codec_dispatch(void)
     free(sym); free(sym_out);
 }
 
+/* L2 cold-tier adaptive encode: the min_gain lever must (a) never produce
+ * a LARGER block than the default 16-byte-floor path, (b) round-trip
+ * exactly, and (c) on data with a small-but-real LZ gain, the aggressive
+ * floor (1) wraps where the default floor (16) leaves it plain. */
+static void test_l2_adaptive_min_gain(void)
+{
+    const size_t N = 4096;
+    /* Float random-walk: domain codec compresses, leaving an LZ-able
+     * residual where the marginal gain hovers near the 16-byte floor. */
+    double *fl = malloc(N * sizeof(double));
+    double *out = malloc(N * sizeof(double));
+    CHECK(fl && out, "alloc l2");
+    double v = 100.0;
+    uint64_t lcg = 0xABCDEF1234567ULL;
+    for (size_t i = 0; i < N; i++) {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        v += ((double)(lcg >> 40) / (double)(1u<<24) - 0.5) * 2.0;
+        fl[i] = v;
+    }
+
+    uint8_t *buf_hot = malloc(N * 16);
+    uint8_t *buf_l2  = malloc(N * 16);
+    CHECK(buf_hot && buf_l2, "alloc l2 bufs");
+
+    tsdb_codec_t c_hot = TSDB_CODEC_NONE, c_l2 = TSDB_CODEC_NONE;
+    uint16_t f_hot = 0, f_l2 = 0;
+
+    int n_hot = tsdb_codec_encode_adaptive(TSDB_TYPE_FLOAT64, fl, N,
+                                           buf_hot, N * 16, &c_hot, &f_hot);
+    int n_l2  = tsdb_codec_encode_adaptive_ex(TSDB_TYPE_FLOAT64, fl, N,
+                                              buf_l2, N * 16, &c_l2, &f_l2,
+                                              /*min_gain*/ 1);
+    CHECK(n_hot > 0 && n_l2 > 0, "l2 encode both ok");
+    /* L2 (lower floor) is never larger than the hot path. */
+    CHECK(n_l2 <= n_hot, "l2 min_gain=1 never larger than default floor");
+
+    /* Both decode back to the exact input. */
+    CHECK(tsdb_codec_decode_adaptive(c_hot, TSDB_TYPE_FLOAT64, f_hot,
+                                     buf_hot, (size_t)n_hot, out, N) == TSDB_OK,
+          "l2 hot decode");
+    for (size_t i = 0; i < N; i++) CHECK(fl[i] == out[i], "l2 hot round-trip");
+    CHECK(tsdb_codec_decode_adaptive(c_l2, TSDB_TYPE_FLOAT64, f_l2,
+                                     buf_l2, (size_t)n_l2, out, N) == TSDB_OK,
+          "l2 cold decode");
+    for (size_t i = 0; i < N; i++) CHECK(fl[i] == out[i], "l2 cold round-trip");
+
+    /* min_gain <= 0 is clamped to 1, not treated as "wrap always". */
+    tsdb_codec_t c0 = TSDB_CODEC_NONE; uint16_t f0 = 0;
+    int n0 = tsdb_codec_encode_adaptive_ex(TSDB_TYPE_FLOAT64, fl, N,
+                                           buf_l2, N * 16, &c0, &f0, 0);
+    CHECK(n0 > 0 && n0 <= n_hot, "l2 min_gain<=0 clamps to 1");
+
+    printf("[L2] float walk N=%zu: hot=%dB (lz=%d) l2=%dB (lz=%d)\n",
+           N, n_hot, (f_hot & TSDB_BF_OUTER_LZ) != 0,
+           n_l2, (f_l2 & TSDB_BF_OUTER_LZ) != 0);
+
+    free(fl); free(out); free(buf_hot); free(buf_l2);
+}
+
 /* ---------------------------------------------------------------- main */
 
 int main(void)
@@ -803,6 +862,7 @@ int main(void)
 
     printf("\n--- Codec dispatch ---\n");
     test_codec_dispatch();
+    test_l2_adaptive_min_gain();
 
     printf("\nAll tests passed.\n");
     return 0;

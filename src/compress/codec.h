@@ -71,6 +71,28 @@ int tsdb_codec_encode_adaptive(tsdb_type_t type,
                                uint16_t *out_flags);
 
 /*
+ * L2 / cold-tier variant of tsdb_codec_encode_adaptive.
+ *
+ * Identical domain-codec selection, but the outer-lzlite wrapper is
+ * applied whenever it saves at least `min_gain` bytes (instead of the
+ * default 16-byte floor).  Compaction recompresses aged/cold blocks
+ * where read frequency is low, so even a few bytes of size reduction is
+ * worth the marginally slower decode — pass min_gain=1 there to capture
+ * the sub-16-byte LZ wins the hot path intentionally skips.
+ *
+ * min_gain <= 0 is clamped to 1 (a 0/negative gain is never worth the
+ * wrap).  Output wire format and the TSDB_BF_OUTER_LZ flag are identical
+ * to the default path, so tsdb_codec_decode_adaptive handles both with
+ * no changes.
+ */
+int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
+                                  const void *in, size_t in_count,
+                                  uint8_t *out, size_t out_cap,
+                                  tsdb_codec_t *out_codec,
+                                  uint16_t *out_flags,
+                                  int min_gain);
+
+/*
  * Adaptive decode: handles both legacy (flags=0) and lzlite-wrapped blocks.
  *
  * flags     - TSDB_BF_* bitmask from block header

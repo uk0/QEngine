@@ -83,6 +83,33 @@ static inline void put_i64le(uint8_t *p, int64_t v)  { put_u64le(p, (uint64_t)v)
 /* Max compressed output for one COMPACT_BLOCK_POINTS chunk. */
 #define MAX_COMP_OUT  (COMPACT_BLOCK_POINTS * 8 * 2 + 512)
 
+/* L2 cold-tier outer-lzlite gain threshold (resolved once).  Compaction
+ * only runs on aged (>=60s) blocks, so we recompress at a lower wrap
+ * threshold than the hot path's 16-byte floor: any positive byte gain is
+ * kept, trading a hair of decode speed for tighter cold storage.  This is
+ * always safe (never larger than before) and never changes the block
+ * layout — only whether the lzlite wrapper is applied at the margin.
+ *   TSDB_L2_COMPRESS=0   → 16 (revert to hot-path floor)
+ *   TSDB_L2_MIN_GAIN=<n> → explicit floor
+ *   default              → 1
+ *
+ * NOTE: a larger-cold-block tier (which measurements show would shrink
+ * DICT/SYMBOL columns ~11x) is NOT shipped here — the read path matches
+ * columns block-by-block by (ts_min,count) and assumes every column shares
+ * one block size (exec.c), so a per-type or larger block would break
+ * column alignment and corrupt reads.  Raising the block-size ceiling is a
+ * separate, correctness-gated change. */
+static int l2_min_gain(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *en = getenv("TSDB_L2_COMPRESS");
+    if (en && en[0] == '0') { cached = 16; return cached; }
+    const char *mg = getenv("TSDB_L2_MIN_GAIN");
+    if (mg && mg[0]) { int v = atoi(mg); cached = v > 0 ? v : 1; return cached; }
+    cached = 1;
+    return cached;
+}
+
 /* ---- Partition directory name classification ------------------------------ */
 
 /*
@@ -439,13 +466,14 @@ static int compact_column_file(const char *part_dir,
             if (blk_ts_min == INT64_MAX) { blk_ts_min = 0; blk_ts_max = 0; }
         }
 
-        /* Encode. */
+        /* Encode at the L2 cold tier (lower outer-lzlite wrap threshold). */
         tsdb_codec_t codec_used = TSDB_CODEC_NONE;
         uint16_t     blk_flags  = 0;
-        int comp_bytes = tsdb_codec_encode_adaptive(
+        int comp_bytes = tsdb_codec_encode_adaptive_ex(
             col_type, chunk_ptr, chunk,
             comp_buf, MAX_COMP_OUT,
-            &codec_used, &blk_flags);
+            &codec_used, &blk_flags,
+            l2_min_gain());
         if (comp_bytes < 0) {
             free(idx_entries);
             free(comp_buf);
