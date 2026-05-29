@@ -378,6 +378,21 @@ static int compact_column_file(const char *part_dir,
 
         if (off + BLK_HDR_SZ + data_sz > map_len || cnt == 0) continue;
 
+        /* Bound the WRITE into raw_buf.  raw_buf is sized to total_vals (the
+         * idx header's total_rows).  If the per-block counts sum to MORE than
+         * that — which happens when a concurrent flush leaves the header and
+         * the block entries momentarily inconsistent (the compactor reads the
+         * .idx lock-free) — decoding the next block would write past raw_buf
+         * and corrupt the heap (observed as a glibc sysmalloc abort under
+         * drop+write+compaction stress).  Bail on the column; it stays as-is
+         * and a later compaction pass picks up the settled, consistent file. */
+        if (out_pos + (size_t)cnt > total_vals) {
+            free(raw_buf);
+            free(infos);
+            munmap(col_map, map_len);
+            return TSDB_OK;
+        }
+
         const uint8_t *data_ptr = col_map + off + BLK_HDR_SZ;
 
         int rc = tsdb_codec_decode_adaptive(
