@@ -226,18 +226,35 @@ static int safe_write(FILE *fp, const void *buf, size_t n) {
  */
 typedef void (*lock_fn_t)(void *ud);
 
+/* Read the current block count from a column's live .idx header.
+ * Returns UINT32_MAX if the file is missing/short/unrecognised — callers treat
+ * that as "changed" and conservatively skip the swap. */
+static uint32_t live_idx_block_count(const char *part_dir, const char *col_name) {
+    char idx_path[4096];
+    snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return UINT32_MAX;
+    uint8_t hdr[8];
+    size_t n = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+    if (n < 8 || get_u32le(hdr) != IDX_MAGIC) return UINT32_MAX;
+    return get_u32le(hdr + 4);
+}
+
 static int compact_column_file(const char *part_dir,
                                const char *col_name,
                                tsdb_type_t col_type,
                                int         threshold,
                                uint64_t   *out_bytes_written,
                                uint64_t   *out_bytes_saved,
-                               int        *out_produced)
+                               int        *out_produced,
+                               uint32_t   *out_src_blocks)
 {
     char col_path[4096], idx_path[4096];
     char col_tmp[4096],  idx_tmp[4096];
 
     if (out_produced) *out_produced = 0;
+    if (out_src_blocks) *out_src_blocks = 0;
 
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
@@ -273,6 +290,7 @@ static int compact_column_file(const char *part_dir,
         return TSDB_OK;
     }
     uint32_t block_count = get_u32le(hdr_buf + 4);
+    if (out_src_blocks) *out_src_blocks = block_count;
     uint16_t idx_ver     = get_u16le(hdr_buf + 8);
     uint64_t total_rows  = get_u64le(hdr_buf + 12);
 
@@ -638,22 +656,27 @@ static int compact_partition(tsdb_schema_t   *schema,
     int any_compacted = 0;
 
     int *produced = calloc((size_t)schema->ncols, sizeof(int));
-    if (!produced) return TSDB_ERR_NOMEM;
+    uint32_t *src_blocks = calloc((size_t)schema->ncols, sizeof(uint32_t));
+    if (!produced || !src_blocks) { free(produced); free(src_blocks); return TSDB_ERR_NOMEM; }
 
     /* Phase 1 — re-encode each eligible column to .col.tmp/.idx.tmp.  No lock:
      * this only reads the live files and writes new .tmp files.  This is the
      * expensive step (decode + best-of-N re-encode) and is deliberately kept
-     * off the compact lock so readers are never blocked during it. */
+     * off the compact lock so readers are never blocked during it.  We record
+     * the source block count each column was compacted from so phase 2 can
+     * detect a concurrent flush that appended blocks in the meantime. */
     for (int ci = 0; ci < schema->ncols; ci++) {
         uint64_t bw = 0, bs = 0;
         int prod = 0;
+        uint32_t srcb = 0;
         int rc = compact_column_file(part_dir,
                                      schema->cols[ci].name,
                                      schema->cols[ci].type,
                                      threshold,
-                                     &bw, &bs, &prod);
+                                     &bw, &bs, &prod, &srcb);
         if (rc == TSDB_OK && prod) {
-            produced[ci] = 1;
+            produced[ci]   = 1;
+            src_blocks[ci] = srcb;
             any_compacted = 1;
             tsdb_metric_inc("qengine_compactions_total");
             if (stats) {
@@ -674,6 +697,22 @@ static int compact_partition(tsdb_schema_t   *schema,
      * boundaries and corrupting the scan's results. */
     if (any_compacted) {
         if (lock_fn) lock_fn(lock_ud);
+
+        /* Staleness guard: if ANY produced column's live .idx grew since we
+         * snapshotted it in phase 1 (a flush appended blocks to this — now no
+         * longer cold — partition), our .tmp is a stale prefix.  Swapping it in
+         * would clobber the appended block and silently drop those rows (until
+         * anti-entropy heals).  Abort the WHOLE partition swap to keep the
+         * cross-column block alignment consistent; a later pass compacts the
+         * settled files.  flush holds compact_mtx for its append, so reading
+         * the live counts here (under the same lock) is a consistent check. */
+        int stale = 0;
+        for (int ci = 0; ci < schema->ncols && !stale; ci++) {
+            if (!produced[ci]) continue;
+            if (live_idx_block_count(part_dir, schema->cols[ci].name) != src_blocks[ci])
+                stale = 1;
+        }
+
         for (int ci = 0; ci < schema->ncols; ci++) {
             if (!produced[ci]) continue;
             char col_path[4096], idx_path[4096], col_tmp[4096], idx_tmp[4096];
@@ -681,6 +720,7 @@ static int compact_partition(tsdb_schema_t   *schema,
             snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, schema->cols[ci].name);
             snprintf(col_tmp,  sizeof(col_tmp),  "%s/%s.col.tmp", part_dir, schema->cols[ci].name);
             snprintf(idx_tmp,  sizeof(idx_tmp),  "%s/%s.idx.tmp", part_dir, schema->cols[ci].name);
+            if (stale) { remove(col_tmp); remove(idx_tmp); continue; }
             /* Test-only: widen the in-swap window (some columns already
              * renamed, others not) so the concurrent-read test deterministically
              * stresses the reader-blocking path.  Under the lock → readers wait
@@ -700,6 +740,7 @@ static int compact_partition(tsdb_schema_t   *schema,
     }
 
     free(produced);
+    free(src_blocks);
     if (any_compacted && stats) {
         stats->parts_merged++;
     }

@@ -348,6 +348,87 @@ static void test_drop_during_compaction(void) {
     printf("[PASS] DROP during compaction (no use-after-free)\n");
 }
 
+/* ---- T4: append to a partition while it is being compacted --------------
+ * The compactor snapshots a partition's block count in phase 1, then swaps in
+ * phase 2.  If a flush appends a block in between, swapping the stale .tmp
+ * would clobber the appended block (silent row loss).  The staleness guard
+ * aborts the swap when the live .idx grew.  This test asserts the INVARIANT —
+ * no rows lost — which must hold whether the append lands before the snapshot
+ * (compacted in) or after it (swap aborted). */
+static tsdb_compactor_t *g_t4_cpt;
+static void *t4_compact_thread(void *ud) {
+    (void)ud;
+    tsdb_compactor_run_once(g_t4_cpt);   /* compacts, then delays in the swap */
+    return NULL;
+}
+static void test_append_during_compaction(void) {
+    printf("\n[TEST] append to partition during compaction (no row loss)\n");
+    const char *DIR4 = "/tmp/tsdb_test_compaction_ad";
+    rm_rf(DIR4);
+
+    tsdb_db_t *db = NULL;
+    ASSERT_OK(tsdb_open(DIR4, &db));
+    ASSERT_OK(tsdb_create_table(db, "adtbl", COLS, (size_t)NCOLS, "ts"));
+    tsdb_table_t *tbl = NULL;
+    ASSERT_OK(tsdb_open_table(db, "adtbl", &tbl));
+
+    int64_t gr = 0, expected = 0;
+    for (int b = 0; b < 12; b++) {        /* 12 blocks → compactor (min 4) merges */
+        tsdb_batch_t *batch = NULL;
+        ASSERT_OK(tsdb_batch_begin(tbl, &batch));
+        for (int r = 0; r < BATCH_ROWS; r++) {
+            ASSERT_OK(tsdb_batch_row_ts(batch, BASE_TS_NS + gr * TS_STEP_NS));
+            ASSERT_OK(tsdb_batch_row_f64(batch, 1, 1.0));
+            ASSERT_OK(tsdb_batch_row_i64(batch, 2, 1));
+            ASSERT_OK(tsdb_batch_row_end(batch));
+            gr++; expected++;
+        }
+        ASSERT_OK(tsdb_batch_commit(batch));
+    }
+    char tdir[4096]; snprintf(tdir, sizeof(tdir), "%s/%s", DIR4, "adtbl");
+    backdate_partitions(tdir);
+
+    /* Long swap delay so the append below reliably overlaps the compaction. */
+    setenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS", "1200", 1);
+    tsdb_compactor_opts_t opts; memset(&opts, 0, sizeof(opts));
+    opts.min_blocks_to_compact = 4; opts.interval_ns = 10000000LL; opts.worker_threads = 1;
+    ASSERT_OK(tsdb_compactor_start(db, &opts, &g_t4_cpt));
+
+    pthread_t th; pthread_create(&th, NULL, t4_compact_thread, NULL);
+    usleep(400000);   /* let phase-1 encode finish, land the append in the swap window */
+
+    /* Append a fresh batch into the SAME partition (continues the ts sequence,
+     * same day) — forces a flush that appends a block to the live .idx. */
+    tsdb_batch_t *ab = NULL;
+    ASSERT_OK(tsdb_batch_begin(tbl, &ab));
+    for (int r = 0; r < BATCH_ROWS; r++) {
+        ASSERT_OK(tsdb_batch_row_ts(ab, BASE_TS_NS + gr * TS_STEP_NS));
+        ASSERT_OK(tsdb_batch_row_f64(ab, 1, 1.0));
+        ASSERT_OK(tsdb_batch_row_i64(ab, 2, 1));
+        ASSERT_OK(tsdb_batch_row_end(ab));
+        gr++; expected++;
+    }
+    ASSERT_OK(tsdb_batch_commit(ab));
+
+    pthread_join(th, NULL);
+    tsdb_compactor_stop(g_t4_cpt);
+    unsetenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS");
+
+    /* Invariant: every row is still present (count == seeded + appended). */
+    tsdb_result_t *res = NULL;
+    ASSERT_OK(tsdb_query(db, "SELECT count(ts) FROM adtbl", &res));
+    ASSERT(tsdb_result_next(res));
+    int64_t got = tsdb_result_i64(res, 0);
+    tsdb_result_free(res);
+    printf("  expected=%lld got=%lld (no rows lost to the swap)\n",
+           (long long)expected, (long long)got);
+    ASSERT(got == expected);
+
+    tsdb_close(db);
+    rm_rf(DIR4);
+    printf("[PASS] append during compaction (no row loss)\n");
+}
+
 int main(void) {
     printf("[TEST] compaction: 32-block → merge via run_once\n");
 
@@ -599,6 +680,9 @@ int main(void) {
 
     /* T3: DROP TABLE while the compactor is actively compacting it. */
     test_drop_during_compaction();
+
+    /* T4: append to a partition mid-compaction must not lose rows. */
+    test_append_during_compaction();
 
     return 0;
 }
