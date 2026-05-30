@@ -77,6 +77,11 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
                       int64_t cutoff_ns, int op_lt, int inclusive,
                       int *out_removed);
 
+/* Persisted per-table delete watermark: every row with ts < (return value) has
+ * been deleted (op_lt deletes only).  0 = none.  Used by anti-entropy to
+ * re-assert deletes so they can't be resurrected by a peer that missed them. */
+int64_t tsdb_table_delwm_load(tsdb_db_t *db, const char *name);
+
 /* Point-in-time recovery (PITR) trim.  Discards every partition whose
  * start timestamp is strictly greater than target_ns across every open
  * table in the db, so the caller can fast-forward a freshly-restored

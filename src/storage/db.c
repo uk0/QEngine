@@ -914,6 +914,37 @@ static int part_dir_to_range(const char *dname, tsdb_partition_unit_t unit,
     return 0;
 }
 
+/* Per-table delete watermark: "every row with ts < W has been deleted".
+ * Persisted as 8 bytes LE in <tabledir>/_delwm.  Only op_lt deletes (the
+ * retention "drop old data" pattern) advance it.  Anti-entropy re-asserts it
+ * so a delete can't be resurrected by a peer that missed it.  0 = none. */
+static void delwm_path(tsdb_db_t *db, const char *name, char *buf, size_t cap) {
+    char tbl_dir[4096];
+    table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
+    snprintf(buf, cap, "%s/_delwm", tbl_dir);
+}
+int64_t tsdb_table_delwm_load(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return 0;
+    char p[4096]; delwm_path(db, name, p, sizeof(p));
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    int64_t w = 0;
+    if (fread(&w, sizeof(w), 1, f) != 1) w = 0;
+    fclose(f);
+    return w;
+}
+/* Advance the watermark to max(existing, W) and persist.  Best-effort: a
+ * write failure leaves the old watermark (a later delete re-advances it). */
+static void delwm_bump(tsdb_db_t *db, const char *name, int64_t w) {
+    if (w <= 0) return;
+    if (tsdb_table_delwm_load(db, name) >= w) return;
+    char p[4096]; delwm_path(db, name, p, sizeof(p));
+    FILE *f = fopen(p, "wb");
+    if (!f) return;
+    fwrite(&w, sizeof(w), 1, f);
+    fclose(f);
+}
+
 int tsdb_delete_range(tsdb_db_t *db, const char *name,
                       int64_t cutoff_ns, int op_lt, int inclusive,
                       int *out_removed)
@@ -968,6 +999,15 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
     }
 
     pthread_mutex_unlock(&t->compact_mtx);
+
+    /* Advance the persisted delete watermark for op_lt ("delete old data")
+     * deletes, so anti-entropy can re-assert it and a peer that missed this
+     * delete (or resurrected it via a refetch) gets the rows re-deleted.
+     * Stored as the exclusive upper bound W: every ts < W is deleted. */
+    if (op_lt) {
+        int64_t w = inclusive ? cutoff_ns + 1 : cutoff_ns;
+        delwm_bump(db, name, w);
+    }
 
     if (out_removed) *out_removed = removed;
     return TSDB_OK;

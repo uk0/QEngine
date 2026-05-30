@@ -556,12 +556,27 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
     if (out_total_peers) *out_total_peers = npeers;
     if (npeers == 0) return TSDB_OK;
 
-    int acked = 0;
-    int rc = tsdb_replica_broadcast_delete_range(tsdb_cluster_replica_mgr(c),
-                                                  table_name,
-                                                  cutoff_ns, op_lt, inclusive,
-                                                  peers, npeers,
-                                                  &acked);
+    /* Retry until every currently-alive peer ACKs (bounded attempts).  A
+     * delete the broadcast fails to deliver leaves that peer with the rows and
+     * a higher count, which anti-entropy would pull back onto the deleting
+     * node (resurrection).  The delete is idempotent (partition-granular), so
+     * re-broadcasting to peers that already applied is a no-op.  Peers that
+     * stay down are caught later by the anti-entropy watermark re-assert. */
+    int acked = 0, rc = TSDB_OK;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        acked = 0;
+        rc = tsdb_replica_broadcast_delete_range(tsdb_cluster_replica_mgr(c),
+                                                 table_name,
+                                                 cutoff_ns, op_lt, inclusive,
+                                                 peers, npeers,
+                                                 &acked);
+        if (rc == TSDB_OK && acked >= npeers) break;
+        struct timespec bk = { 0, 50 * 1000 * 1000 };  /* 50ms backoff */
+        nanosleep(&bk, NULL);
+        npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+        if (out_total_peers) *out_total_peers = npeers;
+        if (npeers == 0) break;
+    }
     if (out_acked_peers) *out_acked_peers = acked;
     return rc;
 }
@@ -809,6 +824,21 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
 
     tsdb_cluster_t *c = cluster_get(db);
     if (!c) return TSDB_OK;
+
+    /* Delete-watermark re-assert (makes deletes durable vs anti-entropy).
+     * If this table has a persisted delete watermark W ("all ts < W deleted"),
+     * (1) re-apply it locally — undoing any rows a prior refetch resurrected —
+     * and (2) re-broadcast it to alive peers BEFORE the count comparison, so a
+     * peer that missed the original delete (or came back with stale rows)
+     * deletes them and can't poison the pull below.  Both ops are idempotent.
+     * Skip while replaying a peer's delete to avoid broadcast recursion. */
+    int64_t wm = tsdb_table_delwm_load(db, table_name);
+    if (wm > 0) {
+        int rmv = 0;
+        tsdb_delete_range(db, table_name, wm, /*op_lt=*/1, /*inclusive=*/0, &rmv);
+        int a = 0, tot = 0;
+        tsdb_cluster_broadcast_delete_range(db, table_name, wm, 1, 0, &a, &tot);
+    }
 
     uint64_t local_count = 0;
     int64_t  local_max_ts = 0;
