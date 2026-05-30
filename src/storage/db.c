@@ -57,6 +57,11 @@ typedef struct tsdb_table_internal {
      * a concurrent DROP is a use-after-free (caught by ASan in agg_write /
      * tsdb_part_col_blocks). */
     volatile int         scan_refs;
+    /* Set (under db->lock) while ALTER ADD COLUMN reallocs schema->cols.
+     * tsdb_db_scan_acquire waits while it is set, so no query starts reading
+     * the cols array during the realloc; ALTER also drains scan_refs to 0
+     * first, closing the schema-realloc-vs-lockless-reader race. */
+    volatile int         altering;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -1020,6 +1025,11 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
 {
     if (!db || !table_name || !col_name) return TSDB_ERR_INVAL;
 
+    /* Find the table, mark it `altering`, and drain in-flight scans to 0 — all
+     * under db->lock.  `altering` makes new tsdb_db_scan_acquire callers wait,
+     * and draining scan_refs waits out existing queries, so no reader is
+     * iterating schema->cols when tsdb_schema_add_column reallocs it below.
+     * DDL is serialised on the cluster, so the table can't be dropped here. */
     pthread_mutex_lock(&db->lock);
     tsdb_table_internal_t *t = NULL;
     for (int i = 0; i < db->ntables; i++) {
@@ -1027,39 +1037,44 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
             t = db->tables[i]; break;
         }
     }
+    if (!t) { pthread_mutex_unlock(&db->lock); return TSDB_ERR_NOTFOUND; }
+    t->altering = 1;
+    while (t->scan_refs > 0) {
+        pthread_mutex_unlock(&db->lock);
+        usleep(1000);
+        pthread_mutex_lock(&db->lock);
+    }
     pthread_mutex_unlock(&db->lock);
 
-    if (!t) return TSDB_ERR_NOTFOUND;
-
-    /* Serialise with compactor and concurrent flushes. */
+    /* Serialise with concurrent writes (batch_mu — the cluster ingest/replica
+     * paths hold it) and with the compactor/flush (compact_mtx).  Same lock
+     * order as the truncate path (batch_mu → compact_mtx) to avoid deadlock. */
+    pthread_mutex_lock(&t->batch_mu);
     pthread_mutex_lock(&t->compact_mtx);
 
     /* Force memtable to disk so we can safely re-size its column buffers.
      * Use the _locked variant since we already hold compact_mtx — calling
      * the public flush_and_clear_ex here would self-deadlock. */
     int rc = flush_and_clear_locked(t, /*skip_replicate=*/1);
-    if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
-
-    /* Persist the schema change first.
-     *
-     * KNOWN RACE (not yet fixed — tracked): tsdb_schema_add_column reallocs
-     * t->schema->cols, but a concurrent SELECT iterates that array by raw
-     * pointer without a per-schema guard (scan_acquire only blocks DROP-free,
-     * not this realloc).  The window is the sub-microsecond cols memcpy and
-     * requires a concurrent ALTER+SELECT on the SAME table, so it is rare; a
-     * correct fix is a copy-on-write schema swap (build a new schema, pin the
-     * old via scan_refs, atomic-swap t->schema) — a larger refactor than this
-     * stability pass.  compact_mtx here already excludes the compactor/flush. */
-    rc = tsdb_schema_add_column(t->schema, col_name, col_type);
-    if (rc != TSDB_OK) { pthread_mutex_unlock(&t->compact_mtx); return rc; }
-
-    /* Grow the memtable's column buffer to match. */
-    rc = tsdb_memtable_extend_for_new_column(t->memtable);
-    /* If this fails the schema is already updated on disk; we leave the
-     * in-memory schema consistent but the memtable cannot ingest new rows
-     * for this column until reopen. Surface the error unchanged. */
+    if (rc == TSDB_OK) {
+        /* Realloc of schema->cols is now safe: scans are drained + gated by
+         * `altering`, writes are excluded by batch_mu, flush/compactor by
+         * compact_mtx. */
+        rc = tsdb_schema_add_column(t->schema, col_name, col_type);
+        if (rc == TSDB_OK) {
+            /* Grow the memtable's column buffer to match.  On failure the
+             * on-disk schema is updated but the memtable can't ingest the new
+             * column until reopen; surface the error unchanged. */
+            rc = tsdb_memtable_extend_for_new_column(t->memtable);
+        }
+    }
 
     pthread_mutex_unlock(&t->compact_mtx);
+    pthread_mutex_unlock(&t->batch_mu);
+
+    pthread_mutex_lock(&db->lock);
+    t->altering = 0;
+    pthread_mutex_unlock(&db->lock);
     return rc;
 }
 
@@ -1446,6 +1461,16 @@ tsdb_table_internal_t *tsdb_db_scan_acquire(tsdb_db_t *db, const char *name) {
     if (!db || !name) return NULL;
     pthread_mutex_lock(&db->lock);
     tsdb_table_internal_t *t = db_find_table(db, name);
+    /* Wait out an in-flight ALTER on this table: it reallocs schema->cols, and
+     * we are about to hand the caller a raw pointer it will read lock-free.
+     * Re-resolve after each wait (the table can't be ALTERed and dropped at
+     * once — DDL is serialised — but re-finding keeps t valid). */
+    while (t && t->altering) {
+        pthread_mutex_unlock(&db->lock);
+        usleep(1000);
+        pthread_mutex_lock(&db->lock);
+        t = db_find_table(db, name);
+    }
     if (t) t->scan_refs++;
     pthread_mutex_unlock(&db->lock);
     return t;
