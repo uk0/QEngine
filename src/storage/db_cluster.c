@@ -1001,6 +1001,40 @@ void *tsdb_resync_startup_thread(void *ud) {
     return NULL;
 }
 
+/* Re-assert every table's persisted delete watermark to all alive peers.
+ * Cheap (only tables that have had an op_lt delete; just an idempotent
+ * broadcast, no count/pull), so it can run on a short period.  This is what
+ * makes a delete durable against a peer that was down when it happened: once
+ * the peer is back, the next re-assert sweep re-broadcasts the watermark and
+ * the peer deletes its stale rows — converging without that peer ever having
+ * to learn the watermark by itself. */
+void tsdb_delwm_reassert_all(tsdb_db_t *db) {
+    if (!db) return;
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return;
+    char names[TSDB_CLUSTER_MAX_NODES * 8][64];
+    int max_names = (int)(sizeof(names) / sizeof(names[0]));
+    int n = tsdb_db_list_table_names(db, names, max_names);
+    for (int i = 0; i < n; i++) {
+        int64_t wm = tsdb_table_delwm_load(db, names[i]);
+        if (wm <= 0) continue;
+        int a = 0, tot = 0;
+        tsdb_cluster_broadcast_delete_range(db, names[i], wm, 1, 0, &a, &tot);
+    }
+}
+
+/* Background thread: re-assert delete watermarks every 30s. */
+void *tsdb_delwm_reassert_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return NULL;
+    for (;;) {
+        struct timespec ts = { 30, 0 };
+        nanosleep(&ts, NULL);
+        tsdb_delwm_reassert_all(db);
+    }
+    return NULL;
+}
+
 /* ---- Phase γ — read-side forwarding for shard mode --------------------
  *
  * When TSDB_SHARD_REPLICA_N is set and this node is NOT in the owner

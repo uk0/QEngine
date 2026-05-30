@@ -1282,6 +1282,24 @@ int main(int argc, char **argv) {
         pthread_attr_destroy(&attr);
     }
 
+    /* Periodic delete-watermark re-assert: re-broadcasts each table's persisted
+     * delete watermark to alive peers every 30s, so a delete sticks even
+     * against a peer that was down when it happened (it re-deletes its stale
+     * rows on the next sweep after rejoining).  Cheap — only tables that have
+     * had a delete, just an idempotent broadcast. */
+    {
+        pthread_t delwm_thr;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        extern void *tsdb_delwm_reassert_thread(void *ud);
+        if (pthread_create(&delwm_thr, &attr,
+                           tsdb_delwm_reassert_thread, db) == 0) {
+            printf("[node] delete-watermark re-assert armed\n");
+        }
+        pthread_attr_destroy(&attr);
+    }
+
     /* Catalog self-heal for data nodes: pull master's catalog log
      * files via TSDB_RPC_CATALOG_DUMP and replay locally.  Closes the
      * recurring 'cnode-3 missing 50 catalog rows' divergence — caused
