@@ -203,6 +203,40 @@ int tsdb_codec_encode(tsdb_type_t type,
         *out_codec = TSDB_CODEC_DICT;
         return (int)dict_bytes;
     }
+    case TSDB_TYPE_FLOAT32: {
+        /* The user chose 32-bit precision for this column.  Narrow every value
+         * to float, then keep whichever is smaller: a Gorilla pass over the
+         * narrowed values (wins on slowly-varying data — matches or beats
+         * full-precision FLOAT64), or a flat 4-byte store (wins on high-entropy
+         * data — half of FLOAT64's ~7 bytes/value).  So a FLOAT32 column is
+         * never larger than the same data as FLOAT64; it's the user's
+         * lossy-by-choice space win. */
+        const double *d = (const double *)in;
+        size_t raw_bytes = in_count * 4;
+        /* Gorilla candidate over f32-precision doubles. */
+        double *nd = malloc(in_count * sizeof(double));
+        if (nd) {
+            for (size_t i = 0; i < in_count; i++) nd[i] = (double)(float)d[i];
+            size_t gcap = in_count * 8 + 64;
+            uint8_t *gtmp = malloc(gcap);
+            size_t gbytes = 0;
+            int grc = gtmp ? tsdb_gorilla_encode(nd, in_count, gtmp, gcap, &gbytes) : -1;
+            free(nd);
+            if (grc == TSDB_OK && gbytes < raw_bytes && gbytes <= out_cap) {
+                memcpy(out, gtmp, gbytes);
+                free(gtmp);
+                *out_codec = TSDB_CODEC_GORILLA;  /* decodes straight to doubles */
+                return (int)gbytes;
+            }
+            free(gtmp);
+        }
+        /* Flat 4-byte narrow. */
+        if (raw_bytes > out_cap) return TSDB_ERR_FULL;
+        float *f = (float *)out;
+        for (size_t i = 0; i < in_count; i++) f[i] = (float)d[i];
+        *out_codec = TSDB_CODEC_F32;
+        return (int)raw_bytes;
+    }
     default:
         return TSDB_ERR_UNSUPPORTED;
     }
@@ -236,6 +270,15 @@ int tsdb_codec_decode(tsdb_codec_t codec,
             /* SYMBOL or any uint32 type. */
             return tsdb_pfor_decode(in, in_bytes, (uint32_t *)out, out_count);
         }
+    case TSDB_CODEC_F32: {
+        /* 4-byte float on disk -> double in the output buffer (FLOAT32 column's
+         * in-memory width is 8). */
+        if (in_bytes < out_count * 4) return TSDB_ERR_CORRUPT;
+        const float *f = (const float *)in;
+        double *d = (double *)out;
+        for (size_t i = 0; i < out_count; i++) d[i] = (double)f[i];
+        return TSDB_OK;
+    }
     case TSDB_CODEC_RAW:
     case TSDB_CODEC_NONE: {
         size_t width = tsdb_type_width(type);

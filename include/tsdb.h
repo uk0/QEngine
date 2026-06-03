@@ -60,7 +60,10 @@ typedef enum {
     TSDB_TYPE_TIMESTAMP = 1, /* int64 nanoseconds since epoch */
     TSDB_TYPE_INT64     = 2,
     TSDB_TYPE_FLOAT64   = 3,
-    TSDB_TYPE_SYMBOL    = 4  /* dictionary-encoded string */
+    TSDB_TYPE_SYMBOL    = 4, /* dictionary-encoded string */
+    TSDB_TYPE_FLOAT32   = 5  /* 4-byte on disk, double in memory/query — halves
+                              * disk for the float column when 32-bit precision
+                              * is enough.  The user opts in per column. */
 } tsdb_type_t;
 
 /* Timestamps: nanoseconds since Unix epoch. */

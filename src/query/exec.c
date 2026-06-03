@@ -80,6 +80,15 @@ void tsdb_set_query_pool_size(int n) {
  * its full definition.  Full typedef appears in the Scan state section below. */
 typedef struct scan_src scan_src_t;
 
+/* A FLOAT32 column is stored 4-byte on disk but is a double everywhere in
+ * memory and in the query path (the codec widens it on decode).  Normalising
+ * its type to FLOAT64 wherever the executor branches on the *value* type lets
+ * every existing FLOAT64 path serve it unchanged — no per-op FLOAT32 cases.
+ * (Schema introspection / DESCRIBE still reports the real FLOAT32 type.) */
+static inline tsdb_type_t qcoltype(tsdb_type_t t) {
+    return t == TSDB_TYPE_FLOAT32 ? TSDB_TYPE_FLOAT64 : t;
+}
+
 /* ---- Bloom filter block-skip statistics --------------------------------- */
 
 /* Counts blocks skipped by Bloom filter in the most recent query.
@@ -681,7 +690,7 @@ static int apply_filter_expr(eval_ctx_t *ctx, qast_expr_t *e, uint64_t *bm) {
         ctx->errored = 1; return TSDB_ERR_UNSUPPORTED;
     }
 
-    tsdb_type_t ct = ctx->schema->cols[col].type;
+    tsdb_type_t ct = qcoltype(ctx->schema->cols[col].type);
 
     /* Build a temp bitmap = all-1, apply, then AND into bm. */
     size_t nw = (ctx->nrows + 63) / 64;
@@ -904,7 +913,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                 memset(&arr[n], 0, sizeof(arr[n]));
                 arr[n].kind = PROJ_COL;
                 arr[n].col = c;
-                arr[n].out_type = s->cols[c].type;
+                arr[n].out_type = qcoltype(s->cols[c].type);
                 snprintf(arr[n].name, sizeof(arr[n].name), "%s", s->cols[c].name);
                 n++;
             }
@@ -919,7 +928,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             if (c < 0) { eset(err, errcap, "unknown column '%s'", e->v.s); free(arr); return TSDB_ERR_SCHEMA; }
             arr[n].kind = PROJ_COL;
             arr[n].col = c;
-            arr[n].out_type = s->cols[c].type;
+            arr[n].out_type = qcoltype(s->cols[c].type);
             snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias ? si->alias : s->cols[c].name);
         } else if (is_agg_call(e)) {
             has_agg = 1;
@@ -1223,7 +1232,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
  * keeps the hot path allocation-free. */
 static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
                        const uint64_t *bm, void *scratch) {
-    tsdb_type_t t = (p->col >= 0) ? s->cols[p->col].type : TSDB_TYPE_INT64;
+    tsdb_type_t t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
 
     if (p->kind == PROJ_AGG_COUNT) {
         p->agg_count += tsdb_bitmap_popcount(bm, n);
@@ -1367,7 +1376,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
         const int64_t *ts_col = (bufs && s->ts_col_idx >= 0)
                                 ? (const int64_t *)bufs[s->ts_col_idx] : NULL;
         if (!ts_col || p->col < 0) return;
-        tsdb_type_t vt = s->cols[p->col].type;
+        tsdb_type_t vt = qcoltype(s->cols[p->col].type);
         for (size_t i = 0; i < n; i++) {
             if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
             int64_t ts = ts_col[i];
@@ -1422,7 +1431,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
 }
 
 static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx) {
-    tsdb_type_t src_t = (p->col >= 0) ? s->cols[p->col].type : TSDB_TYPE_INT64;
+    tsdb_type_t src_t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
     double out_f = 0.0;
     int64_t out_i = 0;
     int is_int = (p->out_type == TSDB_TYPE_INT64 || p->out_type == TSDB_TYPE_TIMESTAMP);
@@ -1550,7 +1559,7 @@ static void agg_apply_stats(proj_t *p, tsdb_schema_t *s,
                              const tsdb_block_meta_t *meta,
                              uint32_t row_count)
 {
-    tsdb_type_t ct = (p->col >= 0) ? s->cols[p->col].type : TSDB_TYPE_INT64;
+    tsdb_type_t ct = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
     switch (p->kind) {
         case PROJ_AGG_COUNT:
             p->agg_count += row_count;
@@ -2118,7 +2127,7 @@ static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m) {
     if (total == 0) { scan_plan_free(&rplan); return TSDB_OK; }
 
     for (size_t c = 0; c < m->ncols; c++) {
-        m->col_types[c] = rs->cols[c].type; m->col_syms[c] = rs->cols[c].symtab;
+        m->col_types[c] = qcoltype(rs->cols[c].type); m->col_syms[c] = rs->cols[c].symtab;
         m->col_bufs[c] = malloc(tsdb_type_width(rs->cols[c].type) * total);
         if (!m->col_bufs[c]) { scan_plan_free(&rplan); right_mat_free(m); return TSDB_ERR_NOMEM; }
     }
@@ -2199,7 +2208,7 @@ static int asof_keys_eq(tsdb_schema_t *ls, void **lb, size_t lr, int *lcol_idx,
                          right_mat_t *m, size_t rr, int *rcol_idx, int nkeys) {
     for (int k = 0; k < nkeys; k++) {
         int lc = lcol_idx[k], rc2 = rcol_idx[k];
-        tsdb_type_t lt = ls->cols[lc].type, rt = m->col_types[rc2];
+        tsdb_type_t lt = qcoltype(ls->cols[lc].type), rt = m->col_types[rc2];
         size_t lw = tsdb_type_width(lt), rw = tsdb_type_width(rt);
         if (lt == TSDB_TYPE_SYMBOL && rt == TSDB_TYPE_SYMBOL) {
             uint32_t a, b2;
@@ -2247,13 +2256,13 @@ static int build_projs_asof(qast_query_t *q, tsdb_schema_t *ls, tsdb_schema_t *r
             for (int c = 0; c < ls->ncols; c++) {
                 if (n >= cap) { cap = cap ? cap*2 : 8; arr = realloc(arr, (size_t)cap*sizeof(*arr)); }
                 memset(&arr[n], 0, sizeof(arr[n]));
-                arr[n].kind = PROJ_COL; arr[n].col = c; arr[n].out_type = ls->cols[c].type;
+                arr[n].kind = PROJ_COL; arr[n].col = c; arr[n].out_type = qcoltype(ls->cols[c].type);
                 snprintf(arr[n].name, sizeof(arr[n].name), "%s", ls->cols[c].name); n++;
             }
             for (int c = 0; c < rs->ncols; c++) {
                 if (n >= cap) { cap = cap ? cap*2 : 8; arr = realloc(arr, (size_t)cap*sizeof(*arr)); }
                 memset(&arr[n], 0, sizeof(arr[n]));
-                arr[n].kind = PROJ_COL; arr[n].col = c | PROJ_RFLAG; arr[n].out_type = rs->cols[c].type;
+                arr[n].kind = PROJ_COL; arr[n].col = c | PROJ_RFLAG; arr[n].out_type = qcoltype(rs->cols[c].type);
                 snprintf(arr[n].name, sizeof(arr[n].name), "%s", rs->cols[c].name); n++;
             }
             continue;
@@ -2264,7 +2273,7 @@ static int build_projs_asof(qast_query_t *q, tsdb_schema_t *ls, tsdb_schema_t *r
         if (e->kind != QAST_IDENT) { eset(err, errcap, "ASOF JOIN: only column references supported"); free(arr); return TSDB_ERR_UNSUPPORTED; }
         int lc = resolve_col(ls, e->v.s);
         if (lc >= 0) {
-            arr[n].kind = PROJ_COL; arr[n].col = lc; arr[n].out_type = ls->cols[lc].type;
+            arr[n].kind = PROJ_COL; arr[n].col = lc; arr[n].out_type = qcoltype(ls->cols[lc].type);
             snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias ? si->alias : ls->cols[lc].name);
         } else {
             int rc2 = resolve_col(rs, e->v.s);
@@ -3567,7 +3576,7 @@ static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                     src_rc = apply_filter_expr(&ctx, q->where, bm);
                 }
                 if (src_rc == TSDB_OK) {
-                    tsdb_type_t vtype = s->cols[val_col].type;
+                    tsdb_type_t vtype = qcoltype(s->cols[val_col].type);
                     for (size_t row = 0; row < n; row++) {
                         if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
                         if (pts_n >= pts_cap) {
@@ -4966,7 +4975,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                     int col = projs[pi].col;
                     if (projs[pi].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; }
                     if (col < 0) continue;
-                    tsdb_type_t ct = s->cols[col].type;
+                    tsdb_type_t ct = qcoltype(s->cols[col].type);
                     if (ct == TSDB_TYPE_FLOAT64) {
                         double x = ((const double *)bufs[col])[i];
                         cur_state.sum_f += x;
@@ -5071,7 +5080,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             if (projs[_pa].kind == PROJ_AGG_COUNT) continue; /* row count above */ \
             int _caa = projs[_pa].col;                                            \
             if (_caa < 0) continue;                                               \
-            if (s->cols[_caa].type == TSDB_TYPE_FLOAT64) {                        \
+            if (qcoltype(s->cols[_caa].type) == TSDB_TYPE_FLOAT64) {                        \
                 double _xa = ((const double *)bufs[_caa])[(ri)];                  \
                 cur_state.sum_f += _xa;                                           \
                 if (_xa < cur_state.min_f) cur_state.min_f = _xa;                 \

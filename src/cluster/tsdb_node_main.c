@@ -729,6 +729,7 @@ static int write_json_cell(char *buf, size_t cap, tsdb_result_t *res,
         case TSDB_TYPE_INT64:
             return snprintf(buf, cap, "%" PRId64,
                             tsdb_result_i64(res, col));
+        case TSDB_TYPE_FLOAT32: /* surfaced as a promoted double */
         case TSDB_TYPE_FLOAT64: {
             double v = tsdb_result_f64(res, col);
             /* JSON has no NaN/Inf — emit null. */
@@ -758,6 +759,7 @@ static const char *type_name(tsdb_type_t t) {
         case TSDB_TYPE_TIMESTAMP: return "TIMESTAMP";
         case TSDB_TYPE_INT64:     return "INT64";
         case TSDB_TYPE_FLOAT64:   return "FLOAT64";
+        case TSDB_TYPE_FLOAT32:   return "FLOAT32";
         case TSDB_TYPE_SYMBOL:    return "SYMBOL";
     }
     return "UNKNOWN";

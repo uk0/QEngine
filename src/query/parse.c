@@ -888,6 +888,8 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                     col->type = TSDB_TYPE_INT64;
                 } else if (ident_ci(&p.tok, "float64")) {
                     col->type = TSDB_TYPE_FLOAT64;
+                } else if (ident_ci(&p.tok, "float32") || ident_ci(&p.tok, "float")) {
+                    col->type = TSDB_TYPE_FLOAT32;
                 } else if (ident_ci(&p.tok, "symbol")) {
                     col->type = TSDB_TYPE_SYMBOL;
                 } else {
@@ -925,6 +927,8 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                     tc->type = TSDB_TYPE_INT64;
                 } else if (ident_ci(&p.tok, "float64")) {
                     tc->type = TSDB_TYPE_FLOAT64;
+                } else if (ident_ci(&p.tok, "float32") || ident_ci(&p.tok, "float")) {
+                    tc->type = TSDB_TYPE_FLOAT32;
                 } else if (ident_ci(&p.tok, "symbol")) {
                     tc->type = TSDB_TYPE_SYMBOL;
                 } else {
@@ -1015,6 +1019,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
                     if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "timestamp")) { ty = TSDB_TYPE_TIMESTAMP; advance(&p); }
                     else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "int64"))   { ty = TSDB_TYPE_INT64;   advance(&p); }
                     else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "float64")) { ty = TSDB_TYPE_FLOAT64; advance(&p); }
+                    else if (p.tok.kind == QTOK_IDENT && (ident_ci(&p.tok, "float32") || ident_ci(&p.tok, "float"))) { ty = TSDB_TYPE_FLOAT32; advance(&p); }
                     else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "symbol"))  { ty = TSDB_TYPE_SYMBOL;  advance(&p); }
                     else {
                         perr(&p, "expected column type (TIMESTAMP/INT64/FLOAT64/SYMBOL)");

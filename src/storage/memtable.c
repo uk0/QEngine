@@ -298,7 +298,10 @@ int tsdb_memtable_row_f64(tsdb_memtable_t *m, int col, double v) {
     if (!m) return TSDB_ERR_INVAL;
     if (!m->in_row) return TSDB_ERR_INVAL;
     if (col < 0 || col >= m->schema->ncols) return TSDB_ERR_INVAL;
-    if (m->schema->cols[col].type != TSDB_TYPE_FLOAT64) return TSDB_ERR_SCHEMA;
+    /* FLOAT32 columns are doubles in memory (8B buffer); only the on-disk
+     * codec narrows to 4 bytes, so the per-row f64 setter serves both. */
+    if (m->schema->cols[col].type != TSDB_TYPE_FLOAT64 &&
+        m->schema->cols[col].type != TSDB_TYPE_FLOAT32) return TSDB_ERR_SCHEMA;
 
     double *buf = (double *)m->col_bufs[col];
     buf[m->nrows] = v;

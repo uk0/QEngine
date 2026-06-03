@@ -65,6 +65,9 @@ const (
 	TypeInt64     byte = 2
 	TypeFloat64   byte = 3
 	TypeSymbol    byte = 4
+	// TypeFloat32 stores 4 bytes on disk (half of Float64) but is sent and
+	// returned as a 64-bit double — write its values via Row.F64.
+	TypeFloat32 byte = 5
 )
 
 // crc32c table (Castagnoli polynomial) — Go's stdlib hash/crc32 uses hardware

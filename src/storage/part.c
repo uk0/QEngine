@@ -451,6 +451,7 @@ static void compute_block_stats(tsdb_type_t type,
             /* TIMESTAMP: SUM deliberately left off even when lossless. */
             break;
         }
+        case TSDB_TYPE_FLOAT32:  /* doubles in memory (width 8) — same stats path */
         case TSDB_TYPE_FLOAT64: {
             const double *v = (const double *)raw_vals;
             double mn = v[0], mx = v[0], s = v[0];

@@ -35,7 +35,9 @@ typedef enum {
     TSDB_CODEC_LZLITE  = 7, /* LZ77-style block wrapper (optional outer layer) */
     TSDB_CODEC_CHIMP128 = 8, /* Chimp128: Chimp + 128-elem ring buffer (VLDB 2022) */
     TSDB_CODEC_BP128   = 9, /* SIMD-BP128 bit-packing (Lemire & Boytsov) */
-    TSDB_CODEC_PFOR    = 10 /* PFOR-Delta (patched frame of reference) */
+    TSDB_CODEC_PFOR    = 10,/* PFOR-Delta (patched frame of reference) */
+    TSDB_CODEC_F32     = 11 /* narrow double->float32: 4 bytes/value on disk,
+                            * widened back to double on decode (FLOAT32 column) */
 } tsdb_codec_t;
 
 /* Size in bytes of a physical value for a given type (fixed-width columns). */
@@ -44,6 +46,8 @@ static inline size_t tsdb_type_width(tsdb_type_t t) {
     case TSDB_TYPE_TIMESTAMP: return 8;
     case TSDB_TYPE_INT64:     return 8;
     case TSDB_TYPE_FLOAT64:   return 8;
+    case TSDB_TYPE_FLOAT32:   return 8; /* double in memory; the F32 codec
+                                         * narrows to 4B only on disk. */
     case TSDB_TYPE_SYMBOL:    return 4; /* uint32 dict code */
     default:                  return 0;
     }
@@ -58,6 +62,7 @@ static inline const char *tsdb_type_name(tsdb_type_t t) {
     case TSDB_TYPE_TIMESTAMP: return "TIMESTAMP";
     case TSDB_TYPE_INT64:     return "INT64";
     case TSDB_TYPE_FLOAT64:   return "FLOAT64";
+    case TSDB_TYPE_FLOAT32:   return "FLOAT32";
     case TSDB_TYPE_SYMBOL:    return "SYMBOL";
     default:                  return "?";
     }
