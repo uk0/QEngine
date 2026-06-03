@@ -18,9 +18,10 @@ import (
 	tsdb "github.com/qengine/tsdb-go"
 )
 
+var priceType = tsdb.TypeFloat64
 var cols = []tsdb.Column{
 	{Name: "ts", Type: tsdb.TypeTimestamp},
-	{Name: "price", Type: tsdb.TypeFloat64},
+	{Name: "price", Type: priceType},
 	{Name: "qty", Type: tsdb.TypeInt64},
 }
 
@@ -54,49 +55,72 @@ func main() {
 	rows := flag.Int("rows", 500000, "rows to ingest per mode")
 	batch := flag.Int("batch", 8192, "rows per batch")
 	window := flag.Int("window", 64, "pipeline in-flight window")
+	mode := flag.String("mode", "both", "sync | pipe | both")
+	table := flag.String("table", "pipebench", "table name prefix (suffixed _sync/_pipe)")
+	quiet := flag.Bool("quiet", false, "print only rows/s (for scripting)")
+	f32 := flag.Bool("f32", false, "store price as FLOAT32")
 	flag.Parse()
+	if *f32 {
+		priceType = tsdb.TypeFloat32
+		cols[1].Type = tsdb.TypeFloat32
+	}
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 	nbatch := (*rows + *batch - 1) / *batch
-
-	// ---- synchronous ----
-	cs := dial(*addr, "pipebench_sync")
-	t0 := time.Now()
-	for b := 0; b < nbatch; b++ {
+	batchN := func(b int) int {
 		n := *batch
 		if b*(*batch)+n > *rows {
 			n = *rows - b*(*batch)
 		}
-		if _, err := cs.WriteBatch("pipebench_sync", cols, mkRows(base, b*(*batch), n)); err != nil {
-			log.Fatalf("sync write: %v", err)
-		}
+		return n
 	}
-	syncS := time.Since(t0).Seconds()
-	cs.Close()
 
-	// ---- pipelined ----
-	cp := dial(*addr, "pipebench_pipe")
-	pw := cp.NewPipelineWriter(*window)
-	t0 = time.Now()
-	for b := 0; b < nbatch; b++ {
-		n := *batch
-		if b*(*batch)+n > *rows {
-			n = *rows - b*(*batch)
+	var syncS, pipeS float64
+	if *mode == "sync" || *mode == "both" {
+		tn := *table + "_sync"
+		cs := dial(*addr, tn)
+		t0 := time.Now()
+		for b := 0; b < nbatch; b++ {
+			if _, err := cs.WriteBatch(tn, cols, mkRows(base, b*(*batch), batchN(b))); err != nil {
+				log.Fatalf("sync write: %v", err)
+			}
 		}
-		if err := pw.Write("pipebench_pipe", cols, mkRows(base, b*(*batch), n)); err != nil {
-			log.Fatalf("pipe write: %v", err)
+		syncS = time.Since(t0).Seconds()
+		cs.Close()
+	}
+	if *mode == "pipe" || *mode == "both" {
+		tn := *table + "_pipe"
+		cp := dial(*addr, tn)
+		pw := cp.NewPipelineWriter(*window)
+		t0 := time.Now()
+		for b := 0; b < nbatch; b++ {
+			if err := pw.Write(tn, cols, mkRows(base, b*(*batch), batchN(b))); err != nil {
+				log.Fatalf("pipe write: %v", err)
+			}
 		}
+		if err := pw.Close(); err != nil {
+			log.Fatalf("pipe close: %v", err)
+		}
+		pipeS = time.Since(t0).Seconds()
+		cp.Close()
 	}
-	if err := pw.Close(); err != nil {
-		log.Fatalf("pipe close: %v", err)
-	}
-	pipeS := time.Since(t0).Seconds()
-	cp.Close()
 
-	syncRps := float64(*rows) / syncS
-	pipeRps := float64(*rows) / pipeS
+	if *quiet {
+		if *mode == "pipe" {
+			fmt.Printf("%.0f\n", float64(*rows)/pipeS)
+		} else {
+			fmt.Printf("%.0f\n", float64(*rows)/syncS)
+		}
+		return
+	}
 	fmt.Printf("rows=%d batch=%d window=%d  (%d batches each)\n", *rows, *batch, *window, nbatch)
-	fmt.Printf("  sync     : %7.3fs  %10.0f rows/s\n", syncS, syncRps)
-	fmt.Printf("  pipelined: %7.3fs  %10.0f rows/s\n", pipeS, pipeRps)
-	fmt.Printf("  speedup  : %.2fx\n", pipeRps/syncRps)
+	if syncS > 0 {
+		fmt.Printf("  sync     : %7.3fs  %10.0f rows/s\n", syncS, float64(*rows)/syncS)
+	}
+	if pipeS > 0 {
+		fmt.Printf("  pipelined: %7.3fs  %10.0f rows/s\n", pipeS, float64(*rows)/pipeS)
+	}
+	if syncS > 0 && pipeS > 0 {
+		fmt.Printf("  speedup  : %.2fx\n", (float64(*rows)/pipeS)/(float64(*rows)/syncS))
+	}
 }

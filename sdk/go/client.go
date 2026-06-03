@@ -137,8 +137,10 @@ func encodeBatch(table string, cols []Column, rows []Row) ([]byte, error) {
 		buf.WriteByte(0) // codec = RAW
 
 		switch col.Type {
-		case TypeTimestamp, TypeInt64, TypeFloat64:
-			// Fixed-width: 8 bytes/row, contiguous.
+		case TypeTimestamp, TypeInt64, TypeFloat64, TypeFloat32:
+			// Fixed-width: 8 bytes/row, contiguous.  FLOAT32 travels as a
+			// double too — the server stores it 8-byte in memory and the codec
+			// narrows to 4 bytes only on disk — so write it via Row.F64.
 			binary.LittleEndian.PutUint32(tmp[0:4], uint32(len(rows)*8))
 			buf.Write(tmp[0:4])
 			for _, r := range rows {
@@ -151,7 +153,7 @@ func encodeBatch(table string, cols []Column, rows []Row) ([]byte, error) {
 						v = r.I64[ci]
 					}
 					binary.LittleEndian.PutUint64(tmp[0:8], uint64(v))
-				case TypeFloat64:
+				case TypeFloat64, TypeFloat32:
 					var v float64
 					if r.F64 != nil {
 						v = r.F64[ci]
