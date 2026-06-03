@@ -161,6 +161,65 @@ func TestSymbolRoundTrip(t *testing.T) {
 	_, _ = c.Query("DROP TABLE sdk_symrt")
 }
 
+// TestPipelineWriter verifies that the pipelined writer ingests every row
+// (no loss/corruption from not waiting per-ack) and reports no error.
+func TestPipelineWriter(t *testing.T) {
+	addr := addrOrSkip(t)
+	c, err := Open(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+
+	cols := []Column{
+		{"ts", TypeTimestamp},
+		{"v", TypeFloat64},
+		{"n", TypeInt64},
+	}
+	_, _ = c.Query("DROP TABLE sdk_pipe")
+	if err := c.CreateTable("sdk_pipe", "ts", cols); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+
+	const nb, bs = 50, 1000 // 50 batches × 1000 rows = 50000
+	pw := c.NewPipelineWriter(16)
+	for b := 0; b < nb; b++ {
+		rows := make([]Row, bs)
+		for i := 0; i < bs; i++ {
+			gr := b*bs + i
+			rows[i] = Row{
+				TS:  int64(gr+1) * 1_000_000,
+				F64: map[int]float64{1: float64(gr)},
+				I64: map[int]int64{2: int64(gr)},
+			}
+		}
+		if err := pw.Write("sdk_pipe", cols, rows); err != nil {
+			t.Fatalf("pipelined Write batch %d: %v", b, err)
+		}
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("pipelined Close: %v", err)
+	}
+
+	qr, err := c.Query("SELECT count(*), sum(n) FROM sdk_pipe")
+	if err != nil {
+		t.Fatalf("Query count: %v", err)
+	}
+	if len(qr.Rows) != 1 {
+		t.Fatalf("want 1 result row, got %d", len(qr.Rows))
+	}
+	gotCount, _ := qr.Rows[0][0].(int64)
+	if gotCount != nb*bs {
+		t.Fatalf("pipelined count = %d, want %d (rows lost/duplicated)", gotCount, nb*bs)
+	}
+	// sum(0..49999) = 49999*50000/2 = 1249975000
+	gotSum, _ := qr.Rows[0][1].(int64)
+	if gotSum != 1249975000 {
+		t.Fatalf("pipelined sum(n) = %d, want 1249975000 (content corrupted)", gotSum)
+	}
+	_, _ = c.Query("DROP TABLE sdk_pipe")
+}
+
 // Helper for child-process orchestration in the bench harness.
 var _ = exec.Command
 var _ = strings.TrimSpace

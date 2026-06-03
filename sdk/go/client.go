@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 )
 
@@ -116,11 +117,9 @@ type Row struct {
 // WriteBatch sends a columnar WRITE_BATCH of rows.  All rows must share
 // the same set of columns.  cols describes ALL columns, in schema order
 // (matching the server's CreateTable).
-func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, error) {
-	if len(rows) == 0 {
-		return 0, nil
-	}
-
+// encodeBatch builds the WRITE_BATCH payload (column-major wire format) for a
+// set of rows.  Shared by the synchronous WriteBatch and the pipelined writer.
+func encodeBatch(table string, cols []Column, rows []Row) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte(byte(len(table)))
 	buf.WriteString(table)
@@ -188,11 +187,25 @@ func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, er
 			buf.Write(sym.Bytes())
 
 		default:
-			return 0, fmt.Errorf("unknown column type %d", col.Type)
+			return nil, fmt.Errorf("unknown column type %d", col.Type)
 		}
 	}
+	return buf.Bytes(), nil
+}
 
-	if _, err := c.Conn.Send(MsgWriteBatch, 0, 0, buf.Bytes()); err != nil {
+// WriteBatch synchronously writes rows and waits for the server's ack,
+// returning the accepted row count.  One round-trip per call: throughput over
+// a high-latency link is bounded by 1/RTT.  For bulk loads over a network use
+// NewPipelineWriter, which keeps many batches in flight.
+func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	payload, err := encodeBatch(table, cols, rows)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := c.Conn.Send(MsgWriteBatch, 0, 0, payload); err != nil {
 		return 0, err
 	}
 	f, err := c.Conn.Recv()
@@ -209,6 +222,110 @@ func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, er
 		return 0, errors.New("short WRITE_ACK")
 	}
 	return binary.LittleEndian.Uint32(f.Payload[:4]), nil
+}
+
+// PipelineWriter streams WRITE_BATCH frames without blocking on each ack, up to
+// a bounded in-flight window, so bulk-load throughput is governed by bandwidth
+// and server ingest rate rather than round-trip latency.  A background
+// goroutine reads acks; the first error seen is surfaced by Write or Close.
+//
+// Use from a SINGLE goroutine: Write serialises frame sends on the connection,
+// and concurrent callers would interleave (and corrupt) frames.  The same Conn
+// must not be used for other requests while the writer is open.
+type PipelineWriter struct {
+	c    *Client
+	sem  chan struct{} // cap = window; acquired before each send, released per ack
+	work chan struct{} // one token per successfully-sent batch awaiting an ack
+	done chan struct{} // closed when the ack reader exits
+	mu   sync.Mutex
+	err  error
+}
+
+// NewPipelineWriter starts a pipelined writer on the client's connection.
+// window is the maximum number of un-acked batches in flight (<=0 → 64).
+func (c *Client) NewPipelineWriter(window int) *PipelineWriter {
+	if window <= 0 {
+		window = 64
+	}
+	pw := &PipelineWriter{
+		c:    c,
+		sem:  make(chan struct{}, window),
+		work: make(chan struct{}, window),
+		done: make(chan struct{}),
+	}
+	go pw.ackReader()
+	return pw
+}
+
+func (pw *PipelineWriter) ackReader() {
+	defer close(pw.done)
+	for range pw.work {
+		f, err := pw.c.Conn.Recv()
+		<-pw.sem // free an in-flight slot regardless of outcome
+		if err != nil {
+			pw.setErr(err)
+			continue
+		}
+		if f.Type == MsgError {
+			pw.setErr(decodeError(f.Payload))
+			continue
+		}
+		if f.Type != MsgWriteAck {
+			pw.setErr(fmt.Errorf("unexpected WRITE response type=%d", f.Type))
+		}
+	}
+}
+
+func (pw *PipelineWriter) setErr(err error) {
+	pw.mu.Lock()
+	if pw.err == nil {
+		pw.err = err
+	}
+	pw.mu.Unlock()
+}
+
+// Err returns the first error seen by the writer (send failure or ack error),
+// or nil. Safe to call concurrently with the background reader.
+func (pw *PipelineWriter) Err() error {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	return pw.err
+}
+
+// Write encodes and sends one batch.  It blocks only when the in-flight window
+// is full (backpressure), not for the batch's own ack.  A prior error (from any
+// earlier batch's ack) is returned without sending.
+func (pw *PipelineWriter) Write(table string, cols []Column, rows []Row) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if err := pw.Err(); err != nil {
+		return err
+	}
+	payload, err := encodeBatch(table, cols, rows)
+	if err != nil {
+		return err
+	}
+	pw.sem <- struct{}{} // acquire an in-flight slot (blocks if window full)
+	if err := pw.Err(); err != nil {
+		<-pw.sem
+		return err
+	}
+	if _, err := pw.c.Conn.Send(MsgWriteBatch, 0, 0, payload); err != nil {
+		<-pw.sem
+		pw.setErr(err)
+		return err
+	}
+	pw.work <- struct{}{} // tell the reader one ack is expected (never blocks: gated by sem)
+	return nil
+}
+
+// Close flushes all in-flight batches, waits for their acks, and returns the
+// first error seen.  The PipelineWriter must not be used after Close.
+func (pw *PipelineWriter) Close() error {
+	close(pw.work)
+	<-pw.done
+	return pw.Err()
 }
 
 // QueryResult holds rows returned from a SELECT.
