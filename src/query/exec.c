@@ -866,8 +866,13 @@ static int is_window_call(qast_expr_t *e) {
            strcasecmp(n, "lag") == 0        ||
            strcasecmp(n, "interp") == 0;
 }
-/* Helper: allocate a fresh tdigest and store into proj; NULLs on failure. */
+/* Helper: allocate a fresh tdigest and store into proj; NULLs on failure.
+ * STDDEV only needs exact stats (sum/sum_sq/count), so it gets a stats-only
+ * digest that skips centroid maintenance — same cost as sum.  Percentiles
+ * (P50/P90/P99/PERCENTILE) need the full quantile-capable digest. */
 static int proj_tdigest_init(proj_t *p) {
+    if (p->kind == PROJ_AGG_STDDEV)
+        return tsdb_tdigest_new_stats(&p->tdigest);
     return tsdb_tdigest_new(100.0, &p->tdigest);
 }
 

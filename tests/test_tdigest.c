@@ -313,6 +313,45 @@ static void test_relative_error(void) {
     printf("  PASS (max rel err = %.4f%%)\n", max_rel_err * 100.0);
 }
 
+/* Stats-only digest: mean/stddev must match a full digest, and clone+merge
+ * (the parallel-GROUP-BY path: master cloned per worker, then merged back)
+ * must preserve the stats exactly — clone on a stats_only digest used to risk
+ * a malloc(0)==NULL "OOM". */
+static void test_stats_only(void) {
+    printf("test_stats_only (mean/stddev + clone/merge)\n");
+    const int N = 100000;
+    tsdb_tdigest_t *full = NULL, *so = NULL;
+    assert(tsdb_tdigest_new(100.0, &full) == 0);
+    assert(tsdb_tdigest_new_stats(&so) == 0);
+    double sum = 0, sq = 0;
+    for (int i = 0; i < N; i++) {
+        double x = 100.0 + (double)(i % 1000) * 0.013 - (i & 1 ? 3.0 : 0.0);
+        tsdb_tdigest_add(full, x);
+        tsdb_tdigest_add(so, x);
+        sum += x; sq += x * x;
+    }
+    double exact_mean = sum / N;
+    double exact_std  = sqrt(sq / N - exact_mean * exact_mean);
+    ASSERT_NEAR(tsdb_tdigest_mean(so),   exact_mean, 1e-6);
+    ASSERT_NEAR(tsdb_tdigest_stddev(so), exact_std,  1e-6);
+    ASSERT_NEAR(tsdb_tdigest_stddev(so), tsdb_tdigest_stddev(full), 0.05);
+
+    /* clone (per-worker copy) then merge back — must reproduce the same stddev. */
+    tsdb_tdigest_t *clone = NULL;
+    assert(tsdb_tdigest_clone(so, &clone) == 0 && clone != NULL);
+    ASSERT_NEAR(tsdb_tdigest_stddev(clone), exact_std, 1e-6);
+    tsdb_tdigest_t *acc = NULL;
+    assert(tsdb_tdigest_new_stats(&acc) == 0);
+    tsdb_tdigest_merge(acc, so);      /* merge two halves' worth */
+    tsdb_tdigest_merge(acc, clone);
+    /* acc now has 2N points (so + clone) — mean unchanged, stddev unchanged. */
+    ASSERT_NEAR(tsdb_tdigest_mean(acc), exact_mean, 1e-6);
+    ASSERT_NEAR(tsdb_tdigest_stddev(acc), exact_std, 1e-6);
+    printf("  PASS (stddev=%.4f exact=%.4f)\n", tsdb_tdigest_stddev(acc), exact_std);
+    tsdb_tdigest_free(full); tsdb_tdigest_free(so);
+    tsdb_tdigest_free(clone); tsdb_tdigest_free(acc);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -326,6 +365,7 @@ int main(void) {
     test_throughput();
     test_merge_throughput();
     test_relative_error();
+    test_stats_only();
 
     printf("\nAll T-digest tests PASSED.\n");
     return 0;

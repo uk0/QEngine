@@ -28,6 +28,10 @@ typedef struct tsdb_tdigest tsdb_tdigest_t;
  * Returns 0 on success, -1 on allocation failure. */
 int  tsdb_tdigest_new(double delta, tsdb_tdigest_t **out);
 
+/* Create a stats-only digest: tracks sum/sum_sq/total for mean & stddev with
+ * no centroids (cheap alloc, tight add loop).  Quantiles undefined on it. */
+int  tsdb_tdigest_new_stats(tsdb_tdigest_t **out);
+
 /* Create a copy of an existing digest (used for parallel worker init). */
 int  tsdb_tdigest_clone(const tsdb_tdigest_t *src, tsdb_tdigest_t **out);
 

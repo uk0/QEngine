@@ -62,6 +62,13 @@ struct tsdb_tdigest {
     /* Exact statistics. */
     double sum;
     double sum_sq;
+
+    /* When set, this digest is only ever asked for exact stats (mean/stddev),
+     * never quantiles.  add_bulk then skips the centroid buffer + compaction
+     * entirely and just accumulates sum/sum_sq/total in a tight loop — stddev
+     * over a column costs the same as sum instead of paying t-digest's
+     * per-fill sort/merge. */
+    int    stats_only;
 };
 
 /* ---- helpers ------------------------------------------------------------ */
@@ -181,11 +188,33 @@ int tsdb_tdigest_new(double delta, tsdb_tdigest_t **out) {
     return 0;
 }
 
+/* Allocate a stats-only digest: tracks sum/sum_sq/total for mean & stddev but
+ * keeps no centroids, so add_bulk is a tight accumulate loop and the alloc is
+ * a single small calloc (no quantile buffers).  Quantiles are undefined on it. */
+int tsdb_tdigest_new_stats(tsdb_tdigest_t **out) {
+    tsdb_tdigest_t *t = (tsdb_tdigest_t *)calloc(1, sizeof(tsdb_tdigest_t));
+    if (!t) return -1;
+    t->delta      = 100.0;
+    t->stats_only = 1;
+    *out = t;
+    return 0;
+}
+
 int tsdb_tdigest_clone(const tsdb_tdigest_t *src, tsdb_tdigest_t **out) {
     tsdb_tdigest_t *t = (tsdb_tdigest_t *)malloc(sizeof(tsdb_tdigest_t));
     if (!t) return -1;
 
-    *t = *src; /* copy scalars */
+    *t = *src; /* copy scalars (incl. stats_only flag + sum/sum_sq/total) */
+
+    /* Stats-only digests have no centroid arrays (cent_cap/buf_cap == 0); a
+     * malloc(0) here could return NULL and be mistaken for OOM.  The scalar
+     * copy above is the whole state — just null the array pointers. */
+    if (src->stats_only) {
+        t->centroids = NULL;
+        t->buf       = NULL;
+        *out = t;
+        return 0;
+    }
 
     /* Deep-copy arrays. */
     t->centroids = (centroid_t *)malloc((size_t)src->cent_cap * sizeof(centroid_t));
@@ -208,6 +237,12 @@ void tsdb_tdigest_free(tsdb_tdigest_t *t) {
 }
 
 void tsdb_tdigest_add(tsdb_tdigest_t *t, double value) {
+    if (t->stats_only) {
+        t->sum    += value;
+        t->sum_sq += value * value;
+        t->total  += 1.0;
+        return;
+    }
     maybe_compact(t);
 
     t->buf[t->nbuf].mean   = value;
@@ -226,6 +261,40 @@ static inline int is_valid(const uint8_t *bm, size_t i) {
 
 void tsdb_tdigest_add_bulk(tsdb_tdigest_t *t, const double *v, size_t n,
                            const uint8_t *null_bitmap) {
+    /* Stats-only: just accumulate sum/sum_sq/total.  The no-null branch is a
+     * tight loop the compiler auto-vectorizes, so stddev costs ~the same as
+     * sum instead of paying the centroid sort/merge below. */
+    if (t->stats_only) {
+        if (!null_bitmap) {
+            /* 4 independent accumulators break the reduction dependency chain
+             * so the compiler can vectorise (and pipeline) the sum/sum_sq even
+             * without -ffast-math, which would otherwise serialise the FP adds. */
+            double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            double q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+            size_t i = 0;
+            for (; i + 4 <= n; i += 4) {
+                double a = v[i], b = v[i + 1], c = v[i + 2], d = v[i + 3];
+                s0 += a; s1 += b; s2 += c; s3 += d;
+                q0 += a * a; q1 += b * b; q2 += c * c; q3 += d * d;
+            }
+            double s = s0 + s1 + s2 + s3;
+            double sq = q0 + q1 + q2 + q3;
+            for (; i < n; i++) { double x = v[i]; s += x; sq += x * x; }
+            t->sum    += s;
+            t->sum_sq += sq;
+            t->total  += (double)n;
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                if (!is_valid(null_bitmap, i)) continue;
+                double x = v[i];
+                t->sum    += x;
+                t->sum_sq += x * x;
+                t->total  += 1.0;
+            }
+        }
+        return;
+    }
+
     /* Fast path: fill buffer in chunks, compacting only when full. */
     for (size_t i = 0; i < n; ) {
         /* Fill as many entries as possible without checking buf_cap each time. */
@@ -270,6 +339,15 @@ void tsdb_tdigest_add_bulk(tsdb_tdigest_t *t, const double *v, size_t n,
 }
 
 void tsdb_tdigest_merge(tsdb_tdigest_t *self, const tsdb_tdigest_t *other) {
+    /* Stats-only digests (same proj on both sides) merge by adding the exact
+     * stats — no centroids to reconcile. */
+    if (self->stats_only || other->stats_only) {
+        self->total  += other->total;
+        self->sum    += other->sum;
+        self->sum_sq += other->sum_sq;
+        return;
+    }
+
     /* Flush other's buffer into a temporary compact copy so we iterate
      * over a sorted centroid list. */
     tsdb_tdigest_t *tmp = NULL;
