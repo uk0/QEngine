@@ -842,14 +842,11 @@ static int truncate_keep_entry(const char *name) {
 int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return TSDB_ERR_INVAL;
 
-    pthread_mutex_lock(&db->lock);
-    tsdb_table_internal_t *t = NULL;
-    for (int i = 0; i < db->ntables; i++) {
-        if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0) {
-            t = db->tables[i]; break;
-        }
-    }
-    pthread_mutex_unlock(&db->lock);
+    /* scan_acquire so a concurrent DROP TABLE waits for us before freeing the
+     * table — we drop db->lock then take batch_mu/compact_mtx, and the
+     * scan_refs hold prevents DROP destroying those mutexes in the gap
+     * (locked-after-destroy crash under drop+truncate stress). */
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, name);
     if (!t) return TSDB_ERR_NOTFOUND;
 
     /* Hold both locks: compact_mtx so no flush is mid-write, batch_mu so
@@ -880,6 +877,7 @@ int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
 
     pthread_mutex_unlock(&t->compact_mtx);
     pthread_mutex_unlock(&t->batch_mu);
+    tsdb_db_scan_release(db, t);
     return TSDB_OK;
 }
 
@@ -951,15 +949,16 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
 {
     if (!db || !name) return TSDB_ERR_INVAL;
 
-    pthread_mutex_lock(&db->lock);
-    tsdb_table_internal_t *t = NULL;
-    for (int i = 0; i < db->ntables; i++) {
-        if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0) {
-            t = db->tables[i]; break;
-        }
+    /* scan_acquire (not a bare find) so a concurrent DROP TABLE waits for us
+     * to finish before freeing the table: we drop db->lock and then take
+     * t->compact_mtx, and without the scan_refs hold DROP could free t (and
+     * destroy compact_mtx) in that gap — a locked-after-destroy crash
+     * (pthread ESRCH assertion) observed under drop+delete stress. */
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, name);
+    if (!t || !t->schema) {
+        if (t) tsdb_db_scan_release(db, t);
+        return TSDB_ERR_NOTFOUND;
     }
-    pthread_mutex_unlock(&db->lock);
-    if (!t || !t->schema) return TSDB_ERR_NOTFOUND;
 
     tsdb_partition_unit_t unit = t->schema->partition_unit;
 
@@ -1009,6 +1008,7 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
         delwm_bump(db, name, w);
     }
 
+    tsdb_db_scan_release(db, t);
     if (out_removed) *out_removed = removed;
     return TSDB_OK;
 }
