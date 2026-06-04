@@ -633,6 +633,23 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
                     else if (cn && strcmp(cn, "ntag_cols")  == 0) ntags_v = (int)tsdb_result_i64(res, c);
                 }
                 if (!vn) continue;
+                /* Skip mirror-shadow stables.  A plain/SDK normal table is
+                 * mirrored into the stable catalog (empty db/group, 0 children)
+                 * so a recovered node learns it via catalog-sync — but it is
+                 * already surfaced in the "tables" section above.  Listing it
+                 * again here double-lists every plain table AND synthesises a
+                 * bogus "(no db)" database in the dashboard tree.  The shadow is
+                 * identifiable by a same-named on-disk table directory (a real
+                 * super-table owns no storage dir of its own); filter it from
+                 * the /tree view only — the catalog entry stays for sync. */
+                {
+                    char vpath[4096];
+                    snprintf(vpath, sizeof(vpath), "%s/%s", g_local_data_dir, vn);
+                    struct stat vst;
+                    if (is_table_dir(vn) && stat(vpath, &vst) == 0 &&
+                        S_ISDIR(vst.st_mode))
+                        continue;
+                }
                 char ne[128], dbe[128], gre[128];
                 j_escape_str(ne,  sizeof(ne),  vn);
                 j_escape_str(dbe, sizeof(dbe), vdb  ? vdb  : "");
