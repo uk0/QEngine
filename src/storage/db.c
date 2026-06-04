@@ -835,7 +835,16 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
      * pointer with no lock, so freeing underneath them is a use-after-free.
      * Both flags are set/cleared under db->lock, so once we observe them 0
      * while holding the lock they cannot restart (they'd need the lock we
-     * hold to re-acquire). */
+     * hold to re-acquire).
+     *
+     * Raise the `altering` drain barrier (same one ALTER uses) FIRST so new
+     * tsdb_db_scan_acquire callers block instead of taking a fresh ref.  Without
+     * it a sustained stream of concurrent DELETE/TRUNCATE keeps scan_refs > 0
+     * forever and starves this DROP — a livelock.  With new acquirers held off,
+     * in-flight scans drain to 0 and we make bounded progress.  DDL is
+     * serialised, so this never races a real ALTER; the barrier dies with the
+     * table when we free it below (no clear needed). */
+    if (idx >= 0) db->tables[idx]->altering = 1;
     while (idx >= 0 && (db->tables[idx]->compacting ||
                         db->tables[idx]->scan_refs > 0)) {
         pthread_mutex_unlock(&db->lock);
@@ -848,6 +857,7 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
                 break;
             }
         }
+        if (idx >= 0) db->tables[idx]->altering = 1;  /* keep the barrier up across re-find */
     }
 
     if (idx >= 0) {
@@ -1565,10 +1575,13 @@ tsdb_table_internal_t *tsdb_db_scan_acquire(tsdb_db_t *db, const char *name) {
     if (!db || !name) return NULL;
     pthread_mutex_lock(&db->lock);
     tsdb_table_internal_t *t = db_find_table(db, name);
-    /* Wait out an in-flight ALTER on this table: it reallocs schema->cols, and
-     * we are about to hand the caller a raw pointer it will read lock-free.
-     * Re-resolve after each wait (the table can't be ALTERed and dropped at
-     * once — DDL is serialised — but re-finding keeps t valid). */
+    /* Wait out the `altering` drain barrier: an in-flight ALTER reallocs
+     * schema->cols (and we are about to hand the caller a raw pointer it reads
+     * lock-free), and a pending DROP raises the same barrier so it can drain
+     * scan_refs to 0 without new acquirers starving it.  Re-resolve after each
+     * wait: under a DROP the table will vanish and db_find_table returns NULL,
+     * so the caller correctly sees the table as gone.  DDL is serialised, so
+     * ALTER and DROP never raise the barrier at once. */
     while (t && t->altering) {
         pthread_mutex_unlock(&db->lock);
         usleep(1000);
