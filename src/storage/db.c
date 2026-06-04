@@ -625,10 +625,17 @@ static int create_table_impl(tsdb_db_t *db,
         on_create(hook_ud, db, name, schema);
     }
 
-    /* Mirror the table into the super-table hierarchy (local catalog only).
-     * Runs on every create path — user CREATE, SCHEMA_SYNC apply, raft replay —
-     * so every node that has the table also carries its VTable+PTable rows. */
-    register_table_as_stable(db, name, schema);
+    /* Mirror the table into the super-table hierarchy (local catalog only) —
+     * ONLY on the originating (non-suppressed) create.  The suppress_hook=1
+     * paths are replicas applying someone else's create: SCHEMA_SYNC receivers
+     * (which provision the STORAGE of a real `CREATE TABLE x USING st` child —
+     * mirroring those would forge a phantom super-table for the child, since the
+     * tsdb_g_creating_child guard is thread-local and unset on the RPC thread),
+     * raft replay, and anti-entropy materialize.  Replicas instead receive the
+     * mirror VTable through catalog-sync of the originator's stables.log, so the
+     * catalog stays consistent without ever mirroring a replicated child. */
+    if (!suppress_hook)
+        register_table_as_stable(db, name, schema);
 
     return TSDB_OK;
 }
@@ -896,7 +903,15 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         tsdb_catalog_t *cat = tsdb_db_catalog(db);
         if (cat) {
             (void)tsdb_child_table_drop(cat, name);
-            (void)tsdb_stable_drop(cat, name);
+            /* Drop the mirrored VTable ONLY when it's a data-bearing mirror,
+             * i.e. it has NO child tables.  A real super-table that happens to
+             * share this name must not be torn down by DROP TABLE — that's DROP
+             * STABLE's job, and tsdb_stable_drop cascade-wipes the whole child
+             * set.  This keeps a name collision from nuking a real stable. */
+            tsdb_child_table_t *ch = NULL; size_t nch = 0;
+            if (tsdb_child_table_list(cat, name, &ch, &nch) == TSDB_OK) free(ch);
+            if (nch == 0)
+                (void)tsdb_stable_drop(cat, name);
         }
     }
     return TSDB_OK;

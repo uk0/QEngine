@@ -224,9 +224,49 @@ static int local_mentions(const char *lbuf, size_t llen, const char *name) {
     return 0;
 }
 
-/* Append, to local log `path`, the peer body's `+` records for names that are
- * live on the peer and absent from the local log.  Returns # records added. */
-static int filtered_append_log(const char *path, const char *body, size_t blen) {
+/* Extract the Nth (0-based) TAB-separated field of a log line into out[]. */
+static int catlog_line_field(const char *p, size_t n, int idx, char *out, size_t cap) {
+    size_t i = 0; int f = 0;
+    while (f < idx) {
+        while (i < n && p[i] != '\t' && p[i] != '\n') i++;
+        if (i >= n || p[i] != '\t') return 0;
+        i++; f++;
+    }
+    size_t j = 0;
+    while (i < n && p[i] != '\t' && p[i] != '\n' && j + 1 < cap) out[j++] = p[i++];
+    out[j] = 0;
+    return j > 0;
+}
+
+/* Is `name` a LIVE stable in <catalog_dir>/stables.log (its last op is '+')?
+ * Used to refuse re-learning a child whose parent super-table is already gone —
+ * otherwise reconcile resurrects orphan child rows that nothing ever cascades. */
+static int local_stable_live(const char *catalog_dir, const char *name) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/stables.log", catalog_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int live = 0;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        char nm[80];
+        if (catlog_line_name(line, strlen(line), nm, sizeof(nm)) && !strcmp(nm, name))
+            live = (line[0] == '+');   /* last op for this name wins */
+    }
+    fclose(f);
+    return live;
+}
+
+/* Append, to <catalog_dir>/<fname>, the peer body's `+` records for names that
+ * are live on the peer and absent from the local log.  For child_tables.log a
+ * `+child` is ALSO skipped unless its parent stable is live locally (the dump
+ * applies stables.log before child_tables.log, so it already reflects this
+ * dump's stables).  Returns # records added. */
+static int filtered_append_log(const char *catalog_dir, const char *fname,
+                               const char *body, size_t blen) {
+    int is_child = (strcmp(fname, "child_tables.log") == 0);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", catalog_dir, fname);
     char *lbuf = NULL; size_t llen = 0;
     FILE *lf = fopen(path, "rb");
     if (lf) {
@@ -255,6 +295,15 @@ static int filtered_append_log(const char *path, const char *body, size_t blen) 
         char key[88]; int kl = snprintf(key, sizeof(key), "\x01%s\x01", nm);
         if (added && strstr(added, key)) continue;                  /* already added */
         if (body_has_line(body, blen, next, '-', nm)) continue;     /* peer dropped it later */
+        if (is_child) {
+            /* `+child\t<name>\t<stable_name>\t...` — refuse to re-learn a child
+             * whose parent super-table isn't live locally (dropped/never seen),
+             * which would otherwise resurrect an orphan that nothing cascades. */
+            char parent[80];
+            if (!catlog_line_field(body + ls, ll, 2, parent, sizeof(parent)) ||
+                !local_stable_live(catalog_dir, parent))
+                continue;
+        }
         if (!out) { out = fopen(path, "ab"); if (!out) break; }
         fwrite(body + ls, 1, ll, out); fputc('\n', out);
         count++;
@@ -291,9 +340,10 @@ int tsdb_catalog_dump_apply_filtered(const char *data_dir,
         for (int k = 0; k < kCatalogLogCount; k++)
             if (!strcmp(name, kCatalogLogs[k])) { ok = 1; break; }
         if (ok && body_len > 0) {
-            char path[4096];
-            snprintf(path, sizeof(path), "%s/catalog/%s", data_dir, name);
-            added += filtered_append_log(path, (const char *)(buf + off), body_len);
+            char catalog_dir[4096];
+            snprintf(catalog_dir, sizeof(catalog_dir), "%s/catalog", data_dir);
+            added += filtered_append_log(catalog_dir, name,
+                                         (const char *)(buf + off), body_len);
         }
         off += body_len;
     }

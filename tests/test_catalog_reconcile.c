@@ -90,6 +90,21 @@ int main(void) {
     ASSERT(file_count(path, "+stable\tC\t") == 1);
     printf("  second apply is a no-op (idempotent)\n");
 
+    /* Child-orphan rejection: a +child under a LIVE local stable (A) is learned;
+     * a +child under a non-existent parent stable is refused, so reconcile never
+     * resurrects an orphan child whose super-table is gone. */
+    const char *child_body =
+        "+child\tchildA\tA\t0\t300\n"             /* parent A is live locally */
+        "+child\tchildGhost\tGHOSTST\t0\t300\n";  /* parent GHOSTST never existed */
+    uint8_t cdump[2048];
+    size_t clen = frame_one(cdump, "child_tables.log", child_body);
+    int cadded = tsdb_catalog_dump_apply_filtered(TMP, cdump, clen);
+    char cpath[600]; snprintf(cpath, sizeof(cpath), "%s/child_tables.log", dir);
+    ASSERT(cadded == 1);
+    ASSERT(file_count(cpath, "+child\tchildA\t") == 1);   /* parent live → learned */
+    ASSERT(file_count(cpath, "childGhost") == 0);         /* parent gone → skipped */
+    printf("  childA learned (parent live), childGhost skipped (orphan refused)\n");
+
     snprintf(path, sizeof(path), "rm -rf %s", TMP); (void)system(path);
     printf("[PASS] reconcile merges new tables, never resurrects dropped ones\n");
     return 0;
