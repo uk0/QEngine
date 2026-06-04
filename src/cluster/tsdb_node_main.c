@@ -21,6 +21,8 @@
 #include "../raft/raft.h"
 #include "../federation/dr_forwarder.h"
 #include "replica.h"
+#include "cluster.h"
+#include "node.h"
 #include "disk_weight.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -481,6 +483,31 @@ static uint64_t dir_bytes_recursive(const char *path, int depth) {
     }
     closedir(d);
     return total;
+}
+
+/* tsdb_db_cluster is an internal accessor (no public header); forward-declare
+ * it the same way the other cluster-plumbing TUs do. */
+extern struct tsdb_cluster *tsdb_db_cluster(tsdb_db_t *db);
+
+/* Periodic data-directory size sampler.  Stores the local node's usage in the
+ * node manager (tsdb_node_manager_set_disk); the gossip layer fans it out via
+ * DISK_SYNC so every node — and the master's /cluster — can show per-node
+ * storage.  First sample runs immediately, then every 30s (a full-tree walk is
+ * cheap here but we don't need it more often). */
+static void *disk_sampler_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return NULL;
+    for (;;) {
+        struct tsdb_cluster *c = tsdb_db_cluster(db);
+        if (c && g_local_data_dir[0]) {
+            uint64_t bytes = dir_bytes_recursive(g_local_data_dir, 0);
+            tsdb_node_manager_set_disk(tsdb_cluster_node_mgr(c),
+                                       tsdb_cluster_local_id(c), bytes);
+        }
+        struct timespec ts = { 30, 0 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
 }
 
 static int tree_json_cb(void *ud, char *buf, size_t cap) {
@@ -1280,6 +1307,19 @@ int main(int argc, char **argv) {
         if (pthread_create(&resync_thr, &attr,
                            tsdb_resync_startup_thread, db) == 0) {
             printf("[node] anti-entropy catch-up armed\n");
+        }
+        pthread_attr_destroy(&attr);
+    }
+
+    /* Periodic data-dir size sampler: stores local usage in the node manager;
+     * gossip DISK_SYNC fans it out so /cluster shows per-node storage. */
+    {
+        pthread_t disk_thr;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&disk_thr, &attr, disk_sampler_thread, db) == 0) {
+            printf("[node] per-node disk sampler armed\n");
         }
         pthread_attr_destroy(&attr);
     }

@@ -55,6 +55,11 @@ typedef struct {
      * Used by /cluster to report "known_for_s" so operators can see how
      * long a peer has been part of our local membership view. */
     int64_t         first_seen_ns;         /* CLOCK_MONOTONIC nanoseconds */
+    /* Data-directory size in bytes.  Propagated by the additive DISK_SYNC
+     * gossip message (NOT in the STATE_SYNC wire record), so each node reports
+     * its own storage and /cluster can show per-node usage.  Preserved across
+     * STATE_SYNC merges; 0 until the owning node's first DISK_SYNC arrives. */
+    uint64_t        disk_bytes;
 } tsdb_node_info_t;
 
 /* Maximum cluster size. */
@@ -118,6 +123,12 @@ int tsdb_node_manager_snapshot(tsdb_node_manager_t *mgr,
 /* Get the info for one specific node. Returns 0 if found, -1 if not found. */
 int tsdb_node_manager_get(tsdb_node_manager_t *mgr, tsdb_node_id_t id,
                           tsdb_node_info_t *out);
+
+/* Set a node's data-directory size (bytes).  Called for the local node by the
+ * periodic disk sampler and for peers when a DISK_SYNC gossip message arrives.
+ * No-op if the node is unknown. */
+void tsdb_node_manager_set_disk(tsdb_node_manager_t *mgr, tsdb_node_id_t id,
+                                uint64_t disk_bytes);
 
 /* Select up to `count` random ALIVE nodes (excluding local).
  * Returns how many were written. */

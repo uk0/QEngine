@@ -137,6 +137,28 @@ static void send_state_sync(struct tsdb_gossip *g, const char *dest_addr) {
            (struct sockaddr *)&sa, sizeof(sa));
 }
 
+/* DISK_SYNC: tell a peer our data-directory size.  Payload is
+ * [local_id u64][disk_bytes u64] — 16 bytes.  The value is whatever the
+ * periodic disk sampler last stored for the local node in the manager. */
+static void send_disk_sync(struct tsdb_gossip *g, const char *dest_addr) {
+    tsdb_node_id_t self = tsdb_node_manager_local_id(g->node_mgr);
+    tsdb_node_info_t info = {0};
+    if (tsdb_node_manager_get(g->node_mgr, self, &info) != 0) return;
+
+    uint8_t payload[16];
+    memcpy(payload,     &self,            8);
+    memcpy(payload + 8, &info.disk_bytes, 8);
+
+    uint8_t frame[64];
+    int flen = tsdb_gossip_encode(frame, sizeof(frame),
+                                  TSDB_GOSSIP_DISK_SYNC, payload, 16);
+    if (flen <= 0) return;
+    struct sockaddr_in sa;
+    if (addr_to_sin(dest_addr, &sa) < 0) return;
+    sendto(g->udp_fd, frame, (size_t)flen, 0,
+           (struct sockaddr *)&sa, sizeof(sa));
+}
+
 static void send_ping(struct tsdb_gossip *g, const char *dest_addr,
                       tsdb_node_id_t target_id) {
     uint8_t payload[8];
@@ -261,6 +283,16 @@ static void *recv_loop(void *arg) {
                 pthread_mutex_unlock(&g->probe_lock);
             }
             break;
+
+        case TSDB_GOSSIP_DISK_SYNC:
+            /* Peer is reporting its data-directory size: [id u64][bytes u64]. */
+            if (plen >= 16) {
+                tsdb_node_id_t pid; uint64_t bytes;
+                memcpy(&pid,   payload,     8);
+                memcpy(&bytes, payload + 8, 8);
+                tsdb_node_manager_set_disk(g->node_mgr, pid, bytes);
+            }
+            break;
         }
     }
     return NULL;
@@ -299,6 +331,21 @@ static void *tick_loop(void *arg) {
             send_state_sync(g, g->seeds[s]);
         }
         pthread_mutex_unlock(&g->seed_lock);
+
+        /* 2c. Piggyback our data-dir size (DISK_SYNC) to the same peers + seeds
+         * every ~2s — it changes slowly and the packet is tiny.  Additive type;
+         * pre-upgrade peers drop it, so it's safe across a rolling deploy. */
+        if (tick_counter % 4 == 0) {
+            for (int i = 0; i < np; i++) {
+                tsdb_node_info_t info = {0};
+                if (tsdb_node_manager_get(g->node_mgr, peers[i], &info) == 0)
+                    send_disk_sync(g, info.gossip_addr);
+            }
+            pthread_mutex_lock(&g->seed_lock);
+            for (int s = 0; s < g->nseeds; s++)
+                send_disk_sync(g, g->seeds[s]);
+            pthread_mutex_unlock(&g->seed_lock);
+        }
 
         /* 2b. Re-probe DEAD nodes periodically so they can rejoin after
          * transient UDP drops / container restarts / conntrack flushes.

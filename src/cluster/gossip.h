@@ -41,7 +41,11 @@ typedef enum {
     TSDB_GOSSIP_PING      = 1,
     TSDB_GOSSIP_ACK       = 2,
     TSDB_GOSSIP_PING_REQ  = 3,
-    TSDB_GOSSIP_STATE_SYNC = 4
+    TSDB_GOSSIP_STATE_SYNC = 4,
+    /* Additive: carries [node_id u64][disk_bytes u64].  Older peers don't
+     * recognise the type and drop it (no STATE_SYNC wire change), so this is
+     * safe across a rolling upgrade. */
+    TSDB_GOSSIP_DISK_SYNC  = 5
 } tsdb_gossip_msg_t;
 
 /* Opaque gossip engine. */

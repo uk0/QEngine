@@ -26,6 +26,9 @@ export interface ClusterNode {
   hb_age_ms: number;
   known_for_s: number;
   suspect_count: number;
+  /** Data-directory size in bytes, propagated via the DISK_SYNC gossip
+   *  message.  0 until the owning node's first sample reaches us. */
+  disk_bytes?: number;
 }
 
 export interface AutobalanceNode {

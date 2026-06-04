@@ -149,10 +149,13 @@ void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
 
         if (info->version > mgr->nodes[idx].version || resurrect) {
             tsdb_node_state_t old_state = mgr->nodes[idx].state;
-            /* Preserve the local-only first_seen_ns across wire updates. */
-            int64_t prev_first_seen = mgr->nodes[idx].first_seen_ns;
+            /* Preserve the local-only first_seen_ns + disk_bytes across wire
+             * updates (neither rides the STATE_SYNC record). */
+            int64_t  prev_first_seen = mgr->nodes[idx].first_seen_ns;
+            uint64_t prev_disk_bytes = mgr->nodes[idx].disk_bytes;
             mgr->nodes[idx] = *info;
             mgr->nodes[idx].first_seen_ns = prev_first_seen;
+            mgr->nodes[idx].disk_bytes    = prev_disk_bytes;
             if (resurrect) {
                 /* Clear SWIM probe state so the next tick doesn't
                  * instantly re-kill this peer from stale fail counts. */
@@ -275,6 +278,16 @@ int tsdb_node_manager_get(tsdb_node_manager_t *mgr, tsdb_node_id_t id,
     if (idx >= 0) *out = mgr->nodes[idx];
     pthread_mutex_unlock(&mgr->lock);
     return idx >= 0 ? 0 : -1;
+}
+
+void tsdb_node_manager_set_disk(tsdb_node_manager_t *mgr, tsdb_node_id_t id,
+                                uint64_t disk_bytes)
+{
+    if (!mgr) return;
+    pthread_mutex_lock(&mgr->lock);
+    int idx = find_node(mgr, id);
+    if (idx >= 0) mgr->nodes[idx].disk_bytes = disk_bytes;
+    pthread_mutex_unlock(&mgr->lock);
 }
 
 int tsdb_node_manager_random_alive(tsdb_node_manager_t *mgr,

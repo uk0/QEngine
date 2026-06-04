@@ -174,6 +174,7 @@ function NodesTable({ cluster }: { cluster: ClusterInfo | null }) {
               <th>Addr</th>
               <th>Role</th>
               <th>State</th>
+              <th>Storage</th>
               <th>HB age</th>
               <th>Susp.</th>
               <th>Known for</th>
@@ -205,6 +206,7 @@ function NodeRow({ n, local }: { n: ClusterNode; local: boolean }) {
       <td className="mono">{n.addr}</td>
       <td><RoleBadge role={n.role} />{n.role}</td>
       <td><span className={`pill ${stClass}`}>{n.state}</span></td>
+      <td className="mono">{n.disk_bytes ? fmtBytes(n.disk_bytes) : '–'}</td>
       <td className={`mono hb-${hbClass}`}>{n.hb_age_ms} ms</td>
       <td>{n.suspect_count || '-'}</td>
       <td>{fmtSec(n.known_for_s)}</td>

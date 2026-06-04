@@ -342,14 +342,15 @@ int tsdb_cluster_stats_str(tsdb_cluster_t *c, char *buf, size_t cap) {
                             "%s{\"id\":\"%llu\",\"addr\":\"%s\",\"state\":\"%s\","
                             "\"role\":\"%s\","
                             "\"ver\":%llu,\"hb_age_ms\":%lld,\"known_for_s\":%lld,"
-                            "\"suspect_count\":%d}",
+                            "\"suspect_count\":%d,\"disk_bytes\":%llu}",
                             (i > 0 ? "," : ""),
                             (unsigned long long)snap[i].id,
                             snap[i].addr, sname, rname,
                             (unsigned long long)snap[i].version,
                             (long long)hb_age_ms,
                             (long long)known_for_s,
-                            snap[i].suspect_count);
+                            snap[i].suspect_count,
+                            (unsigned long long)snap[i].disk_bytes);
     }
     written += snprintf(buf + written, cap - written, "]");
 
