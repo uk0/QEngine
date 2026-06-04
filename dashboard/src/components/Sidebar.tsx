@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, ddl, Tree } from '../api';
+import { api, ddl, Tree, ClusterInfo } from '../api';
 import { useToastCtx } from './Toasts';
 import { useModalCtx } from './ModalCtx';
 
@@ -11,6 +11,7 @@ interface Props {
 
 export function Sidebar({ bump, onSql, onRefresh }: Props) {
   const [tree, setTree] = useState<Tree | null>(null);
+  const [cluster, setCluster] = useState<ClusterInfo | null>(null);
   const [err, setErr] = useState<string>('');
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const toast = useToastCtx();
@@ -24,9 +25,19 @@ export function Sidebar({ bump, onSql, onRefresh }: Props) {
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'tree load failed');
     }
+    /* Cluster membership drives the cluster-aware header (node count +
+     * aggregate storage).  Best-effort: a standalone server has no /cluster
+     * peers, so failure here just falls back to the single-node header. */
+    try { setCluster(await api.cluster()); } catch { /* ignore */ }
   }, []);
 
   useEffect(() => { load(); }, [load, bump]);
+  /* Refresh the cluster summary on the same 4s cadence the Cluster panel uses
+   * so the header's storage/up figures don't go stale between manual reloads. */
+  useEffect(() => {
+    const t = setInterval(() => { api.cluster().then(setCluster).catch(() => {}); }, 4000);
+    return () => clearInterval(t);
+  }, []);
 
   const toggle = (key: string) => setOpen(o => ({ ...o, [key]: !o[key] }));
   const isOpen = (key: string) => !!open[key];
@@ -193,6 +204,17 @@ ${scope};`;
 
   const dbInfo = tree.db ?? {};
 
+  /* Cluster-aware header.  In cluster mode the dashboard talks to one node but
+   * every node is a full replica, so the tables/databases shown ARE the
+   * cluster's.  Aggregate the per-node disk_bytes (from /cluster, fanned out by
+   * DISK_SYNC) into a cluster total + node count so the header reflects the
+   * whole cluster, not just the node we happen to be connected to. */
+  const nodes = cluster?.nodes ?? [];
+  const nodeCount = nodes.length;
+  const isCluster = nodeCount > 1;
+  const aliveCount = nodes.filter(n => n.state === 'ALIVE').length;
+  const totalDisk = nodes.reduce((s, n) => s + (n.disk_bytes ?? 0), 0);
+
   const renderPtables = (vtName: string) => {
     const ps = ptByVt[vtName] ?? [];
     if (!ps.length) return <div className="empty">no ptables</div>;
@@ -304,16 +326,19 @@ ${scope};`;
     <aside className="sidebar">
       <div className="db-hdr">
         <div className="db-name">
-          <span className="ic">NODE</span>
+          <span className="ic">{isCluster ? 'CLUSTER' : 'NODE'}</span>
           <span>{dbInfo.name ?? '-'}</span>
         </div>
         <div className="db-meta">
-          {dbInfo.host && <span>host: {dbInfo.host}</span>}
+          {dbInfo.host && <span>{isCluster ? 'via' : 'host'}: {dbInfo.host}</span>}
+          {isCluster && <span> · {aliveCount}/{nodeCount} nodes</span>}
           {dbInfo.path && <span> · path: {dbInfo.path}</span>}
         </div>
         <div className="db-meta">
           {typeof dbInfo.uptime_s === 'number' && <span>up: {fmtSec(dbInfo.uptime_s)}</span>}
-          {typeof dbInfo.disk_bytes === 'number' && <span> · disk: {fmtBytes(dbInfo.disk_bytes)}</span>}
+          {isCluster && totalDisk > 0
+            ? <span> · disk: {fmtBytes(totalDisk)} across {nodeCount} nodes</span>
+            : typeof dbInfo.disk_bytes === 'number' && <span> · disk: {fmtBytes(dbInfo.disk_bytes)}</span>}
           {tree.tables && <span> · tbls: {tree.tables.length}</span>}
         </div>
       </div>
