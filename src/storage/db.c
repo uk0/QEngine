@@ -7,6 +7,7 @@
 #include "wal.h"
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
+#include "../catalog/stable.h"
 #include "../catalog/device.h"
 #include "../catalog/tmq.h"
 #include "../catalog/udf.h"
@@ -448,6 +449,53 @@ static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {
 /* Defined at end of file; called from create_table_impl and open_table. */
 static void maybe_start_gc_for_table(tsdb_db_t *db, tsdb_table_internal_t *t);
 
+/* Register a freshly-created plain table into the super-table hierarchy as a
+ * data-bearing VTable: a super-table whose own same-named storage IS its data
+ * (it has no child rows).  This makes every data table uniformly part of
+ * Database→Group→VTable and carries it in stables.log, which cluster
+ * catalog-sync replicates.  It registers NO child table — so it never collides
+ * with a real `CREATE TABLE x USING st` child named x.  A SELECT on the table
+ * dispatches to the super-table executor, which (finding zero children) reads
+ * the same-named plain table back via the stable-child guard in exec.c.  Pure
+ * catalog metadata: storage, writes, and the plain-table read path are
+ * untouched.  Best-effort; skips names/widths beyond the catalog limits. */
+/* Set while creating the *storage* for a real child table (CREATE TABLE x USING
+ * st): that storage table must NOT be mirrored as its own super-table, or it
+ * would (a) shadow its role as a child of st and (b) wrongly accept super-table
+ * operations like PARTITION BY tbname.  Defined here, set around the child
+ * storage create in exec.c. */
+__thread int tsdb_g_creating_child = 0;
+
+static void register_table_as_stable(tsdb_db_t *db, const char *name,
+                                      tsdb_schema_t *schema) {
+    tsdb_catalog_t *cat = tsdb_db_catalog(db);
+    if (!cat || !schema) return;
+    if (tsdb_g_creating_child) return;                  /* storage of a real child */
+    if (strlen(name) > TSDB_STABLE_NAME_MAX) return;    /* must round-trip as a name */
+    if (schema->ncols <= 0 || schema->ncols > TSDB_STABLE_MAX_COLS) return;
+    if (tsdb_stable_exists(cat, name)) return;          /* already hierarchical */
+    tsdb_child_table_t existing_child;
+    if (tsdb_child_table_get(cat, name, &existing_child) == TSDB_OK)
+        return;                                         /* already a child of some stable */
+
+    tsdb_stable_t st;
+    memset(&st, 0, sizeof(st));
+    snprintf(st.name, sizeof(st.name), "%s", name);
+    st.ncols      = schema->ncols;
+    st.ts_col_idx = schema->ts_col_idx;
+    st.ntag_cols  = 0;
+    st.created_at = tsdb_now_ns();
+    for (int i = 0; i < schema->ncols; i++) {
+        snprintf(st.cols[i].name, sizeof(st.cols[i].name), "%s", schema->cols[i].name);
+        st.cols[i].type = schema->cols[i].type;
+    }
+    /* Register the VTable only — NO child table.  A data-bearing super-table
+     * has zero child rows; its data is the same-named plain table, which the
+     * executor reads back via the stable-child fallback.  Registering a child
+     * named `name` would collide with a real `CREATE TABLE name USING st`. */
+    (void)tsdb_stable_create(cat, &st);
+}
+
 /* ---- tsdb_create_table -------------------------------------------------- */
 
 /* Internal: create table with optional hook suppression.
@@ -576,6 +624,11 @@ static int create_table_impl(tsdb_db_t *db,
     if (on_create) {
         on_create(hook_ud, db, name, schema);
     }
+
+    /* Mirror the table into the super-table hierarchy (local catalog only).
+     * Runs on every create path — user CREATE, SCHEMA_SYNC apply, raft replay —
+     * so every node that has the table also carries its VTable+PTable rows. */
+    register_table_as_stable(db, name, schema);
 
     return TSDB_OK;
 }
@@ -825,6 +878,17 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     rm_rf(tbl_dir);
 
     pthread_mutex_unlock(&db->lock);
+
+    /* Tear down the super-table + child catalog rows mirrored at create time
+     * (after releasing db->lock to keep db→catalog lock ordering clean).
+     * Idempotent: a table that predates hierarchy-mirroring has neither. */
+    {
+        tsdb_catalog_t *cat = tsdb_db_catalog(db);
+        if (cat) {
+            (void)tsdb_child_table_drop(cat, name);
+            (void)tsdb_stable_drop(cat, name);
+        }
+    }
     return TSDB_OK;
 }
 

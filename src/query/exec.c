@@ -89,6 +89,15 @@ static inline tsdb_type_t qcoltype(tsdb_type_t t) {
     return t == TSDB_TYPE_FLOAT32 ? TSDB_TYPE_FLOAT64 : t;
 }
 
+/* Re-entry guard for the super-table → child recursion.  Every data table is
+ * also registered as a 1-child super-table (its child shares the table's name),
+ * so a SELECT on it dispatches to exec_stable_select, which then re-runs
+ * exec_select against the child.  Because the child name equals the stable name,
+ * that recursive call would re-detect a stable and loop forever.  The guard,
+ * set only across exec_stable_select's recursive exec_select calls, makes the
+ * inner call treat the name as a plain table (read its storage) instead. */
+static __thread int g_inside_stable_child = 0;
+
 /* ---- Bloom filter block-skip statistics --------------------------------- */
 
 /* Counts blocks skipped by Bloom filter in the most recent query.
@@ -4033,6 +4042,21 @@ static void tsdb_result_free_internal(tsdb_result_t *r) {
     r->cur = -1;
 }
 
+/* exec_select wrapper for exec_stable_select's per-child recursion: sets the
+ * stable-child guard so a child whose name equals its super-table's name is read
+ * as a plain table instead of re-dispatching as a super-table (infinite loop).
+ * Restores the prior guard value on every path, so nesting and errors are safe. */
+static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
+                       char *err, size_t errcap);
+static int exec_select_child(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
+                             char *err, size_t errcap) {
+    int saved = g_inside_stable_child;
+    g_inside_stable_child = 1;
+    int rc = exec_select(db, q, r, err, errcap);
+    g_inside_stable_child = saved;
+    return rc;
+}
+
 /* exec_select is forward-declared at line ~130; exec_stable_select follows: */
 static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                                const tsdb_stable_t *st,
@@ -4070,6 +4094,26 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     size_t nchildren = 0;
     int rc = tsdb_child_table_list(cat, st->name, &children, &nchildren);
     if (rc != TSDB_OK) { eset(err, errcap, "failed to list children of stable '%s'", st->name); return rc; }
+
+    /* Data-bearing super-table: a plain table mirrored into the hierarchy has no
+     * child rows — its data is its own same-named storage.  When the stable has
+     * zero children but a same-named plain table exists, treat that table as the
+     * sole child so the per-child read below returns its rows.  A genuinely empty
+     * super-table (no same-named storage) keeps nchildren==0 and yields an empty
+     * result, exactly as before. */
+    if (nchildren == 0) {
+        tsdb_table_t *self_h = NULL;
+        if (tsdb_open_table(db, st->name, &self_h) == TSDB_OK && self_h) {
+            free(children);
+            children = (tsdb_child_table_t *)calloc(1, sizeof(tsdb_child_table_t));
+            if (children) {
+                snprintf(children[0].name, sizeof(children[0].name), "%s", st->name);
+                snprintf(children[0].stable_name, sizeof(children[0].stable_name), "%s", st->name);
+                children[0].ntags = 0;
+                nchildren = 1;
+            }
+        }
+    }
 
     /* Save original from; we will temporarily replace it per child. */
     char *orig_from = q->from;
@@ -4114,7 +4158,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             memset(&child_r, 0, sizeof(child_r));
             child_r.cur = -1;
 
-            rc = exec_select(db, q, &child_r, err, errcap);
+            rc = exec_select_child(db, q, &child_r, err, errcap);
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 q->has_partition_by_tbname = orig_pb_tbname;
@@ -4139,7 +4183,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             memset(&child_r, 0, sizeof(child_r));
             child_r.cur = -1;
 
-            rc = exec_select(db, q, &child_r, err, errcap);
+            rc = exec_select_child(db, q, &child_r, err, errcap);
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 if (saved_where) q->where = saved_where;
@@ -4172,7 +4216,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             memset(&child_r, 0, sizeof(child_r));
             child_r.cur = -1;
 
-            rc = exec_select(db, q, &child_r, err, errcap);
+            rc = exec_select_child(db, q, &child_r, err, errcap);
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 if (saved_where) q->where = saved_where;
@@ -4348,7 +4392,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     /* Check if FROM refers to a STable; if so, expand to union over children. */
     {
         tsdb_catalog_t *cat = tsdb_db_catalog(db);
-        int from_is_stable = (cat && q->from && tsdb_stable_exists(cat, q->from));
+        int from_is_stable = (!g_inside_stable_child && cat && q->from &&
+                              tsdb_stable_exists(cat, q->from));
         if (q->has_partition_by_tbname && !from_is_stable) {
             eset(err, errcap,
                  "PARTITION BY tbname requires FROM to be a super-table");
@@ -6670,7 +6715,13 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             cols[ci].type = st.cols[ci].type;
         }
         const char *ts_col = st.cols[st.ts_col_idx >= 0 ? st.ts_col_idx : 0].name;
+        /* This is a real child's backing storage — keep it out of the
+         * auto-mirror so it isn't re-registered as its own super-table. */
+        extern __thread int tsdb_g_creating_child;
+        int prev_cc = tsdb_g_creating_child;
+        tsdb_g_creating_child = 1;
         rc = tsdb_create_table(db, ct_in->name, cols, (size_t)st.ncols, ts_col);
+        tsdb_g_creating_child = prev_cc;
         if (rc != TSDB_OK && rc != TSDB_ERR_EXISTS) {
             result_status(r, "ERR: create child table failed");
             break;
