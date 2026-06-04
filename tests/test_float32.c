@@ -94,6 +94,22 @@ static void run_checks(tsdb_db_t *db, const char *phase) {
     int64_t cf32 = q_i64(db, "SELECT count(*) FROM f32t WHERE f32c > 500.0");
     printf("  OK WHERE >500        f64=%lld f32=%lld\n", (long long)cf64, (long long)cf32);
     ASSERT(llabs((long long)(cf64 - cf32)) <= 5);
+
+    /* Result column TYPE for every aggregate/projection over a FLOAT32 column
+     * must be normalised to FLOAT64 — otherwise the binary wire emits an
+     * unhandled type-5 cell and clients decode it as nil (min/max/spread/
+     * first/last + raw projection were the gap).  Checks the executor's
+     * out_type labelling directly. */
+    {
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT min(f32c), max(f32c), sum(f32c), avg(f32c), f32c "
+                          "FROM f32t LIMIT 1", &r));
+        ASSERT(tsdb_result_next(r) == 1);
+        for (int c = 0; c < 5; c++)
+            ASSERT(tsdb_result_col_type(r, c) == TSDB_TYPE_FLOAT64);
+        tsdb_result_free(r);
+        printf("  OK f32 result types  min/max/sum/avg/col all FLOAT64\n");
+    }
 }
 
 int main(void) {

@@ -460,7 +460,10 @@ func parseRowsChunk(qr *QueryResult, p []byte) error {
 				switch qr.ColTypes[ci] {
 				case TypeTimestamp, TypeInt64:
 					colVals[ci][ri] = int64(raw)
-				case TypeFloat64:
+				case TypeFloat64, TypeFloat32:
+					// FLOAT32 travels as an 8-byte double on the wire (the
+					// server widens it); decode it identically so aggregates
+					// like min/max over a FLOAT32 column don't come back nil.
 					colVals[ci][ri] = math.Float64frombits(raw)
 				}
 			}

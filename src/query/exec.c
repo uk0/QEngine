@@ -1015,7 +1015,12 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             else if (k == PROJ_AGG_AVG || k == PROJ_AGG_TS_TWA)
                 arr[n].out_type = TSDB_TYPE_FLOAT64;
             else
-                arr[n].out_type = (arr[n].col >= 0) ? s->cols[arr[n].col].type : TSDB_TYPE_FLOAT64;
+                /* min/max/spread/first/last/sum inherit the column's value type.
+                 * qcoltype() normalises FLOAT32→FLOAT64 so the result column is
+                 * labelled (and emitted) as an 8-byte double — otherwise the
+                 * binary wire writes an unhandled type-5 cell and clients
+                 * (Go SDK) decode it as nil. */
+                arr[n].out_type = (arr[n].col >= 0) ? qcoltype(s->cols[arr[n].col].type) : TSDB_TYPE_FLOAT64;
 
             /* Build output column name. */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
@@ -2287,7 +2292,7 @@ static int build_projs_asof(qast_query_t *q, tsdb_schema_t *ls, tsdb_schema_t *r
         } else {
             int rc2 = resolve_col(rs, e->v.s);
             if (rc2 < 0) { eset(err, errcap, "unknown column '%s'", e->v.s); free(arr); return TSDB_ERR_SCHEMA; }
-            arr[n].kind = PROJ_COL; arr[n].col = rc2 | PROJ_RFLAG; arr[n].out_type = rs->cols[rc2].type;
+            arr[n].kind = PROJ_COL; arr[n].col = rc2 | PROJ_RFLAG; arr[n].out_type = qcoltype(rs->cols[rc2].type);
             snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias ? si->alias : rs->cols[rc2].name);
         }
         n++;

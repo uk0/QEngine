@@ -1078,7 +1078,12 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                 int64_t v = tsdb_result_i64(res, c);
                 memcpy(cbuf[c] + (size_t)chunk_rows * 8, &v, 8); break;
             }
-            case TSDB_TYPE_FLOAT64: {
+            case TSDB_TYPE_FLOAT64:
+            case TSDB_TYPE_FLOAT32: {
+                /* FLOAT32 is an 8-byte double everywhere in the query path; the
+                 * executor normally relabels result columns to FLOAT64, but
+                 * handle the raw type here too so an unnormalised FLOAT32 column
+                 * never emits an uninitialised cell to the wire. */
                 double v = tsdb_result_f64(res, c);
                 memcpy(cbuf[c] + (size_t)chunk_rows * 8, &v, 8); break;
             }
