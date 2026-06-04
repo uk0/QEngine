@@ -15,6 +15,7 @@
 #endif
 
 #include "db.h"
+#include "../catalog/stable.h"
 #include "schema.h"
 #include "memtable.h"
 #include "../cluster/cluster.h"
@@ -932,6 +933,36 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
 #include <dirent.h>
 #include <sys/stat.h>
 
+/* For each data-bearing super-table (a mirrored plain table — zero child
+ * tables) the catalog knows but that has no local storage yet, create its
+ * plain-table backing from the stable schema (suppress-hook, no re-broadcast).
+ * Lets a node that just learned a table via tsdb_catalog_reconcile_from_peers
+ * receive its rows through the normal anti-entropy pull.  Real super-tables
+ * (>=1 child) are skipped — their data lives in the children. */
+static void materialize_missing_stables(tsdb_db_t *db) {
+    tsdb_catalog_t *cat = tsdb_db_catalog(db);
+    if (!cat) return;
+    tsdb_stable_t *stbl = NULL; size_t ns = 0;
+    if (tsdb_stable_list(cat, &stbl, &ns) != TSDB_OK || !stbl) return;
+    for (size_t i = 0; i < ns; i++) {
+        tsdb_stable_t *s = &stbl[i];
+        if (tsdb_db_find_table(db, s->name)) continue;          /* already local */
+        tsdb_child_table_t *ch = NULL; size_t nch = 0;
+        if (tsdb_child_table_list(cat, s->name, &ch, &nch) == TSDB_OK) free(ch);
+        if (nch > 0) continue;                                  /* real super-table */
+        if (s->ncols <= 0 || s->ts_col_idx < 0 || s->ts_col_idx >= s->ncols) continue;
+        tsdb_col_t cols[TSDB_STABLE_MAX_COLS];
+        for (int k = 0; k < s->ncols; k++) {
+            cols[k].name = s->cols[k].name;
+            cols[k].type = s->cols[k].type;
+        }
+        const char *ts_col = s->cols[s->ts_col_idx].name;
+        if (tsdb_create_table_local(db, s->name, cols, (size_t)s->ncols, ts_col) == TSDB_OK)
+            fprintf(stderr, "[catalog-reconcile] materialized learned table '%s'\n", s->name);
+    }
+    free(stbl);
+}
+
 /* True for directories that represent a user table (excludes dot-
  * prefixed files, "catalog", "wal", "raft" plumbing dirs). */
 static int resync_is_table_dir(const char *name) {
@@ -957,6 +988,13 @@ void *tsdb_resync_startup_thread(void *ud) {
                            .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
     nanosleep(&ts, NULL);
 
+    /* Catalog reconcile FIRST: pull every alive peer's catalog and merge it
+     * resurrection-safe, so this node — master included — learns any table
+     * created while it was down (e.g. an SDK table that landed in stables.log
+     * on the peers).  Then materialize storage for the data-bearing ones so the
+     * per-table row pull below fills them in. */
+    (void)tsdb_catalog_reconcile_from_peers(db);
+
     /* Pre-open every on-disk table across every striped data dir so
      * db->tables[] reflects them.  Falls back to a single-dir scan
      * when striping is disabled.  tsdb_open_table itself routes the
@@ -979,6 +1017,10 @@ void *tsdb_resync_startup_thread(void *ud) {
         }
         closedir(d);
     }
+
+    /* Create storage for any reconciled-but-unmaterialized data-bearing table,
+     * so it joins db->tables[] and gets its rows pulled by the loop below. */
+    materialize_missing_stables(db);
 
     char names[TSDB_CLUSTER_MAX_NODES * 8][64];
     int max_names = (int)(sizeof(names) / sizeof(names[0]));

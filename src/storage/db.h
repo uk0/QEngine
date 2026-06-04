@@ -137,6 +137,15 @@ int                    tsdb_db_flush_all(tsdb_db_t *db);
  * during cluster CREATE storms).  Defined in catalog_sync.c. */
 int                    tsdb_catalog_pull_from_master(tsdb_db_t *db);
 
+/* Resurrection-safe reverse merge of a CATALOG_DUMP payload: appends only the
+ * peer's live `+` records for names absent from the local log (never resurrects
+ * a locally-dropped table).  tsdb_catalog_reconcile_from_peers pulls every alive
+ * peer's dump and merges it, so a recovered node — including the master — learns
+ * tables created during its downtime.  Defined in catalog_sync.c. */
+int                    tsdb_catalog_dump_apply_filtered(const char *data_dir,
+                                                        const uint8_t *buf, size_t len);
+int                    tsdb_catalog_reconcile_from_peers(tsdb_db_t *db);
+
 /* Access the TMQ consumer-group store embedded in the db. Returns NULL if
  * it failed to open (non-fatal for plain workloads). */
 struct tsdb_tmq;

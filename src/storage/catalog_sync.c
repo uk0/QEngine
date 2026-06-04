@@ -165,6 +165,182 @@ int tsdb_catalog_dump_apply(const char *data_dir, const uint8_t *buf, size_t len
     return applied;
 }
 
+/* ---- Resurrection-safe reverse merge (a recovered MASTER learns tables that
+ * were created while it was down) ----------------------------------------
+ *
+ * tsdb_catalog_dump_apply above appends a peer's whole log verbatim — correct
+ * data<-master, where the master log is authoritative.  The reverse direction
+ * (master<-data, to learn an outage-window CREATE) needs a SAFE merge that can
+ * only ADD genuinely-new tables and can never resurrect one this node
+ * created-then-dropped (whose log carries a `-name` tombstone).  Rule: append a
+ * peer `+NAME` record IFF
+ *     NAME is in the peer's LIVE set (peer's last op for NAME is `+`)   AND
+ *     NAME appears NOWHERE in our local log for that file.
+ * Peer `-` lines are ignored outright: a stale peer must never drop a table we
+ * legitimately hold (DROP still flows the authoritative master->data path). */
+
+/* Name token = text between the 1st and 2nd TAB of a catalog log line. */
+static int catlog_line_name(const char *p, size_t n, char *out, size_t cap) {
+    size_t i = 0;
+    while (i < n && p[i] != '\t' && p[i] != '\n') i++;
+    if (i >= n || p[i] != '\t') return 0;
+    i++;
+    size_t j = 0;
+    while (i < n && p[i] != '\t' && p[i] != '\n' && j + 1 < cap) out[j++] = p[i++];
+    out[j] = 0;
+    return j > 0;
+}
+
+/* Does `buf` contain, at/after byte `from`, a line whose op-char is `op` and
+ * whose name token equals `name`? */
+static int body_has_line(const char *buf, size_t len, size_t from,
+                         char op, const char *name) {
+    size_t i = from;
+    while (i < len) {
+        size_t ls = i;
+        while (i < len && buf[i] != '\n') i++;
+        size_t ll = i - ls;
+        if (i < len) i++;
+        if (ll < 2 || buf[ls] != op) continue;
+        char nm[80];
+        if (catlog_line_name(buf + ls, ll, nm, sizeof(nm)) && !strcmp(nm, name))
+            return 1;
+    }
+    return 0;
+}
+
+/* Whole-file membership: does `lbuf` (local log) mention `name` on any line? */
+static int local_mentions(const char *lbuf, size_t llen, const char *name) {
+    size_t i = 0;
+    while (i < llen) {
+        size_t ls = i;
+        while (i < llen && lbuf[i] != '\n') i++;
+        size_t ll = i - ls;
+        if (i < llen) i++;
+        char nm[80];
+        if (ll >= 2 && catlog_line_name(lbuf + ls, ll, nm, sizeof(nm)) && !strcmp(nm, name))
+            return 1;
+    }
+    return 0;
+}
+
+/* Append, to local log `path`, the peer body's `+` records for names that are
+ * live on the peer and absent from the local log.  Returns # records added. */
+static int filtered_append_log(const char *path, const char *body, size_t blen) {
+    char *lbuf = NULL; size_t llen = 0;
+    FILE *lf = fopen(path, "rb");
+    if (lf) {
+        fseek(lf, 0, SEEK_END); long sz = ftell(lf); fseek(lf, 0, SEEK_SET);
+        if (sz > 0 && sz < 64L * 1024 * 1024) {
+            lbuf = malloc((size_t)sz);
+            if (lbuf && fread(lbuf, 1, (size_t)sz, lf) == (size_t)sz) llen = (size_t)sz;
+            else { free(lbuf); lbuf = NULL; }
+        }
+        fclose(lf);
+    }
+    char *added = NULL; size_t added_len = 0, added_cap = 0;   /* "\x01name\x01..." dedup */
+    FILE *out = NULL;
+    int count = 0;
+    size_t i = 0;
+    while (i < blen) {
+        size_t ls = i;
+        while (i < blen && body[i] != '\n') i++;
+        size_t ll = i - ls;
+        size_t next = (i < blen) ? i + 1 : i;
+        if (i < blen) i++;
+        if (ll < 2 || body[ls] != '+') continue;
+        char nm[80];
+        if (!catlog_line_name(body + ls, ll, nm, sizeof(nm))) continue;
+        if (lbuf && local_mentions(lbuf, llen, nm)) continue;        /* known locally */
+        char key[88]; int kl = snprintf(key, sizeof(key), "\x01%s\x01", nm);
+        if (added && strstr(added, key)) continue;                  /* already added */
+        if (body_has_line(body, blen, next, '-', nm)) continue;     /* peer dropped it later */
+        if (!out) { out = fopen(path, "ab"); if (!out) break; }
+        fwrite(body + ls, 1, ll, out); fputc('\n', out);
+        count++;
+        if (added_len + (size_t)kl + 1 > added_cap) {
+            added_cap = (added_cap ? added_cap * 2 : 1024) + (size_t)kl;
+            char *na = realloc(added, added_cap);
+            if (na) added = na; else continue;
+        }
+        memcpy(added + added_len, key, (size_t)kl); added_len += (size_t)kl; added[added_len] = 0;
+    }
+    if (out) fclose(out);
+    free(lbuf); free(added);
+    return count;
+}
+
+/* Apply a CATALOG_DUMP payload with the resurrection-safe filter (each of the
+ * 4 logs).  Returns total records added across files. */
+int tsdb_catalog_dump_apply_filtered(const char *data_dir,
+                                     const uint8_t *buf, size_t len) {
+    if (!data_dir || !buf || len < 8) return 0;
+    size_t off = 0; int added = 0;
+    while (off + 8 <= len) {
+        uint32_t name_len = (uint32_t)buf[off] | ((uint32_t)buf[off+1] << 8)
+                          | ((uint32_t)buf[off+2] << 16) | ((uint32_t)buf[off+3] << 24);
+        off += 4;
+        if (name_len > 64 || off + name_len + 4 > len) break;
+        char name[80] = {0};
+        memcpy(name, buf + off, name_len); off += name_len;
+        uint32_t body_len = (uint32_t)buf[off] | ((uint32_t)buf[off+1] << 8)
+                          | ((uint32_t)buf[off+2] << 16) | ((uint32_t)buf[off+3] << 24);
+        off += 4;
+        if (off + body_len > len) break;
+        int ok = 0;
+        for (int k = 0; k < kCatalogLogCount; k++)
+            if (!strcmp(name, kCatalogLogs[k])) { ok = 1; break; }
+        if (ok && body_len > 0) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/catalog/%s", data_dir, name);
+            added += filtered_append_log(path, (const char *)(buf + off), body_len);
+        }
+        off += body_len;
+    }
+    return added;
+}
+
+/* Pull each alive peer's catalog dump and merge it resurrection-safe, so a
+ * recovered node (incl. the master) learns tables created during its absence.
+ * Returns the number of catalog records learned; reloads the in-memory catalog
+ * if anything changed. */
+int tsdb_catalog_reconcile_from_peers(tsdb_db_t *db) {
+    if (!db) return 0;
+    struct tsdb_cluster *c = tsdb_db_cluster(db);
+    if (!c) return 0;
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return 0;
+
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(tsdb_cluster_node_mgr(c), snap, TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+
+    size_t cap = 32 * 1024 * 1024;
+    uint8_t *reply = malloc(cap);
+    if (!reply) return 0;
+
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        if (snap[i].id == self)               continue;
+        if (snap[i].state != TSDB_NODE_ALIVE) continue;
+        tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, snap[i].id);
+        if (!conn) continue;
+        uint32_t rlen = 0;
+        int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_CATALOG_DUMP,
+                                     NULL, 0, reply, (uint32_t)cap, &rlen);
+        if (rc == TSDB_OK && rlen > 0)
+            total += tsdb_catalog_dump_apply_filtered(tsdb_db_data_dir(db), reply, rlen);
+    }
+    free(reply);
+
+    if (total > 0) {
+        (void)tsdb_db_reload_catalog(db);
+        fprintf(stderr, "[catalog-reconcile] learned %d missing catalog record(s) from peers\n",
+                total);
+    }
+    return total;
+}
+
 /* Public entry point — data-node startup uses this.  Calls into
  * cluster RPC layer to fetch the dump from any alive master, applies
  * it, reloads the in-memory catalog. */
