@@ -105,6 +105,17 @@ struct tsdb_db {
     volatile int     trash_gc_running;
     uint64_t         trash_seq;
 
+    /* Aggregate-memtable backpressure.  is_full() caps each table's memtable at
+     * block_points ROWS, but with thousands of tables the SUM bloats unbounded
+     * (a 2000-ptable stress held ~3.4 GiB on the master).  The trash/maintenance
+     * thread periodically sums live memtable rows across all tables and raises
+     * this flag when over budget; maybe_flush_b then flushes the table being
+     * written (on the writer's own thread — no cross-thread flush) so aggregate
+     * memory stays bounded and fast writers get natural backpressure.
+     * memtable_budget_rows == 0 disables it (unbounded, legacy behaviour). */
+    volatile int     memtable_over_budget;
+    uint64_t         memtable_budget_rows;
+
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
     int                    ntables;
 
@@ -331,6 +342,14 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
      * (rare in practice: the catalog/ dir already exists by here). */
     if (tsdb_audit_open(data_dir, &db->audit) != 0) {
         db->audit = NULL;
+    }
+
+    /* Aggregate-memtable budget (rows across all tables).  Default 32M ≈ a few
+     * GiB — a runaway cap that never trips a normal workload; 0 = unbounded. */
+    db->memtable_budget_rows = 32ull * 1000 * 1000;
+    {
+        const char *mb = getenv("TSDB_MEMTABLE_BUDGET_ROWS");
+        if (mb && *mb) { long long v = atoll(mb); if (v >= 0) db->memtable_budget_rows = (uint64_t)v; }
     }
 
     /* Background reclaim of trashed (dropped) table dirs; also drains any
@@ -911,6 +930,23 @@ static void *trash_gc_main(void *arg) {
                 if (!db->trash_gc_running) break;
             }
         }
+
+        /* Aggregate-memtable budget: sum live rows across all tables and raise
+         * the over-budget flag so the write path flushes under pressure.  Held
+         * under db->lock so a concurrent drop can't free a table mid-sum; the
+         * lock order is db->lock -> memtable lock (no path takes them the other
+         * way, so no deadlock).  O(ntables) and brief. */
+        if (db->memtable_budget_rows > 0) {
+            uint64_t total = 0;
+            pthread_mutex_lock(&db->lock);
+            for (int ti = 0; ti < db->ntables && db->trash_gc_running; ti++) {
+                tsdb_table_internal_t *t = db->tables[ti];
+                if (t && t->memtable) total += tsdb_memtable_rows(t->memtable);
+            }
+            pthread_mutex_unlock(&db->lock);
+            db->memtable_over_budget = (total > db->memtable_budget_rows) ? 1 : 0;
+        }
+
         /* Sleep ~2s, waking often to honour shutdown. */
         for (int s = 0; s < 20 && db->trash_gc_running; s++) {
             struct timespec ts = { 0, 100 * 1000 * 1000 };
@@ -1394,6 +1430,16 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
  */
 static int maybe_flush_b(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_is_full(t->memtable)) {
+        return flush_and_clear_ex(t, skip_replicate);
+    }
+    /* Aggregate-memtable backpressure: when total memtable rows across all
+     * tables exceed the budget (flag maintained by the maintenance thread),
+     * flush THIS table — it's the one being written, already serialised on the
+     * writer's thread, so no risky cross-thread flush.  The 2048-row floor
+     * avoids tiny fragmenting flushes; substantial tables relieve the pressure
+     * and the next maintenance pass clears the flag. */
+    if (t->db && t->db->memtable_over_budget &&
+        tsdb_memtable_rows(t->memtable) >= 2048) {
         return flush_and_clear_ex(t, skip_replicate);
     }
     return TSDB_OK;
