@@ -131,6 +131,24 @@ int main(void) {
     size_t scount = tsdb_catalog_shadow_v2_count(v1);
     ASSERT(scount >= 4);   /* default, sysdb, prod, plainx (at minimum) */
     printf("  TSDB_CATALOG_V2 shadow built at open: %zu live entities\n", scount);
+
+    /* Continuous dual-write: a live v1 create then resync grows the shadow;
+     * a drop then resync shrinks it back — the shadow tracks v1, not just a
+     * one-shot open snapshot. */
+    {
+        tsdb_database_t extra; memset(&extra, 0, sizeof(extra));
+        snprintf(extra.name, sizeof(extra.name), "extra");
+        ASSERT(tsdb_database_create(v1, &extra) == TSDB_OK);
+        tsdb_catalog_resync_shadow(v1);
+        size_t grew = tsdb_catalog_shadow_v2_count(v1);
+        ASSERT(grew == scount + 1);
+
+        ASSERT(tsdb_database_drop(v1, "extra") == TSDB_OK);
+        tsdb_catalog_resync_shadow(v1);
+        size_t shrank = tsdb_catalog_shadow_v2_count(v1);
+        ASSERT(shrank == scount);
+        printf("  continuous resync: create->%zu, drop->%zu (shadow tracks v1)\n", grew, shrank);
+    }
     tsdb_catalog_close(v1);
     unsetenv("TSDB_CATALOG_V2");
 

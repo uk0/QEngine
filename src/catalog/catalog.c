@@ -272,16 +272,20 @@ struct tsdb_catalog {
     char            stb_path[4096];
     char            chl_path[4096];
 
-    /* Dual-write shadow: a v2 (ID-keyed, unified) mirror of this catalog,
-     * built at open when TSDB_CATALOG_V2 is set.  NULL otherwise.  Proves the
-     * v2 model holds the v1 state before any read path switches over. */
+    /* Dual-write shadow: a v2 (ID-keyed, unified) mirror of this catalog, built
+     * at open and re-synced by the bg thread when TSDB_CATALOG_V2 is set.  NULL
+     * otherwise.  Proves the v2 model holds the v1 state before any read path
+     * switches over.  shadow_lock guards the pointer (lock order: shadow_lock
+     * then c->lock, since the re-sync mirror reads v1 under c->lock). */
     tsdb_catalog_v2_t *shadow_v2;
+    pthread_mutex_t    shadow_lock;
 };
 
 /* ---- Log helpers --------------------------------------------------------- */
 
 /* Forward decls — definitions live further down in this file. */
 static int  split_tab(char *line, char **fields, int max_fields);
+static void shadow_v2_resync(tsdb_catalog_t *c);   /* dual-write v2 mirror rebuild */
 
 /* ---- Catalog log compaction ------------------------------------------- *
  *
@@ -506,6 +510,12 @@ static void *catalog_compact_thread(void *arg) {
         if (file_size_or_zero(c->chl_path) > CATALOG_COMPACT_MIN_BYTES)
             (void)tsdb_catalog_compact_children(c, c->chl_path);
         pthread_mutex_unlock(&c->lock);
+
+        /* Continuous dual-write: rebuild the v2 shadow from the current v1
+         * state so it tracks live creates + drops.  No-op unless the flag is
+         * set.  Runs after releasing c->lock — the resync's mirror re-acquires
+         * it (shadow_lock -> c->lock order). */
+        shadow_v2_resync(c);
     }
     return NULL;
 }
@@ -843,13 +853,17 @@ static int replay_devices(tsdb_catalog_t *c, const char *path) {
 
 /* ---- tsdb_catalog_open / close ------------------------------------------ */
 
-/* Build the v2 dual-write shadow from the just-replayed v1 state, gated by
- * TSDB_CATALOG_V2.  A FRESH shadow each open (old catalog.log/OIDSEQ unlinked)
- * so it reflects the current state including drops.  Logs the mirrored count so
- * a cluster operator can confirm v2 holds exactly what v1 does.  Best-effort:
- * any failure just leaves shadow_v2 NULL and the catalog runs as before. */
-static void shadow_v2_build(tsdb_catalog_t *c) {
+/* (Re)build the v2 dual-write shadow from the current v1 state, gated by
+ * TSDB_CATALOG_V2.  A FRESH shadow each call (old catalog.log/OIDSEQ unlinked)
+ * so it reflects live creates AND drops — this is the continuous dual-write:
+ * built at open, then rebuilt by the bg thread every compaction interval, so a
+ * cluster operator watching the log sees v2's count track v1's.  Best-effort.
+ * Holds shadow_lock for the rebuild (the mirror then takes c->lock to read v1,
+ * so the order is shadow_lock -> c->lock; nothing acquires them the other way). */
+static void shadow_v2_resync(tsdb_catalog_t *c) {
     if (!getenv("TSDB_CATALOG_V2")) return;
+    pthread_mutex_lock(&c->shadow_lock);
+    if (c->shadow_v2) { tsdb_cat2_close(c->shadow_v2); c->shadow_v2 = NULL; }
     char p[4200];
     snprintf(p, sizeof(p), "%s/catalog.log", c->cat_dir);     unlink(p);
     snprintf(p, sizeof(p), "%s/catalog.log.tmp", c->cat_dir); unlink(p);
@@ -857,15 +871,29 @@ static void shadow_v2_build(tsdb_catalog_t *c) {
     uint16_t node_id = 1;
     const char *nid = getenv("TSDB_NODE_ID");
     if (nid && *nid) { long v = strtol(nid, NULL, 10); if (v > 0 && v < 65536) node_id = (uint16_t)v; }
-    if (tsdb_cat2_open(c->data_dir, node_id, &c->shadow_v2) != TSDB_OK) { c->shadow_v2 = NULL; return; }
-    size_t mir = 0, skip = 0;
-    if (tsdb_catalog_mirror_to_v2(c, c->shadow_v2, &mir, &skip) == TSDB_OK)
-        fprintf(stderr, "[catalog] v2 shadow (TSDB_CATALOG_V2): mirrored %zu, skipped %zu\n", mir, skip);
+    if (tsdb_cat2_open(c->data_dir, node_id, &c->shadow_v2) == TSDB_OK) {
+        size_t mir = 0, skip = 0;
+        if (tsdb_catalog_mirror_to_v2(c, c->shadow_v2, &mir, &skip) == TSDB_OK)
+            fprintf(stderr, "[catalog] v2 shadow (TSDB_CATALOG_V2): mirrored %zu, skipped %zu\n", mir, skip);
+    } else {
+        c->shadow_v2 = NULL;
+    }
+    pthread_mutex_unlock(&c->shadow_lock);
+}
+
+/* Public trigger to rebuild the shadow now (the bg thread also does this every
+ * compaction interval).  No-op unless TSDB_CATALOG_V2 is set. */
+void tsdb_catalog_resync_shadow(tsdb_catalog_t *c) {
+    if (c) shadow_v2_resync(c);
 }
 
 /* Live-entity count of the v2 shadow (0 if no shadow). */
 size_t tsdb_catalog_shadow_v2_count(tsdb_catalog_t *c) {
-    return (c && c->shadow_v2) ? tsdb_cat2_count(c->shadow_v2) : 0;
+    if (!c) return 0;
+    pthread_mutex_lock(&c->shadow_lock);
+    size_t n = c->shadow_v2 ? tsdb_cat2_count(c->shadow_v2) : 0;
+    pthread_mutex_unlock(&c->shadow_lock);
+    return n;
 }
 
 int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
@@ -883,6 +911,7 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     }
 
     pthread_mutex_init(&c->lock, NULL);
+    pthread_mutex_init(&c->shadow_lock, NULL);
 
     if (hmap_init(&c->databases) != 0
         || hmap_init(&c->groups) != 0 || hmap_init(&c->device_index) != 0
@@ -978,7 +1007,7 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     if (pthread_create(&c->compact_thread, NULL, catalog_compact_thread, c) != 0)
         c->compact_running = 0;
 
-    shadow_v2_build(c);   /* no-op unless TSDB_CATALOG_V2 is set */
+    shadow_v2_resync(c);   /* no-op unless TSDB_CATALOG_V2 is set */
 
     *out = c;
     return TSDB_OK;
@@ -1034,6 +1063,7 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
 
     pthread_mutex_unlock(&c->lock);
     pthread_mutex_destroy(&c->lock);
+    pthread_mutex_destroy(&c->shadow_lock);
     free(c);
 }
 

@@ -25,4 +25,8 @@ int tsdb_catalog_mirror_to_v2(struct tsdb_catalog *v1, tsdb_catalog_v2_t *v2,
  * surface "v2 holds N entities" alongside the v1 tree for observation. */
 size_t tsdb_catalog_shadow_v2_count(struct tsdb_catalog *v1);
 
+/* Rebuild the v2 shadow from the current v1 state now (the bg thread also does
+ * this every compaction interval).  No-op unless TSDB_CATALOG_V2 is set. */
+void tsdb_catalog_resync_shadow(struct tsdb_catalog *v1);
+
 #endif /* TSDB_CATALOG_MIRROR_H */
