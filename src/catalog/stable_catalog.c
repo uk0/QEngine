@@ -398,7 +398,16 @@ int tsdb_catalog_replay_children(tsdb_catalog_t *c, const char *path) {
                 else if (!strncmp(fields[fi], "GRP=", 4))
                     snprintf(ct->group, sizeof(ct->group), "%s", fields[fi] + 4);
             }
-            sc_hmap_put(&c->child_tables, ct->name, ct);
+            /* Drop orphan children at replay: a child whose parent stable is
+             * not live (dropped, or its +stable line was lost) must NOT be
+             * rebuilt — otherwise every cold restart resurrects on-disk orphans
+             * that no DROP STABLE can cascade away (DROP STABLE enumerates
+             * children from the catalog).  Stables replay before children
+             * (catalog.c:881-883), so the parent set is complete here. */
+            if (sc_hmap_get(&c->stables, ct->stable_name))
+                sc_hmap_put(&c->child_tables, ct->name, ct);
+            else
+                free(ct);
         } else if (!strcmp(fields[0], "-child") && nf >= 2) {
             sc_hmap_del(&c->child_tables, fields[1]);
         }

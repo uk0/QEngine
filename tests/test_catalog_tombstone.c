@@ -103,7 +103,38 @@ int main(void) {
     ASSERT(added == 0);
     ASSERT(file_count(stb_path, "+stable\tB\t") == 0);   /* still not resurrected */
 
+    /* ── replay drops orphan children whose parent stable is gone ─────────── */
+    /* Create stable P + child childP via the API, then hand-append an orphan
+     * +child under a parent that never existed, reopen, and assert replay keeps
+     * childP (live parent) but drops childGhost (orphan) — so a cold restart no
+     * longer rebuilds on-disk orphans that DROP STABLE could never cascade. */
     snprintf(cmd, sizeof(cmd), "rm -rf %s", TMP); (void)system(cmd);
-    printf("[PASS] catalog tombstones survive compaction; no post-compaction resurrection\n");
+    ASSERT(tsdb_catalog_open(TMP, &c) == TSDB_OK);
+    mk_stable(c, "P");
+    {
+        tsdb_child_table_t ct; memset(&ct, 0, sizeof(ct));
+        snprintf(ct.name, sizeof(ct.name), "childP");
+        snprintf(ct.stable_name, sizeof(ct.stable_name), "P");
+        ct.ntags = 0;
+        ASSERT(tsdb_child_table_create(c, &ct) == TSDB_OK);
+    }
+    tsdb_catalog_close(c);
+    {
+        char chl[512]; snprintf(chl, sizeof(chl), "%s/catalog/child_tables.log", TMP);
+        FILE *af = fopen(chl, "a"); ASSERT(af);
+        fputs("+child\tchildGhost\tGHOSTPARENT\t0\t300\n", af);
+        fclose(af);
+    }
+    ASSERT(tsdb_catalog_open(TMP, &c) == TSDB_OK);
+    {
+        tsdb_child_table_t out;
+        ASSERT(tsdb_child_table_get(c, "childP", &out) == TSDB_OK);      /* parent live → kept */
+        ASSERT(tsdb_child_table_get(c, "childGhost", &out) != TSDB_OK);  /* orphan → dropped */
+    }
+    tsdb_catalog_close(c);
+    printf("  replay kept childP (parent live), dropped childGhost (orphan)\n");
+
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", TMP); (void)system(cmd);
+    printf("[PASS] catalog tombstones survive compaction; replay drops orphan children\n");
     return 0;
 }
