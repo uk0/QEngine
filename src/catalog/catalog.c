@@ -393,6 +393,35 @@ static int replay_databases(tsdb_catalog_t *c, const char *path) {
     return TSDB_OK;
 }
 
+/* Compaction rebuilds a catalog log from the live hmap, which holds only
+ * surviving entities — so a naive rewrite silently drops every `-` tombstone.
+ * The cluster reconcile guard (catalog_sync.c local_mentions/local_stable_live)
+ * refuses to resurrect a dropped object by scanning these logs for that prior
+ * `-`; stripping it lets a peer that was down during the drop re-teach it on the
+ * next anti-entropy pass — the catalog analogue of the data-layer DELETE
+ * watermark.  This re-emits each tombstone whose name is still dropped (absent
+ * from `live`), preserving the guard's evidence across compaction.  Used for the
+ * databases/groups logs, whose tombstones are `-\t<pct-encoded-name>`. */
+static void keep_tombstones_pct(const char *old_path, FILE *new_log, hmap_t *live) {
+    FILE *f = fopen(old_path, "r");
+    if (!f) return;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '-' || line[1] != '\t') continue;   /* tombstones only */
+        size_t ln = strlen(line);
+        while (ln && (line[ln-1] == '\n' || line[ln-1] == '\r')) line[--ln] = '\0';
+        char cp[4096];
+        strncpy(cp, line, sizeof(cp) - 1); cp[sizeof(cp) - 1] = '\0';
+        char *fields[4];
+        if (split_tab(cp, fields, 4) < 2) continue;
+        char name[64];
+        pct_decode(fields[1], name, sizeof(name));
+        if (hmap_get(live, name)) continue;     /* re-created → live `+` already written */
+        fprintf(new_log, "-\t%s\n", fields[1]);  /* re-emit the encoded tombstone */
+    }
+    fclose(f);
+}
+
 /* Rewrite databases.log from the post-replay hmap.  Caller passes
  * `path` so this can be invoked at open time before the live append
  * handle is opened. */
@@ -410,6 +439,7 @@ static int compact_databases(tsdb_catalog_t *c, const char *path) {
         tsdb_database_t *d = (tsdb_database_t *)c->databases.buckets[i].val;
         if (log_database(c, '+', d) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
     }
+    if (rc == TSDB_OK) keep_tombstones_pct(path, new_log, &c->databases);
     fflush(new_log);
     fsync(fileno(new_log));
     fclose(new_log);
@@ -989,6 +1019,7 @@ static int compact_groups(tsdb_catalog_t *c, const char *path) {
         tsdb_group_t *g = (tsdb_group_t *)c->groups.buckets[i].val;
         if (log_group(c, '+', g) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
     }
+    if (rc == TSDB_OK) keep_tombstones_pct(path, new_log, &c->groups);
     fflush(new_log);
     fsync(fileno(new_log));
     fclose(new_log);

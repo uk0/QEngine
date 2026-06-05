@@ -227,6 +227,33 @@ static int child_log_write(tsdb_catalog_t *c, char op, const tsdb_child_table_t 
 /* Compaction: rewrite from post-replay hmap.  Same atomic temp+rename
  * pattern as compact_databases / compact_groups in catalog.c. */
 #include <unistd.h>
+
+/* Re-emit drop tombstones whose name is still dropped (absent from `live`), so
+ * compaction does not strip the evidence the cluster reconcile guard relies on
+ * to refuse resurrecting a dropped stable/child (see keep_tombstones_pct in
+ * catalog.c).  Tombstone format here is `<droptok>\t<name>` with names raw
+ * (not pct-encoded): droptok = "-stable" or "-child". */
+static void sc_keep_tombstones(const char *old_path, FILE *new_log,
+                               hmap_t *live, const char *droptok) {
+    FILE *f = fopen(old_path, "r");
+    if (!f) return;
+    size_t tl = strlen(droptok);
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, droptok, tl) != 0 || line[tl] != '\t') continue;
+        char name[TSDB_STABLE_NAME_MAX + 1];
+        size_t w = 0;
+        for (const char *p = line + tl + 1;
+             *p && *p != '\t' && *p != '\n' && *p != '\r' && w < sizeof(name) - 1; p++)
+            name[w++] = *p;
+        name[w] = '\0';
+        if (!name[0]) continue;
+        if (sc_hmap_get(live, name)) continue;   /* re-created → live record already written */
+        fprintf(new_log, "%s\t%s\n", droptok, name);
+    }
+    fclose(f);
+}
+
 int tsdb_catalog_compact_stables(tsdb_catalog_t *c, const char *path) {
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
@@ -240,6 +267,7 @@ int tsdb_catalog_compact_stables(tsdb_catalog_t *c, const char *path) {
         tsdb_stable_t *s = (tsdb_stable_t *)c->stables.buckets[i].val;
         if (stable_log_write(c, '+', s) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
     }
+    if (rc == TSDB_OK) sc_keep_tombstones(path, new_log, &c->stables, "-stable");
     fflush(new_log);
     fsync(fileno(new_log));
     fclose(new_log);
@@ -263,6 +291,7 @@ int tsdb_catalog_compact_children(tsdb_catalog_t *c, const char *path) {
         tsdb_child_table_t *ct = (tsdb_child_table_t *)c->child_tables.buckets[i].val;
         if (child_log_write(c, '+', ct) != TSDB_OK) { rc = TSDB_ERR_IO; break; }
     }
+    if (rc == TSDB_OK) sc_keep_tombstones(path, new_log, &c->child_tables, "-child");
     fflush(new_log);
     fsync(fileno(new_log));
     fclose(new_log);
