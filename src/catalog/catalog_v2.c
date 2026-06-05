@@ -444,6 +444,11 @@ tsdb_oid_t tsdb_cat2_db_by_name(tsdb_catalog_v2_t *c, const char *name) {
     cat2_node_t *n = (cat2_node_t *)h_get(&c->idx, k);
     return (n && n->live) ? n->u.db.oid : TSDB_OID_NONE;
 }
+tsdb_oid_t tsdb_cat2_group_by_name(tsdb_catalog_v2_t *c, tsdb_oid_t db_id, const char *name) {
+    char k[160]; k_grp(k, sizeof(k), db_id, name);
+    cat2_node_t *n = (cat2_node_t *)h_get(&c->idx, k);
+    return (n && n->live) ? n->u.grp.oid : TSDB_OID_NONE;
+}
 tsdb_oid_t tsdb_cat2_table_by_name(tsdb_catalog_v2_t *c, tsdb_oid_t db_id, const char *name) {
     char k[160]; k_tbl(k, sizeof(k), db_id, name);
     cat2_node_t *n = (cat2_node_t *)h_get(&c->idx, k);

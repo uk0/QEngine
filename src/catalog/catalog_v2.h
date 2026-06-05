@@ -93,6 +93,7 @@ int  tsdb_cat2_table_get(tsdb_catalog_v2_t *c, tsdb_oid_t oid, tsdb_table_meta_t
 /* Lookup oid by name.  Databases are global; groups/tables are unique within a
  * database (scoped by db_id).  Returns TSDB_OID_NONE if absent. */
 tsdb_oid_t tsdb_cat2_db_by_name   (tsdb_catalog_v2_t *c, const char *name);
+tsdb_oid_t tsdb_cat2_group_by_name(tsdb_catalog_v2_t *c, tsdb_oid_t db_id, const char *name);
 tsdb_oid_t tsdb_cat2_table_by_name(tsdb_catalog_v2_t *c, tsdb_oid_t db_id, const char *name);
 
 /* Drop a single entity by oid (tombstone).  Cascade is added in P3
