@@ -28,6 +28,10 @@
 /* Forward declaration of mkdir_p from schema.c. */
 extern int tsdb_mkdir_p(const char *path);
 
+/* Deferred-reclaim helpers (defined below, used by tsdb_open/drop). */
+static void *trash_gc_main(void *arg);
+static void  trash_or_rm(tsdb_db_t *db, const char *tbl_dir);
+
 /* ---- Table handle ------------------------------------------------------- */
 
 /*
@@ -90,6 +94,16 @@ struct tsdb_db {
     char             data_dirs[TSDB_MAX_DATA_DIRS][4096];
     int              n_data_dirs;
     pthread_mutex_t  lock;
+
+    /* Deferred storage reclaim.  DROP renames a table's dir into
+     * <its-data-dir>/.trash (an O(1) same-fs rename) instead of an inline
+     * recursive rm_rf — a mass DROP DATABASE cascades thousands of these
+     * through the single raft apply thread, where an inline rm_rf froze
+     * last_applied for tens of seconds and stalled all DDL.  A bg thread
+     * reclaims .trash (and drains crash leftovers on open). */
+    pthread_t        trash_gc_thread;
+    volatile int     trash_gc_running;
+    uint64_t         trash_seq;
 
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
     int                    ntables;
@@ -319,12 +333,25 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         db->audit = NULL;
     }
 
+    /* Background reclaim of trashed (dropped) table dirs; also drains any
+     * leftovers from a crash mid-reclaim. */
+    db->trash_gc_running = 1;
+    if (pthread_create(&db->trash_gc_thread, NULL, trash_gc_main, db) != 0)
+        db->trash_gc_running = 0;
+
     *out = db;
     return TSDB_OK;
 }
 
 void tsdb_close(tsdb_db_t *db) {
     if (!db) return;
+
+    /* Stop the trash GC before tearing the db down. */
+    if (db->trash_gc_running) {
+        db->trash_gc_running = 0;
+        pthread_join(db->trash_gc_thread, NULL);
+    }
+
     pthread_mutex_lock(&db->lock);
 
     for (int i = 0; i < db->ntables; i++) {
@@ -824,6 +851,75 @@ static void rm_rf(const char *path) {
     rmdir(path);
 }
 
+/* Move a dropped table's storage dir out of the way fast (O(1) rename within
+ * the same filesystem) instead of recursively removing it inline.  The bg GC
+ * thread reclaims it later.  Falls back to inline rm_rf on a cross-fs / failed
+ * rename so behaviour is never worse than before.  is_table_dir() rejects names
+ * starting with '.', so .trash is invisible to every table dir-scan. */
+static void trash_or_rm(tsdb_db_t *db, const char *tbl_dir) {
+    /* Trash dir = <parent-of-tbl_dir>/.trash, keeping the rename same-fs even
+     * under TSDB_DATA_DIRS striping. */
+    char parent[4096];
+    snprintf(parent, sizeof(parent), "%s", tbl_dir);
+    char *slash = strrchr(parent, '/');
+    const char *base;
+    if (slash && slash != parent) { *slash = '\0'; base = slash + 1; }
+    else { snprintf(parent, sizeof(parent), "%s", db ? db->data_dir : "."); base = "t"; }
+
+    char trash_dir[4200];
+    snprintf(trash_dir, sizeof(trash_dir), "%s/.trash", parent);
+    if (tsdb_mkdir_p(trash_dir) < 0) { rm_rf(tbl_dir); return; }
+
+    uint64_t seq = db ? __atomic_add_fetch(&db->trash_seq, 1, __ATOMIC_RELAXED) : 0;
+    char dest[4400];
+    snprintf(dest, sizeof(dest), "%s/%s.%llu", trash_dir, base, (unsigned long long)seq);
+    if (rename(tbl_dir, dest) != 0)
+        rm_rf(tbl_dir);   /* cross-fs or other failure → inline recursive remove */
+}
+
+/* Reclaim trashed table dirs off the hot path.  Each pass snapshots the .trash
+ * entries (in every data dir) into a small batch, then rm_rf's them outside the
+ * readdir cursor.  Also drains leftovers from a crash mid-reclaim on the first
+ * pass after open. */
+static void *trash_gc_main(void *arg) {
+    tsdb_db_t *db = (tsdb_db_t *)arg;
+    while (db->trash_gc_running) {
+        int ndirs = db->n_data_dirs > 0 ? db->n_data_dirs : 1;
+        for (int i = 0; i < ndirs && db->trash_gc_running; i++) {
+            const char *dd = db->n_data_dirs > 0 ? db->data_dirs[i] : db->data_dir;
+            char trash_dir[4200];
+            snprintf(trash_dir, sizeof(trash_dir), "%s/.trash", dd);
+            for (;;) {
+                /* Pull one batch of names, then remove — avoids mutating the
+                 * dir under an open readdir cursor. */
+                DIR *d = opendir(trash_dir);
+                if (!d) break;
+                char batch[16][256];
+                int nb = 0;
+                struct dirent *e;
+                while (nb < 16 && (e = readdir(d)) != NULL) {
+                    if (e->d_name[0] == '.') continue;
+                    snprintf(batch[nb++], sizeof(batch[0]), "%s", e->d_name);
+                }
+                closedir(d);
+                if (nb == 0) break;
+                for (int b = 0; b < nb && db->trash_gc_running; b++) {
+                    char p[4500];
+                    snprintf(p, sizeof(p), "%s/%s", trash_dir, batch[b]);
+                    rm_rf(p);
+                }
+                if (!db->trash_gc_running) break;
+            }
+        }
+        /* Sleep ~2s, waking often to honour shutdown. */
+        for (int s = 0; s < 20 && db->trash_gc_running; s++) {
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
 int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return TSDB_ERR_INVAL;
 
@@ -892,7 +988,7 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     /* Remove table directory. */
     char tbl_dir[4096];
     table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
-    rm_rf(tbl_dir);
+    trash_or_rm(db, tbl_dir);   /* fast O(1) rename to .trash; bg GC reclaims */
 
     pthread_mutex_unlock(&db->lock);
 
