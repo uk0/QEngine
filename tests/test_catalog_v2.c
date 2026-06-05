@@ -108,9 +108,56 @@ int main(void) {
     ASSERT(tsdb_cat2_count(c) == 5);
     ASSERT(tsdb_cat2_table_by_name(c, prod, "meters") == meters);
     printf("  after compaction+reopen: child still dropped, live=5\n");
+
+    /* ── P3: referential integrity — no entity under a missing parent ─────── */
+    tsdb_oid_t bogus = tsdb_oid_make(5, 9999999);
+    {
+        tsdb_table_meta_t orphan; memset(&orphan, 0, sizeof(orphan));
+        orphan.db_id = prod; orphan.kind = TBL_CHILD; orphan.parent_id = bogus;
+        snprintf(orphan.name, sizeof(orphan.name), "ghostkid");
+        ASSERT(tsdb_cat2_table_create(c, &orphan) == TSDB_ERR_NOTFOUND);  /* parent gone */
+
+        tsdb_table_meta_t nodb; memset(&nodb, 0, sizeof(nodb));
+        nodb.db_id = bogus; nodb.kind = TBL_PLAIN; snprintf(nodb.name, sizeof(nodb.name), "nodbtbl");
+        nodb.ncols = 1; col(&nodb.cols[0], "ts", TSDB_TYPE_TIMESTAMP);
+        ASSERT(tsdb_cat2_table_create(c, &nodb) == TSDB_ERR_NOTFOUND);    /* db gone */
+
+        tsdb_group_meta_t nog; memset(&nog, 0, sizeof(nog));
+        nog.db_id = bogus; snprintf(nog.name, sizeof(nog.name), "noG");
+        ASSERT(tsdb_cat2_group_create(c, &nog) == TSDB_ERR_NOTFOUND);     /* db gone */
+    }
+    printf("  RI: child/table/group under a missing parent all rejected\n");
+
+    /* ── P3: structural cascade — DROP DATABASE wipes the whole subtree ────── */
+    {
+        tsdb_table_meta_t ch2; memset(&ch2, 0, sizeof(ch2));
+        ch2.db_id = prod; ch2.kind = TBL_CHILD; ch2.parent_id = meters;
+        snprintf(ch2.name, sizeof(ch2.name), "d1002");
+        ch2.ntag_vals = 1; ch2.tag_vals[0].type = TSDB_TYPE_SYMBOL;
+        snprintf(ch2.tag_vals[0].v.s, sizeof(ch2.tag_vals[0].v.s), "hostB");
+        ASSERT(tsdb_cat2_table_create(c, &ch2) == TSDB_OK);
+        tsdb_oid_t d1002 = ch2.oid;
+
+        ASSERT(tsdb_cat2_drop(c, prod) == TSDB_OK);                  /* cascade */
+        ASSERT(tsdb_cat2_db_by_name(c, "prod") == TSDB_OID_NONE);
+        ASSERT(tsdb_cat2_table_by_name(c, prod, "meters") == TSDB_OID_NONE);
+        tsdb_table_meta_t tmp;
+        ASSERT(tsdb_cat2_table_get(c, d1002, &tmp) == TSDB_ERR_NOTFOUND);  /* child cascaded */
+        ASSERT(tsdb_cat2_table_by_name(c, TSDB_OID_DEFAULTDB, "logs") == logs); /* other db intact */
+        ASSERT(tsdb_cat2_count(c) == 3);   /* default, sysdb, logs */
+    }
+    printf("  cascade: DROP DATABASE prod wiped meters+d1002, logs intact, live=3\n");
+
+    /* Cascade survives reopen — no descendant resurrects. */
+    tsdb_cat2_close(c);
+    ASSERT(tsdb_cat2_open(TMP, 5, &c) == TSDB_OK);
+    ASSERT(tsdb_cat2_db_by_name(c, "prod") == TSDB_OID_NONE);
+    ASSERT(tsdb_cat2_table_by_name(c, prod, "meters") == TSDB_OID_NONE);
+    ASSERT(tsdb_cat2_count(c) == 3);
+    printf("  cascade durable across reopen, live=3\n");
     tsdb_cat2_close(c);
 
     snprintf(cmd, sizeof(cmd), "rm -rf %s", TMP); (void)system(cmd);
-    printf("[PASS] v2 catalog: unified kind model, oid identity, no resurrection across compaction\n");
+    printf("[PASS] v2 catalog: unified kind model, oid identity, RI + structural cascade, no resurrection\n");
     return 0;
 }

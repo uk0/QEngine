@@ -344,6 +344,12 @@ void tsdb_cat2_close(tsdb_catalog_v2_t *c) {
 }
 
 /* ── create ───────────────────────────────────────────────────────────────── */
+/* Referential integrity: a parent oid must reference a currently-live node. */
+static int require_live(tsdb_catalog_v2_t *c, tsdb_oid_t oid) {
+    cat2_node_t *n = node_by_oid(c, oid);
+    return n && n->live;
+}
+
 static int create_common(tsdb_catalog_v2_t *c, cat2_node_t *n, tsdb_oid_t *oid_io) {
     if (*oid_io == TSDB_OID_NONE) {
         *oid_io = tsdb_oid_next(&c->alloc);
@@ -375,6 +381,7 @@ int tsdb_cat2_db_create(tsdb_catalog_v2_t *c, tsdb_db_meta_t *db) {
 int tsdb_cat2_group_create(tsdb_catalog_v2_t *c, tsdb_group_meta_t *g) {
     if (!c || !g || !g->name[0]) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&c->lock);
+    if (!require_live(c, g->db_id)) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
     char k[160]; k_grp(k, sizeof(k), g->db_id, g->name);
     if (h_get(&c->idx, k)) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_EXISTS; }
     if (g->created_at == 0) g->created_at = tsdb_now_ns();
@@ -387,6 +394,20 @@ int tsdb_cat2_group_create(tsdb_catalog_v2_t *c, tsdb_group_meta_t *g) {
 int tsdb_cat2_table_create(tsdb_catalog_v2_t *c, tsdb_table_meta_t *t) {
     if (!c || !t || !t->name[0]) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&c->lock);
+    /* RI: db live; group live if set; for a child, parent must be a live SUPER
+     * with a matching tag-value arity.  A child/stable can never be created
+     * under a missing parent → orphans are unrepresentable. */
+    if (!require_live(c, t->db_id)) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
+    if (t->group_id != TSDB_OID_NONE && !require_live(c, t->group_id)) {
+        pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND;
+    }
+    if (t->kind == TBL_CHILD) {
+        cat2_node_t *p = node_by_oid(c, t->parent_id);
+        if (!p || !p->live || p->ent != CAT2_ENT_TABLE || p->u.tbl.kind != TBL_SUPER) {
+            pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND;
+        }
+        if (t->ntag_vals != p->u.tbl.ntag_cols) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_SCHEMA; }
+    }
     if (tsdb_cat2_table_by_name(c, t->db_id, t->name)) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_EXISTS; }
     if (t->created_at == 0) t->created_at = tsdb_now_ns();
     cat2_node_t n; memset(&n, 0, sizeof(n)); n.ent = CAT2_ENT_TABLE; n.u.tbl = *t;
@@ -429,15 +450,58 @@ tsdb_oid_t tsdb_cat2_table_by_name(tsdb_catalog_v2_t *c, tsdb_oid_t db_id, const
     return (n && n->live) ? n->u.tbl.oid : TSDB_OID_NONE;
 }
 
-/* ── drop (single entity; cascade is P3) ──────────────────────────────────── */
-int tsdb_cat2_drop(tsdb_catalog_v2_t *c, tsdb_oid_t oid) {
-    pthread_mutex_lock(&c->lock);
-    cat2_node_t *n = node_by_oid(c, oid);
-    if (!n || !n->live) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
+/* ── structural cascade drop (P3) ─────────────────────────────────────────── */
+
+/* The single cascade edge that owns an entity: dropping this oid drops the
+ * entity.  DB is the subtree root; a group hangs off its db; a child hangs off
+ * its super; a plain/super hangs off its group (or db if ungrouped).  A
+ * recursive walk over this single-parent tree reaches every descendant of a
+ * DROP DATABASE / DROP GROUP / DROP STABLE with no name matching and no orphan. */
+static tsdb_oid_t cascade_parent(const cat2_node_t *n) {
+    if (n->ent == CAT2_ENT_DB)    return TSDB_OID_NONE;
+    if (n->ent == CAT2_ENT_GROUP) return n->u.grp.db_id;
+    if (n->u.tbl.kind == TBL_CHILD)              return n->u.tbl.parent_id;
+    if (n->u.tbl.group_id != TSDB_OID_NONE)      return n->u.tbl.group_id;
+    return n->u.tbl.db_id;
+}
+
+static tsdb_oid_t node_oid(const cat2_node_t *n) {
+    return n->ent == CAT2_ENT_DB ? n->u.db.oid
+         : n->ent == CAT2_ENT_GROUP ? n->u.grp.oid : n->u.tbl.oid;
+}
+
+static int drop_one(tsdb_catalog_v2_t *c, cat2_node_t *n, tsdb_oid_t oid) {
     index_name(c, n, 0);
     n->live = 0; n->lamport = c->lamport++;
     int rc = log_emit(c, c->log, '-', n, oid);
     if (rc == TSDB_OK) fflush(c->log);
+    return rc;
+}
+
+/* Tombstone `oid` and, depth-first, every live entity whose cascade_parent
+ * resolves into the drop.  Caller holds c->lock. */
+static int drop_subtree_locked(tsdb_catalog_v2_t *c, tsdb_oid_t oid) {
+    cat2_node_t *n = node_by_oid(c, oid);
+    if (!n || !n->live) return TSDB_ERR_NOTFOUND;
+    /* Snapshot direct live children before mutating (idx.size bounds them). */
+    tsdb_oid_t *kids = malloc((c->idx.size + 1) * sizeof(tsdb_oid_t));
+    size_t nk = 0;
+    if (kids) {
+        for (size_t i = 0; i < c->idx.cap; i++) {
+            if (!c->idx.b[i].key || strncmp(c->idx.b[i].key, "o:", 2) != 0) continue;
+            cat2_node_t *m = (cat2_node_t *)c->idx.b[i].val;
+            if (m->live && cascade_parent(m) == oid) kids[nk++] = node_oid(m);
+        }
+        for (size_t i = 0; i < nk; i++) (void)drop_subtree_locked(c, kids[i]);
+        free(kids);
+    }
+    return drop_one(c, n, oid);
+}
+
+int tsdb_cat2_drop(tsdb_catalog_v2_t *c, tsdb_oid_t oid) {
+    if (!c) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    int rc = drop_subtree_locked(c, oid);
     pthread_mutex_unlock(&c->lock);
     return rc;
 }
