@@ -9,6 +9,16 @@ interface Props {
   onRefresh: () => void;
 }
 
+/* sysdb is the protected system database — it owns no user tables but surfaces
+ * cluster / RBAC state.  The dashboard hangs these system views under a
+ * synthetic "default" group so sysdb is not an empty 🔒 node; each one runs its
+ * LIST query (all valid server-side, see query/exec.c). */
+const SYSDB_VIEWS: { name: string; q: string }[] = [
+  { name: 'users',     q: 'LIST USERS;' },
+  { name: 'masters',   q: 'LIST MASTERS;' },
+  { name: 'functions', q: 'LIST FUNCTIONS;' },
+];
+
 export function Sidebar({ bump, onSql, onRefresh }: Props) {
   const [tree, setTree] = useState<Tree | null>(null);
   const [cluster, setCluster] = useState<ClusterInfo | null>(null);
@@ -282,6 +292,31 @@ ${scope};`;
     );
   };
 
+  /* The synthetic "default" group under sysdb: system views, each a
+   * double-click-to-run LIST query.  Always expanded so sysdb is never an empty
+   * 🔒 node — it has no real groups/vtables of its own. */
+  const renderSysGroup = () => (
+    <div key="sysdb-default">
+      <div className="node" title="default — system views (cluster / RBAC)">
+        <span className="caret open">▸</span>
+        <span className="ic g">G</span>
+        <span className="nm">default</span>
+        <span className="count">{SYSDB_VIEWS.length}v</span>
+      </div>
+      <div className="kids">
+        {SYSDB_VIEWS.map(s => (
+          <div key={s.name} className="node leaf" title={s.q}
+               onDoubleClick={() => onSql(s.q)}>
+            <span className="caret"></span>
+            <span className="ic v">V</span>
+            <span className="nm">{s.name}</span>
+            <span className="count">sys</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   const renderDb = (dbName: string, isOrphan: boolean, isProtected: boolean) => {
     const k = `db:${dbName}`;
     const o = isOpen(k);
@@ -312,10 +347,11 @@ ${scope};`;
         </div>
         {o && (
           <div className="kids">
-            <div className="section-label">Groups ({allGrps.length + (hasUngrouped ? 1 : 0)})</div>
-            {!allGrps.length && !hasUngrouped && <div className="empty">no groups</div>}
+            <div className="section-label">Groups ({allGrps.length + (hasUngrouped ? 1 : 0) + (dbName === 'sysdb' ? 1 : 0)})</div>
+            {!allGrps.length && !hasUngrouped && dbName !== 'sysdb' && <div className="empty">no groups</div>}
             {allGrps.map(g => renderGroup(dbName, g))}
             {hasUngrouped && renderGroup(dbName, '')}
+            {dbName === 'sysdb' && renderSysGroup()}
           </div>
         )}
       </div>
@@ -348,27 +384,44 @@ ${scope};`;
         <button onClick={onRefresh} title="reload">↻</button>
       </div>
 
-      <div className="section-label">Databases ({(tree.databases ?? []).length})</div>
+      <div className="section-label">Databases ({(tree.databases ?? []).length + (orphanTables.length > 0 ? 1 : 0)})</div>
       {(tree.databases ?? []).map(d => renderDb(d.name, false, !!d.protected))}
 
       {(grpsByDb[''] || vtByDb['']) && renderDb('', true, false)}
 
-      {orphanTables.length > 0 && (
-        <>
-          <div className="section-label">Tables ({orphanTables.length})</div>
-          {orphanTables.map(t => (
-            <div key={t.name} className="node leaf" title={t.name}
-                 onDoubleClick={() => onSql(`SELECT * FROM ${t.name} LIMIT 1000`)}>
-              <span className="caret"></span>
-              <span className="ic t">T</span>
-              <span className="nm">{t.name}</span>
-              <span className="count">{t.ncols}c</span>
-              <span className="x" title="DROP TABLE"
-                    onClick={ev => { ev.stopPropagation(); drop('TABLE', t.name, () => ddl.dropTable(t.name)); }}>✕</span>
+      {/* Normal tables (no database — like TDengine's normal tables) are a
+          feature, not orphans.  Hang them under a synthetic "default" database
+          node so they're part of the hierarchy instead of floating flat. */}
+      {orphanTables.length > 0 && (() => {
+        const k = 'db:__default__';
+        const o = isOpen(k);
+        return (
+          <div key="db-__default__">
+            <div className="node" title="default — normal tables (no database)">
+              <span className={`caret ${o ? 'open' : ''}`} onClick={() => toggle(k)}>▸</span>
+              <span className="ic" onClick={() => toggle(k)}>DB</span>
+              <span className="nm" onClick={() => toggle(k)}>default</span>
+              <span className="count">{orphanTables.length}t</span>
             </div>
-          ))}
-        </>
-      )}
+            {o && (
+              <div className="kids">
+                <div className="section-label">Normal tables ({orphanTables.length})</div>
+                {orphanTables.map(t => (
+                  <div key={t.name} className="node leaf" title={t.name}
+                       onDoubleClick={() => onSql(`SELECT * FROM ${t.name} LIMIT 1000`)}>
+                    <span className="caret"></span>
+                    <span className="ic t">T</span>
+                    <span className="nm">{t.name}</span>
+                    <span className="count">{t.ncols}c</span>
+                    <span className="x" title="DROP TABLE"
+                          onClick={ev => { ev.stopPropagation(); drop('TABLE', t.name, () => ddl.dropTable(t.name)); }}>✕</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </aside>
   );
 }
