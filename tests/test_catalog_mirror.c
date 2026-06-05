@@ -121,9 +121,20 @@ int main(void) {
     ASSERT(tsdb_cat2_table_by_name(v2, TSDB_OID_DEFAULTDB, "plainx") != TSDB_OID_NONE);
     printf("  after v1 DROP STABLE + re-mirror: meters+children gone, db+plainx intact\n");
     tsdb_cat2_close(v2);
+
+    /* Flag-gated shadow at v1 open: TSDB_CATALOG_V2 builds the v2 shadow from
+     * the replayed v1 state.  Reopen v1 with the flag and confirm the shadow
+     * holds prod + plainx (meters stayed dropped). */
     tsdb_catalog_close(v1);
+    setenv("TSDB_CATALOG_V2", "1", 1);
+    ASSERT(tsdb_catalog_open(V1DIR, &v1) == TSDB_OK);
+    size_t scount = tsdb_catalog_shadow_v2_count(v1);
+    ASSERT(scount >= 4);   /* default, sysdb, prod, plainx (at minimum) */
+    printf("  TSDB_CATALOG_V2 shadow built at open: %zu live entities\n", scount);
+    tsdb_catalog_close(v1);
+    unsetenv("TSDB_CATALOG_V2");
 
     snprintf(cmd, sizeof(cmd), "rm -rf %s %s", V1DIR, V2DIR); (void)system(cmd);
-    printf("[PASS] v1->v2 mirror is faithful and reflects drops (dual-write proven)\n");
+    printf("[PASS] v1->v2 mirror faithful, reflects drops, flag-gated shadow builds at open\n");
     return 0;
 }

@@ -20,4 +20,9 @@ struct tsdb_catalog;   /* v1, opaque (defined in catalog.c) */
 int tsdb_catalog_mirror_to_v2(struct tsdb_catalog *v1, tsdb_catalog_v2_t *v2,
                               size_t *out_mirrored, size_t *out_skipped);
 
+/* Live-entity count of the v1 catalog's v2 shadow (built at open when
+ * TSDB_CATALOG_V2 is set).  Returns 0 if there is no shadow.  Lets the cluster
+ * surface "v2 holds N entities" alongside the v1 tree for observation. */
+size_t tsdb_catalog_shadow_v2_count(struct tsdb_catalog *v1);
+
 #endif /* TSDB_CATALOG_MIRROR_H */
