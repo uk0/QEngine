@@ -81,6 +81,9 @@ int tsdb_stable_create(tsdb_catalog_t *c, const tsdb_stable_t *s);
 int tsdb_stable_get   (tsdb_catalog_t *c, const char *name, tsdb_stable_t *out);
 int tsdb_stable_exists(tsdb_catalog_t *c, const char *name);
 int tsdb_stable_drop  (tsdb_catalog_t *c, const char *name);
+/* Drop the stable only if it has 0 children (atomic count+drop under one lock).
+ * TSDB_OK = dropped, TSDB_ERR_EXISTS = has children (kept), NOTFOUND = absent. */
+int tsdb_stable_drop_if_childless(tsdb_catalog_t *c, const char *name);
 int tsdb_stable_list  (tsdb_catalog_t *c, tsdb_stable_t **out_arr, size_t *out_n);
 
 int tsdb_child_table_create(tsdb_catalog_t *c, const tsdb_child_table_t *ct);

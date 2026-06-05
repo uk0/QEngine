@@ -488,6 +488,34 @@ int tsdb_stable_drop(tsdb_catalog_t *c, const char *name) {
     return TSDB_OK;
 }
 
+/* Atomically drop `name`'s stable ONLY if it currently has zero child tables.
+ * Returns TSDB_OK if dropped, TSDB_ERR_EXISTS if it still has children (left
+ * intact — a real super-table, not a data-bearing mirror), TSDB_ERR_NOTFOUND
+ * if absent.  DROP TABLE's mirror teardown uses this instead of a separate
+ * list-then-drop: the count and the drop run under one lock, so a concurrent
+ * CREATE … USING <name> can't slip a child in between and have the whole child
+ * set cascade-wiped, and a child-list failure can never be mistaken for
+ * "0 children" (which would nuke a real stable). */
+int tsdb_stable_drop_if_childless(tsdb_catalog_t *c, const char *name) {
+    if (!c || !name) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&c->lock);
+    tsdb_stable_t *s = sc_hmap_get(&c->stables, name);
+    if (!s) { pthread_mutex_unlock(&c->lock); return TSDB_ERR_NOTFOUND; }
+    for (size_t i = 0; i < c->child_tables.cap; i++) {
+        if (!c->child_tables.buckets[i].key) continue;
+        tsdb_child_table_t *ct = (tsdb_child_table_t *)c->child_tables.buckets[i].val;
+        if (ct && !strcmp(ct->stable_name, name)) {
+            pthread_mutex_unlock(&c->lock);
+            return TSDB_ERR_EXISTS;   /* real super-table — keep */
+        }
+    }
+    tsdb_stable_t snap = *s;
+    sc_hmap_del(&c->stables, name);
+    stable_log_write(c, '-', &snap);
+    pthread_mutex_unlock(&c->lock);
+    return TSDB_OK;
+}
+
 int tsdb_stable_list(tsdb_catalog_t *c, tsdb_stable_t **out_arr, size_t *out_n) {
     if (!c || !out_arr || !out_n) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&c->lock);

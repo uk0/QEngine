@@ -907,11 +907,11 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
              * i.e. it has NO child tables.  A real super-table that happens to
              * share this name must not be torn down by DROP TABLE — that's DROP
              * STABLE's job, and tsdb_stable_drop cascade-wipes the whole child
-             * set.  This keeps a name collision from nuking a real stable. */
-            tsdb_child_table_t *ch = NULL; size_t nch = 0;
-            if (tsdb_child_table_list(cat, name, &ch, &nch) == TSDB_OK) free(ch);
-            if (nch == 0)
-                (void)tsdb_stable_drop(cat, name);
+             * set.  Use the atomic count+drop so a concurrent CREATE … USING
+             * <name> can't race a child in between (a separate list-then-drop
+             * would then cascade-wipe it), and a list error can't be mistaken
+             * for "0 children". */
+            (void)tsdb_stable_drop_if_childless(cat, name);
         }
     }
     return TSDB_OK;

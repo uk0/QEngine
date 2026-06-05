@@ -134,7 +134,30 @@ int main(void) {
     tsdb_catalog_close(c);
     printf("  replay kept childP (parent live), dropped childGhost (orphan)\n");
 
+    /* ── drop-if-childless keeps a real super-table, drops a childless one ─── */
     snprintf(cmd, sizeof(cmd), "rm -rf %s", TMP); (void)system(cmd);
-    printf("[PASS] catalog tombstones survive compaction; replay drops orphan children\n");
+    ASSERT(tsdb_catalog_open(TMP, &c) == TSDB_OK);
+    mk_stable(c, "S");
+    {
+        tsdb_child_table_t ct; memset(&ct, 0, sizeof(ct));
+        snprintf(ct.name, sizeof(ct.name), "kid");
+        snprintf(ct.stable_name, sizeof(ct.stable_name), "S");
+        ct.ntags = 0;
+        ASSERT(tsdb_child_table_create(c, &ct) == TSDB_OK);
+    }
+    mk_stable(c, "Lone");
+    {
+        tsdb_child_table_t out;
+        ASSERT(tsdb_stable_drop_if_childless(c, "S") == TSDB_ERR_EXISTS); /* has child → kept */
+        ASSERT(tsdb_stable_exists(c, "S") == 1);
+        ASSERT(tsdb_child_table_get(c, "kid", &out) == TSDB_OK);          /* child intact */
+        ASSERT(tsdb_stable_drop_if_childless(c, "Lone") == TSDB_OK);      /* childless → dropped */
+        ASSERT(tsdb_stable_exists(c, "Lone") == 0);
+    }
+    tsdb_catalog_close(c);
+    printf("  drop_if_childless kept S (has child, intact), dropped Lone (childless)\n");
+
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", TMP); (void)system(cmd);
+    printf("[PASS] tombstones survive compaction; replay drops orphans; drop-if-childless atomic\n");
     return 0;
 }
