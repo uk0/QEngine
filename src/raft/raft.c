@@ -1657,7 +1657,28 @@ static void *apply_thread_main(void *arg) {
 
         for (uint64_t idx = to_apply; idx <= commit; idx++) {
             tsdb_raft_entry_t e = {0};
-            if (tsdb_raft_log_read(r->log, idx, &e) != 0) break;
+            if (tsdb_raft_log_read(r->log, idx, &e) != 0) {
+                /* idx was subsumed by a snapshot/compaction (idx < first_index)
+                 * — e.g. a concurrent InstallSnapshot or log compaction moved
+                 * the boundary past where this loop started.  Its effect is
+                 * already folded into the snapshot's state, so SKIP the subsumed
+                 * prefix and advance last_applied instead of re-reading the same
+                 * unreadable index forever.  Pre-fix the loop `break`'d without
+                 * advancing last_applied, so it spun on the dead index: every
+                 * DDL propose then timed out ("raft propose failed") and the
+                 * whole cluster wedged under stress-200m churn (the runtime twin
+                 * of the restart gap tsdb_raft_open already seeds around). */
+                uint64_t snap = tsdb_raft_log_snapshot_index(r->log);
+                if (idx <= snap) {
+                    pthread_mutex_lock(&r->lock);
+                    if (r->last_applied < snap) r->last_applied = snap;
+                    pthread_cond_broadcast(&r->commit_cv);
+                    pthread_mutex_unlock(&r->lock);
+                    idx = snap;       /* for-loop idx++ resumes at snap + 1 */
+                    continue;
+                }
+                break;                /* genuine read failure (idx beyond log) */
+            }
             if (e.type == TSDB_RAFT_ENTRY_CONFIG) {
                 /* Raft owns CONFIG entries — apply directly to the
                  * persistent config file.  Three op codes:
