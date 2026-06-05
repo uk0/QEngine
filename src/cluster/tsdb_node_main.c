@@ -638,16 +638,16 @@ static int tree_json_cb(void *ud, char *buf, size_t cap) {
                  * so a recovered node learns it via catalog-sync — but it is
                  * already surfaced in the "tables" section above.  Listing it
                  * again here double-lists every plain table AND synthesises a
-                 * bogus "(no db)" database in the dashboard tree.  The shadow is
-                 * identifiable by a same-named on-disk table directory (a real
-                 * super-table owns no storage dir of its own); filter it from
-                 * the /tree view only — the catalog entry stays for sync. */
-                {
-                    char vpath[4096];
-                    snprintf(vpath, sizeof(vpath), "%s/%s", g_local_data_dir, vn);
-                    struct stat vst;
-                    if (is_table_dir(vn) && stat(vpath, &vst) == 0 &&
-                        S_ISDIR(vst.st_mode))
+                 * bogus "(no db)" database in the dashboard tree.  Detect the
+                 * shadow by whether a real normal table of this name opens:
+                 * tsdb_open_table resolves across striped data dirs
+                 * (TSDB_DATA_DIRS), unlike a bare stat of g_local_data_dir which
+                 * mis-rendered a striped plain table's shadow as a phantom
+                 * VTable.  A real super-table owns no storage dir, so it never
+                 * opens here.  Display-only filter — the catalog entry stays. */
+                if (is_table_dir(vn)) {
+                    tsdb_table_t *shadow_tbl = NULL;
+                    if (tsdb_open_table(db, vn, &shadow_tbl) == 0)
                         continue;
                 }
                 char ne[128], dbe[128], gre[128];
