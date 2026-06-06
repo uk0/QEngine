@@ -74,6 +74,7 @@ int main(int argc, char **argv) {
     int64_t w0 = now_ns();
     long long written = 0;
     int ti = 0;
+    int64_t last_log = w0; long long last_written = 0;
     while (written < nrows) {
         tsdb_table_t *t = th[ti];
         tsdb_batch_t *b = NULL;
@@ -88,6 +89,15 @@ int main(int argc, char **argv) {
         if (tsdb_batch_commit(b) != TSDB_OK) { fprintf(stderr, "commit failed\n"); return 1; }
         written += this_batch;
         ti = (ti + 1) % ntables;
+        int64_t now = now_ns();
+        if (now - last_log >= 2000000000LL) {
+            double inst = (double)(written - last_written) / ((now - last_log) / 1e9);
+            double avg  = (double)written              / ((now - w0)       / 1e9);
+            printf("[bench_flush] t=%4.0fs  rows=%10lld  inst=%6.0fk r/s  avg=%6.0fk r/s\n",
+                   (now - w0) / 1e9, written, inst / 1e3, avg / 1e3);
+            fflush(stdout);
+            last_log = now; last_written = written;
+        }
     }
     /* Flush everything so the comparison includes all data on disk. */
     tsdb_db_flush_all(db);
