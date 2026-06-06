@@ -14,6 +14,7 @@
 #include "../catalog/user.h"
 #include "../catalog/audit.h"
 #include "../server/metrics.h"
+#include "iopolicy.h"
 #include "retention.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,6 +116,18 @@ struct tsdb_db {
      * memtable_budget_rows == 0 disables it (unbounded, legacy behaviour). */
     volatile int     memtable_over_budget;
     uint64_t         memtable_budget_rows;
+
+    /* Monotonic flush counter — bumped once per successful memtable→disk
+     * flush in flush_and_clear_locked.  Read by the compactor's adaptive
+     * pause logic (compaction.c) to skip cycles while writes are hot, so
+     * the compactor stops fighting the writer for the HDD device queue.
+     * Relaxed atomic: only the delta over a few-second window matters. */
+    volatile uint64_t flush_seq;
+
+    /* Detected storage class — drives write-path defaults (memtable budget,
+     * compactor backoff threshold) at open time.  Detection rule lives in
+     * src/storage/iopolicy.h; env vars still override individual knobs. */
+    tsdb_iopolicy_t iopolicy;
 
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
     int                    ntables;
@@ -344,13 +357,41 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         db->audit = NULL;
     }
 
-    /* Aggregate-memtable budget (rows across all tables).  Default 32M ≈ a few
-     * GiB — a runaway cap that never trips a normal workload; 0 = unbounded. */
-    db->memtable_budget_rows = 32ull * 1000 * 1000;
+    /* Hardware-adaptive defaults.  Detect storage class once (per the
+     * iopolicy.h rules: env override → /sys/block rotational probe → SSD
+     * fallback) and use it to pick write-path defaults; env vars below
+     * still override individual knobs as an operator escape hatch.
+     * Drives:
+     *   - memtable_budget_rows (smaller on rotational → trash_gc_main
+     *     flushes biggest table earlier, less device-queue contention)
+     *   - compactor adaptive-pause threshold (in tsdb_compactor_start) */
+    db->iopolicy = tsdb_iopolicy_detect(data_dir);
+
+    /* Aggregate-memtable budget (rows across all tables).  Policy-based:
+     *   SSD/NVMe : 32M  — generous; flushes fire at is_full(8192/table),
+     *                     no proactive pressure (random I/O is cheap).
+     *   SAS/HDD  :  8M  — earlier backpressure; rotational devices pay
+     *                     per-flush seek cost so we'd rather flush bigger,
+     *                     less often, and not race the compactor.
+     * 0 = unbounded (legacy).  Env TSDB_MEMTABLE_BUDGET_ROWS overrides. */
+    switch (db->iopolicy) {
+    case TSDB_IOPOLICY_HDD:
+    case TSDB_IOPOLICY_SAS:
+        db->memtable_budget_rows = 8ull * 1000 * 1000;
+        break;
+    case TSDB_IOPOLICY_SSD:
+    default:
+        db->memtable_budget_rows = 32ull * 1000 * 1000;
+    }
     {
         const char *mb = getenv("TSDB_MEMTABLE_BUDGET_ROWS");
         if (mb && *mb) { long long v = atoll(mb); if (v >= 0) db->memtable_budget_rows = (uint64_t)v; }
     }
+    fprintf(stderr,
+            "[db] iopolicy=%s  memtable_budget_rows=%llu  wal_only_commit=%d\n",
+            tsdb_iopolicy_name(db->iopolicy),
+            (unsigned long long)db->memtable_budget_rows,
+            db->wal_only_commit);
 
     /* Background reclaim of trashed (dropped) table dirs; also drains any
      * leftovers from a crash mid-reclaim. */
@@ -1403,11 +1444,22 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
                                  t->name);
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_flushes_total");
+        if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
         tsdb_memtable_clear(t->memtable);
         /* Truncate WAL after successful flush. */
         if (t->wal) tsdb_wal_truncate(t->wal);
     }
     return rc;
+}
+
+uint64_t tsdb_db_flush_seq(tsdb_db_t *db) {
+    if (!db) return 0;
+    return __atomic_load_n(&db->flush_seq, __ATOMIC_RELAXED);
+}
+
+tsdb_iopolicy_t tsdb_db_iopolicy(tsdb_db_t *db) {
+    if (!db) return TSDB_IOPOLICY_SSD;
+    return db->iopolicy;
 }
 
 /* Public wrapper: serialises concurrent batch_commit calls on the same

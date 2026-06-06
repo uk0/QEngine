@@ -771,6 +771,15 @@ struct tsdb_compactor {
     pthread_t      *workers;
     volatile int    quit;
 
+    /* Adaptive backoff — skip this cycle if recent flush rate exceeds the
+     * threshold so the writer's I/O isn't fighting compactor I/O for the
+     * device queue.  Threshold derived from iopolicy at start: SSD=0
+     * (never pause), SAS=100/s, HDD=50/s.  Env override
+     * TSDB_COMPACTION_BUSY_THRESHOLD; 0 disables. */
+    int             busy_threshold;
+    int64_t         last_check_ns;
+    uint64_t        last_flush_seq;
+
     /* Stats (protected by stats_mtx). */
     pthread_mutex_t         stats_mtx;
     tsdb_compactor_stats_t  stats;
@@ -788,7 +797,39 @@ static void cpt_unlock(void *ud) {
 
 /* ---- compactor_run_once_impl ---------------------------------------------- */
 
+static int64_t compactor_now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* True if the writer has flushed faster than busy_threshold over the last
+ * sampling window — compactor backs off this round so the writer's flushes
+ * get exclusive use of the device queue.  The single-sampler-per-cycle
+ * design keeps the cost to one atomic load per compactor wake-up, far
+ * cheaper than tracking a sliding window. */
+static int compactor_should_pause(tsdb_compactor_t *c) {
+    if (c->busy_threshold <= 0) return 0;
+    int64_t now = compactor_now_ns();
+    uint64_t cur = tsdb_db_flush_seq(c->db);
+    if (c->last_check_ns == 0) {
+        c->last_check_ns = now;
+        c->last_flush_seq = cur;
+        return 0;
+    }
+    int64_t dt = now - c->last_check_ns;
+    if (dt < 1000000000LL) return 0;   /* < 1 s — not enough signal */
+    double rate = (double)(cur - c->last_flush_seq) * 1e9 / (double)dt;
+    int pause = rate > (double)c->busy_threshold;
+    c->last_check_ns = now;
+    c->last_flush_seq = cur;
+    return pause;
+}
+
 static int compactor_run_once_impl(tsdb_compactor_t *c) {
+    if (compactor_should_pause(c)) {
+        tsdb_metric_inc("qengine_compaction_paused_total");
+        return TSDB_OK;
+    }
     /* Snapshot the db's table list under db->lock. */
     tsdb_db_t *db = c->db;
 
@@ -947,6 +988,24 @@ int tsdb_compactor_start(tsdb_db_t *db,
             c->interval_ns = opts->interval_ns;
         if (opts->worker_threads > 0)
             c->nworkers   = opts->worker_threads;
+    }
+
+    /* Adaptive backoff threshold from storage class.  Numbers tuned from
+     * the 4-node lvm1 cluster (HDD-backed) where a writer steady-state
+     * sustained ~44 flushes/s (2000 tables × ~22 s per table to fill 8192
+     * rows) — 50 is high enough that idle compactor cycles still fire,
+     * low enough to prevent contention during bursts.  Env override:
+     * TSDB_COMPACTION_BUSY_THRESHOLD=0 → never pause. */
+    {
+        tsdb_iopolicy_t pol = tsdb_db_iopolicy(db);
+        switch (pol) {
+        case TSDB_IOPOLICY_HDD: c->busy_threshold = 50;  break;
+        case TSDB_IOPOLICY_SAS: c->busy_threshold = 100; break;
+        case TSDB_IOPOLICY_SSD:
+        default:                c->busy_threshold = 0;   break;
+        }
+        const char *e = getenv("TSDB_COMPACTION_BUSY_THRESHOLD");
+        if (e && *e) c->busy_threshold = atoi(e);
     }
 
     pthread_mutex_init(&c->stats_mtx, NULL);

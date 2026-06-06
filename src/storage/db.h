@@ -13,6 +13,7 @@
 #include "memtable.h"
 #include "part.h"
 #include "wal.h"
+#include "iopolicy.h"
 #include "../catalog/group.h"
 #include <pthread.h>
 
@@ -130,6 +131,17 @@ int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
  * Best-effort: per-table failures log but don't abort.  Defined in
  * db.c. */
 int                    tsdb_db_flush_all(tsdb_db_t *db);
+
+/* Detected hardware class — set once at open from tsdb_iopolicy_detect().
+ * Drives write-path defaults: memtable budget, compactor backoff
+ * threshold.  Env vars still override individual knobs. */
+tsdb_iopolicy_t        tsdb_db_iopolicy(tsdb_db_t *db);
+
+/* Monotonic flush counter — bumped once per successful memtable→disk
+ * flush in flush_and_clear_locked.  Used by the compactor's adaptive
+ * pause to back off while writes are hot.  Relaxed atomic; only the
+ * delta over a few-second window matters. */
+uint64_t               tsdb_db_flush_seq(tsdb_db_t *db);
 
 /* Catalog self-heal: pull the master's catalog log files via
  * TSDB_RPC_CATALOG_DUMP and replay them locally.  Used by data
