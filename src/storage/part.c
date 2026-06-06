@@ -2,6 +2,7 @@
 
 #include "part.h"
 #include "iopolicy.h"
+#include "io_async.h"
 #include "../compress/codec.h"
 #include "../core/bits.h"
 #include "../server/proto.h"  /* tsdb_crc32c — block-level integrity check */
@@ -15,6 +16,29 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+
+/* Thread-local io_async ring used by tsdb_part_fsync_idx — lazily created
+ * on first use, destroyed at thread exit.  Each flush thread gets its own
+ * ring so submissions don't need cross-thread serialisation.  Opt-in via
+ * env TSDB_PART_IO_URING=1 (default off — keeps the legacy fsync path for
+ * deployments that haven't validated io_uring yet).  Falls back to a plain
+ * fsync() if io_async isn't available (stub build, or ring create failed). */
+static __thread tsdb_io_async_t *tl_io_async   = NULL;
+static __thread int              tl_io_async_inited = 0;
+static __thread int              tl_io_async_enabled = 0;
+
+static void tsdb_part_fsync_idx(int fd) {
+    if (!tl_io_async_inited) {
+        tl_io_async_inited = 1;
+        const char *e = getenv("TSDB_PART_IO_URING");
+        tl_io_async_enabled = (e && e[0] == '1');
+        if (tl_io_async_enabled && tsdb_io_async_available()) {
+            if (tsdb_io_async_create(32, &tl_io_async) != 0) tl_io_async = NULL;
+        }
+    }
+    if (tl_io_async && tsdb_io_async_fsync_sync(tl_io_async, fd) == 0) return;
+    (void)fsync(fd);   /* fallback */
+}
 
 /*
  * Raw-block hook type local to part.c (mirrors db.h's tsdb_on_raw_block_fn,
@@ -702,10 +726,16 @@ static int col_writer_close(col_writer_t *w) {
             }
             fwrite(w->idx_entries, 1, w->idx_n * TSDB_IDX_ENTRY_SIZE, idx_w);
             fflush(idx_w);
-            /* fsync data + dir for crash safety; rename for atomic
-             * visibility to concurrent readers (POSIX guarantees rename
-             * onto an existing path is atomic). */
-            (void)fsync(fileno(idx_w));
+            /* fsync the idx file before rename: POSIX guarantees rename
+             * is atomic only after the bytes have hit the device.
+             *
+             * Phase 1B (kdb+/Kafka-style modernisation): route the fsync
+             * through io_uring when available so future iters can batch
+             * many idx fsyncs in one device-queue dispatch.  fsync_sync
+             * is single submit+wait — identical observable semantics to
+             * plain fsync(), but the wiring runs on the new io_async
+             * substrate. */
+            tsdb_part_fsync_idx(fileno(idx_w));
             fclose(idx_w);
             if (rename(tmp_path, w->idx_path) != 0) {
                 unlink(tmp_path);
