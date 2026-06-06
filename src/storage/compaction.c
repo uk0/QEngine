@@ -780,9 +780,28 @@ struct tsdb_compactor {
     int64_t         last_check_ns;
     uint64_t        last_flush_seq;
 
+    /* Per-table mtime memo (kdb+ style "immutable HDB" inspired): a table
+     * whose dir mtime hasn't moved since we last processed it has had no
+     * new flush → no compaction possible.  Skipping it saves the inner
+     * partition-walk syscalls (open+getdents+stat per partition) which
+     * dominate compactor CPU at 2000 tables.  Compactor's own writes DO
+     * update the dir mtime, so the next cycle still re-checks any table
+     * we just touched. The memo is reset (size set to 0) on disable via
+     * TSDB_COMPACTION_MEMO=0 — useful for safety drills. */
+    int                       memo_enabled;
+    pthread_mutex_t           memo_mtx;
+    struct tsdb_compact_memo *memo;       /* heap-grown table → mtime map */
+    int                       memo_n;
+    int                       memo_cap;
+
     /* Stats (protected by stats_mtx). */
     pthread_mutex_t         stats_mtx;
     tsdb_compactor_stats_t  stats;
+};
+
+struct tsdb_compact_memo {
+    char    name[64];
+    time_t  last_mtime;
 };
 
 /* lock/unlock callbacks passed into compact_partition. */
@@ -807,6 +826,36 @@ static int64_t compactor_now_ns(void) {
  * get exclusive use of the device queue.  The single-sampler-per-cycle
  * design keeps the cost to one atomic load per compactor wake-up, far
  * cheaper than tracking a sliding window. */
+/* mtime memo lookup — returns the stored mtime, or 0 if name unknown.
+ * Hot path under memo_mtx: O(N) linear over N=#tables ever seen.
+ * For 2000 tables that's ~2000 strcmps (~64 KiB compares) per cycle —
+ * cheap vs. the per-partition syscalls we'd do without the skip. */
+static time_t compactor_memo_get(tsdb_compactor_t *c, const char *name) {
+    pthread_mutex_lock(&c->memo_mtx);
+    time_t out = 0;
+    for (int i = 0; i < c->memo_n; i++) {
+        if (strcmp(c->memo[i].name, name) == 0) { out = c->memo[i].last_mtime; break; }
+    }
+    pthread_mutex_unlock(&c->memo_mtx);
+    return out;
+}
+static void compactor_memo_set(tsdb_compactor_t *c, const char *name, time_t mtime) {
+    pthread_mutex_lock(&c->memo_mtx);
+    for (int i = 0; i < c->memo_n; i++) {
+        if (strcmp(c->memo[i].name, name) == 0) { c->memo[i].last_mtime = mtime; pthread_mutex_unlock(&c->memo_mtx); return; }
+    }
+    if (c->memo_n >= c->memo_cap) {
+        int newcap = c->memo_cap ? c->memo_cap * 2 : 64;
+        struct tsdb_compact_memo *nm = realloc(c->memo, (size_t)newcap * sizeof(*nm));
+        if (!nm) { pthread_mutex_unlock(&c->memo_mtx); return; }
+        c->memo = nm; c->memo_cap = newcap;
+    }
+    snprintf(c->memo[c->memo_n].name, sizeof(c->memo[c->memo_n].name), "%s", name);
+    c->memo[c->memo_n].last_mtime = mtime;
+    c->memo_n++;
+    pthread_mutex_unlock(&c->memo_mtx);
+}
+
 static int compactor_should_pause(tsdb_compactor_t *c) {
     if (c->busy_threshold <= 0) return 0;
     int64_t now = compactor_now_ns();
@@ -856,6 +905,21 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
         snprintf(tbl_dir, sizeof(tbl_dir), "%s/%s", data_dir, de->d_name);
         struct stat tst;
         if (stat(tbl_dir, &tst) < 0 || !S_ISDIR(tst.st_mode)) continue;
+
+        /* mtime memo: skip the entire per-partition scan if this table's
+         * dir hasn't been touched since we last processed it.  No new
+         * flush → no new candidate blocks → no work to do.  Compaction
+         * itself rewrites files in the dir and bumps the mtime, so the
+         * NEXT cycle still re-checks any table we just touched.  Big win
+         * on wide-cardinality workloads where most tables are idle in any
+         * given 10 s window. */
+        if (c->memo_enabled) {
+            time_t cached = compactor_memo_get(c, de->d_name);
+            if (cached != 0 && cached == tst.st_mtime) {
+                tsdb_metric_inc("qengine_compaction_memo_skipped_total");
+                continue;
+            }
+        }
 
         /* Acquire the table for compaction: marks it `compacting` so a
          * concurrent DROP TABLE waits before freeing it (we use its raw
@@ -912,6 +976,12 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
         }
         closedir(td);
         tsdb_db_compact_release(db, tbl);
+
+        /* Memo: record the mtime we just observed so the next cycle can
+         * fast-skip this table if no flush has touched it.  Recorded even
+         * when no compaction happened — equally valid signal. */
+        if (c->memo_enabled) compactor_memo_set(c, de->d_name, tst.st_mtime);
+
         if (c->quit) break;
     }
     closedir(dd);
@@ -990,6 +1060,18 @@ int tsdb_compactor_start(tsdb_db_t *db,
             c->nworkers   = opts->worker_threads;
     }
 
+    /* Per-table mtime memo — kdb+ inspired "stable data stays stable": if
+     * a table dir's mtime hasn't changed, there's no new flush so no work
+     * to do, skip the inner enumeration entirely.  Default ON; env
+     * TSDB_COMPACTION_MEMO=0 disables (useful when chasing a bug to force
+     * a full re-scan every cycle). */
+    {
+        const char *e = getenv("TSDB_COMPACTION_MEMO");
+        c->memo_enabled = !(e && e[0] == '0');
+        pthread_mutex_init(&c->memo_mtx, NULL);
+        c->memo = NULL; c->memo_n = 0; c->memo_cap = 0;
+    }
+
     /* Adaptive backoff threshold from storage class.  Numbers tuned from
      * the 4-node lvm1 cluster (HDD-backed) where a writer steady-state
      * sustained ~44 flushes/s (2000 tables × ~22 s per table to fill 8192
@@ -1046,6 +1128,8 @@ void tsdb_compactor_stop(tsdb_compactor_t *c) {
     }
 
     pthread_mutex_destroy(&c->stats_mtx);
+    pthread_mutex_destroy(&c->memo_mtx);
+    free(c->memo);
     free(c);
 }
 

@@ -118,6 +118,14 @@ static metric_t g_metrics[] = {
     { "qengine_compactions_total",
       "Total column-file compaction operations", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_compaction_paused_total",
+      "Compactor cycles skipped because writer flush rate exceeded busy_threshold",
+      MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_compaction_memo_skipped_total",
+      "Table dirs the compactor fast-skipped via mtime memo (no new flush since last cycle)",
+      MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_rawblock_pushes_total",
       "Total raw-block replication pushes sent", MT_COUNTER, { .c = { 0 } } },
 
