@@ -40,6 +40,13 @@ typedef struct {
     sl_node_t *pool;
     size_t     pool_cap;
     size_t     pool_used;
+    /* Iter 7: monotonic-append fast path.  Time-series writes are >95%
+     * strictly ascending keys; for that case we skip the multi-level
+     * walk (perf showed sl_insert at 26.5% of leader CPU at 2.5M r/s)
+     * and splice at each level's tail in O(1). */
+    sl_node_t *tail[SL_MAX_LEVEL];
+    int64_t    monotonic_key;
+    int        have_monotonic_key;
 } skiplist_t;
 
 static uint32_t xs32(uint32_t *s) {
@@ -80,9 +87,13 @@ static void sl_free(skiplist_t *sl) {
 
 static void sl_reset(skiplist_t *sl) {
     /* Clear without freeing the pool — reuse for next batch. */
-    for (int i = 0; i < SL_MAX_LEVEL; i++) sl->head.next[i] = NULL;
+    for (int i = 0; i < SL_MAX_LEVEL; i++) {
+        sl->head.next[i] = NULL;
+        sl->tail[i]      = NULL;
+    }
     sl->top_level = 0;
     sl->pool_used = 0;
+    sl->have_monotonic_key = 0;
 }
 
 /* Insert (key, value).  Stable: if two nodes share the same key, the
@@ -90,13 +101,36 @@ static void sl_reset(skiplist_t *sl) {
  * preserves arrival order for equal timestamps, matching the old
  * insertion-order semantics for ts-ties. */
 static int sl_insert(skiplist_t *sl, int64_t key, uint32_t value) {
+    if (sl->pool_used >= sl->pool_cap) return -1;   /* pool exhausted */
+
+    /* Iter 7 fast path: monotonic-append.  No multi-level walk; splice at
+     * each level's stored tail in O(1).  >95% of time-series inserts hit
+     * this path; out-of-order arrivals fall through to the legacy walk. */
+    if (sl->have_monotonic_key && key >= sl->monotonic_key) {
+        int lvl = sl_random_level(sl);
+        if (lvl > sl->top_level) sl->top_level = lvl;
+        sl_node_t *n = &sl->pool[sl->pool_used++];
+        n->key   = key;
+        n->value = value;
+        n->level = lvl;
+        for (int i = 0; i <= lvl; i++) {
+            n->next[i] = NULL;
+            if (sl->tail[i]) sl->tail[i]->next[i] = n;
+            else             sl->head.next[i]     = n;
+            sl->tail[i] = n;
+        }
+        for (int i = lvl + 1; i < SL_MAX_LEVEL; i++) n->next[i] = NULL;
+        sl->monotonic_key = key;
+        return 0;
+    }
+
+    /* Legacy walk: first insert OR out-of-order arrival. */
     sl_node_t *update[SL_MAX_LEVEL];
     sl_node_t *x = &sl->head;
     for (int i = sl->top_level; i >= 0; i--) {
         while (x->next[i] && x->next[i]->key <= key) x = x->next[i];
         update[i] = x;
     }
-    if (sl->pool_used >= sl->pool_cap) return -1;   /* pool exhausted */
     int lvl = sl_random_level(sl);
     if (lvl > sl->top_level) {
         for (int i = sl->top_level + 1; i <= lvl; i++) update[i] = &sl->head;
@@ -109,9 +143,13 @@ static int sl_insert(skiplist_t *sl, int64_t key, uint32_t value) {
     for (int i = 0; i <= lvl; i++) {
         n->next[i]         = update[i]->next[i];
         update[i]->next[i] = n;
+        if (n->next[i] == NULL) sl->tail[i] = n;   /* keep tail in sync */
     }
-    /* zero any stale higher-level pointers from pool reuse */
     for (int i = lvl + 1; i < SL_MAX_LEVEL; i++) n->next[i] = NULL;
+    if (!sl->have_monotonic_key || key > sl->monotonic_key) {
+        sl->monotonic_key      = key;
+        sl->have_monotonic_key = 1;
+    }
     return 0;
 }
 
