@@ -76,17 +76,32 @@ int tsdb_io_async_submit_fsync(tsdb_io_async_t *io, int fd, uint64_t user_data) 
     if (!io->alive) { errno = EINVAL; return -1; }
     struct io_uring_sqe *sqe = io_uring_get_sqe(&io->ring);
     if (!sqe) { errno = EAGAIN; return -1; }     /* SQ full — caller should drain */
+    /* Iter 8: IORING_FSYNC_DATASYNC = fdatasync semantics.  Skips the
+     * inode metadata journal entry when file size hasn't changed, which
+     * (per perf at the 4-min cliff regime) was responsible for 3.84% in
+     * `__lock_text_start` blocked behind jbd2_log_wait_commit.  For our
+     * WAL + partition idx files, the metadata we care about (size) IS
+     * synced — durability semantics preserved.  Opt out at compile time
+     * by undefining TSDB_USE_FDATASYNC. */
+#  ifndef TSDB_NO_FDATASYNC
+    io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+#  else
     io_uring_prep_fsync(sqe, fd, 0);
+#  endif
     /* io_uring_sqe_set_data64 isn't in every liburing version; use the
      * field directly which works back to the earliest releases. */
     sqe->user_data = user_data;
     io->pending_subs++;
     return 0;
 #else
-    /* Stub: do the fsync inline, record the tag so drain() can return it. */
+    /* Stub: do the fdatasync inline, record the tag so drain() can return it. */
     int next = (io->tail + 1) & 15;
     if (next == io->head) { errno = EAGAIN; return -1; }
+#  if defined(__linux__) && !defined(TSDB_NO_FDATASYNC)
+    if (fdatasync(fd) < 0) return -1;
+#  else
     if (fsync(fd) < 0) return -1;
+#  endif
     io->inflight[io->tail] = user_data;
     io->tail = next;
     return 0;
