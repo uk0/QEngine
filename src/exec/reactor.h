@@ -1,30 +1,30 @@
-/* reactor.h — single-producer/single-consumer ring + per-core reactor.
+/* reactor.h — lock-free SPSC ring + per-core reactor + reactor pool.
  *
- * Foundation for the ScyllaDB-style shard-per-core evolution (Phase 0).
- * Two primitives, neither yet wired into the storage/cluster hot path:
+ * Foundation for the ScyllaDB-style shard-per-core architecture.  Goal:
+ * every table is owned by exactly one core whose single-threaded reactor
+ * mutates its memtable/WAL/flush with NO locks, because that reactor is the
+ * sole accessor.  Cross-thread hand-off is by lock-free message passing, not
+ * shared mutable state under a mutex.
  *
- *   1. tsdb_spsc_ring_t — a bounded, lock-free ring for ONE producer
- *      thread and ONE consumer thread.  Unlike the Vyukov MPMC ring
- *      (src/core/mpmc_ring.h), SPSC needs only two monotonic counters
- *      with an acquire/release pair: the producer writes `tail` only,
- *      the consumer writes `head` only, so there is no CAS and no
- *      contention between the two ends.  This is the queue a front-end
- *      I/O thread will use to hand work to the single core that owns a
- *      table's shard.
+ * Three layers:
  *
- *   2. tsdb_reactor_t — a single-threaded event loop bound (later) to one
- *      core.  Work is submitted as (fn, arg) closures from a producer
- *      thread; the reactor drains its inbox and runs each closure ON its
- *      own thread.  In the target architecture the closure mutates the
- *      core's owned tables with no locks because the reactor is the sole
- *      accessor.  Phase 0 ships the loop + lifecycle only.
+ *   1. tsdb_spsc_ring_t — bounded lock-free ring for ONE producer + ONE
+ *      consumer (two monotonic counters, acquire/release, no CAS).  The
+ *      zero-contention primitive for a future pinned-IO-thread → core path.
  *
- * Invariants:
- *   - SPSC ring cap MUST be a power of two and >= 2 (enforced at init).
- *   - Exactly one thread may call push (the producer); exactly one thread
- *     may call pop (the consumer).  Violating this is undefined.
- *   - Stored items are void*; NULL is a legal value.
- *   - head/tail sit on separate cache lines to avoid false sharing.
+ *   2. tsdb_reactor_t — a single-threaded event loop bound (optionally) to
+ *      one core.  Its inbox is a lock-free MPMC ring (Vyukov) so any number
+ *      of front-end I/O threads can submit work to a core without a lock.
+ *      The reactor is the single consumer; it runs each closure on its own
+ *      thread.
+ *
+ *   3. tsdb_reactor_pool_t — N reactors, one per core, each pinned.  A table
+ *      name hashes to its owning core (hash(name) % ncores); pool_submit
+ *      routes a closure to that core's inbox.  This is the routing layer the
+ *      write/query paths will sit on top of (Phase 2+).
+ *
+ * Everything here is lock-free on the hot path: SPSC (no CAS), MPMC inbox
+ * (Vyukov CAS, wait-free uncontended), and stateless hash routing.
  */
 #ifndef TSDB_EXEC_REACTOR_H
 #define TSDB_EXEC_REACTOR_H
@@ -32,6 +32,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+
+#include "../core/mpmc_ring.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,22 +52,11 @@ typedef struct {
     uint64_t cap;
 } tsdb_spsc_ring_t;
 
-/* Initialize with `cap` slots.  cap MUST be a power of two and >= 2.
- * Returns 0 on success, -1 on invalid cap / allocation failure. */
+/* cap MUST be a power of two and >= 2.  Returns 0 / -1. */
 int  tsdb_spsc_init(tsdb_spsc_ring_t *r, uint64_t cap);
-
-/* Release the slot array.  Does NOT free items still in the ring — the
- * caller drains first. */
 void tsdb_spsc_destroy(tsdb_spsc_ring_t *r);
-
-/* Producer-only.  Returns 1 on success, 0 if full. */
-int  tsdb_spsc_push(tsdb_spsc_ring_t *r, void *item);
-
-/* Consumer-only.  Returns 1 and stores into *out on success, 0 if empty. */
-int  tsdb_spsc_pop(tsdb_spsc_ring_t *r, void **out);
-
-/* Approximate occupancy (tail - head).  Safe to call from either end;
- * the value may be stale by the in-flight op of the other thread. */
+int  tsdb_spsc_push(tsdb_spsc_ring_t *r, void *item);   /* producer-only; 1 ok, 0 full */
+int  tsdb_spsc_pop(tsdb_spsc_ring_t *r, void **out);    /* consumer-only; 1 ok, 0 empty */
 uint64_t tsdb_spsc_size(const tsdb_spsc_ring_t *r);
 
 /* ---- reactor: a single-threaded, single-owner event loop. ------------- */
@@ -73,35 +64,60 @@ typedef void (*tsdb_reactor_task_fn)(void *arg);
 
 typedef struct {
     int               core_id;     /* logical index 0..ncores-1 */
-    tsdb_spsc_ring_t  inbox;       /* producer(s) → this core */
-    _Atomic int       running;     /* loop flag (0 stop, 1 run) */
-    int               started;     /* thread alive? (owner-thread only) */
+    int               cpu;         /* CPU to pin to, or -1 for no affinity */
+    tsdb_mpmc_ring_t  inbox;       /* lock-free MPMC: any producer → this core */
+    _Atomic int       running;
+    int               started;     /* owner-thread bookkeeping */
     pthread_t         thread;
 } tsdb_reactor_t;
 
-/* Create a reactor with an inbox of `inbox_cap` slots (pow2, >= 2).  Does
- * NOT start the background thread.  Returns 0 / -1. */
-int  tsdb_reactor_init(tsdb_reactor_t *r, int core_id, uint64_t inbox_cap);
-
-/* Stop the thread if running, free any undrained tasks, release the inbox. */
+/* inbox_cap: pow2, >= 2.  cpu: CPU id to pin the thread to (Linux), or -1. */
+int  tsdb_reactor_init(tsdb_reactor_t *r, int core_id, int cpu, uint64_t inbox_cap);
 void tsdb_reactor_destroy(tsdb_reactor_t *r);
 
-/* Producer side: enqueue a (fn, arg) closure.  Returns 1 on success, 0 if
- * the inbox is full. */
+/* Producer side (any thread): enqueue a closure.  1 ok, 0 if inbox full. */
 int  tsdb_reactor_submit(tsdb_reactor_t *r, tsdb_reactor_task_fn fn, void *arg);
 
-/* Consumer side: drain up to `budget` tasks on the CURRENT thread, running
- * each closure.  budget <= 0 drains all currently-queued tasks.  Returns
- * the number processed.  Lets tests drive the loop deterministically
- * without spawning the background thread. */
+/* Consumer side: drain up to `budget` tasks on the CURRENT thread (budget
+ * <= 0 drains all queued).  Returns the count processed.  For deterministic
+ * tests without the background thread. */
 int  tsdb_reactor_run_once(tsdb_reactor_t *r, int budget);
 
-/* Start / stop the background reactor thread.  start() returns 0 / -1;
- * stop() joins.  After start(), submit() from another thread and the
- * reactor drains in the background.  Do not call run_once concurrently
- * with a started reactor (that would be a second consumer). */
+/* The reactor draining on the CURRENT thread (set on entry to run_once /
+ * the background loop), or NULL if this thread is not a reactor.  Lets a
+ * task closure learn which core owns it. */
+tsdb_reactor_t *tsdb_reactor_current(void);
+
+/* Start / stop the background reactor thread (pins to r->cpu on Linux). */
 int  tsdb_reactor_start(tsdb_reactor_t *r);
 void tsdb_reactor_stop(tsdb_reactor_t *r);
+
+/* ---- reactor pool: N cores, table→core ownership. --------------------- */
+typedef struct {
+    tsdb_reactor_t *reactors;
+    int             ncores;
+} tsdb_reactor_pool_t;
+
+/* Create a pool of `ncores` reactors (clamped to >= 1) each with an inbox of
+ * `inbox_cap` slots, start their threads, and pin reactor i to CPU i on
+ * Linux.  Returns NULL on failure. */
+tsdb_reactor_pool_t *tsdb_reactor_pool_new(int ncores, uint64_t inbox_cap);
+
+/* Stop + join all reactor threads and free the pool. */
+void tsdb_reactor_pool_free(tsdb_reactor_pool_t *pool);
+
+int  tsdb_reactor_pool_ncores(const tsdb_reactor_pool_t *pool);
+
+/* Deterministic owner index for a table name: hash(name) % ncores.  Stateless
+ * — any thread can compute it with no lock and no shared lookup. */
+int  tsdb_reactor_pool_owner_index(const tsdb_reactor_pool_t *pool, const char *name);
+
+/* The reactor that owns `name`. */
+tsdb_reactor_t *tsdb_reactor_pool_owner(tsdb_reactor_pool_t *pool, const char *name);
+
+/* Route a closure to the core that owns `name`.  1 ok, 0 if that inbox full. */
+int  tsdb_reactor_pool_submit(tsdb_reactor_pool_t *pool, const char *name,
+                              tsdb_reactor_task_fn fn, void *arg);
 
 #ifdef __cplusplus
 }

@@ -146,7 +146,7 @@ static void inc_task(void *arg) { (*(int *)arg)++; }
 static void t_reactor_run_once(void) {
     printf("\n[5] reactor run_once: budget cap + drain-all\n");
     tsdb_reactor_t r;
-    assert(tsdb_reactor_init(&r, 0, 2048) == 0);
+    assert(tsdb_reactor_init(&r, 0, -1, 2048) == 0);
 
     int counter = 0;
     for (int i = 0; i < 1000; i++)
@@ -170,7 +170,7 @@ static void bg_inc(void *arg) { (void)arg; atomic_fetch_add(&g_bg_counter, 1); }
 static void t_reactor_thread(void) {
     printf("\n[6] reactor background thread: 10k tasks, clean shutdown\n");
     tsdb_reactor_t r;
-    assert(tsdb_reactor_init(&r, 3, 1024) == 0);
+    assert(tsdb_reactor_init(&r, 3, -1, 1024) == 0);
     atomic_store(&g_bg_counter, 0);
     assert(tsdb_reactor_start(&r) == 0);
 
@@ -193,6 +193,112 @@ static void t_reactor_thread(void) {
     PASS("background loop drains all tasks + joins cleanly");
 }
 
+/* ---- [7] reactor pool: deterministic table→core routing ------------ */
+
+#define POOL_CORES 4
+static _Atomic long g_core_runs[POOL_CORES];
+static _Atomic long g_route_mismatch;
+
+/* Runs ON a reactor thread; arg = the core the submitter expects to own it.
+ * tsdb_reactor_current() reports the core that actually ran it. */
+static void route_task(void *arg) {
+    int expected = (int)(intptr_t)arg;
+    tsdb_reactor_t *self = tsdb_reactor_current();
+    int actual = self ? self->core_id : -1;
+    if (actual == expected && actual >= 0 && actual < POOL_CORES)
+        atomic_fetch_add(&g_core_runs[actual], 1);
+    else
+        atomic_fetch_add(&g_route_mismatch, 1);
+}
+
+static void t_pool_routing(void) {
+    printf("\n[7] reactor pool: deterministic table->core routing\n");
+    tsdb_reactor_pool_t *pool = tsdb_reactor_pool_new(POOL_CORES, 4096);
+    assert(pool && tsdb_reactor_pool_ncores(pool) == POOL_CORES);
+
+    for (int i = 0; i < POOL_CORES; i++) atomic_store(&g_core_runs[i], 0);
+    atomic_store(&g_route_mismatch, 0);
+
+    const int NTAB = 400, PER = 50;
+    long expected_per_core[POOL_CORES] = {0};
+    for (int t = 0; t < NTAB; t++) {
+        char name[32]; snprintf(name, sizeof(name), "lt_%d", t);
+        int own = tsdb_reactor_pool_owner_index(pool, name);
+        assert(own >= 0 && own < POOL_CORES);
+        assert(own == tsdb_reactor_pool_owner_index(pool, name));    /* stable */
+        for (int k = 0; k < PER; k++)
+            while (!tsdb_reactor_pool_submit(pool, name, route_task, (void *)(intptr_t)own))
+                sched_yield();
+        expected_per_core[own] += PER;
+    }
+
+    long total = (long)NTAB * PER;
+    for (int spins = 0; spins < 200000; spins++) {
+        long done = atomic_load(&g_route_mismatch);
+        for (int i = 0; i < POOL_CORES; i++) done += atomic_load(&g_core_runs[i]);
+        if (done >= total) break;
+        struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL);
+    }
+
+    assert(atomic_load(&g_route_mismatch) == 0);    /* every task ran on its owner core */
+    long sum = 0; int nonempty = 0;
+    for (int i = 0; i < POOL_CORES; i++) {
+        long c = atomic_load(&g_core_runs[i]);
+        assert(c == expected_per_core[i]);           /* per-core counts exact */
+        sum += c; if (c > 0) nonempty++;
+    }
+    assert(sum == total);
+    assert(nonempty >= 2);                            /* hash actually spread tables */
+    printf("  routed %ld tasks, 0 mismatch, spread over %d/%d cores\n",
+           sum, nonempty, POOL_CORES);
+
+    tsdb_reactor_pool_free(pool);
+    PASS("pool routes each table to hash(name)%ncores and runs it there");
+}
+
+/* ---- [8] reactor pool: lock-free MPMC inbox under many producers --- */
+
+static tsdb_reactor_pool_t *g_mp_pool;
+static _Atomic long g_mp_runs;
+static void mp_task(void *arg) { (void)arg; atomic_fetch_add(&g_mp_runs, 1); }
+
+#define MP_PRODUCERS 4
+#define MP_PER 5000
+
+static void *mp_producer(void *arg) {
+    uintptr_t id = (uintptr_t)arg;
+    for (int i = 0; i < MP_PER; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "lt_%lu", (unsigned long)((id * 131 + (unsigned)i) % 256));
+        while (!tsdb_reactor_pool_submit(g_mp_pool, name, mp_task, NULL))
+            sched_yield();
+    }
+    return NULL;
+}
+
+static void t_pool_multiproducer(void) {
+    printf("\n[8] reactor pool: %d producers concurrently submitting\n", MP_PRODUCERS);
+    g_mp_pool = tsdb_reactor_pool_new(POOL_CORES, 1024);
+    assert(g_mp_pool);
+    atomic_store(&g_mp_runs, 0);
+
+    pthread_t prod[MP_PRODUCERS];
+    for (uintptr_t i = 0; i < MP_PRODUCERS; i++)
+        assert(pthread_create(&prod[i], NULL, mp_producer, (void *)i) == 0);
+    for (int i = 0; i < MP_PRODUCERS; i++) pthread_join(prod[i], NULL);
+
+    long total = (long)MP_PRODUCERS * MP_PER;
+    for (int spins = 0; spins < 200000 && atomic_load(&g_mp_runs) < total; spins++) {
+        struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL);
+    }
+    assert(atomic_load(&g_mp_runs) == total);        /* no task lost or duplicated */
+    printf("  %d producers x %d submits = %ld tasks all ran (lock-free MPMC inbox)\n",
+           MP_PRODUCERS, MP_PER, total);
+
+    tsdb_reactor_pool_free(g_mp_pool);
+    PASS("multi-producer routing: no loss/dup through MPMC inboxes");
+}
+
 int main(void) {
     printf("=== test_reactor ===\n");
     t_basic();
@@ -201,6 +307,8 @@ int main(void) {
     t_stream_mincap();
     t_reactor_run_once();
     t_reactor_thread();
-    printf("\n[PASS] reactor + SPSC ring: all cases passed\n");
+    t_pool_routing();
+    t_pool_multiproducer();
+    printf("\n[PASS] reactor + SPSC ring + pool: all cases passed\n");
     return 0;
 }
