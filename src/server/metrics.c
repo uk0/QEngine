@@ -141,6 +141,12 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_recv_ok_total",
       "WRITE_BATCH RPCs received where the local batch_commit landed rows", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_replicate_bytes_raw_total",
+      "Replication WRITE_BATCH payload bytes BEFORE lzlite compression", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replicate_bytes_wire_total",
+      "Replication WRITE_BATCH payload bytes actually sent (post-compression)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_recv_err_total",
       "WRITE_BATCH RPCs received where the local apply failed (missing table, batch_begin fail, commit fail)", MT_COUNTER, { .c = { 0 } } },
 

@@ -11,6 +11,7 @@
 #include "../storage/memtable.h"
 #include "../federation/fedrpc.h"
 #include "../server/metrics.h"
+#include "../compress/lzlite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -254,6 +255,82 @@ typedef struct {
 } handler_args_t;
 
 /* Handle one client connection in its own thread. */
+/* Decode a raw WRITE_BATCH payload and apply it locally (local_only, so it
+ * doesn't re-enter the cluster fanout).  Returns 1 if rows landed, 0 on any
+ * decode/open/append/commit failure.  Shared by the WRITE_BATCH (raw) and
+ * WRITE_BATCH_LZ (post-decompress) receive paths.  Extracted from the
+ * inline handler so the lz path doesn't duplicate the 80-line apply chain. */
+static int rpc_apply_write_batch(tsdb_db_t *db,
+                                 const uint8_t *payload, uint32_t payload_len) {
+    if (!db || payload_len == 0) return 0;
+
+    char table_name[64] = {0};
+    int ncols = 0, nrows = 0;
+    int col_types[TSDB_MAX_COLS];
+    uint8_t *col_data[TSDB_MAX_COLS] = {0};
+
+    int rc = tsdb_rpc_decode_write_batch(payload, payload_len,
+                                         table_name, sizeof(table_name),
+                                         &ncols, col_types, &nrows,
+                                         (uint8_t **)col_data);
+    if (rc != 0 || nrows <= 0) return 0;
+
+    tsdb_table_t *tbl = NULL;
+    if (tsdb_open_table(db, table_name, &tbl) != TSDB_OK || !tbl) return 0;
+
+    int write_ok = 0;
+    tsdb_table_lock_write(tbl);
+    tsdb_batch_t *batch = NULL;
+    if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
+        tsdb_batch_set_local_only(batch);
+
+        /* Wire layout: non-symbol cols are nrows×8 raw bytes, symbol cols are
+         * [u32 total][u16 len][bytes]…  Compute per-column offsets into the
+         * single contiguous payload and hand pointers to bulk-append. */
+        int ts_ci = -1;
+        int base[TSDB_MAX_COLS];
+        int boff = 0;
+        int sizing_ok = 1;
+        for (int c = 0; c < ncols; c++) {
+            base[c] = boff;
+            if (col_types[c] == TSDB_TYPE_TIMESTAMP) ts_ci = c;
+            if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                uint32_t total = 0;
+                memcpy(&total, col_data[0] + boff, 4);
+                boff += 4 + (int)total;
+            } else {
+                boff += 8 * nrows;
+            }
+            if ((uint32_t)boff > payload_len) { sizing_ok = 0; break; }
+        }
+        const void *col_arrs[TSDB_MAX_COLS];
+        int data_types[TSDB_MAX_COLS];
+        int n_data = 0;
+        for (int c = 0; c < ncols && sizing_ok; c++) {
+            if (c == ts_ci) continue;
+            col_arrs[n_data]   = col_data[0] + base[c];
+            data_types[n_data] = col_types[c];
+            n_data++;
+        }
+        const int64_t *ts_arr = (ts_ci >= 0)
+            ? (const int64_t *)(col_data[0] + base[ts_ci]) : NULL;
+        int64_t *ts_synth = NULL;
+        if (!ts_arr) ts_synth = calloc(nrows, sizeof(int64_t));
+        int append_rc = sizing_ok
+            ? tsdb_batch_append_bulk(batch, ts_arr ? ts_arr : ts_synth,
+                                     col_arrs, data_types, n_data, (size_t)nrows)
+            : TSDB_ERR_CORRUPT;
+        free(ts_synth);
+        if (append_rc == TSDB_OK) {
+            if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+        } else {
+            tsdb_batch_discard(batch);
+        }
+    }
+    tsdb_table_unlock_write(tbl);
+    return write_ok;
+}
+
 static void *connection_handler(void *arg) {
     handler_args_t *ha = (handler_args_t *)arg;
     int fd = ha->fd;
@@ -320,98 +397,40 @@ static void *connection_handler(void *arg) {
             break;
 
         case TSDB_RPC_WRITE_BATCH: {
-            /* Track whether the entire decode→open→begin→commit chain
-             * actually landed the rows so we can reflect the truth in
-             * the RPC reply — previously the receiver unconditionally
-             * ACKed even when the table was missing or batch_commit
-             * failed, so the sender counted it as a successful replica
-             * and dropped the rows silently.  Under concurrent writes
-             * this is the smoking gun for the 3-8% row-loss we've
-             * observed: send-side ack_count climbs, receive-side
-             * memtable stays empty. */
+            /* Reflect the TRUE decode→open→begin→commit outcome in the reply.
+             * ACK-without-landing used to drop rows silently (sender counts a
+             * phantom replica) — the apply helper returns the real result. */
+            int write_ok = rpc_apply_write_batch(db, msg.payload, msg.payload_len);
+            if (write_ok) {
+                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_replicate_recv_ok_total");
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                tsdb_metric_inc("qengine_replicate_recv_err_total");
+            }
+            break;
+        }
+
+        case TSDB_RPC_WRITE_BATCH_LZ: {
+            /* Compressed WRITE_BATCH: [u32 orig_len LE][lzlite bytes].
+             * Decompress into a scratch buffer, then apply via the shared
+             * helper exactly as a raw WRITE_BATCH. */
             int write_ok = 0;
-            if (db && msg.payload_len > 0) {
-                char table_name[64] = {0};
-                int ncols = 0, nrows = 0;
-                int col_types[TSDB_MAX_COLS];
-                uint8_t *col_data[TSDB_MAX_COLS] = {0};
-
-                int rc = tsdb_rpc_decode_write_batch(
-                    msg.payload, msg.payload_len,
-                    table_name, sizeof(table_name),
-                    &ncols, col_types, &nrows,
-                    (uint8_t **)col_data);
-
-                if (rc == 0 && nrows > 0) {
-                    tsdb_table_t *tbl = NULL;
-                    if (tsdb_open_table(db, table_name, &tbl) == TSDB_OK && tbl) {
-                        /* Serialize concurrent replicate RPCs on the
-                         * same table.  See tsdb_table_lock_write() doc. */
-                        tsdb_table_lock_write(tbl);
-                        tsdb_batch_t *batch = NULL;
-                        if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
-                            tsdb_batch_set_local_only(batch);
-
-                            /* Bulk columnar append.  The wire payload
-                             * already lays each column out in the format
-                             * tsdb_memtable_append_bulk expects:
-                             * non-symbol cols are nrows × 8 raw bytes,
-                             * symbol cols are `[u32 total][u16 len][bytes]…`.
-                             * We just compute the per-column starting
-                             * offset and hand pointers in.  Replaces a
-                             * per-row dispatch + per-cell setter that
-                             * used to dominate the receiver hot path. */
-                            int ts_ci = -1;
-                            int base[TSDB_MAX_COLS];
-                            int boff = 0;
-                            int sizing_ok = 1;
-                            for (int c = 0; c < ncols; c++) {
-                                base[c] = boff;
-                                if (col_types[c] == TSDB_TYPE_TIMESTAMP) ts_ci = c;
-                                if (col_types[c] == TSDB_TYPE_SYMBOL) {
-                                    uint32_t total = 0;
-                                    memcpy(&total, col_data[0] + boff, 4);
-                                    boff += 4 + (int)total;
-                                } else {
-                                    boff += 8 * nrows;
-                                }
-                                if ((uint32_t)boff > msg.payload_len) {
-                                    sizing_ok = 0;
-                                    break;
-                                }
-                            }
-                            const void *col_arrs[TSDB_MAX_COLS];
-                            int data_types[TSDB_MAX_COLS];
-                            int n_data = 0;
-                            for (int c = 0; c < ncols && sizing_ok; c++) {
-                                if (c == ts_ci) continue;
-                                col_arrs[n_data]   = col_data[0] + base[c];
-                                data_types[n_data] = col_types[c];
-                                n_data++;
-                            }
-                            const int64_t *ts_arr = (ts_ci >= 0)
-                                ? (const int64_t *)(col_data[0] + base[ts_ci])
-                                : NULL;
-                            int64_t *ts_synth = NULL;
-                            if (!ts_arr) {
-                                /* Defensive: synth a 0-fill ts so append_bulk
-                                 * still sees a valid pointer.  Receiver-side
-                                 * payloads always carry a ts col in practice. */
-                                ts_synth = calloc(nrows, sizeof(int64_t));
-                            }
-                            int append_rc = sizing_ok
-                                ? tsdb_batch_append_bulk(batch, ts_arr ? ts_arr : ts_synth,
-                                                          col_arrs, data_types, n_data,
-                                                          (size_t)nrows)
-                                : TSDB_ERR_CORRUPT;
-                            free(ts_synth);
-                            if (append_rc == TSDB_OK) {
-                                if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
-                            } else {
-                                tsdb_batch_discard(batch);
-                            }
+            if (db && msg.payload_len > 4) {
+                uint32_t orig_len = 0;
+                memcpy(&orig_len, msg.payload, 4);
+                /* Guard against a malformed/huge orig_len (cap at 256 MiB). */
+                if (orig_len > 0 && orig_len <= (256u << 20)) {
+                    uint8_t *raw = malloc(orig_len);
+                    if (raw) {
+                        size_t got = 0;
+                        int drc = tsdb_lzlite_decode(msg.payload + 4,
+                                                     msg.payload_len - 4,
+                                                     raw, orig_len, &got);
+                        if (drc == TSDB_OK && got == orig_len) {
+                            write_ok = rpc_apply_write_batch(db, raw, (uint32_t)got);
                         }
-                        tsdb_table_unlock_write(tbl);
+                        free(raw);
                     }
                 }
             }

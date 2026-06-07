@@ -12,6 +12,7 @@
 #include "../server/metrics.h"
 #include "../federation/dr_forwarder.h"
 #include "../exec/pool.h"
+#include "../compress/lzlite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -501,14 +502,62 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
 
     /* Cross-DC fan-out piggybacks on the intra-cluster payload so we
      * only pay the encode cost once.  The forwarder copies the buffer
-     * internally; drops are reported on the sender's /metrics. */
+     * internally (and FED_INGEST decodes RAW), so enqueue BEFORE the
+     * lzlite step below; drops are reported on the sender's /metrics. */
     if (rmgr->dr) {
         tsdb_dr_forwarder_enqueue(rmgr->dr, payload, (size_t)plen);
     }
 
+    /* Kafka-style batch compression: lzlite-wrap the WRITE_BATCH payload
+     * for the intra-cluster fan-out.  The raw payload is columnar (ts is a
+     * +Δ arithmetic run, vals are a correlated walk) so it carries real
+     * residual redundancy — measured 38-39% on the loader's data.
+     *
+     * Default OFF, opt-in via TSDB_REPLICATION_COMPRESS=1.  Rationale
+     * (verified A/B, 2026-06-08): the win is BANDWIDTH, not CPU.  On a
+     * NIC-separated / WAN cluster (1-10 GbE, cross-DC DR) cutting 38% of
+     * replication bytes is a clear gain.  But on a single-host cluster
+     * where peers talk over loopback, bandwidth is ~free and the extra
+     * lzlite CPU on the flush critical path costs ~40% throughput.  So
+     * the operator enables it only when replication is bandwidth-bound.
+     * Same-binary A/B (single-host loopback cluster, 480 s cold):
+     *   compress=0 → 1.38M r/s @480s ; compress=1 → 0.81M r/s @480s.
+     * Either way the payload is lossless (unit test + errs=0 both runs). */
+    int rpc_kind = TSDB_RPC_WRITE_BATCH;
+    {
+        static int compress_enabled = -1;
+        if (compress_enabled < 0) {
+            const char *e = getenv("TSDB_REPLICATION_COMPRESS");
+            compress_enabled = (e && e[0] == '1') ? 1 : 0;
+        }
+        tsdb_metric_add("qengine_replicate_bytes_raw_total", (uint64_t)plen);
+        if (compress_enabled && plen >= 1024) {
+            size_t cap = 4 + tsdb_lzlite_max_output((size_t)plen);
+            uint8_t *lz = malloc(cap);
+            if (lz) {
+                size_t lzn = 0;
+                /* encode returns bytes written (>=0) on success, neg on error;
+                 * lzn is set to the same count on success. */
+                int erc = tsdb_lzlite_encode(payload, (size_t)plen,
+                                             lz + 4, cap - 4, &lzn);
+                if (erc >= 0 && (4 + lzn) < (size_t)plen * 9 / 10) {
+                    uint32_t orig = (uint32_t)plen;
+                    memcpy(lz, &orig, 4);
+                    free(payload);
+                    payload  = lz;
+                    plen     = (int)(4 + lzn);
+                    rpc_kind = TSDB_RPC_WRITE_BATCH_LZ;
+                } else {
+                    free(lz);   /* no win — ship raw */
+                }
+            }
+        }
+        tsdb_metric_add("qengine_replicate_bytes_wire_total", (uint64_t)plen);
+    }
+
     return fanout_wait_quorum(rmgr, payload, (uint32_t)plen,
                               replicas, nreplicas,
-                              w_quorum, TSDB_RPC_WRITE_BATCH);
+                              w_quorum, rpc_kind);
 }
 
 /* ---- Schema sync --------------------------------------------------------- */

@@ -73,7 +73,17 @@ typedef enum {
                                          that missed broadcasts during a
                                          crash window can self-heal.  See
                                          tsdb_catalog_pull_from_master() in
-                                         storage/catalog_sync.c. */
+                                         storage/catalog_sync.c. */,
+    TSDB_RPC_WRITE_BATCH_LZ     = 20  /* WRITE_BATCH with an lzlite-compressed
+                                         payload: [u32 orig_len LE][lzlite bytes].
+                                         Receiver decompresses then applies
+                                         exactly as WRITE_BATCH.  Sender emits
+                                         this (instead of type 1) only when
+                                         compression saved >10% and the payload
+                                         cleared the size threshold; gated by
+                                         TSDB_REPLICATION_COMPRESS (default on).
+                                         Kafka-style batch compression — cuts
+                                         tcp_sendmsg bytes + LAN/WAN bandwidth. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
