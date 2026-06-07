@@ -797,6 +797,16 @@ static void *accept_loop(void *arg) {
         int one = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+        /* Iter 10: enlarge the receive buffer on the replication-accept
+         * side so a peer can absorb a burst of WRITE_BATCH frames without
+         * forcing the sender to stall.  Mirrors the SO_SNDBUF bump on the
+         * connect side.  Env TSDB_RPC_RCVBUF_KB overrides (0 = autotune). */
+        {
+            const char *e = getenv("TSDB_RPC_RCVBUF_KB");
+            int kb = e ? atoi(e) : 4096;
+            if (kb > 0) { int b = kb * 1024; setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &b, sizeof(b)); }
+        }
+
         handler_args_t *ha = malloc(sizeof(*ha));
         if (!ha) { close(client_fd); continue; }
         ha->fd       = client_fd;
@@ -919,6 +929,18 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /* Iter 10: enlarge the send buffer on the leader→peer replication
+     * link.  perf on a virgin cluster put tcp_sendmsg at 7.27% of leader
+     * CPU; a 4 MiB SO_SNDBUF lets the kernel absorb many 64 KiB WRITE_BATCH
+     * frames before the writer blocks, cutting push-cycle churn on this
+     * high-throughput LAN path.  Env TSDB_RPC_SNDBUF_KB overrides (0 =
+     * leave kernel autotuning alone). */
+    {
+        const char *e = getenv("TSDB_RPC_SNDBUF_KB");
+        int kb = e ? atoi(e) : 4096;
+        if (kb > 0) { int b = kb * 1024; setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &b, sizeof(b)); }
+    }
 
     tsdb_rpc_conn_t *conn = calloc(1, sizeof(*conn));
     if (!conn) { close(fd); return NULL; }
