@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/uio.h>
 
 /* ---- CRC32C hardware dispatch ------------------------------------------- *
  *
@@ -294,6 +295,34 @@ static int read_all(int fd, uint8_t *buf, size_t n) {
     return TSDB_OK;
 }
 
+/* Gathered write of a whole frame in one syscall — header + payload + CRC as
+ * a single writev so a frame leaves as one TCP segment instead of 3 (cuts
+ * per-frame syscalls and the multi-segment latency on every response).
+ * Mutates the local iov array to absorb partial writes; callers pass a copy. */
+static int writev_all(int fd, struct iovec *iov, int iovcnt) {
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+    size_t done = 0;
+    while (done < total) {
+        ssize_t w = writev(fd, iov, iovcnt);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return TSDB_ERR_IO;
+        }
+        if (w == 0) return TSDB_ERR_IO;
+        done += (size_t)w;
+        if (done < total) {                 /* partial: advance past written bytes */
+            size_t adv = (size_t)w;
+            while (iovcnt > 0 && adv >= iov[0].iov_len) { adv -= iov[0].iov_len; iov++; iovcnt--; }
+            if (iovcnt > 0) {
+                iov[0].iov_base = (char *)iov[0].iov_base + adv;
+                iov[0].iov_len -= adv;
+            }
+        }
+    }
+    return TSDB_OK;
+}
+
 /* ---- Public send / recv -------------------------------------------------- */
 
 /*
@@ -332,12 +361,12 @@ int tsdb_proto_send(int fd, uint8_t type, uint16_t flags, uint64_t req_id,
     crc_bytes[2] = (uint8_t)(crc >> 16);
     crc_bytes[3] = (uint8_t)(crc >> 24);
 
-    int rc;
-    if ((rc = write_all(fd, raw_hdr, TSDB_PROTO_HDR_SIZE)) != TSDB_OK) return rc;
-    if (n > 0 && payload) {
-        if ((rc = write_all(fd, (const uint8_t *)payload, n)) != TSDB_OK) return rc;
-    }
-    return write_all(fd, crc_bytes, 4);
+    struct iovec iov[3];
+    int nio = 0;
+    iov[nio].iov_base = raw_hdr;             iov[nio].iov_len = TSDB_PROTO_HDR_SIZE; nio++;
+    if (n > 0 && payload) { iov[nio].iov_base = (void *)payload; iov[nio].iov_len = n; nio++; }
+    iov[nio].iov_base = crc_bytes;           iov[nio].iov_len = 4; nio++;
+    return writev_all(fd, iov, nio);
 }
 
 int tsdb_proto_recv(int fd, tsdb_frame_hdr_t *hdr, uint8_t **out_payload) {
@@ -445,6 +474,18 @@ int tsdb_proto_send_io(tsdb_io_t *io, uint8_t type, uint16_t flags,
     uint8_t crc_bytes[4];
     crc_bytes[0]=(uint8_t)(crc);      crc_bytes[1]=(uint8_t)(crc>>8);
     crc_bytes[2]=(uint8_t)(crc>>16);  crc_bytes[3]=(uint8_t)(crc>>24);
+
+    /* Plain fd: one gathered writev (one syscall, one TCP segment).  TLS has
+     * no scatter-gather here, so keep the 3-step path (the TLS layer buffers
+     * records internally anyway). */
+    if (!io->tls) {
+        struct iovec iov[3];
+        int nio = 0;
+        iov[nio].iov_base = raw_hdr;             iov[nio].iov_len = TSDB_PROTO_HDR_SIZE; nio++;
+        if (n > 0 && payload) { iov[nio].iov_base = (void *)payload; iov[nio].iov_len = n; nio++; }
+        iov[nio].iov_base = crc_bytes;           iov[nio].iov_len = 4; nio++;
+        return writev_all(io->fd, iov, nio);
+    }
 
     int rc;
     if ((rc = write_all_io(io, raw_hdr, TSDB_PROTO_HDR_SIZE)) != TSDB_OK) return rc;
