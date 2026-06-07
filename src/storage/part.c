@@ -19,10 +19,15 @@
 
 /* Thread-local io_async ring used by tsdb_part_fsync_idx — lazily created
  * on first use, destroyed at thread exit.  Each flush thread gets its own
- * ring so submissions don't need cross-thread serialisation.  Opt-in via
- * env TSDB_PART_IO_URING=1 (default off — keeps the legacy fsync path for
- * deployments that haven't validated io_uring yet).  Falls back to a plain
- * fsync() if io_async isn't available (stub build, or ring create failed). */
+ * ring so submissions don't need cross-thread serialisation.
+ *
+ * Default ON since iter 4 (cluster validated: 1.40M → 1.55M @480s, errs=0,
+ * reverse-drift); opt OUT via env TSDB_PART_IO_URING=0 if a deployment
+ * needs to fall back to the legacy fsync path (e.g. kernel < 5.1, or
+ * seccomp blocks io_uring_setup).  When the ring can't be created
+ * (TSDB_USE_IOURING not compiled, kernel rejects setup, etc) we fall
+ * back to plain fsync() per-call — the writer just pays the syscall
+ * cost without the ring overhead. */
 static __thread tsdb_io_async_t *tl_io_async   = NULL;
 static __thread int              tl_io_async_inited = 0;
 static __thread int              tl_io_async_enabled = 0;
@@ -31,7 +36,7 @@ static void tsdb_part_fsync_idx(int fd) {
     if (!tl_io_async_inited) {
         tl_io_async_inited = 1;
         const char *e = getenv("TSDB_PART_IO_URING");
-        tl_io_async_enabled = (e && e[0] == '1');
+        tl_io_async_enabled = !(e && e[0] == '0');   /* default ON */
         if (tl_io_async_enabled && tsdb_io_async_available()) {
             if (tsdb_io_async_create(32, &tl_io_async) != 0) tl_io_async = NULL;
         }
