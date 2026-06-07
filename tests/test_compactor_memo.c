@@ -63,7 +63,8 @@ static void run_memo_enabled(void) {
     make_and_flush(db, "tB");
     OK(tsdb_db_flush_all(db));
 
-    tsdb_compactor_opts_t opts = {0};
+    tsdb_compactor_opts_t opts = { .worker_threads = -1 };  /* manual: we drive
+                                  run_once, no background worker to race the memo */
     tsdb_compactor_t *cpt = NULL;
     OK(tsdb_compactor_start(db, &opts, &cpt));
 
@@ -101,7 +102,8 @@ static void run_memo_disabled(void) {
     make_and_flush(db, "tA");
     OK(tsdb_db_flush_all(db));
 
-    tsdb_compactor_opts_t opts = {0};
+    tsdb_compactor_opts_t opts = { .worker_threads = -1 };  /* manual: we drive
+                                  run_once, no background worker to race the memo */
     tsdb_compactor_t *cpt = NULL;
     OK(tsdb_compactor_start(db, &opts, &cpt));
 

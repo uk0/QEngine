@@ -1058,6 +1058,10 @@ int tsdb_compactor_start(tsdb_db_t *db,
             c->interval_ns = opts->interval_ns;
         if (opts->worker_threads > 0)
             c->nworkers   = opts->worker_threads;
+        else if (opts->worker_threads < 0)
+            c->nworkers   = 0;        /* manual mode: no background workers; the
+                                         caller drives tsdb_compactor_run_once
+                                         (deterministic, race-free for tests) */
     }
 
     /* Per-table mtime memo — kdb+ inspired "stable data stays stable": if
@@ -1092,8 +1096,8 @@ int tsdb_compactor_start(tsdb_db_t *db,
 
     pthread_mutex_init(&c->stats_mtx, NULL);
 
-    c->workers = calloc((size_t)c->nworkers, sizeof(pthread_t));
-    if (!c->workers) {
+    c->workers = c->nworkers ? calloc((size_t)c->nworkers, sizeof(pthread_t)) : NULL;
+    if (c->nworkers && !c->workers) {
         pthread_mutex_destroy(&c->stats_mtx);
         free(c);
         return TSDB_ERR_NOMEM;

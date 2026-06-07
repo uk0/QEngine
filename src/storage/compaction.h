@@ -49,7 +49,9 @@ typedef struct {
     int     min_blocks_to_compact;  /* default COMPACT_THRESHOLD_DEFAULT (16) */
     int     max_tier;               /* unused in current impl (future) */
     int64_t interval_ns;            /* sleep between full scans; default 5e9 (5 s) */
-    int     worker_threads;         /* default 1 */
+    int     worker_threads;         /* >0 = N workers; 0 = default (1);
+                                       <0 = manual (no bg thread, drive via
+                                       tsdb_compactor_run_once) */
 } tsdb_compactor_opts_t;
 
 /* ---- Statistics ----------------------------------------------------------- */
