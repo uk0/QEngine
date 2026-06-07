@@ -1,6 +1,7 @@
 /* wal.c — Write-Ahead Log implementation. */
 
 #include "wal.h"
+#include "io_async.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,32 @@
 #include <sys/types.h>
 #include <pthread.h>
 #include <time.h>
+
+/* Thread-local io_async ring used by tsdb_wal_sync — mirrors part.c's
+ * pattern.  Iter 5: 2000-table workloads were spawning 2000 per-table
+ * group_commit threads, almost all sleeping on futex.  Disabling
+ * group_commit (TSDB_GROUP_COMMIT_US=0) collapses those threads, but
+ * exposes plain fsync() in the writer's path; routing it through
+ * io_uring restores the kernel-side pipelining we'd otherwise lose.
+ * Default ON when liburing is linked + ring create succeeds; falls
+ * back to plain fsync() on any failure.  Opt-out: TSDB_WAL_IO_URING=0. */
+static __thread tsdb_io_async_t *tl_wal_io_async   = NULL;
+static __thread int              tl_wal_io_async_inited = 0;
+
+static int wal_async_fsync(int fd) {
+    if (!tl_wal_io_async_inited) {
+        tl_wal_io_async_inited = 1;
+        const char *e = getenv("TSDB_WAL_IO_URING");
+        int enabled = !(e && e[0] == '0');
+        if (enabled && tsdb_io_async_available()) {
+            if (tsdb_io_async_create(32, &tl_wal_io_async) != 0)
+                tl_wal_io_async = NULL;
+        }
+    }
+    if (tl_wal_io_async &&
+        tsdb_io_async_fsync_sync(tl_wal_io_async, fd) == 0) return 0;
+    return fsync(fd);
+}
 
 /* Forward declaration of mkdir_p from schema.c. */
 extern int tsdb_mkdir_p(const char *path);
@@ -135,6 +162,14 @@ int tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n) {
 }
 
 int tsdb_wal_sync(tsdb_wal_t *w) {
+    if (!w || w->fd < 0) return TSDB_ERR_INVAL;
+    return wal_async_fsync(w->fd) == 0 ? TSDB_OK : TSDB_ERR_IO;
+}
+
+/* Legacy direct-fsync path kept available for code that explicitly wants
+ * to bypass the async ring (e.g. test harnesses that don't want a
+ * thread-local instance leaked).  Not currently called. */
+static int tsdb_wal_sync_direct(tsdb_wal_t *w) {
     if (!w || w->fd < 0) return TSDB_ERR_INVAL;
     if (fsync(w->fd) < 0) return TSDB_ERR_IO;
     return TSDB_OK;
