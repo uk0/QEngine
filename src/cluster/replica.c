@@ -11,6 +11,7 @@
 #include "rpc.h"
 #include "../server/metrics.h"
 #include "../federation/dr_forwarder.h"
+#include "../exec/pool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -254,6 +255,35 @@ static void fanout_ctx_unref(fanout_ctx_t *ctx) {
     }
 }
 
+/* Iter 6: shared fanout worker pool — replaces per-batch pthread_create
+ * which spawned one detached thread PER replica PER WRITE_BATCH.  Under
+ * sustained writes (8000-16000 batches/s × ~1-2 replicas each, QUORUM=0
+ * leaving workers waiting on peer ACK in the background) thread count
+ * piled into the thousands.  A fixed-size pool (default 64) reuses
+ * threads across batches: lower context-switch overhead, bounded RSS,
+ * predictable scheduling.  Env TSDB_FANOUT_POOL_SIZE overrides.
+ *
+ * Lazy init under pthread_once so the pool only materialises if fanout
+ * ever runs (single-node tests don't pay for it).  Falls back to
+ * pthread_create if the pool can't be created or submit fails — same
+ * observable behaviour as before, just bounded by the pool's queue. */
+static void *fanout_worker(void *arg);   /* forward */
+
+static pthread_once_t g_fanout_pool_once = PTHREAD_ONCE_INIT;
+static tsdb_pool_t   *g_fanout_pool      = NULL;
+
+static void fanout_pool_init(void) {
+    int n = 64;
+    const char *e = getenv("TSDB_FANOUT_POOL_SIZE");
+    if (e && *e) { int v = atoi(e); if (v > 0 && v <= 4096) n = v; }
+    if (tsdb_pool_new(n, &g_fanout_pool) != TSDB_OK) g_fanout_pool = NULL;
+}
+
+/* Adapter: pool callback returns void; the underlying worker returns void*. */
+static void fanout_worker_pool_cb(void *arg) {
+    (void)fanout_worker(arg);
+}
+
 static void *fanout_worker(void *arg) {
     worker_arg_t *wa = (worker_arg_t *)arg;
     fanout_ctx_t *ctx = wa->ctx;
@@ -373,8 +403,20 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
         wa->ctx     = ctx;
         wa->node_id = replicas[i];
 
-        pthread_t tid;
-        if (pthread_create(&tid, &attr, fanout_worker, wa) == 0) {
+        /* Iter 6: prefer the shared pool over a per-batch pthread_create.
+         * Lazily materialise the pool on first fanout. */
+        pthread_once(&g_fanout_pool_once, fanout_pool_init);
+        int submitted = 0;
+        if (g_fanout_pool && tsdb_pool_submit(g_fanout_pool,
+                                              fanout_worker_pool_cb, wa) == TSDB_OK) {
+            submitted = 1;
+        } else {
+            /* Pool unavailable or full — fall back to legacy detached thread
+             * so a transient pool issue can never wedge writes. */
+            pthread_t tid;
+            if (pthread_create(&tid, &attr, fanout_worker, wa) == 0) submitted = 1;
+        }
+        if (submitted) {
             launched++;
         } else {
             /* Worker never ran — same handling as the malloc-fail path. */
