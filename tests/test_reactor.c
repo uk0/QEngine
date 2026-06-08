@@ -299,6 +299,65 @@ static void t_pool_multiproducer(void) {
     PASS("multi-producer routing: no loss/dup through MPMC inboxes");
 }
 
+/* ---- [9] reactor pool: synchronous cross-thread call --------------- */
+
+typedef struct {
+    int input;
+    int output;      /* set by the closure ON the reactor thread */
+    int ran_core;    /* core that actually ran it */
+    int want_core;   /* core the submitter expects to own it */
+} call_ctx_t;
+
+static void call_task(void *p) {
+    call_ctx_t *c = (call_ctx_t *)p;
+    tsdb_reactor_t *self = tsdb_reactor_current();
+    c->ran_core = self ? self->core_id : -1;
+    c->output   = c->input * 2 + 1;        /* deterministic "work" */
+}
+
+static tsdb_reactor_pool_t *g_call_pool;
+static _Atomic long g_call_bad;
+
+#define CALL_PRODUCERS 4
+#define CALL_PER 3000
+
+static void *call_caller(void *arg) {
+    uintptr_t id = (uintptr_t)arg;
+    for (int i = 0; i < CALL_PER; i++) {
+        char name[32];
+        int v = (int)(id * 1000000 + (unsigned)i);
+        snprintf(name, sizeof(name), "lt_%d", v % 512);
+        call_ctx_t ctx = { .input = v, .output = -1, .ran_core = -2,
+                           .want_core = tsdb_reactor_pool_owner_index(g_call_pool, name) };
+        if (tsdb_reactor_pool_call(g_call_pool, name, call_task, &ctx) != 0 ||
+            ctx.output  != v * 2 + 1 ||         /* call ran and returned our result */
+            ctx.ran_core != ctx.want_core) {    /* ran on the owning core */
+            atomic_fetch_add(&g_call_bad, 1);
+        }
+    }
+    return NULL;
+}
+
+static void t_pool_sync_call(void) {
+    printf("\n[9] reactor pool: synchronous cross-thread call (%d callers x %d)\n",
+           CALL_PRODUCERS, CALL_PER);
+    g_call_pool = tsdb_reactor_pool_new(POOL_CORES, 64);
+    assert(g_call_pool);
+    atomic_store(&g_call_bad, 0);
+
+    pthread_t th[CALL_PRODUCERS];
+    for (uintptr_t i = 0; i < CALL_PRODUCERS; i++)
+        assert(pthread_create(&th[i], NULL, call_caller, (void *)i) == 0);
+    for (int i = 0; i < CALL_PRODUCERS; i++) pthread_join(th[i], NULL);
+
+    assert(atomic_load(&g_call_bad) == 0);
+    printf("  all %d sync calls returned the right result on the owner core\n",
+           CALL_PRODUCERS * CALL_PER);
+
+    tsdb_reactor_pool_free(g_call_pool);
+    PASS("sync call: per-call result correct, runs on owner core, blocks caller");
+}
+
 int main(void) {
     printf("=== test_reactor ===\n");
     t_basic();
@@ -309,6 +368,7 @@ int main(void) {
     t_reactor_thread();
     t_pool_routing();
     t_pool_multiproducer();
-    printf("\n[PASS] reactor + SPSC ring + pool: all cases passed\n");
+    t_pool_sync_call();
+    printf("\n[PASS] reactor + SPSC ring + pool + sync-call: all cases passed\n");
     return 0;
 }

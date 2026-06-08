@@ -119,6 +119,20 @@ tsdb_reactor_t *tsdb_reactor_pool_owner(tsdb_reactor_pool_t *pool, const char *n
 int  tsdb_reactor_pool_submit(tsdb_reactor_pool_t *pool, const char *name,
                               tsdb_reactor_task_fn fn, void *arg);
 
+/* ---- synchronous cross-thread call (the Phase 2 write/query bridge) ---- */
+
+/* Submit fn(arg) to reactor `r` and BLOCK the calling thread until the reactor
+ * has run it ON its own (owner) thread, then return.  Returns 0 on success,
+ * -1 if the work could not be enqueued.  The closure mutates the core's owned
+ * state with no data-path lock (single owner); pass inputs + outputs through
+ * `arg`.  Only the completion handoff parks the caller — the data path stays
+ * lock-free.  Do NOT call from the reactor's own thread (would self-deadlock). */
+int  tsdb_reactor_call(tsdb_reactor_t *r, tsdb_reactor_task_fn fn, void *arg);
+
+/* tsdb_reactor_call routed to the core that owns `name`. */
+int  tsdb_reactor_pool_call(tsdb_reactor_pool_t *pool, const char *name,
+                            tsdb_reactor_task_fn fn, void *arg);
+
 #ifdef __cplusplus
 }
 #endif

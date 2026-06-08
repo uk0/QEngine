@@ -216,3 +216,59 @@ int tsdb_reactor_pool_submit(tsdb_reactor_pool_t *pool, const char *name,
     if (!pool) return 0;
     return tsdb_reactor_submit(tsdb_reactor_pool_owner(pool, name), fn, arg);
 }
+
+/* ---- synchronous cross-thread call ---------------------------------- */
+
+typedef struct {
+    tsdb_reactor_task_fn fn;
+    void               *arg;
+    pthread_mutex_t     mu;
+    pthread_cond_t      cv;
+    int                 done;
+} reactor_call_t;
+
+/* Runs ON the reactor thread: execute the real closure, then publish done. */
+static void reactor_call_trampoline(void *p) {
+    reactor_call_t *c = (reactor_call_t *)p;
+    c->fn(c->arg);
+    pthread_mutex_lock(&c->mu);
+    c->done = 1;
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+int tsdb_reactor_call(tsdb_reactor_t *r, tsdb_reactor_task_fn fn, void *arg) {
+    if (!r || !fn) return -1;
+
+    reactor_call_t c;
+    c.fn = fn; c.arg = arg; c.done = 0;
+    pthread_mutex_init(&c.mu, NULL);
+    pthread_cond_init(&c.cv, NULL);
+
+    /* Enqueue the trampoline; the reactor is draining so a full inbox clears
+     * shortly.  Bounded so a dead reactor returns instead of hanging. */
+    int enq = 0;
+    for (long spin = 0; spin < 100000000L; spin++) {
+        if (tsdb_reactor_submit(r, reactor_call_trampoline, &c)) { enq = 1; break; }
+        sched_yield();
+    }
+    if (!enq) {
+        pthread_mutex_destroy(&c.mu);
+        pthread_cond_destroy(&c.cv);
+        return -1;
+    }
+
+    pthread_mutex_lock(&c.mu);
+    while (!c.done) pthread_cond_wait(&c.cv, &c.mu);
+    pthread_mutex_unlock(&c.mu);
+
+    pthread_mutex_destroy(&c.mu);
+    pthread_cond_destroy(&c.cv);
+    return 0;
+}
+
+int tsdb_reactor_pool_call(tsdb_reactor_pool_t *pool, const char *name,
+                           tsdb_reactor_task_fn fn, void *arg) {
+    if (!pool) return -1;
+    return tsdb_reactor_call(tsdb_reactor_pool_owner(pool, name), fn, arg);
+}
