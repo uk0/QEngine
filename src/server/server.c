@@ -20,6 +20,7 @@
 #include "../storage/schema.h"
 #include "../query/result_internal.h"  /* peek+rewind status-row results */
 #include "../query/exec.h"              /* tsdb_query_set_deadline_ns */
+#include "../exec/reactor.h"            /* per-core reactor pool (TSDB_REACTOR) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -365,6 +366,11 @@ struct tsdb_server {
     tsdb_sub_list_t     subs;
     write_lock_pool_t   write_locks;
 
+    /* Per-core reactor pool (shard-per-core).  NULL unless TSDB_REACTOR=1;
+     * when set, a table's WRITE_BATCH local-write runs on the one core that
+     * owns hash(name)%ncores, so its memtable has a single writer. */
+    tsdb_reactor_pool_t *reactor_pool;
+
     /* TLS context (NULL when running in plaintext mode). */
     tsdb_tls_ctx_t     *tls_ctx;
 
@@ -467,6 +473,108 @@ static int auth_gate(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
  */
 #define TSDB_CODEC_RAW  0
 
+/* The local DB-write half of a WRITE_BATCH, factored out so it can run either
+ * inline on the connection thread or — under TSDB_REACTOR — ON the core that
+ * owns the table (single writer per memtable).  Reads the decoded columns from
+ * the ctx, performs open + validate + bulk append + commit, and reports the
+ * result via cx->err / cx->msg.  Does NO socket I/O (the caller sends the
+ * ack/error). */
+typedef struct {
+    tsdb_server_t  *srv;
+    const char     *table_name;
+    const uint8_t **col_data;    /* [ncols] */
+    const uint8_t  *col_types;   /* [ncols] */
+    const uint32_t *col_sizes;   /* [ncols] */
+    int             ncols;
+    uint32_t        nrows;
+    int             err;         /* out: TSDB_OK or error code */
+    const char     *msg;         /* out: static error string, or NULL */
+} lw_ctx_t;
+
+static void do_local_write(void *arg) {
+    lw_ctx_t       *cx        = (lw_ctx_t *)arg;
+    tsdb_server_t  *srv       = cx->srv;
+    const char     *table_name = cx->table_name;
+    const uint8_t **col_data  = cx->col_data;
+    const uint8_t  *col_types = cx->col_types;
+    const uint32_t *col_sizes = cx->col_sizes;
+    int             ncols     = cx->ncols;
+    uint32_t        nrows     = cx->nrows;
+
+    cx->err = TSDB_OK;
+    cx->msg = NULL;
+
+    /* Per-table write lock — kept for Phase 2 (uncontended under single-owner
+     * routing; removed in Phase 3 once both write paths route here). */
+    write_lock_acquire(&srv->write_locks, table_name);
+
+    tsdb_table_t *tbl = NULL;
+    if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
+        write_lock_release(&srv->write_locks, table_name);
+        cx->err = TSDB_ERR_NOTFOUND; cx->msg = "table not found"; return;
+    }
+
+    tsdb_batch_t *batch = NULL;
+    if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
+        write_lock_release(&srv->write_locks, table_name);
+        cx->err = TSDB_ERR_INTERNAL; cx->msg = "batch_begin failed"; return;
+    }
+
+    int ts_ci = -1;
+    for (int c = 0; c < ncols; c++)
+        if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
+
+    for (int c = 0; c < ncols; c++) {
+        if (col_types[c] == TSDB_TYPE_SYMBOL) {
+            if (col_sizes[c] < 4) {
+                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                cx->err = TSDB_ERR_INVAL; cx->msg = "symbol col too short"; return;
+            }
+            uint32_t total = (uint32_t)col_data[c][0]
+                | ((uint32_t)col_data[c][1] <<  8)
+                | ((uint32_t)col_data[c][2] << 16)
+                | ((uint32_t)col_data[c][3] << 24);
+            if (total + 4 > col_sizes[c]) {
+                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                cx->err = TSDB_ERR_INVAL; cx->msg = "symbol total > csz"; return;
+            }
+        } else {
+            if (col_sizes[c] < 8 * nrows) {
+                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                cx->err = TSDB_ERR_INVAL; cx->msg = "col data too short"; return;
+            }
+        }
+    }
+
+    int write_err = TSDB_OK;
+    {
+        const void *col_arrs[TSDB_MAX_COLS];
+        int         col_types_arr[TSDB_MAX_COLS];
+        int         n_data = 0;
+        for (int c = 0; c < ncols; c++) {
+            if (c == ts_ci) continue;
+            col_arrs[n_data]      = col_data[c];
+            col_types_arr[n_data] = col_types[c];
+            n_data++;
+        }
+        const int64_t *ts_arr = (ts_ci >= 0) ? (const int64_t *)col_data[ts_ci] : NULL;
+        int64_t *ts_synth = NULL;
+        if (!ts_arr) ts_synth = calloc(nrows, sizeof(int64_t));
+        write_err = tsdb_batch_append_bulk(batch, ts_arr ? ts_arr : ts_synth,
+                                           col_arrs, col_types_arr, n_data, (size_t)nrows);
+        free(ts_synth);
+    }
+
+    if (write_err != TSDB_OK) {
+        tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+        cx->err = write_err; cx->msg = "append_bulk failed"; return;
+    }
+
+    write_err = tsdb_batch_commit(batch);
+    write_lock_release(&srv->write_locks, table_name);
+    if (write_err != TSDB_OK) { cx->err = write_err; cx->msg = "batch_commit failed"; }
+}
+
 static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                const uint8_t *payload, uint32_t plen) {
     int fd = io->fd;
@@ -530,103 +638,22 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     }
 #undef NEED
 
-    /* Acquire per-table write lock — tsdb_batch API is not thread-safe
-     * for concurrent writes to the same table. */
-    write_lock_acquire(&srv->write_locks, table_name);
+    /* Run the local DB write — open + validate + bulk append + commit — on the
+     * core that owns this table when the reactor pool is enabled (shard-per-
+     * core), else inline on this connection thread.  Either way exactly one
+     * thread mutates the table's memtable at a time. */
+    lw_ctx_t lw = {
+        .srv = srv, .table_name = table_name,
+        .col_data = col_data, .col_types = col_types, .col_sizes = col_sizes,
+        .ncols = ncols, .nrows = nrows, .err = TSDB_OK, .msg = NULL,
+    };
+    if (srv->reactor_pool)
+        tsdb_reactor_pool_call(srv->reactor_pool, table_name, do_local_write, &lw);
+    else
+        do_local_write(&lw);
 
-    /* Open the table (under write lock so open + begin are atomic). */
-    tsdb_table_t *tbl = NULL;
-    if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
-        write_lock_release(&srv->write_locks, table_name);
-        return send_error(io, req_id, TSDB_ERR_NOTFOUND, "table not found");
-    }
-
-    tsdb_batch_t *batch = NULL;
-    if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
-        write_lock_release(&srv->write_locks, table_name);
-        return send_error(io, req_id, TSDB_ERR_INTERNAL, "batch_begin failed");
-    }
-
-    /* Find timestamp column index. */
-    int ts_ci = -1;
-    for (int c = 0; c < ncols; c++) {
-        if (col_types[c] == TSDB_TYPE_TIMESTAMP) { ts_ci = c; break; }
-    }
-
-    /* Sanity-check column sizes.
-     *
-     * SYMBOL columns now carry a length-prefix wire format that mirrors
-     * the cluster RPC WRITE_BATCH receiver:
-     *
-     *   [u32 total_bytes] [u16 len_0] [bytes_0] … [u16 len_n-1] [bytes_n-1]
-     *
-     * `csz` for a SYMBOL column is `4 + total_bytes`, NOT a stride*nrows
-     * product.  The legacy 4-byte sym-id encoding never worked end-to-end
-     * (the receiver fabricated "sym_%u" strings the client never set),
-     * so this is a clean upgrade — no real client used the old shape.
-     * INT64/FLOAT64/TIMESTAMP keep the 8-byte stride. */
-    for (int c = 0; c < ncols; c++) {
-        if (col_types[c] == TSDB_TYPE_SYMBOL) {
-            if (col_sizes[c] < 4) {
-                tsdb_batch_discard(batch);
-                write_lock_release(&srv->write_locks, table_name);
-                return send_error(io, req_id, TSDB_ERR_INVAL, "symbol col too short");
-            }
-            uint32_t total = (uint32_t)col_data[c][0]
-                | ((uint32_t)col_data[c][1] <<  8)
-                | ((uint32_t)col_data[c][2] << 16)
-                | ((uint32_t)col_data[c][3] << 24);
-            if (total + 4 > col_sizes[c]) {
-                tsdb_batch_discard(batch);
-                write_lock_release(&srv->write_locks, table_name);
-                return send_error(io, req_id, TSDB_ERR_INVAL, "symbol total > csz");
-            }
-        } else {
-            if (col_sizes[c] < 8 * nrows) {
-                tsdb_batch_discard(batch);
-                write_lock_release(&srv->write_locks, table_name);
-                return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
-            }
-        }
-    }
-
-    /* Bulk columnar append — same fast path the cluster RPC receiver
-     * uses since b4c1461.  Per-row dispatch is gone; the wire payload
-     * already maps onto memtable_append_bulk's expected layout. */
-    int write_err = TSDB_OK;
-    {
-        const void *col_arrs[TSDB_MAX_COLS];
-        int         col_types_arr[TSDB_MAX_COLS];
-        int         n_data = 0;
-        for (int c = 0; c < ncols; c++) {
-            if (c == ts_ci) continue;
-            col_arrs[n_data]      = col_data[c];
-            col_types_arr[n_data] = col_types[c];
-            n_data++;
-        }
-        const int64_t *ts_arr = (ts_ci >= 0)
-            ? (const int64_t *)col_data[ts_ci]
-            : NULL;
-        int64_t *ts_synth = NULL;
-        if (!ts_arr) ts_synth = calloc(nrows, sizeof(int64_t));
-        write_err = tsdb_batch_append_bulk(batch,
-                                           ts_arr ? ts_arr : ts_synth,
-                                           col_arrs, col_types_arr,
-                                           n_data, (size_t)nrows);
-        free(ts_synth);
-    }
-
-    if (write_err != TSDB_OK) {
-        tsdb_batch_discard(batch);
-        write_lock_release(&srv->write_locks, table_name);
-        return send_error(io, req_id, write_err, "append_bulk failed");
-    }
-
-    write_err = tsdb_batch_commit(batch);
-    write_lock_release(&srv->write_locks, table_name);
-
-    if (write_err != TSDB_OK)
-        return send_error(io, req_id, write_err, "batch_commit failed");
+    if (lw.err != TSDB_OK)
+        return send_error(io, req_id, lw.err, lw.msg ? lw.msg : "write failed");
 
     atomic_fetch_add(&srv->stat_rows_written, nrows);
     tsdb_metric_add("qengine_rows_written_total", nrows);
@@ -1463,6 +1490,21 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
     write_lock_pool_init(&srv->write_locks);
     srv->tls_ctx = NULL;
 
+    /* Shard-per-core: opt-in via TSDB_REACTOR=1.  Spawn one reactor per online
+     * CPU (clamped) so each table's local-write runs on its owner core. */
+    srv->reactor_pool = NULL;
+    {
+        const char *e = getenv("TSDB_REACTOR");
+        if (e && e[0] == '1') {
+            long nc = sysconf(_SC_NPROCESSORS_ONLN);
+            int ncores = (nc > 0) ? (int)nc : 1;
+            if (ncores > 64) ncores = 64;
+            srv->reactor_pool = tsdb_reactor_pool_new(ncores, 4096);
+            fprintf(stderr, "[server] TSDB_REACTOR=1: reactor pool ncores=%d (%s)\n",
+                    ncores, srv->reactor_pool ? "ok" : "FAILED, falling back to inline");
+        }
+    }
+
     /* Initialise TLS context if cert + key are provided. */
     if (opts->tls_cert && opts->tls_cert[0] &&
         opts->tls_key  && opts->tls_key[0]) {
@@ -1526,6 +1568,7 @@ void tsdb_server_stop(tsdb_server_t *s) {
     tsdb_tls_free(s->tls_ctx);
     sub_list_destroy(&s->subs);
     write_lock_pool_destroy(&s->write_locks);
+    if (s->reactor_pool) tsdb_reactor_pool_free(s->reactor_pool);
     free(s);
 }
 
