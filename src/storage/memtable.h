@@ -56,6 +56,17 @@ int  tsdb_memtable_row_end(tsdb_memtable_t *m);
 /* Return the number of committed rows. */
 size_t tsdb_memtable_rows(tsdb_memtable_t *m);
 
+/*
+ * Like tsdb_memtable_rows but reads the committed-row counter with a
+ * relaxed atomic load instead of taking m->lock.  The value may be
+ * momentarily stale (a concurrent writer's in-progress nrows++ may or
+ * may not be observed), so callers must tolerate slack.  Used by the
+ * aggregate-memtable budget sum in db.c's maintenance thread, where an
+ * O(ntables) per-table mutex-acquire storm under db->lock was the
+ * contention source and an approximate sum is sufficient.
+ */
+size_t tsdb_memtable_rows_relaxed(tsdb_memtable_t *m);
+
 /* Returns non-zero if the memtable has reached TSDB_BLOCK_POINTS rows. */
 int  tsdb_memtable_is_full(tsdb_memtable_t *m);
 

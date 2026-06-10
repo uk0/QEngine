@@ -132,6 +132,19 @@ struct tsdb_db {
     tsdb_table_internal_t *tables[TSDB_DB_MAX_TABLES];
     int                    ntables;
 
+    /* Open-addressing hash index: table name -> tsdb_table_internal_t*.
+     * Lives beside tables[] (which stays the iteration order) and is
+     * maintained at every tables[] mutation.  db_find_table probes this
+     * instead of the old O(ntables) strcmp walk that ran under db->lock on
+     * every read and write — at 2000+ tables that linear walk was the
+     * db->lock hold-time source behind master-node query-p99 tail latency.
+     * Sized to 2x TSDB_DB_MAX_TABLES (power of two) so the load factor stays
+     * <= 0.5 and probe chains stay short.  Stores POINTERS, not indices, so
+     * the drop path's array-compaction of tables[] never invalidates it.
+     * A NULL slot is empty; TBL_TOMBSTONE marks a deleted slot so linear
+     * probing can continue past it. */
+    tsdb_table_internal_t *tbl_index[TSDB_DB_MAX_TABLES * 2];
+
     /* Cluster hooks (NULL for standalone mode). */
     tsdb_on_replicate_fn on_replicate;
     tsdb_on_create_fn    on_create;
@@ -521,12 +534,68 @@ struct tsdb_retention *tsdb_db_retention(tsdb_db_t *db) {
     return db ? db->retention : NULL;
 }
 
+/* ---- Table name index (open addressing, must hold db->lock) ------------- */
+
+/* Capacity (power of two) and mask for tbl_index[].  Load factor never
+ * exceeds 0.5 because ntables is capped at TSDB_DB_MAX_TABLES. */
+#define TBL_INDEX_CAP  (TSDB_DB_MAX_TABLES * 2)
+#define TBL_INDEX_MASK (TBL_INDEX_CAP - 1)
+
+/* Tombstone sentinel for a deleted slot: distinct from NULL (empty) so a
+ * linear probe continues past a removed entry instead of stopping early.
+ * The address of a static is a stable, never-a-real-table pointer value. */
+static tsdb_table_internal_t *const TBL_TOMBSTONE =
+    (tsdb_table_internal_t *)(void *)&(char){0};
+
+/* Insert t under its name.  Caller holds db->lock and guarantees the name is
+ * not already present (every callsite checks via db_find_table first, or is
+ * inserting a freshly-created unique table).  Reuses the first tombstone seen
+ * so deleted slots don't permanently lengthen probe chains. */
+static void tbl_index_insert(tsdb_db_t *db, tsdb_table_internal_t *t) {
+    uint64_t h = db_fnv1a(t->name);
+    size_t i = (size_t)(h & TBL_INDEX_MASK);
+    size_t first_tomb = TBL_INDEX_CAP;   /* sentinel: none seen yet */
+    for (size_t probe = 0; probe < TBL_INDEX_CAP; probe++) {
+        tsdb_table_internal_t *slot = db->tbl_index[i];
+        if (slot == NULL) {
+            db->tbl_index[(first_tomb != TBL_INDEX_CAP) ? first_tomb : i] = t;
+            return;
+        }
+        if (slot == TBL_TOMBSTONE) {
+            if (first_tomb == TBL_INDEX_CAP) first_tomb = i;
+        }
+        i = (i + 1) & TBL_INDEX_MASK;
+    }
+    /* Unreachable: the map can never be full (load factor <= 0.5). */
+}
+
+/* Remove the entry for `name` (a no-op if absent).  Caller holds db->lock.
+ * Writes a tombstone, not NULL, so probe chains over this slot survive. */
+static void tbl_index_remove(tsdb_db_t *db, const char *name) {
+    uint64_t h = db_fnv1a(name);
+    size_t i = (size_t)(h & TBL_INDEX_MASK);
+    for (size_t probe = 0; probe < TBL_INDEX_CAP; probe++) {
+        tsdb_table_internal_t *slot = db->tbl_index[i];
+        if (slot == NULL) return;                       /* not present */
+        if (slot != TBL_TOMBSTONE && strcmp(slot->name, name) == 0) {
+            db->tbl_index[i] = TBL_TOMBSTONE;
+            return;
+        }
+        i = (i + 1) & TBL_INDEX_MASK;
+    }
+}
+
 /* ---- Table lookup (must hold db->lock) ---------------------------------- */
 
 static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {
-    for (int i = 0; i < db->ntables; i++) {
-        if (db->tables[i] && strcmp(db->tables[i]->name, name) == 0)
-            return db->tables[i];
+    uint64_t h = db_fnv1a(name);
+    size_t i = (size_t)(h & TBL_INDEX_MASK);
+    for (size_t probe = 0; probe < TBL_INDEX_CAP; probe++) {
+        tsdb_table_internal_t *slot = db->tbl_index[i];
+        if (slot == NULL) return NULL;                  /* empty slot: miss */
+        if (slot != TBL_TOMBSTONE && strcmp(slot->name, name) == 0)
+            return slot;
+        i = (i + 1) & TBL_INDEX_MASK;
     }
     return NULL;
 }
@@ -658,6 +727,7 @@ static int create_table_impl(tsdb_db_t *db,
     }
 
     db->tables[db->ntables++] = t;
+    tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -869,6 +939,7 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
     }
 
     db->tables[db->ntables++] = t;
+    tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -974,15 +1045,19 @@ static void *trash_gc_main(void *arg) {
 
         /* Aggregate-memtable budget: sum live rows across all tables and raise
          * the over-budget flag so the write path flushes under pressure.  Held
-         * under db->lock so a concurrent drop can't free a table mid-sum; the
-         * lock order is db->lock -> memtable lock (no path takes them the other
-         * way, so no deadlock).  O(ntables) and brief. */
+         * under db->lock so a concurrent drop can't free a table mid-sum (the
+         * lock guards tables[] iteration).  Each per-table count is a relaxed
+         * atomic load (tsdb_memtable_rows_relaxed) rather than a per-memtable
+         * mutex acquire: the old version took every table's memtable lock under
+         * db->lock — an O(ntables) lock-acquire storm every 2s contending with
+         * all writers/queries.  The sum only feeds the over-budget heuristic,
+         * so slightly stale per-table counts are fine.  O(ntables) and brief. */
         if (db->memtable_budget_rows > 0) {
             uint64_t total = 0;
             pthread_mutex_lock(&db->lock);
             for (int ti = 0; ti < db->ntables && db->trash_gc_running; ti++) {
                 tsdb_table_internal_t *t = db->tables[ti];
-                if (t && t->memtable) total += tsdb_memtable_rows(t->memtable);
+                if (t && t->memtable) total += tsdb_memtable_rows_relaxed(t->memtable);
             }
             pthread_mutex_unlock(&db->lock);
             db->memtable_over_budget = (total > db->memtable_budget_rows) ? 1 : 0;
@@ -1042,6 +1117,10 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
 
     if (idx >= 0) {
         tsdb_table_internal_t *t = db->tables[idx];
+        /* Drop the name-index entry first (writes a tombstone).  The index
+         * stores pointers, so the tables[] array-compaction below never
+         * invalidates it — only this dropped name must be removed. */
+        tbl_index_remove(db, t->name);
         /* Stop group-commit bg thread before closing WAL. */
         if (t->gc)       { tsdb_group_commit_stop(t->gc); t->gc = NULL; }
         if (t->wal)      tsdb_wal_close(t->wal);

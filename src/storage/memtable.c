@@ -406,6 +406,16 @@ size_t tsdb_memtable_rows(tsdb_memtable_t *m) {
     return n;
 }
 
+size_t tsdb_memtable_rows_relaxed(tsdb_memtable_t *m) {
+    if (!m) return 0;
+    /* Lock-free relaxed read of the committed-row counter.  nrows is only
+     * mutated under m->lock (row_end, append_bulk), so a relaxed load can
+     * lag a concurrent increment — acceptable for the budget heuristic that
+     * is the sole caller.  Avoids an O(ntables) mutex-acquire storm under
+     * db->lock in trash_gc_main. */
+    return __atomic_load_n(&m->nrows, __ATOMIC_RELAXED);
+}
+
 int tsdb_memtable_is_full(tsdb_memtable_t *m) {
     if (!m) return 0;
     pthread_mutex_lock(&m->lock);
