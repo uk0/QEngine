@@ -67,6 +67,7 @@ typedef struct {
     int             nsubs;
     pthread_mutex_t lock;
     atomic_uint_fast64_t next_sub_id;
+    atomic_int      active;     /* exact count of live subs; 0 => fanout fast path */
 } tsdb_sub_list_t;
 
 static void sub_list_init(tsdb_sub_list_t *sl) {
@@ -75,6 +76,7 @@ static void sub_list_init(tsdb_sub_list_t *sl) {
     for (int i = 0; i < SUBS_MAX; i++)
         pthread_mutex_init(&sl->subs[i].lock, NULL);
     atomic_store(&sl->next_sub_id, 1);
+    atomic_store(&sl->active, 0);
 }
 
 static void sub_list_destroy(tsdb_sub_list_t *sl) {
@@ -117,6 +119,7 @@ static uint64_t sub_list_add(tsdb_sub_list_t *sl, const char *table,
     snprintf(s->filter_col, sizeof(s->filter_col), "%s", filter_col ? filter_col : "");
     snprintf(s->filter_val, sizeof(s->filter_val), "%s", filter_val ? filter_val : "");
     if (slot == sl->nsubs) sl->nsubs++;
+    atomic_fetch_add(&sl->active, 1);
     pthread_mutex_unlock(&sl->lock);
     return id;
 }
@@ -129,6 +132,7 @@ static void sub_list_remove_by_id(tsdb_sub_list_t *sl, uint64_t sub_id) {
             sl->subs[i].conn_fd = -1;
             sl->subs[i].sub_id  = 0;
             pthread_mutex_unlock(&sl->subs[i].lock);
+            atomic_fetch_sub(&sl->active, 1);
             break;
         }
     }
@@ -143,6 +147,7 @@ static void sub_list_remove_by_fd(tsdb_sub_list_t *sl, int conn_fd) {
             sl->subs[i].conn_fd = -1;
             sl->subs[i].sub_id  = 0;
             pthread_mutex_unlock(&sl->subs[i].lock);
+            atomic_fetch_sub(&sl->active, 1);
         }
     }
     pthread_mutex_unlock(&sl->lock);
@@ -668,8 +673,12 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
      * above; we walk the per-row records and write the locally-interned
      * symbol code (resolved against the receiver's symtab) into a
      * scratch 8-byte buffer.  That code is what subscribers can pass
-     * back to tsdb_symtab_str() if they share the same db handle. */
-    {
+     * back to tsdb_symtab_str() if they share the same db handle.
+     *
+     * Fast path: with zero active subscriptions (the common case) this whole
+     * block is pure waste — skip the find_table scan, the per-SYMBOL scratch
+     * alloc, and the per-row intern walk. */
+    if (atomic_load(&srv->subs.active) > 0) {
         fanout_col_t fcols[TSDB_MAX_COLS];
         uint8_t *sym_scratch[TSDB_MAX_COLS];
         memset(sym_scratch, 0, sizeof(sym_scratch));
