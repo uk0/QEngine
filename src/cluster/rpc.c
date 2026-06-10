@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -182,6 +183,60 @@ static int write_full(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+/* Full writev: drain all iovecs, advancing past whatever a short write
+ * consumed.  EINTR-safe (retries), same error contract as write_full. */
+static int writev_all(int fd, struct iovec *iov, int iovcnt) {
+    while (iovcnt > 0) {
+        ssize_t w = writev(fd, iov, iovcnt);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) return -1;
+        size_t adv = (size_t)w;
+        while (iovcnt > 0 && adv >= iov->iov_len) {
+            adv -= iov->iov_len;
+            iov++;
+            iovcnt--;
+        }
+        if (iovcnt > 0 && adv > 0) {
+            iov->iov_base = (uint8_t *)iov->iov_base + adv;
+            iov->iov_len -= adv;
+        }
+    }
+    return 0;
+}
+
+/* Encode just the 18-byte frame header into hdr (byte-identical to the
+ * header tsdb_rpc_encode emits, including the CRC that chains the payload),
+ * so the body can be referenced in place and sent via writev instead of
+ * being copied into a contiguous send buffer. */
+static void encode_header(uint8_t hdr[TSDB_RPC_HDR_SIZE],
+                          tsdb_rpc_type_t type, uint32_t req_id,
+                          const uint8_t *payload, uint32_t payload_len)
+{
+    uint8_t *p = hdr;
+    uint32_t magic = TSDB_RPC_MAGIC;
+    memcpy(p, &magic, 4); p += 4;
+    *p++ = TSDB_RPC_VER;
+    *p++ = (uint8_t)type;
+    memcpy(p, &req_id, 4); p += 4;
+    memcpy(p, &payload_len, 4); p += 4;
+
+    uint32_t crc = 0;
+    {
+        uint8_t tmp[10];
+        tmp[0] = TSDB_RPC_VER;
+        tmp[1] = (uint8_t)type;
+        memcpy(tmp + 2, &req_id, 4);
+        memcpy(tmp + 6, &payload_len, 4);
+        crc = crc32(tmp, 10);
+        if (payload && payload_len > 0)
+            crc = crc32(payload, payload_len) ^ crc; /* simple chain */
+    }
+    memcpy(p, &crc, 4);
+}
+
 /* ---- Per-connection handler ---------------------------------------------- */
 
 /* Recv a complete frame into caller-allocated buffer. */
@@ -197,20 +252,17 @@ static int recv_frame(int fd, uint8_t *hdr_buf, uint8_t **payload_out,
     uint32_t plen;
     memcpy(&plen, hdr_buf + 10, 4);
 
-    uint8_t *payload = NULL;
-    if (plen > 0) {
-        payload = malloc(plen);
-        if (!payload) return -1;
-        if (read_full(fd, payload, plen) < 0) { free(payload); return -1; }
-    }
-
-    /* Build a contiguous buffer for tsdb_rpc_decode. */
+    /* One contiguous allocation for header+payload; read the body straight
+     * in after the header so tsdb_rpc_decode sees a single buffer without a
+     * second malloc + full-payload memcpy. */
     size_t total = TSDB_RPC_HDR_SIZE + plen;
     uint8_t *combined = malloc(total);
-    if (!combined) { free(payload); return -1; }
+    if (!combined) return -1;
     memcpy(combined, hdr_buf, TSDB_RPC_HDR_SIZE);
-    if (plen > 0) memcpy(combined + TSDB_RPC_HDR_SIZE, payload, plen);
-    free(payload);
+    if (plen > 0 && read_full(fd, combined + TSDB_RPC_HDR_SIZE, plen) < 0) {
+        free(combined);
+        return -1;
+    }
 
     int consumed = tsdb_rpc_decode(combined, total, msg);
     if (consumed <= 0) { free(combined); return -1; }
@@ -999,23 +1051,28 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     pthread_mutex_lock(&conn->lock);
 
     uint32_t req_id = conn->next_req_id++;
-    size_t buf_size = TSDB_RPC_HDR_SIZE + payload_len;
-    uint8_t *sendbuf = malloc(buf_size);
-    if (!sendbuf) { pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
 
-    int n = tsdb_rpc_encode(sendbuf, buf_size, type, req_id, payload, payload_len);
-    if (n < 0) {
-        free(sendbuf);
-        pthread_mutex_unlock(&conn->lock);
-        return TSDB_ERR_INTERNAL;
+    /* Header on the stack + payload referenced in place; a single writev
+     * ships [header][payload] without a malloc'd send buffer or a
+     * full-payload memcpy.  Frame bytes are identical to tsdb_rpc_encode. */
+    uint8_t sendhdr[TSDB_RPC_HDR_SIZE];
+    encode_header(sendhdr, type, req_id, payload, payload_len);
+
+    struct iovec iov[2];
+    int iovcnt = 0;
+    iov[iovcnt].iov_base = sendhdr;
+    iov[iovcnt].iov_len  = TSDB_RPC_HDR_SIZE;
+    iovcnt++;
+    if (payload && payload_len > 0) {
+        iov[iovcnt].iov_base = (void *)payload;
+        iov[iovcnt].iov_len  = payload_len;
+        iovcnt++;
     }
 
-    if (write_full(conn->fd, sendbuf, (size_t)n) < 0) {
-        free(sendbuf);
+    if (writev_all(conn->fd, iov, iovcnt) < 0) {
         pthread_mutex_unlock(&conn->lock);
         return TSDB_ERR_IO;
     }
-    free(sendbuf);
 
     /* Read response header. */
     uint8_t hdr[TSDB_RPC_HDR_SIZE];
@@ -1027,25 +1084,17 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     uint32_t rlen;
     memcpy(&rlen, hdr + 10, 4);
 
-    /* Read response payload. */
-    uint8_t *rbuf = NULL;
-    if (rlen > 0) {
-        rbuf = malloc(rlen);
-        if (!rbuf) { pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
-        if (read_full(conn->fd, rbuf, rlen) < 0) {
-            free(rbuf);
-            pthread_mutex_unlock(&conn->lock);
-            return TSDB_ERR_IO;
-        }
-    }
-
-    /* Parse complete response frame. */
+    /* One contiguous allocation for header+payload; read the body straight
+     * in after the header (single malloc, no second buffer + memcpy). */
     size_t total = TSDB_RPC_HDR_SIZE + rlen;
     uint8_t *combined = malloc(total);
-    if (!combined) { free(rbuf); pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
+    if (!combined) { pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
     memcpy(combined, hdr, TSDB_RPC_HDR_SIZE);
-    if (rlen > 0) memcpy(combined + TSDB_RPC_HDR_SIZE, rbuf, rlen);
-    free(rbuf);
+    if (rlen > 0 && read_full(conn->fd, combined + TSDB_RPC_HDR_SIZE, rlen) < 0) {
+        free(combined);
+        pthread_mutex_unlock(&conn->lock);
+        return TSDB_ERR_IO;
+    }
 
     tsdb_rpc_msg_t resp = {0};
     int consumed = tsdb_rpc_decode(combined, total, &resp);
