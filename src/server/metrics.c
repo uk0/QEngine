@@ -132,6 +132,9 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_sent_total",
       "Total per-peer WRITE_BATCH RPCs fanned out from this node", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_fanout_wait_timeout_total",
+      "Fanout quorum waits that hit the hard deadline (worker left behind)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_ack_total",
       "Total per-peer WRITE_BATCH RPCs that returned OK", MT_COUNTER, { .c = { 0 } } },
 

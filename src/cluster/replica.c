@@ -18,6 +18,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <errno.h>
 
 /* ---- Connection pool ----------------------------------------------------- */
 
@@ -433,10 +434,33 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
     pthread_attr_destroy(&attr);
     (void)launched;
 
-    /* Wait for quorum OR for every worker to finish (whichever first). */
+    /* Wait for quorum OR for every worker to finish — with a hard deadline.
+     * This waiter can be the raft apply thread (catalog broadcast); an
+     * unbounded wait there froze last_applied and timed out every DDL
+     * propose cluster-wide when one worker wedged on a dead peer conn.
+     * Workers hold their own ctx refs, so leaving them behind is safe —
+     * fanout_ctx refcounting already supports workers outliving us. */
+    static int wait_tmo_ms = -1;
+    if (wait_tmo_ms < 0) {
+        const char *e = getenv("TSDB_FANOUT_WAIT_TIMEOUT_MS");
+        wait_tmo_ms = (e && *e) ? atoi(e) : 45000;
+    }
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec  += wait_tmo_ms / 1000;
+    dl.tv_nsec += (long)(wait_tmo_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+
     pthread_mutex_lock(&ctx->mu);
     while (ctx->ack_count < ctx->quorum && ctx->done_count < ctx->nreplicas) {
-        pthread_cond_wait(&ctx->cv, &ctx->mu);
+        if (wait_tmo_ms > 0) {
+            if (pthread_cond_timedwait(&ctx->cv, &ctx->mu, &dl) == ETIMEDOUT) {
+                tsdb_metric_inc("qengine_fanout_wait_timeout_total");
+                break;
+            }
+        } else {
+            pthread_cond_wait(&ctx->cv, &ctx->mu);
+        }
     }
     int ok = (ctx->ack_count >= ctx->quorum);
     int final_acks = ctx->ack_count;

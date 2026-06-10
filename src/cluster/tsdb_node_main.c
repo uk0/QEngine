@@ -809,98 +809,19 @@ static const char *type_name(tsdb_type_t t) {
     return "UNKNOWN";
 }
 
-/* Minimal TCP-HTTP client just good enough to forward POST /sql from
- * a data node to a master dashboard.  No keepalive, no pipelining,
- * one request per connection; blocking I/O with a generous overall
- * timeout.  Every cluster node exposes the dashboard API on the same
- * conventional port (28094), so we swap the port in the master's
- * gossip-advertised host:RPC address. */
+/* Forward a catalog DDL from a data node to a master over the trusted
+ * node-to-node RPC channel (TSDB_RPC_DDL_FORWARD) and render the returned
+ * status text in the same JSON shape the dashboard /sql endpoint emits.
+ *
+ * This used to ride a hand-rolled HTTP POST /sql to the master's dashboard
+ * port — which the dashboard auth gate (TSDB_DASHBOARD_AUTH=1) correctly
+ * rejected with "login required", because session cookies are node-local.
+ * Peers on the RPC port already trust each other, so the RPC channel is
+ * the right layering. */
 #include <sys/socket.h>
 #include <netdb.h>
 #include <sys/time.h>
 #include <errno.h>
-
-#define TSDB_METRICS_DEFAULT_PORT 28094
-
-static int http_post_sql(const char *host, int port,
-                          const char *q, size_t qlen,
-                          char *body_buf, size_t body_cap)
-{
-    struct addrinfo hints = {0}, *ai = NULL;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &ai) != 0) return -1;
-
-    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd < 0) { freeaddrinfo(ai); return -1; }
-
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
-        close(fd); freeaddrinfo(ai); return -1;
-    }
-    freeaddrinfo(ai);
-
-    /* Build body {"q":"…"} with minimal escaping for quote + backslash. */
-    size_t esc_cap = qlen * 2 + 16;
-    char *esc = malloc(esc_cap);
-    if (!esc) { close(fd); return -1; }
-    size_t ew = 0;
-    esc[ew++] = '{'; esc[ew++] = '"'; esc[ew++] = 'q'; esc[ew++] = '"';
-    esc[ew++] = ':'; esc[ew++] = '"';
-    for (size_t i = 0; i < qlen && ew + 2 < esc_cap; i++) {
-        char c = q[i];
-        if (c == '"' || c == '\\') esc[ew++] = '\\';
-        esc[ew++] = c;
-    }
-    if (ew + 2 >= esc_cap) { free(esc); close(fd); return -1; }
-    esc[ew++] = '"'; esc[ew++] = '}';
-
-    char hdr[512];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "POST /sql HTTP/1.1\r\nHost: %s\r\n"
-        "Content-Type: application/json\r\nContent-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", host, ew);
-    if (hlen <= 0 || send(fd, hdr, (size_t)hlen, 0) != hlen ||
-        send(fd, esc, ew, 0) != (ssize_t)ew) {
-        free(esc); close(fd); return -1;
-    }
-    free(esc);
-
-    /* Read full HTTP response into a local buffer, then slice body. */
-    size_t rcap = 64 * 1024, rlen = 0;
-    char *raw = malloc(rcap);
-    if (!raw) { close(fd); return -1; }
-    for (;;) {
-        if (rlen + 4096 > rcap) {
-            size_t nc = rcap * 2;
-            if (nc > 4 * 1024 * 1024) break;
-            char *nr = realloc(raw, nc);
-            if (!nr) break;
-            raw = nr; rcap = nc;
-        }
-        ssize_t n = recv(fd, raw + rlen, rcap - rlen - 1, 0);
-        if (n <= 0) break;
-        rlen += (size_t)n;
-    }
-    close(fd);
-    raw[rlen] = '\0';
-
-    /* Locate body after "\r\n\r\n". */
-    char *body = strstr(raw, "\r\n\r\n");
-    if (!body) { free(raw); return -1; }
-    body += 4;
-    size_t blen = rlen - (size_t)(body - raw);
-    if (blen >= body_cap) blen = body_cap - 1;
-    memcpy(body_buf, body, blen);
-    body_buf[blen] = '\0';
-    free(raw);
-    return (int)blen;
-}
 
 static int proxy_sql_to_master(tsdb_db_t *db,
                                 const char *q, size_t qlen,
@@ -909,24 +830,45 @@ static int proxy_sql_to_master(tsdb_db_t *db,
     tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr_for_db(db);
     if (!mgr) return -1;
 
+    uint8_t payload[4608];
+    if (qlen >= 4096) return -1;
+    char qz[4096];
+    memcpy(qz, q, qlen); qz[qlen] = '\0';
+    int plen = tsdb_rpc_encode_catalog_qtl(payload, sizeof(payload), qz);
+    if (plen <= 0) return -1;
+
     tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
     int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    char last_txt[512] = {0};
     for (int i = 0; i < n; i++) {
         if (snap[i].role != TSDB_ROLE_MASTER) continue;
         if (snap[i].state == TSDB_NODE_DEAD) continue;
 
-        /* addr is "host:RPC_PORT"; split on ':'. */
-        char host[128];
-        snprintf(host, sizeof(host), "%s", snap[i].addr);
-        char *colon = strchr(host, ':');
-        if (!colon) continue;
-        *colon = '\0';
+        tsdb_rpc_conn_t *conn = tsdb_rpc_connect(snap[i].addr, 3000);
+        if (!conn) continue;
+        uint8_t resp[512];
+        uint32_t rlen = 0;
+        int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_DDL_FORWARD,
+                                    payload, (uint32_t)plen,
+                                    resp, sizeof(resp) - 1, &rlen);
+        tsdb_rpc_conn_close(conn);
+        if (rc != TSDB_OK) continue;
 
-        int rc = http_post_sql(host, TSDB_METRICS_DEFAULT_PORT,
-                                q, qlen, buf, cap);
-        if (rc > 0) return rc;
+        resp[rlen] = '\0';
+        snprintf(last_txt, sizeof(last_txt), "%s", (const char *)resp);
+        /* A non-leader master answers "ERR: not raft leader …" — try the
+         * next master, keeping this as the fallback answer. */
+        if (strncmp(last_txt, "ERR: not raft leader", 20) == 0) continue;
+        break;
     }
-    return -1;
+    if (!last_txt[0]) return -1;
+
+    char esc[1024];
+    j_escape_str(esc, sizeof(esc), last_txt);
+    int w = snprintf(buf, cap,
+        "{\"cols\":[\"status\"],\"types\":[\"SYMBOL\"],"
+        "\"rows\":[[\"%s\"]],\"nrows\":1,\"truncated\":false}", esc);
+    return (w > 0 && (size_t)w < cap) ? w : -1;
 }
 
 static int64_t now_ms(void) {

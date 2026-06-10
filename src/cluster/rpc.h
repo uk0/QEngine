@@ -83,7 +83,16 @@ typedef enum {
                                          cleared the size threshold; gated by
                                          TSDB_REPLICATION_COMPRESS (default on).
                                          Kafka-style batch compression — cuts
-                                         tcp_sendmsg bytes + LAN/WAN bandwidth. */
+                                         tcp_sendmsg bytes + LAN/WAN bandwidth. */,
+    TSDB_RPC_DDL_FORWARD        = 21  /* data-node → master: run this catalog
+                                         QTL through the master's FULL query
+                                         path (raft propose + broadcast) and
+                                         return the status text as the ACK
+                                         payload.  Replaces the old HTTP
+                                         /sql proxy, which could not pass the
+                                         dashboard auth gate (session cookies
+                                         are node-local).  Payload format is
+                                         the same as APPLY_CATALOG_QTL. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */

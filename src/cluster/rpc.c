@@ -729,6 +729,35 @@ static void *connection_handler(void *arg) {
             }
             break;
 
+        case TSDB_RPC_DDL_FORWARD:
+            /* Data-node → master DDL forward: run the QTL through the FULL
+             * local query path (raft propose + catalog broadcast — no
+             * suppress flag, unlike APPLY_CATALOG_QTL) and return the
+             * status text as the ACK payload.  Peers on the RPC port are
+             * already mutually trusted; this replaces the HTTP /sql proxy
+             * that the dashboard auth gate rejected (cookies are
+             * node-local). */
+            if (db && msg.payload_len > 0) {
+                char qtl[4096] = {0};
+                if (tsdb_rpc_decode_catalog_qtl(msg.payload, msg.payload_len,
+                                                qtl, sizeof(qtl)) == 0) {
+                    tsdb_result_t *qr = NULL;
+                    int qrc = tsdb_query(db, qtl, &qr);
+                    const char *txt = NULL;
+                    if (qr && tsdb_result_next(qr) == 1)
+                        txt = tsdb_result_sym(qr, 0);   /* status row */
+                    if (!txt) txt = (qrc == TSDB_OK) ? "OK" : tsdb_errstr(qrc);
+                    send_reply(fd, TSDB_RPC_ACK, msg.req_id,
+                               (const uint8_t *)txt, (uint32_t)strlen(txt));
+                    if (qr) tsdb_result_free(qr);
+                } else {
+                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
+            } else {
+                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+            }
+            break;
+
         case TSDB_RPC_CATALOG_DUMP: {
             /* Master serves a snapshot of its catalog log files so a
              * data peer that missed earlier broadcasts (typical after
@@ -1000,6 +1029,28 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /* Bounded I/O: a peer that accepts a request and never responds must
+     * not wedge this connection forever.  A blocked read here holds
+     * conn->lock, which cascades: catalog-broadcast fanout workers queue
+     * on the same mutex, which wedges the raft apply thread, which times
+     * out every DDL propose cluster-wide (observed live: one lost fed-
+     * query response during a rolling restart froze DDL on all nodes).
+     * 30 s default — far above any healthy LAN RPC, small enough to
+     * self-heal; env TSDB_RPC_IO_TIMEOUT_MS overrides (0 = unbounded). */
+    {
+        static int io_tmo_ms = -1;
+        if (io_tmo_ms < 0) {
+            const char *e = getenv("TSDB_RPC_IO_TIMEOUT_MS");
+            io_tmo_ms = (e && *e) ? atoi(e) : 30000;
+        }
+        if (io_tmo_ms > 0) {
+            struct timeval tv = { .tv_sec  = io_tmo_ms / 1000,
+                                  .tv_usec = (io_tmo_ms % 1000) * 1000 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
+    }
 
     /* Iter 10: enlarge the send buffer on the leader→peer replication
      * link.  perf on a virgin cluster put tcp_sendmsg at 7.27% of leader
