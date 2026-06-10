@@ -239,11 +239,36 @@ static metric_t g_metrics[] = {
 
 #define N_METRICS  ((int)(sizeof(g_metrics)/sizeof(g_metrics[0])))
 
-static int g_initialized = 0;
+/* ---- Name -> index lookup table -----------------------------------------
+ *
+ * find_metric() runs on every metric mutation, multiple times per write
+ * batch / RPC / query.  A linear strcmp scan over g_metrics[] is O(N).
+ * Replace it with a static open-addressing hash table mapping
+ * hash(name) -> index into g_metrics[].  Built once (pthread_once), so it
+ * is safe under repeated tsdb_metrics_init() calls and against metric bumps
+ * that race ahead of any explicit init.
+ *
+ * Size is the next power of two >= 4*N_METRICS, keeping the load factor
+ * <= 0.25 so expected probe length is ~1.  Empty slots are marked -1.
+ */
+#define IDX_TABLE_SIZE  256   /* pow2 >= 4*N_METRICS (N_METRICS ~= 43) */
 
-void tsdb_metrics_init(void) {
-    if (g_initialized) return;
-    g_initialized = 1;
+static int16_t g_idx_table[IDX_TABLE_SIZE];
+static pthread_once_t g_build_once = PTHREAD_ONCE_INIT;
+
+static uint64_t fnv1a(const char *s) {
+    uint64_t h = 1469598103934665603ULL; /* FNV offset basis */
+    for (; *s; s++) {
+        h ^= (uint64_t)(unsigned char)*s;
+        h *= 1099511628211ULL;           /* FNV prime */
+    }
+    return h;
+}
+
+/* Build the index table (and initialise atomics).  Runs exactly once. */
+static void build_registry(void) {
+    for (int i = 0; i < IDX_TABLE_SIZE; i++)
+        g_idx_table[i] = -1;
 
     for (int i = 0; i < N_METRICS; i++) {
         metric_t *m = &g_metrics[i];
@@ -262,17 +287,34 @@ void tsdb_metrics_init(void) {
             /* mutex already initialised via PTHREAD_MUTEX_INITIALIZER */
             break;
         }
+
+        /* Insert i into the open-addressing table keyed by name hash. */
+        uint64_t slot = fnv1a(m->name) & (IDX_TABLE_SIZE - 1);
+        while (g_idx_table[slot] != -1)
+            slot = (slot + 1) & (IDX_TABLE_SIZE - 1);
+        g_idx_table[slot] = (int16_t)i;
     }
+}
+
+void tsdb_metrics_init(void) {
+    pthread_once(&g_build_once, build_registry);
 }
 
 /* ---- Registry lookup ----------------------------------------------------- */
 
 static metric_t *find_metric(const char *name) {
-    for (int i = 0; i < N_METRICS; i++) {
-        if (strcmp(g_metrics[i].name, name) == 0)
-            return &g_metrics[i];
+    /* Fall back to building the table on first use (defensive init). */
+    pthread_once(&g_build_once, build_registry);
+
+    uint64_t slot = fnv1a(name) & (IDX_TABLE_SIZE - 1);
+    for (;;) {
+        int16_t idx = g_idx_table[slot];
+        if (idx < 0)
+            return NULL;                 /* empty slot — name not registered */
+        if (strcmp(g_metrics[idx].name, name) == 0)
+            return &g_metrics[idx];
+        slot = (slot + 1) & (IDX_TABLE_SIZE - 1);
     }
-    return NULL;
 }
 
 /* ---- Counter ------------------------------------------------------------- */
