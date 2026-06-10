@@ -24,8 +24,11 @@ export function AuditPanel() {
 
   return (
     <div className="card">
-      <h3>
+      <h3 className="card-title">
         Audit log <span className="mu">— JSONL tail from /audit?n={limit}</span>
+        {rows.length > 0 && (
+          <span className="badge mut num">{rows.length.toLocaleString()} records</span>
+        )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
           <select value={limit} onChange={e => setLimit(Number(e.target.value))}>
             {[50, 100, 200, 500, 1000, 2000].map(n => (
@@ -47,7 +50,7 @@ export function AuditPanel() {
         </div>
         {rows.map((r, i) => (
           <div key={i} className="audit-row">
-            <div>{r.ts.replace(/Z$/, '').replace('T', ' ')}</div>
+            <div>{(r.ts ?? '').replace(/Z$/, '').replace('T', ' ')}</div>
             <div><span className={`ev ${r.event}`}>{r.event}</span></div>
             <div>{r.user || '-'}</div>
             <div>{r.action}</div>
@@ -61,7 +64,7 @@ export function AuditPanel() {
           </div>
         ))}
         {!rows.length && !err && (
-          <div className="empty">No audit records yet.</div>
+          <div className="empty">{loading ? 'Loading audit tail…' : 'No audit records yet.'}</div>
         )}
       </div>
     </div>

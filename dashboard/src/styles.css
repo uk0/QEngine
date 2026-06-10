@@ -1,6 +1,8 @@
 :root {
   --fg: #0f172a;
   --mu: #64748b;
+  /* Alias — some components reference --muted; keep it in lockstep with --mu. */
+  --muted: #64748b;
   --bd: #e2e8f0;
   --bg: #f8fafc;
   --card: #ffffff;
@@ -453,7 +455,10 @@ table.rows tbody tr:hover { background: var(--hover); }
   position: sticky;
   top: 0;
 }
-.audit-row .ev { text-align: center; border-radius: 10px; padding: 1px 6px; font-size: 10px; font-weight: 600; }
+/* Base styling so an unrecognised event still renders as a badge, not bare
+ * text. Known events override the colours below. */
+.audit-row .ev { text-align: center; border-radius: 10px; padding: 1px 6px; font-size: 10px; font-weight: 600; background: var(--hover); color: var(--mu); }
+.audit-row .rc { font-variant-numeric: tabular-nums; }
 .audit-row .ev.AUTH   { background: #dbeafe; color: #1e3a8a; }
 .audit-row .ev.DDL    { background: #fef3c7; color: #92400e; }
 .audit-row .ev.GRANT  { background: #dcfce7; color: #15803d; }
@@ -614,4 +619,126 @@ table.rows tbody tr:hover { background: var(--hover); }
 @keyframes slideIn {
   from { transform: translateY(6px); opacity: 0; }
   to   { transform: translateY(0);   opacity: 1; }
+}
+
+/* ─── Card title (alias of `.card h3`) ─── */
+/* Some cluster cards use <h3 className="card-title"> instead of a bare <h3>.
+ * Mirror the h3 treatment so titles render consistently either way. */
+.card-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card-title .mu { font-weight: 400; }
+
+/* A header row that keeps the title left and a status badge hard right. */
+.card h3 .grow,
+.card-title .grow { margin-left: auto; }
+
+/* ─── Status badge (role / health) ─── */
+/* Filled variant for prominent state read-outs (Raft role, "NO LEADER").
+ * The `.pill` above stays the lightweight inline tag; `.badge` is the
+ * stronger, uppercase signal used in card headers. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.badge.ok   { background: #dcfce7; color: #15803d; border-color: #bbf7d0; }
+.badge.warn { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+.badge.bad  { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+.badge.mut  { background: var(--hover); color: var(--mu); border-color: var(--bd); }
+/* Pulsing dot inside a bad badge so a degraded state reads at a glance. */
+.badge .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.badge.bad .dot { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
+/* ─── Standalone status dot (sharding / inline) ─── */
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* ─── Metric numerals ─── */
+/* Tabular figures everywhere a counter/rate is shown so digits don't jitter
+ * column-to-column as values tick. `.stat-val` already opts in via its font;
+ * this covers ad-hoc inline numbers. */
+.num { font-variant-numeric: tabular-nums; }
+
+/* Subtle hover lift on metric cards within a stat row. */
+.stat { transition: border-color 0.12s, background 0.12s; }
+.stat:hover { border-color: #cbd5e1; background: #fff; }
+
+/* Stat that spans the full row width (for prose-y sub notes). */
+.stat.wide { grid-column: 1 / -1; }
+
+/* ─── Cluster panel loading / empty states ─── */
+.panel-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.skeleton-card {
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 8px;
+  padding: 16px;
+  height: 92px;
+  position: relative;
+  overflow: hidden;
+}
+.skeleton-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(148, 163, 184, 0.12) 50%,
+    transparent 100%
+  );
+  transform: translateX(-100%);
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+@keyframes shimmer { to { transform: translateX(100%); } }
+
+/* Inline "live" indicator on a refreshing card. */
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  display: inline-block;
+  margin-right: 5px;
+  box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5);
+  animation: live 2s ease-out infinite;
+}
+@keyframes live {
+  0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+  70%  { box-shadow: 0 0 0 5px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
 }

@@ -88,6 +88,7 @@ export interface RaftInfo {
   commit_index?: number;
   last_applied?: number;
   last_index?: number;
+  snapshot_index?: number;
 }
 
 export interface AuditRecord {
