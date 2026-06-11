@@ -50,6 +50,13 @@ struct tsdb_replica_mgr {
      * async delivery to the remote DC.  Transparent to cluster RPC
      * fanout — see src/federation/dr_forwarder.c. */
     struct tsdb_dr_forwarder *dr;
+
+    /* In-flight fanout workers (pool tasks holding ctx->rmgr).  mgr_free
+     * must wait for this to drain before freeing — ASan caught a worker
+     * reading peers[] after tsdb_close_cluster freed the mgr at shutdown.
+     * Guarded by `lock`; signaled on zero via infl_cv. */
+    int            fanout_inflight;
+    pthread_cond_t infl_cv;
 };
 
 static int env_conns_per_peer(void) {
@@ -67,6 +74,7 @@ tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr) {
     r->node_mgr = node_mgr;
     r->conns_per_peer = env_conns_per_peer();
     pthread_mutex_init(&r->lock, NULL);
+    pthread_cond_init(&r->infl_cv, NULL);
     return r;
 }
 
@@ -77,6 +85,29 @@ void tsdb_replica_mgr_set_dr(tsdb_replica_mgr_t *rmgr, struct tsdb_dr_forwarder 
 
 void tsdb_replica_mgr_free(tsdb_replica_mgr_t *rmgr) {
     if (!rmgr) return;
+
+    /* Wait for in-flight fanout workers (they read peers[]/conns via
+     * ctx->rmgr).  On timeout, LEAK the mgr — a worker still running
+     * means free() here is a use-after-free. */
+    pthread_mutex_lock(&rmgr->lock);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 10;
+    int drained = 1;
+    while (rmgr->fanout_inflight > 0) {
+        if (pthread_cond_timedwait(&rmgr->infl_cv, &rmgr->lock, &dl) == ETIMEDOUT) {
+            drained = 0;
+            break;
+        }
+    }
+    int leftover = rmgr->fanout_inflight;
+    pthread_mutex_unlock(&rmgr->lock);
+    if (!drained) {
+        fprintf(stderr, "[replica] free: %d fanout worker(s) still in flight "
+                        "after 10s — leaking mgr instead of freeing\n", leftover);
+        return;
+    }
+
     for (int i = 0; i < MAX_PEERS; i++) {
         peer_slot_t *p = &rmgr->peers[i];
         if (p->node_id == 0) continue;
@@ -290,6 +321,9 @@ static void *fanout_worker(void *arg) {
     worker_arg_t *wa = (worker_arg_t *)arg;
     fanout_ctx_t *ctx = wa->ctx;
     tsdb_node_id_t nid = wa->node_id;
+    /* Capture before fanout_ctx_unref can free ctx; the submitter took our
+     * inflight slot before submit, so rmgr outlives this function. */
+    tsdb_replica_mgr_t *rmgr_local = ctx->rmgr;
     free(wa);
 
     /* Retry fanout against a single peer up to MAX_ATTEMPTS times
@@ -350,6 +384,12 @@ static void *fanout_worker(void *arg) {
     pthread_mutex_unlock(&ctx->mu);
 
     fanout_ctx_unref(ctx);
+
+    /* Release the inflight slot the submitter reserved for us. */
+    pthread_mutex_lock(&rmgr_local->lock);
+    if (--rmgr_local->fanout_inflight == 0)
+        pthread_cond_broadcast(&rmgr_local->infl_cv);
+    pthread_mutex_unlock(&rmgr_local->lock);
     return NULL;
 }
 
@@ -382,6 +422,13 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
      * worker that exits before the loop ends can't drop refcount to 0. */
     atomic_fetch_add_explicit(&ctx->refcount, nreplicas, memory_order_acq_rel);
 
+    /* Reserve an mgr-inflight slot per worker while rmgr is guaranteed
+     * alive (we're on the submitter's thread).  Workers release theirs at
+     * exit; mgr_free waits for zero before freeing. */
+    pthread_mutex_lock(&rmgr->lock);
+    rmgr->fanout_inflight += nreplicas;
+    pthread_mutex_unlock(&rmgr->lock);
+
     tsdb_metric_add("qengine_replicate_sent_total", (uint64_t)nreplicas);
 
     pthread_attr_t attr;
@@ -400,6 +447,10 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
                 pthread_cond_broadcast(&ctx->cv);
             pthread_mutex_unlock(&ctx->mu);
             fanout_ctx_unref(ctx);
+            pthread_mutex_lock(&rmgr->lock);
+            if (--rmgr->fanout_inflight == 0)
+                pthread_cond_broadcast(&rmgr->infl_cv);
+            pthread_mutex_unlock(&rmgr->lock);
             continue;
         }
         wa->ctx     = ctx;
@@ -429,6 +480,10 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
                 pthread_cond_broadcast(&ctx->cv);
             pthread_mutex_unlock(&ctx->mu);
             fanout_ctx_unref(ctx);
+            pthread_mutex_lock(&rmgr->lock);
+            if (--rmgr->fanout_inflight == 0)
+                pthread_cond_broadcast(&rmgr->infl_cv);
+            pthread_mutex_unlock(&rmgr->lock);
         }
     }
     pthread_attr_destroy(&attr);
