@@ -304,7 +304,12 @@ typedef struct {
     int                  fd;
     tsdb_db_t           *db;
     tsdb_node_manager_t *node_mgr;
+    struct tsdb_rpc_server *srv;   /* for live-connection tracking */
 } handler_args_t;
+
+/* Forward decls — registry lives in struct tsdb_rpc_server below. */
+static void rpc_conn_track_add(struct tsdb_rpc_server *s, int fd);
+static void rpc_conn_track_remove(struct tsdb_rpc_server *s, int fd);
 
 /* Handle one client connection in its own thread. */
 /* Decode a raw WRITE_BATCH payload and apply it locally (local_only, so it
@@ -388,7 +393,9 @@ static void *connection_handler(void *arg) {
     int fd = ha->fd;
     tsdb_db_t *db = ha->db;
     tsdb_node_manager_t *node_mgr = ha->node_mgr;
+    struct tsdb_rpc_server *srv = ha->srv;
     free(ha);
+    rpc_conn_track_add(srv, fd);
 
     uint8_t hdr_buf[TSDB_RPC_HDR_SIZE];
     for (;;) {
@@ -864,6 +871,7 @@ static void *connection_handler(void *arg) {
         free(combined);
     }
 
+    rpc_conn_track_remove(srv, fd);   /* deregister before close (fd reuse) */
     close(fd);
     return NULL;
 }
@@ -877,7 +885,39 @@ struct tsdb_rpc_server {
     tsdb_node_manager_t *node_mgr;
     pthread_t            accept_thread;
     volatile int         running;
+
+    /* Live-connection registry — mirrors the wire server's drain: stop()
+     * kicks every blocked recv (shutdown) and waits for the detached
+     * handlers to finish before the caller tears down the db they use. */
+    pthread_mutex_t conn_mu;
+    pthread_cond_t  conn_cv;
+    int            *conn_fds;
+    int             conn_n, conn_cap;
+    int             conn_inflight;
 };
+
+static void rpc_conn_track_add(struct tsdb_rpc_server *s, int fd) {
+    if (!s) return;
+    pthread_mutex_lock(&s->conn_mu);
+    if (s->conn_n >= s->conn_cap) {
+        int ncap = s->conn_cap ? s->conn_cap * 2 : 64;
+        int *nf = realloc(s->conn_fds, (size_t)ncap * sizeof(int));
+        if (nf) { s->conn_fds = nf; s->conn_cap = ncap; }
+    }
+    if (s->conn_n < s->conn_cap) s->conn_fds[s->conn_n++] = fd;
+    s->conn_inflight++;
+    pthread_mutex_unlock(&s->conn_mu);
+}
+
+static void rpc_conn_track_remove(struct tsdb_rpc_server *s, int fd) {
+    if (!s) return;
+    pthread_mutex_lock(&s->conn_mu);
+    for (int i = 0; i < s->conn_n; i++) {
+        if (s->conn_fds[i] == fd) { s->conn_fds[i] = s->conn_fds[--s->conn_n]; break; }
+    }
+    if (--s->conn_inflight == 0) pthread_cond_broadcast(&s->conn_cv);
+    pthread_mutex_unlock(&s->conn_mu);
+}
 
 static void *accept_loop(void *arg) {
     tsdb_rpc_server_t *srv = (tsdb_rpc_server_t *)arg;
@@ -912,6 +952,7 @@ static void *accept_loop(void *arg) {
         ha->fd       = client_fd;
         ha->db       = srv->db;
         ha->node_mgr = srv->node_mgr;
+        ha->srv      = srv;
 
         pthread_t tid;
         pthread_attr_t attr;
@@ -963,6 +1004,8 @@ tsdb_rpc_server_t *tsdb_rpc_server_new(const char *bind_addr,
     srv->db        = db;
     srv->node_mgr  = node_mgr;
     srv->running   = 1;
+    pthread_mutex_init(&srv->conn_mu, NULL);
+    pthread_cond_init(&srv->conn_cv, NULL);
 
     pthread_create(&srv->accept_thread, NULL, accept_loop, srv);
     return srv;
@@ -973,6 +1016,35 @@ void tsdb_rpc_server_stop(tsdb_rpc_server_t *srv) {
     srv->running = 0;
     pthread_join(srv->accept_thread, NULL);
     close(srv->listen_fd);
+
+    /* Drain detached peer handlers: kick blocked recvs, wait for zero
+     * inflight.  On timeout leak srv (and let the caller's db outlive us)
+     * rather than freeing under a live handler. */
+    pthread_mutex_lock(&srv->conn_mu);
+    for (int i = 0; i < srv->conn_n; i++)
+        shutdown(srv->conn_fds[i], SHUT_RDWR);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 10;
+    int drained = 1;
+    while (srv->conn_inflight > 0) {
+        if (pthread_cond_timedwait(&srv->conn_cv, &srv->conn_mu, &dl) == ETIMEDOUT) {
+            drained = 0;
+            break;
+        }
+    }
+    int leftover = srv->conn_inflight;
+    pthread_mutex_unlock(&srv->conn_mu);
+    if (!drained) {
+        fprintf(stderr, "[rpc] stop: %d peer handler(s) still in flight after "
+                        "10s — leaking server state instead of freeing\n",
+                leftover);
+        return;
+    }
+
+    pthread_mutex_destroy(&srv->conn_mu);
+    pthread_cond_destroy(&srv->conn_cv);
+    free(srv->conn_fds);
     free(srv);
 }
 

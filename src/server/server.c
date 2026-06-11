@@ -376,6 +376,17 @@ struct tsdb_server {
      * owns hash(name)%ncores, so its memtable has a single writer. */
     tsdb_reactor_pool_t *reactor_pool;
 
+    /* Active-connection registry.  Handlers are DETACHED threads; stop()
+     * must shutdown() every live conn fd (kicks blocking recvs) and wait
+     * for the handlers to drain before free(srv) — without this, any
+     * in-flight request keeps using srv after the free (ASan-confirmed
+     * heap-use-after-free during restart-under-load). */
+    pthread_mutex_t conn_mu;
+    pthread_cond_t  conn_cv;
+    int            *conn_fds;
+    int             conn_n, conn_cap;
+    int             conn_inflight;
+
     /* TLS context (NULL when running in plaintext mode). */
     tsdb_tls_ctx_t     *tls_ctx;
 
@@ -1241,12 +1252,37 @@ static int handle_unsubscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
 
 /* ---- Main connection handler --------------------------------------------- */
 
+/* Track a live connection so stop() can kick + drain it.  inflight is
+ * incremented under conn_mu; the handler removes itself (and signals the
+ * drain cv at zero) on exit. */
+static void conn_track_add(tsdb_server_t *s, int fd) {
+    pthread_mutex_lock(&s->conn_mu);
+    if (s->conn_n >= s->conn_cap) {
+        int ncap = s->conn_cap ? s->conn_cap * 2 : 64;
+        int *nf = realloc(s->conn_fds, (size_t)ncap * sizeof(int));
+        if (nf) { s->conn_fds = nf; s->conn_cap = ncap; }
+    }
+    if (s->conn_n < s->conn_cap) s->conn_fds[s->conn_n++] = fd;
+    s->conn_inflight++;
+    pthread_mutex_unlock(&s->conn_mu);
+}
+
+static void conn_track_remove(tsdb_server_t *s, int fd) {
+    pthread_mutex_lock(&s->conn_mu);
+    for (int i = 0; i < s->conn_n; i++) {
+        if (s->conn_fds[i] == fd) { s->conn_fds[i] = s->conn_fds[--s->conn_n]; break; }
+    }
+    if (--s->conn_inflight == 0) pthread_cond_broadcast(&s->conn_cv);
+    pthread_mutex_unlock(&s->conn_mu);
+}
+
 static void *connection_handler(void *arg) {
     conn_ctx_t *ctx = (conn_ctx_t *)arg;
     tsdb_server_t   *srv = ctx->srv;
     int              fd  = ctx->fd;
     tsdb_tls_conn_t *tls = ctx->tls;
     free(ctx);
+    conn_track_add(srv, fd);
 
     /* Build IO abstraction — dispatches through TLS when tls != NULL. */
     tsdb_io_t io_obj = { .fd = fd, .tls = tls };
@@ -1339,6 +1375,9 @@ static void *connection_handler(void *arg) {
 done:
     free(payload);
     sub_list_remove_by_fd(&srv->subs, fd);
+    /* Deregister BEFORE closing so stop() can never shutdown() a
+     * recycled fd number. */
+    conn_track_remove(srv, fd);
     /* Close TLS connection (sends close_notify + closes fd).
      * For plain connections close the fd directly. */
     if (tls)
@@ -1497,6 +1536,8 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
 
     sub_list_init(&srv->subs);
     write_lock_pool_init(&srv->write_locks);
+    pthread_mutex_init(&srv->conn_mu, NULL);
+    pthread_cond_init(&srv->conn_cv, NULL);
     srv->tls_ctx = NULL;
 
     /* Shard-per-core: opt-in via TSDB_REACTOR=1.  Spawn one reactor per online
@@ -1574,10 +1615,40 @@ void tsdb_server_stop(tsdb_server_t *s) {
         pthread_join(s->accept_threads[i], NULL);
     for (int i = 0; i < s->n_listeners; i++)
         close(s->listen_fds[i]);
+
+    /* Drain detached connection handlers before freeing srv: kick every
+     * blocked recv with shutdown(), then wait for inflight to hit zero.
+     * On timeout we deliberately LEAK the server state — a handler still
+     * running means free(s) would be the ASan-confirmed use-after-free. */
+    pthread_mutex_lock(&s->conn_mu);
+    for (int i = 0; i < s->conn_n; i++)
+        shutdown(s->conn_fds[i], SHUT_RDWR);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 10;
+    int drained = 1;
+    while (s->conn_inflight > 0) {
+        if (pthread_cond_timedwait(&s->conn_cv, &s->conn_mu, &dl) == ETIMEDOUT) {
+            drained = 0;
+            break;
+        }
+    }
+    int leftover = s->conn_inflight;
+    pthread_mutex_unlock(&s->conn_mu);
+    if (!drained) {
+        fprintf(stderr, "[server] stop: %d handler(s) still in flight after "
+                        "10s — leaking server state instead of freeing\n",
+                leftover);
+        return;
+    }
+
     tsdb_tls_free(s->tls_ctx);
     sub_list_destroy(&s->subs);
     write_lock_pool_destroy(&s->write_locks);
     if (s->reactor_pool) tsdb_reactor_pool_free(s->reactor_pool);
+    pthread_mutex_destroy(&s->conn_mu);
+    pthread_cond_destroy(&s->conn_cv);
+    free(s->conn_fds);
     free(s);
 }
 

@@ -1468,6 +1468,11 @@ int main(int argc, char **argv) {
     if (cpt) tsdb_compactor_stop(cpt);   /* join workers before closing db */
     if (ms)  tsdb_metrics_server_stop(ms);
     if (srv) tsdb_server_stop(srv);
+    /* Stop the cluster layer (peer RPC server, gossip, replica mgr) BEFORE
+     * tearing down the db — its handler threads dereference db, so closing
+     * the db first is the same use-after-free class tsdb_server_stop's
+     * connection drain fixes on the wire side. */
+    tsdb_close_cluster(db);
     tsdb_close(db);
     printf("[node] done.\n");
     return 0;
