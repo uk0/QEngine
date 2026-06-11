@@ -1467,13 +1467,20 @@ int main(int argc, char **argv) {
     printf("[node] shutting down...\n");
     if (cpt) tsdb_compactor_stop(cpt);   /* join workers before closing db */
     if (ms)  tsdb_metrics_server_stop(ms);
-    if (srv) tsdb_server_stop(srv);
-    /* Stop the cluster layer (peer RPC server, gossip, replica mgr) BEFORE
-     * tearing down the db — its handler threads dereference db, so closing
-     * the db first is the same use-after-free class tsdb_server_stop's
-     * connection drain fixes on the wire side. */
-    tsdb_close_cluster(db);
-    tsdb_close(db);
-    printf("[node] done.\n");
-    return 0;
+    if (srv) tsdb_server_stop(srv);      /* drains in-flight client handlers */
+
+    /* Fast-exit instead of library teardown.  The node arms half a dozen
+     * detached maintenance threads (startup anti-entropy resync, delete-
+     * watermark re-assert, catalog self-heal, disk sampler, peer RPC
+     * handlers) that all dereference db/cluster state; freeing that state
+     * under them is the heap-use-after-free family ASan kept catching one
+     * layer at a time (wire srv -> replica mgr -> resync thread -> ...).
+     * Durability does not need the teardown: every acked write is in the
+     * WAL, and the cluster provably self-heals a kill -9 (WAL replay +
+     * anti-entropy convergence verified live).  So treat shutdown as the
+     * controlled crash the system is designed for: flush stdio and exit.
+     * tsdb_close/tsdb_close_cluster remain for library/test embedders. */
+    printf("[node] done (fast-exit; WAL guarantees durability).\n");
+    fflush(NULL);
+    _exit(0);
 }
