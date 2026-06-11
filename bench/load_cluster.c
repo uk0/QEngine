@@ -20,11 +20,13 @@
  *   TSDB_LOAD_MAX_SEC    wall-clock safety cap (0=off)        default 0
  *   TSDB_LOAD_AUTH       "user:pass" to AUTH_LOGIN (optional) default none
  *   TSDB_LOAD_NOCREATE   1 = skip CREATE (tables already up)  default 0
+ *   TSDB_LOAD_PIPELINE   WRITE_BATCH frames in flight/conn    default 1
  *
  * SIGINT/SIGTERM → graceful stop (workers drain the in-flight batch).
  */
 #define _DEFAULT_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 1      /* macOS: un-hide INADDR_LOOPBACK et al. */
 #include "tsdb_wire.h"
 
 #include <stdio.h>
@@ -49,6 +51,7 @@ static char     g_auth_user[64] = {0}, g_auth_pass[64] = {0}; static int g_auth 
 static char     g_stable[64] = "loadst";
 static uint64_t g_target_bytes;
 static int      g_tables = 2000, g_batch = 4096, g_threads = 16, g_nocreate = 0;
+static int      g_pipeline = 1;
 static double   g_disk_cap = 90.0, g_max_sec = 0.0;
 static char     g_disk_path[256] = "/home/nas";
 
@@ -136,13 +139,19 @@ static size_t build_batch(uint8_t *buf, const char *tbl, uint32_t nrows,
     return (size_t)(p - buf);
 }
 
-static int write_batch(tsdb_conn_t *c, const char *tbl, uint32_t nrows,
-                       int64_t base_ts, uint64_t seed, double *walk) {
+static int send_batch(tsdb_conn_t *c, const char *tbl, uint32_t nrows,
+                      int64_t base_ts, uint64_t seed, double *walk) {
     static __thread uint8_t buf[1 << 18];   /* 256 KiB; fits batch<=8192 */
     size_t n = build_batch(buf, tbl, nrows, base_ts, seed, walk);
-    if (frame_send(c, MSG_WRITE_BATCH, 0, c->next_req_id++, buf, (uint32_t)n) < 0) return -1;
+    return frame_send(c, MSG_WRITE_BATCH, 0, c->next_req_id++, buf, (uint32_t)n) < 0 ? -1 : 0;
+}
+
+/* Reap one reply.  0 = WRITE_ACK; -1 = non-ACK frame (server error);
+ * -2 = transport failure (timeout/CRC/reset) — connection unusable. */
+static int recv_ack(tsdb_conn_t *c) {
     tsdb_msg_t r = {0}; int rc = frame_recv(c, &r);
-    int ok = (rc == 0 && r.hdr.type == MSG_WRITE_ACK); msg_free(&r);
+    if (rc != 0) { msg_free(&r); return -2; }
+    int ok = (r.hdr.type == MSG_WRITE_ACK); msg_free(&r);
     return ok ? 0 : -1;
 }
 
@@ -160,24 +169,49 @@ static void *worker(void *arg) {
     double  *walk = calloc((size_t)ntab, sizeof(double));
     const int64_t base = 1000000000000LL;   /* 1e12 ns origin */
     uint32_t k = 0;
+    int in_flight = 0;
     while (!atomic_load(&g_stop)) {
         int ti = (int)(k++ % (uint32_t)ntab);
         int tno = j->tbl_lo + ti;
         char tbl[40]; snprintf(tbl, sizeof(tbl), "lt_%d", tno);
         int64_t bts = base + ts[ti] * 1000000LL;
-        if (write_batch(&c, tbl, (uint32_t)g_batch, bts,
-                        ((uint64_t)tno << 20) ^ (uint64_t)ts[ti], &walk[ti]) < 0) {
+        int rc = send_batch(&c, tbl, (uint32_t)g_batch, bts,
+                            ((uint64_t)tno << 20) ^ (uint64_t)ts[ti], &walk[ti]);
+        if (rc == 0) {
+            in_flight++;
+            if (g_pipeline > 1) {           /* pipelined: count at send time */
+                ts[ti] += g_batch;
+                atomic_fetch_add(&g_rows, (uint64_t)g_batch);
+                atomic_fetch_add(&g_bytes, (uint64_t)g_batch * ROW_BYTES);
+            }
+            if (in_flight >= g_pipeline) {  /* pipe full — reap one ACK */
+                rc = recv_ack(&c) < 0 ? -1 : 0;
+                if (rc == 0) {
+                    in_flight--;
+                    if (g_pipeline <= 1) {  /* unpipelined: count after ACK */
+                        ts[ti] += g_batch;
+                        atomic_fetch_add(&g_rows, (uint64_t)g_batch);
+                        atomic_fetch_add(&g_bytes, (uint64_t)g_batch * ROW_BYTES);
+                    }
+                }
+            }
+        }
+        if (rc < 0) {
             atomic_fetch_add(&g_errs, 1);
             close(fd); usleep(20 * 1000);
+            in_flight = 0;      /* conn gone — outstanding ACKs went with it */
             fd = node_connect(j->port);
             if (fd < 0) break;
             c.fd = fd; c.next_req_id = 1;
             if (handshake(&c) < 0) break;
             continue;   /* retry same table next loop; ts gap is harmless */
         }
-        ts[ti] += g_batch;
-        atomic_fetch_add(&g_rows, (uint64_t)g_batch);
-        atomic_fetch_add(&g_bytes, (uint64_t)g_batch * ROW_BYTES);
+    }
+    while (in_flight > 0) {     /* drain ACKs still in flight at stop */
+        int rc = recv_ack(&c);
+        if (rc < 0) atomic_fetch_add(&g_errs, 1);
+        if (rc == -2) break;    /* transport dead — nothing more to drain */
+        in_flight--;
     }
     free(ts); free(walk); close(fd);
     return NULL;
@@ -203,6 +237,7 @@ int main(void) {
     g_disk_cap = envf("TSDB_LOAD_DISK_CAP", 90.0);
     g_max_sec  = envf("TSDB_LOAD_MAX_SEC", 0.0);
     g_nocreate = envi("TSDB_LOAD_NOCREATE", 0);
+    g_pipeline = envi("TSDB_LOAD_PIPELINE", 1); if (g_pipeline < 1) g_pipeline = 1;
     { const char *v = getenv("TSDB_LOAD_DISK_PATH"); if (v) snprintf(g_disk_path, sizeof(g_disk_path), "%s", v); }
     { const char *v = getenv("TSDB_LOAD_STABLE"); if (v) snprintf(g_stable, sizeof(g_stable), "%s", v); }
     { char pb[128]; const char *v = getenv("TSDB_LOAD_PORTS");
@@ -214,8 +249,8 @@ int main(void) {
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
 
-    printf("[load] target=%.1f GiB  threads=%d  tables=%d  batch=%d  ports=%d  stable=%s  disk_cap=%.0f%% (%s)  auth=%s\n",
-           gb, g_threads, g_tables, g_batch, g_nports, g_stable, g_disk_cap, g_disk_path, g_auth ? g_auth_user : "(none)");
+    printf("[load] target=%.1f GiB  threads=%d  tables=%d  batch=%d  pipeline=%d  ports=%d  stable=%s  disk_cap=%.0f%% (%s)  auth=%s\n",
+           gb, g_threads, g_tables, g_batch, g_pipeline, g_nports, g_stable, g_disk_cap, g_disk_path, g_auth ? g_auth_user : "(none)");
 
     int fd = node_connect(g_ports[0]);
     if (fd < 0) { fprintf(stderr, "[load] connect :%d failed\n", g_ports[0]); return 1; }
