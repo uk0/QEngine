@@ -2,6 +2,7 @@
 
 #include "wal.h"
 #include "io_async.h"
+#include "../server/metrics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +66,96 @@ static void crc32_init(void) {
 struct tsdb_wal {
     int  fd;           /* file descriptor, opened O_WRONLY|O_APPEND|O_CREAT */
     char path[4096];   /* for truncate / replay */
+    int  dirty;        /* interval mode: 1 = appended since last fsync
+                          (plain int, accessed via __atomic builtins) */
 };
+
+/* ---- Interval fsync mode (TSDB_WAL_SYNC_MS) -----------------------------
+ *
+ * Default (env unset / 0): tsdb_wal_sync fdatasyncs on every commit — the
+ * commit ack means "on stable storage".  On this HDD cluster that is a
+ * ~30 ms jbd2 commit cycle per ack, and it is THE ingest ceiling (batch-size
+ * A/B: commit rate pinned at ~500-548/s regardless of flush work).
+ *
+ * TSDB_WAL_SYNC_MS=N flips the WAL to Kafka-style acks: tsdb_wal_sync only
+ * marks the WAL dirty and returns; one global flusher thread fdatasyncs
+ * every dirty WAL each N ms.  A process crash loses NOTHING (the appends
+ * are in the page cache, which survives the process); only a POWER CUT can
+ * lose up to the last N ms of acked rows.  The commit ack therefore means
+ * "on stable storage within N ms".  Opt-in per deployment.
+ *
+ * The mode is latched once per process on first WAL use. */
+static int             g_wal_sync_ms      = -1;   /* -1 = not read yet */
+static pthread_mutex_t g_wal_reg_mu       = PTHREAD_MUTEX_INITIALIZER;
+static tsdb_wal_t    **g_wal_reg          = NULL;
+static int             g_wal_reg_n        = 0;
+static int             g_wal_reg_cap      = 0;
+static pthread_once_t  g_wal_flusher_once = PTHREAD_ONCE_INIT;
+
+static int wal_interval_ms(void) {
+    if (g_wal_sync_ms < 0) {
+        const char *e = getenv("TSDB_WAL_SYNC_MS");
+        g_wal_sync_ms = (e && *e) ? atoi(e) : 0;
+        if (g_wal_sync_ms < 0) g_wal_sync_ms = 0;
+    }
+    return g_wal_sync_ms;
+}
+
+static void *wal_flusher_main(void *arg) {
+    (void)arg;
+    const int ms = wal_interval_ms();
+    for (;;) {
+        struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        /* fsync under the registry mutex: open/close are cold paths, and
+         * holding it makes the fd guaranteed-valid for the whole sync (no
+         * use-after-close / fd-reuse race with tsdb_wal_close). */
+        pthread_mutex_lock(&g_wal_reg_mu);
+        for (int i = 0; i < g_wal_reg_n; i++) {
+            tsdb_wal_t *w = g_wal_reg[i];
+            if (__atomic_exchange_n(&w->dirty, 0, __ATOMIC_ACQ_REL)) {
+                if (wal_async_fsync(w->fd) == 0)
+                    tsdb_metric_inc("qengine_wal_interval_fsync_total");
+                else
+                    __atomic_store_n(&w->dirty, 1, __ATOMIC_RELEASE);
+            }
+        }
+        pthread_mutex_unlock(&g_wal_reg_mu);
+    }
+    return NULL;
+}
+
+static void wal_flusher_start(void) {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, wal_flusher_main, NULL);
+    pthread_attr_destroy(&attr);
+}
+
+static void wal_reg_add(tsdb_wal_t *w) {
+    pthread_mutex_lock(&g_wal_reg_mu);
+    if (g_wal_reg_n >= g_wal_reg_cap) {
+        int ncap = g_wal_reg_cap ? g_wal_reg_cap * 2 : 256;
+        tsdb_wal_t **nr = realloc(g_wal_reg, (size_t)ncap * sizeof(*nr));
+        if (!nr) { pthread_mutex_unlock(&g_wal_reg_mu); return; }
+        g_wal_reg = nr; g_wal_reg_cap = ncap;
+    }
+    g_wal_reg[g_wal_reg_n++] = w;
+    pthread_mutex_unlock(&g_wal_reg_mu);
+}
+
+static void wal_reg_remove(tsdb_wal_t *w) {
+    pthread_mutex_lock(&g_wal_reg_mu);
+    for (int i = 0; i < g_wal_reg_n; i++) {
+        if (g_wal_reg[i] == w) {
+            g_wal_reg[i] = g_wal_reg[--g_wal_reg_n];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_wal_reg_mu);
+}
 
 /* ---- Record format helpers ---------------------------------------------- */
 
@@ -107,12 +197,24 @@ int tsdb_wal_open(const char *db_dir, const char *table_name, tsdb_wal_t **out) 
     w->fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (w->fd < 0) { free(w); return TSDB_ERR_IO; }
 
+    if (wal_interval_ms() > 0) {
+        pthread_once(&g_wal_flusher_once, wal_flusher_start);
+        wal_reg_add(w);
+    }
+
     *out = w;
     return TSDB_OK;
 }
 
 void tsdb_wal_close(tsdb_wal_t *w) {
     if (!w) return;
+    if (wal_interval_ms() > 0) {
+        wal_reg_remove(w);
+        /* Drain the durability debt on clean close so a graceful shutdown
+         * never loses acked rows even across a subsequent power cut. */
+        if (w->fd >= 0 && __atomic_exchange_n(&w->dirty, 0, __ATOMIC_ACQ_REL))
+            (void)fsync(w->fd);
+    }
     if (w->fd >= 0) close(w->fd);
     free(w);
 }
@@ -163,6 +265,13 @@ int tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n) {
 
 int tsdb_wal_sync(tsdb_wal_t *w) {
     if (!w || w->fd < 0) return TSDB_ERR_INVAL;
+    if (wal_interval_ms() > 0) {
+        /* Interval mode: ack now, the global flusher makes it stable within
+         * TSDB_WAL_SYNC_MS.  Appends are already in the page cache, so a
+         * process crash loses nothing; only power loss can cost the window. */
+        __atomic_store_n(&w->dirty, 1, __ATOMIC_RELEASE);
+        return TSDB_OK;
+    }
     return wal_async_fsync(w->fd) == 0 ? TSDB_OK : TSDB_ERR_IO;
 }
 

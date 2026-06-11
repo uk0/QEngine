@@ -135,6 +135,9 @@ static metric_t g_metrics[] = {
     { "qengine_fanout_wait_timeout_total",
       "Fanout quorum waits that hit the hard deadline (worker left behind)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_wal_interval_fsync_total",
+      "WAL fdatasyncs issued by the interval flusher (TSDB_WAL_SYNC_MS mode)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_ack_total",
       "Total per-peer WRITE_BATCH RPCs that returned OK", MT_COUNTER, { .c = { 0 } } },
 
