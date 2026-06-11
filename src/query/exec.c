@@ -1745,6 +1745,14 @@ static size_t scan_max_block_rows(const scan_src_t *srcs, size_t nsrcs) {
 }
 
 /* Worker function: scan the assigned sources and accumulate into private projs[]. */
+/* 32-byte-aligned scratch sized for `rows` 8-byte lanes.  C11 aligned_alloc
+ * requires size % alignment == 0 — glibc tolerates a violation but ASan
+ * (correctly) rejects it and other libcs may return NULL, so round up. */
+static void *agg_scratch_alloc(size_t rows) {
+    size_t sz = (rows * 8 + 31) & ~(size_t)31;
+    return aligned_alloc(32, sz);
+}
+
 void tsdb_par_scan_task(void *arg) {
     par_task_t *t = (par_task_t *)arg;
     t->rc = TSDB_OK;
@@ -1752,7 +1760,7 @@ void tsdb_par_scan_task(void *arg) {
     /* Per-worker scratch for SIMD gather. Allocated once per task, reused
      * across every block this worker processes; sized to the worker's largest
      * assigned block so compacted (>8192-row) blocks don't overflow it. */
-    void *agg_scratch = aligned_alloc(32, scan_max_block_rows(t->srcs, t->nsrcs) * 8);
+    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(t->srcs, t->nsrcs));
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
 
     /* Kill switch — TSDB_DISABLE_STATS_FASTPATH=1 forces the scan path for
@@ -2805,7 +2813,7 @@ static void tsdb_gbpar_scan_task(void *arg) {
         gb_prof.enabled = (e && *e == '1');
     }
 
-    void *agg_scratch = aligned_alloc(32, scan_max_block_rows(t->srcs, t->nsrcs) * 8);
+    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(t->srcs, t->nsrcs));
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
 
     for (size_t si = 0; si < t->nsrcs; si++) {
@@ -3196,7 +3204,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
     size_t nused = 0;
 
     /* SIMD gather scratch for agg updates. */
-    void *agg_scratch = aligned_alloc(32, scan_max_block_rows(plan.srcs, plan.nsrcs) * 8);
+    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(plan.srcs, plan.nsrcs));
     if (!agg_scratch) {
         free(ht); scan_plan_free(&plan); return TSDB_ERR_NOMEM;
     }
@@ -4763,7 +4771,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* SIMD gather scratch (64 KB), reused across blocks for the serial path. */
     if (has_agg) {
-        serial_agg_scratch = aligned_alloc(32, scan_max_block_rows(plan.srcs, plan.nsrcs) * 8);
+        serial_agg_scratch = agg_scratch_alloc(scan_max_block_rows(plan.srcs, plan.nsrcs));
         if (!serial_agg_scratch) { rc = TSDB_ERR_NOMEM; goto done; }
     }
 
