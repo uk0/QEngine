@@ -788,9 +788,13 @@ static int send_request_vote(tsdb_raft_t *r, uint64_t peer_id,
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_REQUEST_VOTE,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
+    /* Hard 2 s deadline: a silently-dead peer (stopped container — no
+     * RST, write buffers, read blocks) must not park the tick thread;
+     * that froze every survivor's election after a leader kill. */
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_REQUEST_VOTE,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    2000);
     if (rc != TSDB_OK) {
         /* Dead conn (peer restarted?) — evict so the next attempt
          * re-dials instead of hitting the same poisoned socket. */
@@ -836,9 +840,10 @@ static int send_pre_vote(tsdb_raft_t *r, uint64_t peer_id,
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_PRE_VOTE,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_PRE_VOTE,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    2000);
     if (rc != TSDB_OK) {
         tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id, conn);
         return 0;
@@ -1022,11 +1027,13 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
 
                 uint8_t sresp_buf[32];
                 uint32_t sresp_len = 0;
-                int rc2 = tsdb_rpc_call_recv(conn2,
-                                              TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
-                                              sbuf, (uint32_t)sn,
-                                              sresp_buf, sizeof(sresp_buf),
-                                              &sresp_len);
+                /* 5 s: the peer stages the 64 KB chunk to disk before
+                 * ACKing, so leave headroom over the vote/AE deadline. */
+                int rc2 = tsdb_rpc_call_recv_to(conn2,
+                                                 TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
+                                                 sbuf, (uint32_t)sn,
+                                                 sresp_buf, sizeof(sresp_buf),
+                                                 &sresp_len, 5000);
                 if (rc2 != TSDB_OK) {
                     tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id,
                                                  conn2);
@@ -1127,9 +1134,10 @@ skip_snap:
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_APPEND_ENTRIES,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_APPEND_ENTRIES,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    3000);
     free(req_buf);
     if (rc != TSDB_OK) {
         tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id, conn);

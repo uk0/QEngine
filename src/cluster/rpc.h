@@ -153,6 +153,19 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
                        uint8_t *resp_buf, uint32_t resp_cap,
                        uint32_t *resp_len);
 
+/*
+ * Same as tsdb_rpc_call_recv but with a hard per-call socket deadline
+ * (SO_RCVTIMEO/SO_SNDTIMEO armed for the duration of the exchange,
+ * cleared after).  Used by the raft senders so a silently-dead peer
+ * cannot park the tick thread in a blocking read.  timeout_ms <= 0
+ * behaves like the plain variant.
+ */
+int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
+                          tsdb_rpc_type_t type,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint8_t *resp_buf, uint32_t resp_cap,
+                          uint32_t *resp_len, int timeout_ms);
+
 /* ---- Wire helpers (used by gossip and replica layers) -------------------- */
 
 /*

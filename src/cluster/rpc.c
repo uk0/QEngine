@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include <time.h>
 
 /* ---- CRC32 (IEEE polynomial, software) ----------------------------------- */
@@ -988,31 +989,27 @@ int tsdb_rpc_call(tsdb_rpc_conn_t *conn,
                               dummy, 1, &resp_len);
 }
 
-int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
-                       tsdb_rpc_type_t type,
-                       const uint8_t *payload, uint32_t payload_len,
-                       uint8_t *resp_buf, uint32_t resp_cap,
-                       uint32_t *resp_len)
+/* Lock-free request/response body shared by tsdb_rpc_call_recv and
+ * tsdb_rpc_call_recv_to.  Caller holds conn->lock. */
+static int call_recv_locked(tsdb_rpc_conn_t *conn,
+                            tsdb_rpc_type_t type,
+                            const uint8_t *payload, uint32_t payload_len,
+                            uint8_t *resp_buf, uint32_t resp_cap,
+                            uint32_t *resp_len)
 {
-    if (!conn) return TSDB_ERR_INVAL;
-
-    pthread_mutex_lock(&conn->lock);
-
     uint32_t req_id = conn->next_req_id++;
     size_t buf_size = TSDB_RPC_HDR_SIZE + payload_len;
     uint8_t *sendbuf = malloc(buf_size);
-    if (!sendbuf) { pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
+    if (!sendbuf) return TSDB_ERR_NOMEM;
 
     int n = tsdb_rpc_encode(sendbuf, buf_size, type, req_id, payload, payload_len);
     if (n < 0) {
         free(sendbuf);
-        pthread_mutex_unlock(&conn->lock);
         return TSDB_ERR_INTERNAL;
     }
 
     if (write_full(conn->fd, sendbuf, (size_t)n) < 0) {
         free(sendbuf);
-        pthread_mutex_unlock(&conn->lock);
         return TSDB_ERR_IO;
     }
     free(sendbuf);
@@ -1020,7 +1017,6 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     /* Read response header. */
     uint8_t hdr[TSDB_RPC_HDR_SIZE];
     if (read_full(conn->fd, hdr, TSDB_RPC_HDR_SIZE) < 0) {
-        pthread_mutex_unlock(&conn->lock);
         return TSDB_ERR_IO;
     }
 
@@ -1031,10 +1027,9 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     uint8_t *rbuf = NULL;
     if (rlen > 0) {
         rbuf = malloc(rlen);
-        if (!rbuf) { pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
+        if (!rbuf) return TSDB_ERR_NOMEM;
         if (read_full(conn->fd, rbuf, rlen) < 0) {
             free(rbuf);
-            pthread_mutex_unlock(&conn->lock);
             return TSDB_ERR_IO;
         }
     }
@@ -1042,14 +1037,14 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     /* Parse complete response frame. */
     size_t total = TSDB_RPC_HDR_SIZE + rlen;
     uint8_t *combined = malloc(total);
-    if (!combined) { free(rbuf); pthread_mutex_unlock(&conn->lock); return TSDB_ERR_NOMEM; }
+    if (!combined) { free(rbuf); return TSDB_ERR_NOMEM; }
     memcpy(combined, hdr, TSDB_RPC_HDR_SIZE);
     if (rlen > 0) memcpy(combined + TSDB_RPC_HDR_SIZE, rbuf, rlen);
     free(rbuf);
 
     tsdb_rpc_msg_t resp = {0};
     int consumed = tsdb_rpc_decode(combined, total, &resp);
-    if (consumed < 0) { free(combined); pthread_mutex_unlock(&conn->lock); return TSDB_ERR_CORRUPT; }
+    if (consumed < 0) { free(combined); return TSDB_ERR_CORRUPT; }
 
     if (resp_len) *resp_len = resp.payload_len;
     if (resp_buf && resp_cap > 0 && resp.payload_len > 0) {
@@ -1059,8 +1054,62 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
 
     int result = (resp.type == TSDB_RPC_ACK) ? TSDB_OK : TSDB_ERR_INTERNAL;
     free(combined);
-    pthread_mutex_unlock(&conn->lock);
     return result;
+}
+
+int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
+                       tsdb_rpc_type_t type,
+                       const uint8_t *payload, uint32_t payload_len,
+                       uint8_t *resp_buf, uint32_t resp_cap,
+                       uint32_t *resp_len)
+{
+    if (!conn) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&conn->lock);
+    int rc = call_recv_locked(conn, type, payload, payload_len,
+                              resp_buf, resp_cap, resp_len);
+    pthread_mutex_unlock(&conn->lock);
+    return rc;
+}
+
+/* Arm (timeout_ms > 0) or clear (timeout_ms == 0) the socket I/O
+ * deadline.  0 restores the blocking default the data path relies on. */
+static void conn_set_io_timeout(int fd, int timeout_ms) {
+    struct timeval tv = { 0, 0 };
+    if (timeout_ms > 0) {
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+    }
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* tsdb_rpc_call_recv with a hard per-call socket deadline.
+ *
+ * Pool conns are blocking sockets with no recv timeout — right for the
+ * data path (large streamed payloads under disk pressure), fatal for
+ * the raft tick thread: a peer that dies silently (container stopped,
+ * its IP simply vanishes, so no RST ever arrives) leaves write()
+ * buffering into the void and read() parked forever.  Observed live as
+ * three survivors frozen mid PreVote round after the leader was
+ * stopped — no election ever fired.  The deadline is armed and cleared
+ * under conn->lock so a concurrent data-path call never runs with our
+ * timeout in effect. */
+int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
+                          tsdb_rpc_type_t type,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint8_t *resp_buf, uint32_t resp_cap,
+                          uint32_t *resp_len, int timeout_ms)
+{
+    if (!conn) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&conn->lock);
+    conn_set_io_timeout(conn->fd, timeout_ms);
+    int rc = call_recv_locked(conn, type, payload, payload_len,
+                              resp_buf, resp_cap, resp_len);
+    conn_set_io_timeout(conn->fd, 0);
+    pthread_mutex_unlock(&conn->lock);
+    return rc;
 }
 
 /* ---- Write-batch payload encode / decode --------------------------------- */
