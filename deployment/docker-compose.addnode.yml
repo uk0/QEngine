@@ -27,7 +27,7 @@ services:
     hostname: qengine-cnode-4
     environment:
       TSDB_ROLE:                   cluster-node
-      TSDB_NODE_ROLE:              data
+      TSDB_NODE_ROLE:              master
       TSDB_CONSENSUS:              raft
       TSDB_DATA_DIR:               /var/lib/tsdb
       TSDB_BIND:                   0.0.0.0:28090
