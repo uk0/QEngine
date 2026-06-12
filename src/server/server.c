@@ -541,8 +541,18 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         return send_error(io, req_id, TSDB_ERR_NOTFOUND, "table not found");
     }
 
+    /* Also take the table's own batch lock (batch_mu).  The pool lock above
+     * only serialises wire writers against each other; the cluster RPC
+     * receiver, the influx path and the anti-entropy re-pull all serialise
+     * on batch_mu instead.  Without joining that domain, a wire write can
+     * append to the memtable while one of those callers is mid-flush, and
+     * tsdb_part_flush_ex's sorted-permutation walk runs past the row count
+     * it snapshotted — heap corruption under repair + live-write load. */
+    tsdb_table_lock_write(tbl);
+
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
+        tsdb_table_unlock_write(tbl);
         write_lock_release(&srv->write_locks, table_name);
         return send_error(io, req_id, TSDB_ERR_INTERNAL, "batch_begin failed");
     }
@@ -569,6 +579,7 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         if (col_types[c] == TSDB_TYPE_SYMBOL) {
             if (col_sizes[c] < 4) {
                 tsdb_batch_discard(batch);
+                tsdb_table_unlock_write(tbl);
                 write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "symbol col too short");
             }
@@ -578,12 +589,14 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
                 | ((uint32_t)col_data[c][3] << 24);
             if (total + 4 > col_sizes[c]) {
                 tsdb_batch_discard(batch);
+                tsdb_table_unlock_write(tbl);
                 write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "symbol total > csz");
             }
         } else {
             if (col_sizes[c] < 8 * nrows) {
                 tsdb_batch_discard(batch);
+                tsdb_table_unlock_write(tbl);
                 write_lock_release(&srv->write_locks, table_name);
                 return send_error(io, req_id, TSDB_ERR_INVAL, "col data too short");
             }
@@ -618,11 +631,13 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
 
     if (write_err != TSDB_OK) {
         tsdb_batch_discard(batch);
+        tsdb_table_unlock_write(tbl);
         write_lock_release(&srv->write_locks, table_name);
         return send_error(io, req_id, write_err, "append_bulk failed");
     }
 
     write_err = tsdb_batch_commit(batch);
+    tsdb_table_unlock_write(tbl);
     write_lock_release(&srv->write_locks, table_name);
 
     if (write_err != TSDB_OK)

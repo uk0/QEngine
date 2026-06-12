@@ -815,8 +815,20 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
      * the call is O(n); for out-of-order inserts it's a level-0 traversal
      * that yields each row in ascending ts order.  Blocks emitted below
      * inherit that order even when writes were out of sequence, which
-     * tightens per-block ts_min/ts_max zone maps. */
-    size_t *sorted_all = malloc(nrows * sizeof(size_t));
+     * tightens per-block ts_min/ts_max zone maps.
+     *
+     * Buffer is sized to the memtable's row CAPACITY, not the `nrows`
+     * snapshot above: tsdb_memtable_sorted_indices fills indices for the
+     * row count it observes under its own lock, so a writer that is not
+     * serialised against this flush can grow m->nrows in between and the
+     * walk would run past an nrows-sized buffer (glibc heap corruption
+     * under anti-entropy truncate + re-pull concurrent with live wire
+     * writes).  block_points is the hard cap on m->nrows. */
+    size_t sort_cap = (s->block_points > 0 &&
+                       s->block_points <= TSDB_BLOCK_POINTS)
+                        ? (size_t)s->block_points : (size_t)TSDB_BLOCK_POINTS;
+    if (sort_cap < nrows) sort_cap = nrows;
+    size_t *sorted_all = malloc(sort_cap * sizeof(size_t));
     if (!sorted_all) { free(days); return TSDB_ERR_NOMEM; }
     if (tsdb_memtable_sorted_indices(m, sorted_all) != TSDB_OK) {
         for (size_t i = 0; i < nrows; i++) sorted_all[i] = i;
@@ -1298,6 +1310,16 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
                                &ts_min, &ts_max, &data_size);
     (void)ts_min; (void)ts_max;
     if (rc != TSDB_OK) return rc;
+
+    /* Cross-check the header against the idx-derived meta.  The writer
+     * emits both from the same values, so a mismatch means the caller's
+     * idx snapshot is paired with a different generation of the .col
+     * file (truncate + re-pull or a compactor swap replaced the pair
+     * between the idx read and the col mmap).  out_buf is sized from
+     * meta->count; decoding header `count` values into it would overrun
+     * the heap — same class the compactor read loop already guards. */
+    if (count != meta->count || data_size != meta->size)
+        return TSDB_ERR_CORRUPT;
 
     if (off + TSDB_BLOCK_HEADER_SIZE + data_size > map_sz) return TSDB_ERR_CORRUPT;
 
