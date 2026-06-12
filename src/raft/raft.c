@@ -791,7 +791,12 @@ static int send_request_vote(tsdb_raft_t *r, uint64_t peer_id,
     int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_REQUEST_VOTE,
                                  req_buf, (uint32_t)rn,
                                  resp_buf, sizeof(resp_buf), &resp_len);
-    if (rc != TSDB_OK) return 0;
+    if (rc != TSDB_OK) {
+        /* Dead conn (peer restarted?) — evict so the next attempt
+         * re-dials instead of hitting the same poisoned socket. */
+        tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id, conn);
+        return 0;
+    }
 
     tsdb_raft_resp_vote_t resp = {0};
     if (tsdb_raft_decode_resp_vote(resp_buf, resp_len, &resp) != 0) return 0;
@@ -834,7 +839,10 @@ static int send_pre_vote(tsdb_raft_t *r, uint64_t peer_id,
     int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_PRE_VOTE,
                                  req_buf, (uint32_t)rn,
                                  resp_buf, sizeof(resp_buf), &resp_len);
-    if (rc != TSDB_OK) return 0;
+    if (rc != TSDB_OK) {
+        tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id, conn);
+        return 0;
+    }
 
     tsdb_raft_resp_vote_t resp = {0};
     if (tsdb_raft_decode_resp_vote(resp_buf, resp_len, &resp) != 0) return 0;
@@ -1019,7 +1027,11 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
                                               sbuf, (uint32_t)sn,
                                               sresp_buf, sizeof(sresp_buf),
                                               &sresp_len);
-                if (rc2 != TSDB_OK) { aborted = 1; break; }
+                if (rc2 != TSDB_OK) {
+                    tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id,
+                                                 conn2);
+                    aborted = 1; break;
+                }
 
                 tsdb_raft_resp_install_t sresp = {0};
                 if (tsdb_raft_decode_resp_install(sresp_buf, sresp_len,
@@ -1119,7 +1131,10 @@ skip_snap:
                                  req_buf, (uint32_t)rn,
                                  resp_buf, sizeof(resp_buf), &resp_len);
     free(req_buf);
-    if (rc != TSDB_OK) goto done;
+    if (rc != TSDB_OK) {
+        tsdb_replica_mgr_evict_conn(r->replica_mgr, peer_id, conn);
+        goto done;
+    }
 
     tsdb_raft_resp_append_t resp = {0};
     if (tsdb_raft_decode_resp_append(resp_buf, resp_len, &resp) != 0) goto done;
