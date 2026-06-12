@@ -57,8 +57,11 @@ static void t_solo_stays_follower(void) {
     tsdb_raft_t *r = tsdb_raft_open(dir, 42ULL, mgr, rmgr, NULL, NULL);
     assert(r);
 
-    /* Sleep past the grace period. */
-    usleep(1800 * 1000);
+    /* Sleep past the grace period plus one full election window: the
+     * tick thread keeps re-rolling the timer during grace, so the
+     * first election fires at grace + rand(ELECTION_MIN..MAX) —
+     * 1500 + 600..1200 ms with the current tunables. */
+    usleep(3000 * 1000);
 
     tsdb_raft_state_t s = tsdb_raft_state(r);
     uint64_t term = tsdb_raft_current_term(r);

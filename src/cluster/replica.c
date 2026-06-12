@@ -200,19 +200,6 @@ static void evict_one_conn(tsdb_replica_mgr_t *rmgr,
     /* DO NOT tsdb_rpc_conn_close(bad). */
 }
 
-/* Public wrapper so out-of-module callers that share the pool (the
- * Raft RPC senders) can drop a dead conn after a failed call.  Without
- * this a peer restart poisons the raft path forever: get_conn keeps
- * returning the same dead socket and the leader never re-dials —
- * observed as a follower that never receives AppendEntries after its
- * container is recreated. */
-void tsdb_replica_mgr_evict_conn(tsdb_replica_mgr_t *rmgr,
-                                  tsdb_node_id_t node_id,
-                                  tsdb_rpc_conn_t *bad)
-{
-    evict_one_conn(rmgr, node_id, bad);
-}
-
 /* ---- Replication --------------------------------------------------------- */
 
 /*
