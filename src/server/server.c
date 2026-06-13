@@ -520,8 +520,7 @@ static void do_local_write(void *arg) {
     cx->err = TSDB_OK;
     cx->msg = NULL;
 
-    /* Per-table write lock — kept for Phase 2 (uncontended under single-owner
-     * routing; removed in Phase 3 once both write paths route here). */
+    /* Per-table write lock — serialises wire writers against each other. */
     write_lock_acquire(&srv->write_locks, table_name);
 
     tsdb_table_t *tbl = NULL;
@@ -530,9 +529,18 @@ static void do_local_write(void *arg) {
         cx->err = TSDB_ERR_NOTFOUND; cx->msg = "table not found"; return;
     }
 
+    /* Also take the table's batch lock (batch_mu): the pool lock above only
+     * serialises wire writers, but the cluster RPC receiver, the influx path
+     * and the anti-entropy re-pull serialise on batch_mu instead.  Without
+     * joining that domain a wire append can race a flush from one of them,
+     * and tsdb_part_flush_ex's sort-permutation walk runs past its snapshot
+     * row count → heap corruption under repair+live-write (#162).  Released
+     * on every exit path below. */
+    tsdb_table_lock_write(tbl);
+
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
-        write_lock_release(&srv->write_locks, table_name);
+        tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
         cx->err = TSDB_ERR_INTERNAL; cx->msg = "batch_begin failed"; return;
     }
 
@@ -543,7 +551,7 @@ static void do_local_write(void *arg) {
     for (int c = 0; c < ncols; c++) {
         if (col_types[c] == TSDB_TYPE_SYMBOL) {
             if (col_sizes[c] < 4) {
-                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                tsdb_batch_discard(batch); tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
                 cx->err = TSDB_ERR_INVAL; cx->msg = "symbol col too short"; return;
             }
             uint32_t total = (uint32_t)col_data[c][0]
@@ -551,12 +559,12 @@ static void do_local_write(void *arg) {
                 | ((uint32_t)col_data[c][2] << 16)
                 | ((uint32_t)col_data[c][3] << 24);
             if (total + 4 > col_sizes[c]) {
-                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                tsdb_batch_discard(batch); tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
                 cx->err = TSDB_ERR_INVAL; cx->msg = "symbol total > csz"; return;
             }
         } else {
             if (col_sizes[c] < 8 * nrows) {
-                tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+                tsdb_batch_discard(batch); tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
                 cx->err = TSDB_ERR_INVAL; cx->msg = "col data too short"; return;
             }
         }
@@ -582,11 +590,12 @@ static void do_local_write(void *arg) {
     }
 
     if (write_err != TSDB_OK) {
-        tsdb_batch_discard(batch); write_lock_release(&srv->write_locks, table_name);
+        tsdb_batch_discard(batch); tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
         cx->err = write_err; cx->msg = "append_bulk failed"; return;
     }
 
     write_err = tsdb_batch_commit(batch);
+    tsdb_table_unlock_write(tbl);
     write_lock_release(&srv->write_locks, table_name);
     if (write_err != TSDB_OK) { cx->err = write_err; cx->msg = "batch_commit failed"; }
 }
