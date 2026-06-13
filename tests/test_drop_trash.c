@@ -72,7 +72,23 @@ int main(void) {
         tsdb_table_t *t2 = NULL;
         ASSERT(tsdb_open_table(db, "t1", &t2) != TSDB_OK);  /* no longer openable */
     }
-    printf("  drop: dir left t1's location, table not openable\n");
+    /* Read path on a dropped table must surface a CLEAN NOTFOUND, never an
+     * "internal error".  Across cluster nodes the dropped table's on-disk
+     * dir can be in different teardown states (already trashed vs. a
+     * residual half-torn schema), so exec_select must normalize ANY re-open
+     * failure to NOTFOUND rather than leaking tsdb_schema_open's specific rc
+     * (CORRUPT/IO) — otherwise the wire rc diverges per node. */
+    {
+        tsdb_result_t *qr = NULL;
+        int qrc = tsdb_query(db, "SELECT count(*) FROM t1", &qr);
+        if (qr) tsdb_result_free(qr);
+        if (qrc != TSDB_ERR_NOTFOUND) {
+            fprintf(stderr, "post-drop SELECT rc=%d (want NOTFOUND=%d)\n",
+                    qrc, TSDB_ERR_NOTFOUND);
+            FAIL("post-drop read did not return clean NOTFOUND");
+        }
+    }
+    printf("  drop: dir left t1's location, not openable, read → NOTFOUND\n");
 
     /* The bg GC reclaims .trash within a couple of seconds. */
     int reclaimed = 0;
