@@ -143,6 +143,13 @@ tsdb_iopolicy_t        tsdb_db_iopolicy(tsdb_db_t *db);
  * delta over a few-second window matters. */
 uint64_t               tsdb_db_flush_seq(tsdb_db_t *db);
 
+/* Monotonic table-set generation — bumped under db->lock on every table
+ * insert (open/create), drop detach, and ALTER ADD COLUMN.  The steady write
+ * path caches an open table handle to skip the db->lock tsdb_open_table takes
+ * per WRITE_BATCH, revalidating it against this counter (#168 lever 2).
+ * Relaxed atomic. */
+uint64_t               tsdb_db_table_set_gen(tsdb_db_t *db);
+
 /* Catalog self-heal: pull the master's catalog log files via
  * TSDB_RPC_CATALOG_DUMP and replay them locally.  Used by data
  * nodes at startup to recover from broadcast misses (crash window

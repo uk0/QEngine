@@ -124,6 +124,15 @@ struct tsdb_db {
      * Relaxed atomic: only the delta over a few-second window matters. */
     volatile uint64_t flush_seq;
 
+    /* Monotonic table-set generation — bumped under db->lock on every table
+     * INSERT (open/create), DROP detach, and ALTER ADD COLUMN.  The steady
+     * write path caches an already-open table handle to skip the db->lock that
+     * tsdb_open_table takes on EVERY WRITE_BATCH; it revalidates the cached
+     * handle by comparing this counter, so a drop/alter that could have freed
+     * or resized the table invalidates every cache without the writer touching
+     * db->lock on the hot path (#168 lever 2).  Relaxed atomic. */
+    volatile uint64_t table_set_gen;
+
     /* Detected storage class — drives write-path defaults (memtable budget,
      * compactor backoff threshold) at open time.  Detection rule lives in
      * src/storage/iopolicy.h; env vars still override individual knobs. */
@@ -728,6 +737,7 @@ static int create_table_impl(tsdb_db_t *db,
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -940,6 +950,7 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -1143,6 +1154,7 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         for (int i = idx; i < db->ntables - 1; i++)
             db->tables[i] = db->tables[i + 1];
         db->tables[--db->ntables] = NULL;
+        __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
     }
 
     pthread_mutex_unlock(&db->lock);
@@ -1478,6 +1490,7 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
 
     pthread_mutex_lock(&db->lock);
     t->altering = 0;
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* schema->cols realloced — drop cached handles */
     pthread_mutex_unlock(&db->lock);
     return rc;
 }
@@ -1557,6 +1570,11 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
 uint64_t tsdb_db_flush_seq(tsdb_db_t *db) {
     if (!db) return 0;
     return __atomic_load_n(&db->flush_seq, __ATOMIC_RELAXED);
+}
+
+uint64_t tsdb_db_table_set_gen(tsdb_db_t *db) {
+    if (!db) return 0;
+    return __atomic_load_n(&db->table_set_gen, __ATOMIC_RELAXED);
 }
 
 tsdb_iopolicy_t tsdb_db_iopolicy(tsdb_db_t *db) {
