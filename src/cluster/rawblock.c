@@ -177,9 +177,23 @@ static void rawblk_write_header(uint8_t *hdr,
 #define RAWBLK_IDX_VER         3
 #define RAWBLK_IDX_HDR_SIZE_V1 20u
 #define RAWBLK_IDX_HDR_SIZE_V2 36u
-#define RAWBLK_IDX_HDR_SIZE    40u   /* V3 */
+#define RAWBLK_IDX_HDR_SIZE    40u   /* V3 — what this path WRITES */
+#define RAWBLK_IDX_HDR_SIZE_V4 48u   /* V4 — written by the standalone WAL-redo
+                                      * flush path (max_seq tail); rawblock only
+                                      * needs to READ past it correctly */
+#define RAWBLK_IDX_HDR_SIZE_MAX 48u  /* read buffer = largest known header */
 #define RAWBLK_IDX_ENT_SIZE_V2 40u
-#define RAWBLK_IDX_ENT_SIZE    88u   /* V3 */
+#define RAWBLK_IDX_ENT_SIZE    88u   /* V3/V4 entries */
+
+/* Header byte size for a given idx version (v3 default for unknown). */
+static size_t rawblk_idx_hdr_size(uint16_t ver) {
+    switch (ver) {
+    case 1: return RAWBLK_IDX_HDR_SIZE_V1;
+    case 2: return RAWBLK_IDX_HDR_SIZE_V2;
+    case 4: return RAWBLK_IDX_HDR_SIZE_V4;
+    default: return RAWBLK_IDX_HDR_SIZE;   /* v3 */
+    }
+}
 
 static void rawblk_write_idx_header(uint8_t *buf, uint32_t count,
                                     uint64_t total_rows,
@@ -261,16 +275,14 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     {
         FILE *idx_r = fopen(idx_path, "rb");
         if (idx_r) {
-            uint8_t hdr[RAWBLK_IDX_HDR_SIZE];
-            size_t  hdr_n = fread(hdr, 1, RAWBLK_IDX_HDR_SIZE, idx_r);
+            uint8_t hdr[RAWBLK_IDX_HDR_SIZE_MAX];
+            size_t  hdr_n = fread(hdr, 1, RAWBLK_IDX_HDR_SIZE_MAX, idx_r);
             if (hdr_n >= RAWBLK_IDX_HDR_SIZE_V1
                 && rb_get_u32(hdr) == RAWBLK_IDX_MAGIC) {
                 uint32_t cnt = rb_get_u32(hdr + 4);
                 uint16_t ver = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);
-                size_t   hsz = (ver == 1) ? RAWBLK_IDX_HDR_SIZE_V1
-                             : (ver == 2) ? RAWBLK_IDX_HDR_SIZE_V2
-                                          : RAWBLK_IDX_HDR_SIZE;
-                size_t   esz = (ver == 3 && hdr_n >= RAWBLK_IDX_HDR_SIZE)
+                size_t   hsz = rawblk_idx_hdr_size(ver);
+                size_t   esz = (ver >= 3 && hdr_n >= RAWBLK_IDX_HDR_SIZE)
                                ? (size_t)((uint16_t)hdr[36]
                                           | ((uint16_t)hdr[37] << 8))
                                : (size_t)RAWBLK_IDX_ENT_SIZE_V2;
@@ -355,16 +367,14 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     {
         FILE *idx_r = fopen(idx_path, "rb");
         if (idx_r) {
-            uint8_t ih[RAWBLK_IDX_HDR_SIZE];
-            size_t  ih_n = fread(ih, 1, RAWBLK_IDX_HDR_SIZE, idx_r);
+            uint8_t ih[RAWBLK_IDX_HDR_SIZE_MAX];
+            size_t  ih_n = fread(ih, 1, RAWBLK_IDX_HDR_SIZE_MAX, idx_r);
             if (ih_n >= RAWBLK_IDX_HDR_SIZE_V1
                 && rb_get_u32(ih) == RAWBLK_IDX_MAGIC) {
                 old_count = rb_get_u32(ih + 4);
                 uint16_t ver = (uint16_t)ih[8] | ((uint16_t)ih[9] << 8);
-                size_t   hsz = (ver == 1) ? RAWBLK_IDX_HDR_SIZE_V1
-                             : (ver == 2) ? RAWBLK_IDX_HDR_SIZE_V2
-                                          : RAWBLK_IDX_HDR_SIZE;
-                size_t   esz = (ver == 3 && ih_n >= RAWBLK_IDX_HDR_SIZE)
+                size_t   hsz = rawblk_idx_hdr_size(ver);
+                size_t   esz = (ver >= 3 && ih_n >= RAWBLK_IDX_HDR_SIZE)
                                ? (size_t)((uint16_t)ih[36]
                                           | ((uint16_t)ih[37] << 8))
                                : (size_t)RAWBLK_IDX_ENT_SIZE_V2;

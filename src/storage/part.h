@@ -59,7 +59,8 @@ extern "C" {
 /* Magic constants. */
 #define TSDB_BLOCK_MAGIC  0x314B4C42u  /* "BLK1" LE */
 #define TSDB_IDX_MAGIC    0x31584449u  /* "IDX1" LE */
-#define TSDB_IDX_VERSION  3            /* writer version: v3 adds per-block column stats */
+#define TSDB_IDX_VERSION  4            /* writer version: v4 adds durable max commit-seq
+                                        * (WAL redo checkpoint); v3 added per-block stats */
 
 /* Block header on-disk size. */
 #define TSDB_BLOCK_HEADER_SIZE  32u
@@ -82,7 +83,8 @@ extern "C" {
  *        evolve without another header bump. */
 #define TSDB_IDX_HEADER_SIZE_V1  20u
 #define TSDB_IDX_HEADER_SIZE_V2  36u
-#define TSDB_IDX_HEADER_SIZE     40u   /* V3 */
+#define TSDB_IDX_HEADER_SIZE_V3  40u
+#define TSDB_IDX_HEADER_SIZE     48u   /* V4: V3 + max_seq u64 at [40..47] */
 
 /* Block index entry on-disk sizes.
  *   V1/V2 entries = 40 bytes (offset,size,count,ts_min,ts_max,bloom).
@@ -139,6 +141,25 @@ typedef struct {
 int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m);
 int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                        struct tsdb_db *db, const char *table_name);
+/*
+ * Like tsdb_part_flush_ex but stamps each written partition's idx with a
+ * durable max commit-sequence (the WAL redo checkpoint).  Every column idx
+ * published by this flush records max(existing_max_seq, max_seq), so on
+ * reopen the recovery path can skip WAL records whose seq <= that value
+ * (already durable in the partition).  Pass max_seq == 0 to leave the
+ * checkpoint untouched (used by the non-redo / default flush path).
+ */
+int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
+                        struct tsdb_db *db, const char *table_name,
+                        uint64_t max_seq);
+
+/*
+ * Read the maximum durable commit-sequence checkpoint recorded across all
+ * columns of a single partition directory (the max over every <col>.idx
+ * v4 header).  Returns 0 if the partition predates v4 (no checkpoint) or
+ * has no idx files.  Used by recovery to compute C for the WAL seq>C skip.
+ */
+uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir);
 
 /* Opaque partition handle (for reading). */
 typedef struct tsdb_part tsdb_part_t;
