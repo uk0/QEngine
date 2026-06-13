@@ -126,6 +126,8 @@ int tsdb_tls_server_ctx(const char *cert_path,
 
 int tsdb_tls_client_ctx(const char *ca_path,
                         int         skip_verify,
+                        const char *cert_path,
+                        const char *key_path,
                         tsdb_tls_ctx_t **out)
 {
     if (!out) { errno = EINVAL; return -1; }
@@ -136,6 +138,22 @@ int tsdb_tls_client_ctx(const char *ca_path,
     SSL_CTX_set_min_proto_version(cx, TLS1_2_VERSION);
     SSL_CTX_set_options(cx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
                             SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
+    /* Optional client certificate — presented when the peer runs mutual TLS. */
+    if (cert_path && *cert_path && key_path && *key_path) {
+        if (SSL_CTX_use_certificate_chain_file(cx, cert_path) != 1) {
+            log_ssl_errors("use_certificate_chain_file (client)");
+            SSL_CTX_free(cx); return -1;
+        }
+        if (SSL_CTX_use_PrivateKey_file(cx, key_path, SSL_FILETYPE_PEM) != 1) {
+            log_ssl_errors("use_PrivateKey_file (client)");
+            SSL_CTX_free(cx); return -1;
+        }
+        if (SSL_CTX_check_private_key(cx) != 1) {
+            log_ssl_errors("check_private_key (client)");
+            SSL_CTX_free(cx); return -1;
+        }
+    }
 
     if (skip_verify) {
         SSL_CTX_set_verify(cx, SSL_VERIFY_NONE, NULL);
@@ -308,8 +326,9 @@ struct tsdb_tls_conn { int _dummy; };
 int tsdb_tls_server_ctx(const char *c, const char *k, const char *ca,
                         tsdb_tls_ctx_t **o)
 { (void)c;(void)k;(void)ca;(void)o; fprintf(stderr,"[tls] mbedtls not available\n"); return -1; }
-int tsdb_tls_client_ctx(const char *ca, int sv, tsdb_tls_ctx_t **o)
-{ (void)ca;(void)sv;(void)o; fprintf(stderr,"[tls] mbedtls not available\n"); return -1; }
+int tsdb_tls_client_ctx(const char *ca, int sv, const char *cert, const char *key,
+                        tsdb_tls_ctx_t **o)
+{ (void)ca;(void)sv;(void)cert;(void)key;(void)o; fprintf(stderr,"[tls] mbedtls not available\n"); return -1; }
 void tsdb_tls_free(tsdb_tls_ctx_t *ctx) { (void)ctx; }
 int tsdb_tls_server_wrap(tsdb_tls_ctx_t *x, int fd, tsdb_tls_conn_t **o)
 { (void)x;(void)fd;(void)o; return -1; }
@@ -331,8 +350,9 @@ struct tsdb_tls_conn { int _dummy; };
 int tsdb_tls_server_ctx(const char *c, const char *k, const char *ca,
                         tsdb_tls_ctx_t **o)
 { (void)c;(void)k;(void)ca;(void)o; errno=ENOTSUP; return -1; }
-int tsdb_tls_client_ctx(const char *ca, int sv, tsdb_tls_ctx_t **o)
-{ (void)ca;(void)sv;(void)o; errno=ENOTSUP; return -1; }
+int tsdb_tls_client_ctx(const char *ca, int sv, const char *cert, const char *key,
+                        tsdb_tls_ctx_t **o)
+{ (void)ca;(void)sv;(void)cert;(void)key;(void)o; errno=ENOTSUP; return -1; }
 void tsdb_tls_free(tsdb_tls_ctx_t *ctx) { (void)ctx; }
 int tsdb_tls_server_wrap(tsdb_tls_ctx_t *x, int fd, tsdb_tls_conn_t **o)
 { (void)x;(void)fd;(void)o; errno=ENOTSUP; return -1; }
