@@ -129,7 +129,7 @@ services:
         condition: service_healthy
     environment:
       TSDB_ROLE:                   cluster-node
-      TSDB_NODE_ROLE:              data
+      TSDB_NODE_ROLE:              master
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
       TSDB_AUTH_SEED_BANNER:       "1"
@@ -192,7 +192,7 @@ services:
         condition: service_healthy
     environment:
       TSDB_ROLE:                   cluster-node
-      TSDB_NODE_ROLE:              data
+      TSDB_NODE_ROLE:              master
       TSDB_CONSENSUS:              raft
       TSDB_DASHBOARD_AUTH:         "1"
       TSDB_AUTH_SEED_BANNER:       "1"

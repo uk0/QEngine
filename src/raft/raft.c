@@ -43,11 +43,19 @@
 /* --- Tunables --------------------------------------------------------- */
 
 /* Election timeout window (ms).  Randomised per-node to avoid split
- * votes.  Must be comfortably larger than heartbeat_ms × 3. */
-static const int ELECTION_MIN_MS = 150;
-static const int ELECTION_MAX_MS = 300;
+ * votes.  Must be comfortably larger than heartbeat_ms × 3.
+ *
+ * Widened from 150-300/50: on a multi-node deployment sharing one
+ * saturated disk, fsync-bound raft log appends and scheduler hiccups
+ * routinely pushed heartbeat handling past 300 ms and the cluster
+ * churned through elections while perfectly healthy (terms climbed by
+ * the dozens per minute under anti-entropy I/O).  600-1200/150 keeps
+ * failover detection ~1 s — far inside any operational budget — while
+ * tolerating real-world stalls. */
+static const int ELECTION_MIN_MS = 600;
+static const int ELECTION_MAX_MS = 1200;
 /* Heartbeat interval (ms) while leader. */
-static const int HEARTBEAT_MS    = 50;
+static const int HEARTBEAT_MS    = 150;
 
 /* Max masters we track at once.  Catalog consensus clusters are
  * almost always 3 or 5 nodes — picking something well above typical
@@ -110,6 +118,13 @@ struct tsdb_raft {
     tsdb_raft_snapshot_write_fn   snap_write_fn;
     tsdb_raft_snapshot_restore_fn snap_restore_fn;
     void                         *snap_ud;
+
+    /* Raft-private peer connections (see raft_conn_get below). */
+    pthread_mutex_t    conn_lock;
+    struct {
+        uint64_t         id;
+        tsdb_rpc_conn_t *conn;
+    }                  rconns[MAX_PEERS];
 
     /* Tick thread control. */
     pthread_t          tick_thread;
@@ -766,6 +781,71 @@ static int on_install_snapshot(void *ud,
     return 0;
 }
 
+/* --- Raft-private peer connections ------------------------------------
+ *
+ * Raft control RPCs used to ride the shared replica pool
+ * (tsdb_replica_mgr_get_conn).  Each pool conn also carries bulk data —
+ * WRITE_BATCH fanout, anti-entropy READ_BLOCK streams — and both ends
+ * serialise per conn, so under disk pressure a heartbeat queued behind
+ * a multi-MB transfer routinely overshot the election window and the
+ * cluster churned through elections while perfectly healthy.  Raft
+ * traffic is tiny and latency-critical: give it a dedicated conn per
+ * peer.  Eviction mirrors replica.c's evict_one_conn: clear the slot so
+ * the next get re-dials, intentionally leak the object (an in-flight
+ * caller may still hold conn->lock). */
+static tsdb_rpc_conn_t *raft_conn_get(tsdb_raft_t *r, uint64_t peer_id) {
+    pthread_mutex_lock(&r->conn_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (r->rconns[i].id == peer_id && r->rconns[i].conn) {
+            tsdb_rpc_conn_t *c = r->rconns[i].conn;
+            pthread_mutex_unlock(&r->conn_lock);
+            return c;
+        }
+    }
+    pthread_mutex_unlock(&r->conn_lock);
+
+    /* Resolve the peer's RPC address from gossip and dial outside the
+     * lock (connect can block up to its own timeout). */
+    tsdb_node_info_t info;
+    if (tsdb_node_manager_get(r->node_mgr, peer_id, &info) < 0) return NULL;
+    tsdb_rpc_conn_t *nc = tsdb_rpc_connect(info.addr, 2000);
+    if (!nc) return NULL;
+
+    pthread_mutex_lock(&r->conn_lock);
+    /* Another thread may have dialed the same peer while we did. */
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (r->rconns[i].id == peer_id && r->rconns[i].conn) {
+            tsdb_rpc_conn_t *c = r->rconns[i].conn;
+            pthread_mutex_unlock(&r->conn_lock);
+            tsdb_rpc_conn_close(nc);
+            return c;
+        }
+    }
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (r->rconns[i].conn == NULL) {
+            r->rconns[i].id   = peer_id;
+            r->rconns[i].conn = nc;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&r->conn_lock);
+    return nc;
+}
+
+static void raft_conn_evict(tsdb_raft_t *r, uint64_t peer_id,
+                             tsdb_rpc_conn_t *bad)
+{
+    if (!bad) return;
+    pthread_mutex_lock(&r->conn_lock);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (r->rconns[i].id == peer_id && r->rconns[i].conn == bad) {
+            r->rconns[i].conn = NULL;  /* next get re-dials; leak `bad` */
+            break;
+        }
+    }
+    pthread_mutex_unlock(&r->conn_lock);
+}
+
 /* --- Outgoing election: send RequestVote to every peer -------------- */
 
 /* Send RequestVote to peer_id and merge the response.  May cause us
@@ -782,16 +862,24 @@ static int send_request_vote(tsdb_raft_t *r, uint64_t peer_id,
     int rn = tsdb_raft_encode_req_vote(req_buf, sizeof(req_buf), &req);
     if (rn <= 0) return 0;
 
-    /* Grab a connection from the replica pool (shared with data path). */
-    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+    tsdb_rpc_conn_t *conn = raft_conn_get(r, peer_id);
     if (!conn) return 0;
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_REQUEST_VOTE,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
-    if (rc != TSDB_OK) return 0;
+    /* Hard 1 s deadline: a silently-dead peer (stopped container — no
+     * RST, write buffers, read blocks) must not park the tick thread;
+     * that froze every survivor's election after a leader kill. */
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_REQUEST_VOTE,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    1000);
+    if (rc != TSDB_OK) {
+        /* Dead conn (peer restarted?) — evict so the next attempt
+         * re-dials instead of hitting the same poisoned socket. */
+        raft_conn_evict(r, peer_id, conn);
+        return 0;
+    }
 
     tsdb_raft_resp_vote_t resp = {0};
     if (tsdb_raft_decode_resp_vote(resp_buf, resp_len, &resp) != 0) return 0;
@@ -826,15 +914,19 @@ static int send_pre_vote(tsdb_raft_t *r, uint64_t peer_id,
     int rn = tsdb_raft_encode_req_vote(req_buf, sizeof(req_buf), &req);
     if (rn <= 0) return 0;
 
-    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+    tsdb_rpc_conn_t *conn = raft_conn_get(r, peer_id);
     if (!conn) return 0;
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_PRE_VOTE,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
-    if (rc != TSDB_OK) return 0;
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_PRE_VOTE,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    1000);
+    if (rc != TSDB_OK) {
+        raft_conn_evict(r, peer_id, conn);
+        return 0;
+    }
 
     tsdb_raft_resp_vote_t resp = {0};
     if (tsdb_raft_decode_resp_vote(resp_buf, resp_len, &resp) != 0) return 0;
@@ -1008,18 +1100,22 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
                              sbuf, INSTALL_HDR_MAX + take, &sreq);
                 if (sn <= 0) { aborted = 1; break; }
 
-                tsdb_rpc_conn_t *conn2 =
-                    tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+                tsdb_rpc_conn_t *conn2 = raft_conn_get(r, peer_id);
                 if (!conn2) { aborted = 1; break; }
 
                 uint8_t sresp_buf[32];
                 uint32_t sresp_len = 0;
-                int rc2 = tsdb_rpc_call_recv(conn2,
-                                              TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
-                                              sbuf, (uint32_t)sn,
-                                              sresp_buf, sizeof(sresp_buf),
-                                              &sresp_len);
-                if (rc2 != TSDB_OK) { aborted = 1; break; }
+                /* 5 s: the peer stages the 64 KB chunk to disk before
+                 * ACKing, so leave headroom over the vote/AE deadline. */
+                int rc2 = tsdb_rpc_call_recv_to(conn2,
+                                                 TSDB_RPC_RAFT_INSTALL_SNAPSHOT,
+                                                 sbuf, (uint32_t)sn,
+                                                 sresp_buf, sizeof(sresp_buf),
+                                                 &sresp_len, 5000);
+                if (rc2 != TSDB_OK) {
+                    raft_conn_evict(r, peer_id, conn2);
+                    aborted = 1; break;
+                }
 
                 tsdb_raft_resp_install_t sresp = {0};
                 if (tsdb_raft_decode_resp_install(sresp_buf, sresp_len,
@@ -1110,16 +1206,20 @@ skip_snap:
     int rn = tsdb_raft_encode_req_append(req_buf, bcap, &req);
     if (rn <= 0) { free(req_buf); goto done; }
 
-    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(r->replica_mgr, peer_id);
+    tsdb_rpc_conn_t *conn = raft_conn_get(r, peer_id);
     if (!conn) { free(req_buf); goto done; }
 
     uint8_t resp_buf[32];
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_RAFT_APPEND_ENTRIES,
-                                 req_buf, (uint32_t)rn,
-                                 resp_buf, sizeof(resp_buf), &resp_len);
+    int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAFT_APPEND_ENTRIES,
+                                    req_buf, (uint32_t)rn,
+                                    resp_buf, sizeof(resp_buf), &resp_len,
+                                    3000);
     free(req_buf);
-    if (rc != TSDB_OK) goto done;
+    if (rc != TSDB_OK) {
+        raft_conn_evict(r, peer_id, conn);
+        goto done;
+    }
 
     tsdb_raft_resp_append_t resp = {0};
     if (tsdb_raft_decode_resp_append(resp_buf, resp_len, &resp) != 0) goto done;
@@ -1411,6 +1511,7 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
     tsdb_raft_t *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     pthread_mutex_init(&r->lock, NULL);
+    pthread_mutex_init(&r->conn_lock, NULL);
     pthread_cond_init(&r->commit_cv, NULL);
 
     r->self_id     = local_id;
@@ -1500,6 +1601,13 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     tsdb_raft_config_close(r->config);
     tsdb_raft_log_close(r->log);
     pthread_cond_destroy(&r->commit_cv);
+    /* Close raft-private peer conns.  Tick + apply are joined; any
+     * conn still referenced by a straggling propose caller was evicted
+     * (slot==NULL) rather than left here, so these are quiescent. */
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (r->rconns[i].conn) tsdb_rpc_conn_close(r->rconns[i].conn);
+    }
+    pthread_mutex_destroy(&r->conn_lock);
     pthread_mutex_destroy(&r->lock);
     free(r);
 }
