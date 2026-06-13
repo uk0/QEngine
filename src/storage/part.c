@@ -322,6 +322,9 @@ static size_t write_idx_entry(uint8_t *buf,
 typedef struct {
     FILE    *col_fp;
     uint64_t col_offset;
+    uint64_t col_start_offset;  /* .col EOF at open — rollback point on a
+                                   failed flush (e.g. ENOSPC) so a partial
+                                   append leaves no orphan block behind */
     uint32_t block_count;
     uint64_t total_rows;
 
@@ -337,6 +340,7 @@ typedef struct {
     size_t   idx_n;
 
     char     idx_path[4096];
+    char     col_path[4096];   /* for rollback-by-path on a failed close */
 
     /* Raw-block hook (optional, set by tsdb_part_flush_ex). */
     part_raw_block_fn_t  raw_block_fn;
@@ -351,13 +355,12 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
                            const char *col_name)
 {
     memset(w, 0, sizeof(*w));
-    char col_path[4096];
 
-    snprintf(col_path,    sizeof(col_path),    "%s/%s.col", part_dir, col_name);
+    snprintf(w->col_path, sizeof(w->col_path), "%s/%s.col", part_dir, col_name);
     snprintf(w->idx_path, sizeof(w->idx_path), "%s/%s.idx", part_dir, col_name);
 
     /* Open .col for appending. */
-    w->col_fp = fopen(col_path, "ab");
+    w->col_fp = fopen(w->col_path, "ab");
     if (!w->col_fp) return TSDB_ERR_IO;
 
     /* On HDD, coalesce write syscalls with a larger stdio buffer.  Each
@@ -374,7 +377,8 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     }
 
     fseek(w->col_fp, 0, SEEK_END);
-    w->col_offset = (uint64_t)ftell(w->col_fp);
+    w->col_offset       = (uint64_t)ftell(w->col_fp);
+    w->col_start_offset = w->col_offset;   /* rollback point on failure */
 
     /* Read existing idx header to prime block_count, total_rows, and the
      * file-level zone map (v2 only). */
@@ -627,6 +631,35 @@ static int col_writer_write_block(col_writer_t *w,
     return TSDB_OK;
 }
 
+/*
+ * Abort a column writer after a failed flush (e.g. ENOSPC mid-write).
+ * Rolls the .col file back to the EOF it had at open and closes WITHOUT
+ * publishing the idx, so the on-disk state is byte-identical to before this
+ * flush started — no orphan/partial block is left behind.  Without this, a
+ * partial append leaks dead bytes into the .col on every failed flush; under
+ * sustained disk-full retries those orphans accumulate and consume the very
+ * space that is already scarce.
+ *
+ * The .col was opened append-only ("ab"), so the appended bytes are this
+ * flush's alone; truncating to col_start_offset removes exactly them.  The
+ * idx is never touched, so a reader (which enumerates blocks via the ts
+ * column's idx) sees the unchanged pre-flush picture.
+ */
+static void col_writer_abort(col_writer_t *w) {
+    if (w->col_fp) {
+        int fd = fileno(w->col_fp);
+        /* Drop buffered (un-written) bytes, then truncate back to pre-flush
+         * length.  Either step failing is non-fatal: the worst case is the
+         * pre-existing orphan-block behaviour, never worse. */
+        (void)fflush(w->col_fp);
+        if (fd >= 0) (void)ftruncate(fd, (off_t)w->col_start_offset);
+        fclose(w->col_fp);
+        w->col_fp = NULL;
+    }
+    free(w->idx_entries);
+    w->idx_entries = NULL;
+}
+
 static int col_writer_close(col_writer_t *w) {
     int rc = TSDB_OK;
 
@@ -752,6 +785,15 @@ static int col_writer_close(col_writer_t *w) {
 
     free(w->idx_entries);
     w->idx_entries = NULL;
+
+    /* Failed close (final col fflush or idx publish failed, e.g. ENOSPC):
+     * roll the .col back to its pre-flush length.  col_fp is already closed,
+     * so truncate by path.  This removes the blocks this flush appended whose
+     * idx was never published, keeping the partition byte-identical to before
+     * the flush (no orphan-block accumulation under disk-full retries). */
+    if (rc != TSDB_OK)
+        (void)truncate(w->col_path, (off_t)w->col_start_offset);
+
     return rc;
 }
 
@@ -976,7 +1018,7 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
 
                 uint8_t *chunk_buf = malloc(chunk * width);
                 if (!chunk_buf) {
-                    col_writer_close(&w);
+                    col_writer_abort(&w);
                     free(row_idx); free(days); free(sorted_all);
                     return TSDB_ERR_NOMEM;
                 }
@@ -1006,7 +1048,7 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                                             ts_min, ts_max);
                 free(chunk_buf);
                 if (rc != TSDB_OK) {
-                    col_writer_close(&w);
+                    col_writer_abort(&w);
                     free(row_idx); free(days); free(sorted_all);
                     return rc;
                 }
