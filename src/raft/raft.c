@@ -63,6 +63,12 @@ typedef struct {
      * starts at last_log_index+1 after winning; shrinks on mismatch. */
     uint64_t next_index;
     uint64_t match_index;
+    /* CLOCK_MONOTONIC stamp of the last SUCCESSFUL AppendEntries reply
+     * from this peer (etcd-style CheckQuorum, §6.2 leader liveness).
+     * Reset to "now" when we become leader so a freshly elected leader
+     * gets a full election timeout before the first quorum check fires.
+     * Left at 0 for a peer we have never heard back from. */
+    int64_t  last_ack_ns;
 } peer_t;
 
 struct tsdb_raft {
@@ -89,6 +95,16 @@ struct tsdb_raft {
     /* Peer table (rebuilt from node_mgr each tick) */
     peer_t             peers[MAX_PEERS];
     int                npeers;
+
+    /* Count of replicate_to() RPCs currently in flight (the wire call
+     * runs with r->lock dropped).  Incremented under the lock right
+     * before the RPC, decremented under the lock once the response is
+     * merged.  tsdb_raft_propose consults it on timeout: it will only
+     * truncate its un-acked tail when NO replication is in flight, so a
+     * peer cannot be silently holding the entry without it being
+     * reflected in match_index — see the propose timeout path for the
+     * Log-Matching safety argument. */
+    int                replicating;
 
     /* Timers, all measured against CLOCK_MONOTONIC. */
     int64_t            election_deadline_ns;
@@ -256,6 +272,7 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
                 r->peers[k].id          = mems[i].id;
                 r->peers[k].next_index  = tsdb_raft_log_last_index(r->log) + 1;
                 r->peers[k].match_index = 0;
+                r->peers[k].last_ack_ns = 0;
                 k++;
             }
         }
@@ -279,6 +296,7 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
             r->peers[k].id          = snap[i].id;
             r->peers[k].next_index  = tsdb_raft_log_last_index(r->log) + 1;
             r->peers[k].match_index = 0;
+            r->peers[k].last_ack_ns = 0;
             k++;
         }
     }
@@ -336,11 +354,15 @@ static void become_candidate_locked(tsdb_raft_t *r) {
 static void become_leader_locked(tsdb_raft_t *r) {
     r->state     = TSDB_RAFT_LEADER;
     r->leader_id = r->self_id;
-    /* Reset per-peer replication state. */
+    /* Reset per-peer replication state.  Seed last_ack_ns to now so the
+     * CheckQuorum sweep grants the new leader a full election timeout
+     * before it can step down for lack of contact (§6.2). */
     uint64_t last = tsdb_raft_log_last_index(r->log);
+    int64_t  now  = now_ns();
     for (int i = 0; i < r->npeers; i++) {
         r->peers[i].next_index  = last + 1;
         r->peers[i].match_index = 0;
+        r->peers[i].last_ack_ns = now;
     }
     bump_heartbeat_deadline(r);
 
@@ -896,6 +918,41 @@ static void run_election_unlocked(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
 }
 
+/* --- CheckQuorum (leader only, §6.2) ---------------------------------
+ *
+ * etcd-style leader liveness: a partitioned leader that can no longer
+ * reach a quorum must relinquish leadership instead of serving stale
+ * reads forever.  We count ourselves plus every peer that ACKed an
+ * AppendEntries within the last election timeout; if that tally drops
+ * below quorum we step down to follower at the CURRENT term (no term
+ * bump — a higher-term message will still step us down via the normal
+ * path, and bumping here would needlessly disrupt a peer that is about
+ * to win an election).
+ *
+ * Safety: stepping down can never violate Leader Append-Only or Log
+ * Matching — it only makes this node STOP acting as leader, so it can
+ * no longer append or advance commit.  It is purely a liveness/freshness
+ * improvement.  Called under r->lock from the tick thread. */
+static void check_quorum_locked(tsdb_raft_t *r) {
+    if (r->state != TSDB_RAFT_LEADER) return;
+    int64_t now     = now_ns();
+    int64_t horizon = ms_to_ns(r->election_timeout_ms);
+    int alive = 1; /* self always counts */
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].last_ack_ns != 0 &&
+            now - r->peers[i].last_ack_ns <= horizon) {
+            alive++;
+        }
+    }
+    if (alive < quorum_needed(r)) {
+        /* Lost contact with a quorum — demote.  leader_id=0 so clients
+         * stop being told we're the leader; reset_election_timer (inside
+         * become_follower_locked) gives surviving peers time to elect a
+         * new leader without us immediately disrupting them. */
+        become_follower_locked(r, tsdb_raft_log_current_term(r->log), 0);
+    }
+}
+
 /* --- Commit advance (leader only) ------------------------------------
  *
  * After any matchIndex update, sweep the range [commit_index+1,
@@ -1094,6 +1151,12 @@ skip_snap:
             entries[i] = tmp; /* payload malloc'd by log_read */
         }
     }
+    /* Mark an AppendEntries carrying real entries as in flight so a
+     * concurrent propose-timeout won't truncate an index this RPC may
+     * already be delivering to the peer.  Heartbeats (n_send==0) carry
+     * nothing to resurrect, so they don't need the guard. */
+    int counted = 0;
+    if (n_send > 0) { r->replicating++; counted = 1; }
     pthread_mutex_unlock(&r->lock);
 
     tsdb_raft_req_append_t req = {
@@ -1140,6 +1203,9 @@ skip_snap:
         goto done;
     }
     if (resp.success) {
+        /* Heard back from this peer — refresh its CheckQuorum stamp so
+         * it counts toward leader liveness (§6.2). */
+        r->peers[new_idx].last_ack_ns = now_ns();
         uint64_t new_match = prev_idx + n_send;
         if (new_match > r->peers[new_idx].match_index)
             r->peers[new_idx].match_index = new_match;
@@ -1156,6 +1222,11 @@ skip_snap:
     pthread_mutex_unlock(&r->lock);
 
 done:
+    if (counted) {
+        pthread_mutex_lock(&r->lock);
+        if (r->replicating > 0) r->replicating--;
+        pthread_mutex_unlock(&r->lock);
+    }
     if (entries) {
         for (uint32_t i = 0; i < n_send; i++) free(entries[i].payload);
         free(entries);
@@ -1332,6 +1403,28 @@ static void *tick_thread_main(void *arg) {
          * normal replication.  See become_leader_locked() for the
          * flag that kicks this off. */
         if (st == TSDB_RAFT_LEADER) {
+            /* CheckQuorum (§6.2): once per election timeout, verify we
+             * still hear from a quorum.  If not, step down so a
+             * partitioned leader can't keep serving stale reads.  Reuse
+             * the election deadline as the cadence; reset it after the
+             * check so it fires roughly every election timeout while we
+             * remain leader. */
+            if (now >= ed) {
+                pthread_mutex_lock(&r->lock);
+                check_quorum_locked(r);
+                if (r->state == TSDB_RAFT_LEADER) reset_election_timer(r);
+                tsdb_raft_state_t after = r->state;
+                pthread_mutex_unlock(&r->lock);
+                if (after != TSDB_RAFT_LEADER) {
+                    /* Stepped down — skip the heartbeat sweep this tick;
+                     * the follower branch takes over next iteration. */
+                    struct timespec ts = { .tv_sec = 0,
+                                           .tv_nsec = 10 * 1000000 };
+                    nanosleep(&ts, NULL);
+                    continue;
+                }
+            }
+
             drive_pending_noop(r);
             drive_pending_seed(r);
 
@@ -1864,7 +1957,52 @@ int tsdb_raft_propose(tsdb_raft_t *r,
     while (r->last_applied < my_index) {
         if (r->state != TSDB_RAFT_LEADER) { rc = TSDB_ERR_PERMISSION; break; }
         int w = pthread_cond_timedwait(&r->commit_cv, &r->lock, &deadline);
-        if (w == ETIMEDOUT) { rc = TSDB_ERR_IO; break; }
+        if (w == ETIMEDOUT) {
+            /* BUG-1: the entry never committed within the deadline.  We
+             * must NOT report a plain failure while leaving a possibly-
+             * replicated entry in the log — that "phantom DDL" lies to
+             * the client (it later commits when quorum returns).
+             *
+             * Two cases, both preserving Leader Append-Only:
+             *
+             *  (a) Provably un-replicated.  Still leader (so still our
+             *      term — a term change would have flipped state away
+             *      from LEADER), the entry is still uncommitted, it is
+             *      the very tail (my_index == last_index, so we are not
+             *      stranding any later proposal's entries), NO peer has
+             *      acked it (match_index < my_index for all), AND no
+             *      AppendEntries carrying entries is in flight
+             *      (r->replicating == 0).  Together the last two prove
+             *      no follower holds the entry: a follower only gets it
+             *      via a replicate_to that either finished (→ match_index
+             *      bumped, excluded) or is still mid-RPC (→ replicating
+             *      > 0, excluded).  Truncating our own un-replicated tail
+             *      cannot violate Log Matching (no other log has the
+             *      index) and is the standard safe rollback.  Return a
+             *      definitive failure.
+             *
+             *  (b) Otherwise it MAY have replicated/committed.  Leave the
+             *      log untouched (Leader Append-Only) and return a
+             *      distinct INDETERMINATE status so the caller retries
+             *      idempotently instead of assuming failure. */
+            uint64_t last_idx = tsdb_raft_log_last_index(r->log);
+            int replicated = 0;
+            for (int i = 0; i < r->npeers; i++) {
+                if (r->peers[i].match_index >= my_index) { replicated = 1; break; }
+            }
+            if (r->state == TSDB_RAFT_LEADER &&
+                r->commit_index < my_index &&
+                my_index == last_idx &&
+                !replicated &&
+                r->replicating == 0)
+            {
+                (void)tsdb_raft_log_truncate(r->log, my_index);
+                rc = TSDB_ERR_IO;          /* definitive: write did NOT apply */
+            } else {
+                rc = TSDB_ERR_INDETERMINATE; /* unknown: may commit later */
+            }
+            break;
+        }
     }
     /* Surface apply outcome.  Best-effort: if the slot was overwritten
      * by a later apply (in-flight count > ring size) we conservatively
