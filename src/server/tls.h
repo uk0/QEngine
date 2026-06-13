@@ -17,7 +17,7 @@
  *   5. tsdb_tls_free(ctx)    on server shutdown.
  *
  * Lifecycle (client side):
- *   1. tsdb_tls_client_ctx(ca, skip_verify) → ctx
+ *   1. tsdb_tls_client_ctx(ca, skip_verify, cert, key) → ctx
  *   2. tsdb_tls_client_wrap(ctx, fd, hostname) → conn
  *   3. Use tsdb_tls_read / tsdb_tls_write.
  *   4. tsdb_tls_close(conn)
@@ -81,10 +81,15 @@ int tsdb_tls_server_ctx(const char *cert_path,
  * Create a client-side TLS context.
  *   ca_path      — PEM CA bundle (NULL = use system default)
  *   skip_verify  — non-zero to disable certificate verification (insecure)
+ *   cert_path    — PEM client certificate to present (NULL = none); required
+ *                  to authenticate against a peer running mutual TLS.
+ *   key_path     — PEM private key matching cert_path (NULL = none).
  * Returns 0 on success, -1 on error.
  */
 int tsdb_tls_client_ctx(const char *ca_path,
                         int         skip_verify,
+                        const char *cert_path,
+                        const char *key_path,
                         tsdb_tls_ctx_t **out);
 
 /* Free a TLS context.  Safe to call with NULL. */

@@ -11,6 +11,7 @@
 #include "../storage/memtable.h"
 #include "../federation/fedrpc.h"
 #include "../server/metrics.h"
+#include "../server/tls.h"
 #include "../compress/lzlite.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,22 +163,83 @@ static int parse_addr(const char *addr, char *host_out, size_t host_cap, int *po
     return 0;
 }
 
-/* Full read: keep going until all bytes received or error. */
-static int read_full(int fd, uint8_t *buf, size_t len) {
+/* ---- Optional mutual TLS for the inter-node RPC channel ------------------
+ *
+ * Off by default: when TSDB_RPC_TLS is unset the int-fd plaintext path below
+ * runs unchanged (byte-identical to before this feature).  When set, each
+ * accepted peer fd is wrapped server-side (require + verify the client cert
+ * against the CA) and each tsdb_rpc_connect wraps its fd client-side,
+ * presenting the configured cert.  Reuses src/server/tls.c primitives.
+ *
+ *   TSDB_RPC_TLS=1                 enable
+ *   TSDB_RPC_TLS_CERT=<pem>        this node's certificate (chain)
+ *   TSDB_RPC_TLS_KEY=<pem>         matching private key
+ *   TSDB_RPC_TLS_CA=<pem>          CA that signed peer certs (mutual verify)
+ *   TSDB_RPC_TLS_SKIP_VERIFY=1     client skips cert verification (bootstrap)
+ */
+static int rpc_tls_enabled(void) {
+    const char *e = getenv("TSDB_RPC_TLS");
+    return (e && *e && e[0] != '0') ? 1 : 0;
+}
+
+static pthread_once_t   rpc_tls_srv_once = PTHREAD_ONCE_INIT;
+static pthread_once_t   rpc_tls_cli_once = PTHREAD_ONCE_INIT;
+static tsdb_tls_ctx_t  *rpc_tls_srv_ctx  = NULL;
+static tsdb_tls_ctx_t  *rpc_tls_cli_ctx  = NULL;
+
+static void rpc_tls_srv_init(void) {
+    const char *cert = getenv("TSDB_RPC_TLS_CERT");
+    const char *key  = getenv("TSDB_RPC_TLS_KEY");
+    const char *ca   = getenv("TSDB_RPC_TLS_CA");
+    if (!cert || !*cert || !key || !*key) {
+        fprintf(stderr, "[rpc] TSDB_RPC_TLS set but CERT/KEY missing\n");
+        return;
+    }
+    /* ca non-NULL → server requires + verifies the client cert (mutual). */
+    if (tsdb_tls_server_ctx(cert, key, ca, &rpc_tls_srv_ctx) != 0)
+        rpc_tls_srv_ctx = NULL;
+}
+
+static void rpc_tls_cli_init(void) {
+    const char *cert = getenv("TSDB_RPC_TLS_CERT");
+    const char *key  = getenv("TSDB_RPC_TLS_KEY");
+    const char *ca   = getenv("TSDB_RPC_TLS_CA");
+    const char *sv   = getenv("TSDB_RPC_TLS_SKIP_VERIFY");
+    int skip = (sv && *sv && sv[0] != '0') ? 1 : 0;
+    if (tsdb_tls_client_ctx(ca, skip, cert, key, &rpc_tls_cli_ctx) != 0)
+        rpc_tls_cli_ctx = NULL;
+}
+
+static tsdb_tls_ctx_t *rpc_tls_server_ctx(void) {
+    pthread_once(&rpc_tls_srv_once, rpc_tls_srv_init);
+    return rpc_tls_srv_ctx;
+}
+
+static tsdb_tls_ctx_t *rpc_tls_client_ctx(void) {
+    pthread_once(&rpc_tls_cli_once, rpc_tls_cli_init);
+    return rpc_tls_cli_ctx;
+}
+
+/* Full read: keep going until all bytes received or error.
+ * tls != NULL routes through the TLS connection; NULL is the plain fd path. */
+static int read_full(int fd, tsdb_tls_conn_t *tls, uint8_t *buf, size_t len) {
     size_t done = 0;
     while (done < len) {
-        ssize_t r = read(fd, buf + done, len - done);
+        ssize_t r = tls ? tsdb_tls_read(tls, buf + done, len - done)
+                        : read(fd, buf + done, len - done);
         if (r <= 0) return -1;
         done += (size_t)r;
     }
     return 0;
 }
 
-/* Full write: keep going until all bytes sent or error. */
-static int write_full(int fd, const uint8_t *buf, size_t len) {
+/* Full write: keep going until all bytes sent or error.
+ * tls != NULL routes through the TLS connection; NULL is the plain fd path. */
+static int write_full(int fd, tsdb_tls_conn_t *tls, const uint8_t *buf, size_t len) {
     size_t done = 0;
     while (done < len) {
-        ssize_t w = write(fd, buf + done, len - done);
+        ssize_t w = tls ? tsdb_tls_write(tls, buf + done, len - done)
+                        : write(fd, buf + done, len - done);
         if (w <= 0) return -1;
         done += (size_t)w;
     }
@@ -185,8 +247,21 @@ static int write_full(int fd, const uint8_t *buf, size_t len) {
 }
 
 /* Full writev: drain all iovecs, advancing past whatever a short write
- * consumed.  EINTR-safe (retries), same error contract as write_full. */
-static int writev_all(int fd, struct iovec *iov, int iovcnt) {
+ * consumed.  EINTR-safe (retries), same error contract as write_full.
+ *
+ * TLS has no scatter-write primitive, so when tls != NULL each iov segment
+ * is sent in order via write_full (TLS framing makes the on-wire bytes
+ * differ from plaintext writev anyway — the decoded frame is identical).
+ * tls == NULL keeps the exact single-writev plaintext path. */
+static int writev_all(int fd, tsdb_tls_conn_t *tls, struct iovec *iov, int iovcnt) {
+    if (tls) {
+        for (int i = 0; i < iovcnt; i++) {
+            if (write_full(fd, tls, (const uint8_t *)iov[i].iov_base,
+                           iov[i].iov_len) < 0)
+                return -1;
+        }
+        return 0;
+    }
     while (iovcnt > 0) {
         ssize_t w = writev(fd, iov, iovcnt);
         if (w < 0) {
@@ -241,10 +316,11 @@ static void encode_header(uint8_t hdr[TSDB_RPC_HDR_SIZE],
 /* ---- Per-connection handler ---------------------------------------------- */
 
 /* Recv a complete frame into caller-allocated buffer. */
-static int recv_frame(int fd, uint8_t *hdr_buf, uint8_t **payload_out,
+static int recv_frame(int fd, tsdb_tls_conn_t *tls, uint8_t *hdr_buf,
+                      uint8_t **payload_out,
                       uint32_t *payload_len_out, tsdb_rpc_msg_t *msg)
 {
-    if (read_full(fd, hdr_buf, TSDB_RPC_HDR_SIZE) < 0) return -1;
+    if (read_full(fd, tls, hdr_buf, TSDB_RPC_HDR_SIZE) < 0) return -1;
 
     uint32_t magic;
     memcpy(&magic, hdr_buf, 4);
@@ -260,7 +336,7 @@ static int recv_frame(int fd, uint8_t *hdr_buf, uint8_t **payload_out,
     uint8_t *combined = malloc(total);
     if (!combined) return -1;
     memcpy(combined, hdr_buf, TSDB_RPC_HDR_SIZE);
-    if (plen > 0 && read_full(fd, combined + TSDB_RPC_HDR_SIZE, plen) < 0) {
+    if (plen > 0 && read_full(fd, tls, combined + TSDB_RPC_HDR_SIZE, plen) < 0) {
         free(combined);
         return -1;
     }
@@ -289,20 +365,22 @@ static int recv_frame(int fd, uint8_t *hdr_buf, uint8_t **payload_out,
  * Heap-allocate when the body doesn't fit the stack buffer; fall back
  * to a silent no-op on malloc failure so a memory-pressured master
  * doesn't double-fault writing a partial frame. */
-static void send_reply(int fd, tsdb_rpc_type_t type, uint32_t req_id,
+static void send_reply(int fd, tsdb_tls_conn_t *tls, tsdb_rpc_type_t type,
+                       uint32_t req_id,
                        const uint8_t *body, uint32_t body_len) {
     uint8_t small[TSDB_RPC_HDR_SIZE + 64];
     size_t  cap = TSDB_RPC_HDR_SIZE + body_len;
     uint8_t *buf = (cap <= sizeof(small)) ? small : malloc(cap);
     if (!buf) return;
     int n = tsdb_rpc_encode(buf, cap, type, req_id, body, body_len);
-    if (n > 0) write_full(fd, buf, (size_t)n);
+    if (n > 0) write_full(fd, tls, buf, (size_t)n);
     if (buf != small) free(buf);
 }
 
 /* Server handler args. */
 typedef struct {
     int                  fd;
+    tsdb_tls_conn_t     *tls;   /* NULL → plaintext (default) */
     tsdb_db_t           *db;
     tsdb_node_manager_t *node_mgr;
     struct tsdb_rpc_server *srv;   /* for live-connection tracking */
@@ -392,6 +470,7 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
 static void *connection_handler(void *arg) {
     handler_args_t *ha = (handler_args_t *)arg;
     int fd = ha->fd;
+    tsdb_tls_conn_t *tls = ha->tls;
     tsdb_db_t *db = ha->db;
     tsdb_node_manager_t *node_mgr = ha->node_mgr;
     struct tsdb_rpc_server *srv = ha->srv;
@@ -404,7 +483,7 @@ static void *connection_handler(void *arg) {
         uint32_t plen     = 0;
         tsdb_rpc_msg_t msg = {0};
 
-        if (recv_frame(fd, hdr_buf, &combined, &plen, &msg) < 0) break;
+        if (recv_frame(fd, tls, hdr_buf, &combined, &plen, &msg) < 0) break;
 
         switch (msg.type) {
         case TSDB_RPC_HEARTBEAT:
@@ -416,7 +495,7 @@ static void *connection_handler(void *arg) {
                 if (msg.payload_len >= 16) memcpy(&ver, msg.payload + 8, 8);
                 tsdb_node_manager_alive(node_mgr, nid, ver);
             }
-            send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
 
         case TSDB_RPC_SCHEMA_SYNC:
@@ -450,9 +529,9 @@ static void *connection_handler(void *arg) {
                     tsdb_create_table_local_ex(db, table_name, cols, ncols, ts_name,
                                                 part_unit, block_points, sort_by_tag_col);
                 }
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -462,10 +541,10 @@ static void *connection_handler(void *arg) {
              * phantom replica) — the apply helper returns the real result. */
             int write_ok = rpc_apply_write_batch(db, msg.payload, msg.payload_len);
             if (write_ok) {
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_replicate_recv_ok_total");
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_replicate_recv_err_total");
             }
             break;
@@ -495,10 +574,10 @@ static void *connection_handler(void *arg) {
                 }
             }
             if (write_ok) {
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_replicate_recv_ok_total");
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_replicate_recv_err_total");
             }
             break;
@@ -581,10 +660,10 @@ static void *connection_handler(void *arg) {
                 }
             }
             if (write_ok) {
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_dr_recv_ok_total");
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 tsdb_metric_inc("qengine_dr_recv_err_total");
             }
             break;
@@ -618,25 +697,25 @@ static void *connection_handler(void *arg) {
                                                              TSDB_RPC_ACK,
                                                              msg.req_id,
                                                              rbuf, (uint32_t)encoded);
-                                    if (fn > 0) write_full(fd, frame, (size_t)fn);
+                                    if (fn > 0) write_full(fd, tls, frame, (size_t)fn);
                                     free(frame);
                                 }
                             } else {
-                                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                             }
                             free(rbuf);
                         } else {
-                            send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                            send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                         }
                         tsdb_result_free(qr);
                     } else {
-                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                     }
                 } else {
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -649,11 +728,11 @@ static void *connection_handler(void *arg) {
                     rc = tsdb_rawblock_apply(db, &rb);
                 }
                 if (rc == TSDB_OK)
-                    send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                 else
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -670,14 +749,14 @@ static void *connection_handler(void *arg) {
                      * peer simply wasn't a replica for that table.  Only
                      * real I/O errors count as failure. */
                     if (trc == TSDB_OK || trc == TSDB_ERR_NOTFOUND)
-                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                     else
-                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 } else {
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -694,14 +773,14 @@ static void *connection_handler(void *arg) {
                     int trc = tsdb_delete_range(db, tbl, cutoff,
                                                 op_lt, inclusive, &removed);
                     if (trc == TSDB_OK || trc == TSDB_ERR_NOTFOUND)
-                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                     else
-                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 } else {
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -726,14 +805,14 @@ static void *connection_handler(void *arg) {
                     /* EXISTS is a common idempotent case on re-broadcast
                      * or stale peer catch-up — treat as success. */
                     if (qrc == TSDB_OK || qrc == TSDB_ERR_EXISTS)
-                        send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
                     else
-                        send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                        send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 } else {
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -755,14 +834,14 @@ static void *connection_handler(void *arg) {
                     if (qr && tsdb_result_next(qr) == 1)
                         txt = tsdb_result_sym(qr, 0);   /* status row */
                     if (!txt) txt = (qrc == TSDB_OK) ? "OK" : tsdb_errstr(qrc);
-                    send_reply(fd, TSDB_RPC_ACK, msg.req_id,
+                    send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id,
                                (const uint8_t *)txt, (uint32_t)strlen(txt));
                     if (qr) tsdb_result_free(qr);
                 } else {
-                    send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 }
             } else {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
             break;
 
@@ -775,23 +854,23 @@ static void *connection_handler(void *arg) {
                                                     uint8_t *out, size_t cap);
             extern const char *tsdb_db_data_dir(tsdb_db_t *db);
             if (!db) {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 break;
             }
             const char *dd = tsdb_db_data_dir(db);
             size_t cap = 32 * 1024 * 1024;
             uint8_t *body = (uint8_t *)malloc(cap);
             if (!body) {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 break;
             }
             int n = tsdb_catalog_dump_serialize(dd, body, cap);
             if (n < 0) {
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
                 free(body);
                 break;
             }
-            send_reply(fd, TSDB_RPC_ACK, msg.req_id, body, (uint32_t)n);
+            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, body, (uint32_t)n);
             free(body);
             break;
         }
@@ -807,9 +886,9 @@ static void *connection_handler(void *arg) {
                                                  uint8_t *, uint32_t, uint32_t *);
             if (tsdb_raft_rpc_handle_vote(msg.payload, msg.payload_len,
                                           rb, sizeof(rb), &rn) == 0)
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, rb, rn);
             else
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             break;
         }
 
@@ -824,9 +903,9 @@ static void *connection_handler(void *arg) {
                                                    uint8_t *, uint32_t, uint32_t *);
             if (tsdb_raft_rpc_handle_append(msg.payload, msg.payload_len,
                                             rb, sizeof(rb), &rn) == 0)
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, rb, rn);
             else
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             break;
         }
 
@@ -840,9 +919,9 @@ static void *connection_handler(void *arg) {
                                                     uint32_t *);
             if (tsdb_raft_rpc_handle_install(msg.payload, msg.payload_len,
                                              rb, sizeof(rb), &rn) == 0)
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, rb, rn);
             else
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             break;
         }
 
@@ -858,14 +937,14 @@ static void *connection_handler(void *arg) {
                                                      uint32_t *);
             if (tsdb_raft_rpc_handle_pre_vote(msg.payload, msg.payload_len,
                                                rb, sizeof(rb), &rn) == 0)
-                send_reply(fd, TSDB_RPC_ACK, msg.req_id, rb, rn);
+                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, rb, rn);
             else
-                send_reply(fd, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             break;
         }
 
         default:
-            send_reply(fd, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
             break;
         }
 
@@ -873,7 +952,8 @@ static void *connection_handler(void *arg) {
     }
 
     rpc_conn_track_remove(srv, fd);   /* deregister before close (fd reuse) */
-    close(fd);
+    if (tls) tsdb_tls_close(tls);     /* sends close_notify + closes fd */
+    else     close(fd);
     return NULL;
 }
 
@@ -948,9 +1028,25 @@ static void *accept_loop(void *arg) {
             if (kb > 0) { int b = kb * 1024; setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &b, sizeof(b)); }
         }
 
+        /* Optional mutual TLS: wrap the accepted fd (synchronous handshake,
+         * requires + verifies the peer cert) before handing it off.  Off by
+         * default — tls stays NULL and the handler runs the plaintext path. */
+        tsdb_tls_conn_t *tls = NULL;
+        if (rpc_tls_enabled()) {
+            tsdb_tls_ctx_t *sc = rpc_tls_server_ctx();
+            if (!sc || tsdb_tls_server_wrap(sc, client_fd, &tls) != 0) {
+                close(client_fd);
+                continue;
+            }
+        }
+
         handler_args_t *ha = malloc(sizeof(*ha));
-        if (!ha) { close(client_fd); continue; }
+        if (!ha) {
+            if (tls) tsdb_tls_close(tls); else close(client_fd);
+            continue;
+        }
         ha->fd       = client_fd;
+        ha->tls      = tls;
         ha->db       = srv->db;
         ha->node_mgr = srv->node_mgr;
         ha->srv      = srv;
@@ -961,7 +1057,7 @@ static void *accept_loop(void *arg) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&tid, &attr, connection_handler, ha) != 0) {
             free(ha);
-            close(client_fd);
+            if (tls) tsdb_tls_close(tls); else close(client_fd);
         }
         pthread_attr_destroy(&attr);
     }
@@ -1056,10 +1152,11 @@ int tsdb_rpc_server_port(tsdb_rpc_server_t *srv) {
 /* ---- Client connection --------------------------------------------------- */
 
 struct tsdb_rpc_conn {
-    int             fd;
-    pthread_mutex_t lock;
-    uint32_t        next_req_id;
-    char            addr[TSDB_ADDR_MAX];
+    int              fd;
+    tsdb_tls_conn_t *tls;   /* NULL → plaintext (default) */
+    pthread_mutex_t  lock;
+    uint32_t         next_req_id;
+    char             addr[TSDB_ADDR_MAX];
 };
 
 tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
@@ -1137,9 +1234,24 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
         if (kb > 0) { int b = kb * 1024; setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &b, sizeof(b)); }
     }
 
+    /* Optional mutual TLS: wrap the connected fd client-side, presenting our
+     * cert so a mutual-TLS peer accepts us.  Off by default — tls stays NULL
+     * and the int-fd plaintext path runs unchanged. */
+    tsdb_tls_conn_t *tls = NULL;
+    if (rpc_tls_enabled()) {
+        tsdb_tls_ctx_t *cc = rpc_tls_client_ctx();
+        if (!cc || tsdb_tls_client_wrap(cc, fd, host, &tls) != 0) {
+            close(fd); return NULL;
+        }
+    }
+
     tsdb_rpc_conn_t *conn = calloc(1, sizeof(*conn));
-    if (!conn) { close(fd); return NULL; }
-    conn->fd = fd;
+    if (!conn) {
+        if (tls) tsdb_tls_close(tls); else close(fd);
+        return NULL;
+    }
+    conn->fd  = fd;
+    conn->tls = tls;
     pthread_mutex_init(&conn->lock, NULL);
     conn->next_req_id = 1;
     snprintf(conn->addr, sizeof(conn->addr), "%s", addr);
@@ -1149,7 +1261,8 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
 void tsdb_rpc_conn_close(tsdb_rpc_conn_t *conn) {
     if (!conn) return;
-    close(conn->fd);
+    if (conn->tls) tsdb_tls_close(conn->tls);   /* closes underlying fd */
+    else           close(conn->fd);
     pthread_mutex_destroy(&conn->lock);
     free(conn);
 }
@@ -1191,13 +1304,13 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
         iovcnt++;
     }
 
-    if (writev_all(conn->fd, iov, iovcnt) < 0) {
+    if (writev_all(conn->fd, conn->tls, iov, iovcnt) < 0) {
         return TSDB_ERR_IO;
     }
 
     /* Read response header. */
     uint8_t hdr[TSDB_RPC_HDR_SIZE];
-    if (read_full(conn->fd, hdr, TSDB_RPC_HDR_SIZE) < 0) {
+    if (read_full(conn->fd, conn->tls, hdr, TSDB_RPC_HDR_SIZE) < 0) {
         return TSDB_ERR_IO;
     }
 
@@ -1210,7 +1323,7 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
     uint8_t *combined = malloc(total);
     if (!combined) { return TSDB_ERR_NOMEM; }
     memcpy(combined, hdr, TSDB_RPC_HDR_SIZE);
-    if (rlen > 0 && read_full(conn->fd, combined + TSDB_RPC_HDR_SIZE, rlen) < 0) {
+    if (rlen > 0 && read_full(conn->fd, conn->tls, combined + TSDB_RPC_HDR_SIZE, rlen) < 0) {
         free(combined);
         return TSDB_ERR_IO;
     }
