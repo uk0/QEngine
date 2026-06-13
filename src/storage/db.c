@@ -1115,12 +1115,42 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         if (idx >= 0) db->tables[idx]->altering = 1;  /* keep the barrier up across re-find */
     }
 
+    /* Detach the table from the index + tables[] array UNDER db->lock (O(1)
+     * pointer surgery), then free its heavy state AFTER releasing the lock.
+     *
+     * The slow part of a drop — tsdb_group_commit_stop joins a bg fsync thread
+     * (possibly mid-fsync), tsdb_wal_close fsync+close, memtable/schema free —
+     * used to run under db->lock.  In a 2000-child DROP DATABASE cascade
+     * (exec.c loops tsdb_drop_table per child) that serialised 2000 thread-
+     * joins under db->lock, blocking every concurrent WRITE_BATCH's
+     * tsdb_open_table for seconds and starving the 10 ms raft tick → election
+     * storm (#168).  Detach-then-free keeps the per-child lock hold to a few
+     * pointer ops.
+     *
+     * Safe to free unlocked: the drain loop above guaranteed compacting==0 and
+     * scan_refs==0 and raised the `altering` barrier, so no concurrent reader
+     * holds `t`; once it is out of tbl_index + tables[] no NEW reader can find
+     * it.  `t` is therefore solely owned by this thread from here on. */
+    tsdb_table_internal_t *t_detached = NULL;
     if (idx >= 0) {
-        tsdb_table_internal_t *t = db->tables[idx];
+        t_detached = db->tables[idx];
         /* Drop the name-index entry first (writes a tombstone).  The index
          * stores pointers, so the tables[] array-compaction below never
          * invalidates it — only this dropped name must be removed. */
-        tbl_index_remove(db, t->name);
+        tbl_index_remove(db, t_detached->name);
+
+        /* Compact table array. */
+        for (int i = idx; i < db->ntables - 1; i++)
+            db->tables[i] = db->tables[i + 1];
+        db->tables[--db->ntables] = NULL;
+    }
+
+    pthread_mutex_unlock(&db->lock);
+
+    /* --- everything below runs WITHOUT db->lock --- */
+
+    if (t_detached) {
+        tsdb_table_internal_t *t = t_detached;
         /* Stop group-commit bg thread before closing WAL. */
         if (t->gc)       { tsdb_group_commit_stop(t->gc); t->gc = NULL; }
         if (t->wal)      tsdb_wal_close(t->wal);
@@ -1129,11 +1159,6 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         pthread_mutex_destroy(&t->compact_mtx);
         pthread_mutex_destroy(&t->batch_mu);
         free(t);
-
-        /* Compact table array. */
-        for (int i = idx; i < db->ntables - 1; i++)
-            db->tables[i] = db->tables[i + 1];
-        db->tables[--db->ntables] = NULL;
     }
 
     /* Remove WAL file. */
@@ -1145,8 +1170,6 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     char tbl_dir[4096];
     table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     trash_or_rm(db, tbl_dir);   /* fast O(1) rename to .trash; bg GC reclaims */
-
-    pthread_mutex_unlock(&db->lock);
 
     /* Tear down the super-table + child catalog rows mirrored at create time
      * (after releasing db->lock to keep db→catalog lock ordering clean).
