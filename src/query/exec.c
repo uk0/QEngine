@@ -6224,6 +6224,16 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             *out = r;
             return TSDB_OK;
         }
+        if (prc == TSDB_ERR_INDETERMINATE) {
+            /* The entry could not be proven un-replicated, so it was left
+             * in the log and may still commit once quorum returns.  Tell
+             * the client the outcome is unknown — DDL apply is idempotent
+             * (CREATE→exists OK, DROP→not-found OK), so a retry is safe. */
+            result_status(r,
+                "INDETERMINATE: may have committed, retry idempotently");
+            *out = r;
+            return TSDB_OK;
+        }
         if (prc != TSDB_OK) {
             result_status(r, "ERR: raft propose failed (timeout or IO)");
             *out = r;
@@ -7159,6 +7169,9 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             result_status(r, stmt.kind == QAST_STMT_ADD_MASTER
                              ? "OK: master added (raft committed)"
                              : "OK: master removed (raft committed)");
+        } else if (prc == TSDB_ERR_INDETERMINATE) {
+            result_status(r,
+                "INDETERMINATE: may have committed, retry idempotently");
         } else {
             result_status(r, "ERR: raft propose failed (timeout or IO)");
         }

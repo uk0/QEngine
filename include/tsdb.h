@@ -41,12 +41,20 @@ typedef enum {
                                    tail — we serialise ADD/REMOVE
                                    MASTER one at a time rather than
                                    run joint consensus) */
-    TSDB_ERR_TIMEOUT     = -15  /* per-query deadline elapsed; the
+    TSDB_ERR_TIMEOUT     = -15, /* per-query deadline elapsed; the
                                    executor aborted at a block boundary
                                    so partial work is discarded.  Set
                                    via tsdb_query_set_deadline() before
                                    the call; server.c populates it from
                                    request_timeout_ns. */
+    TSDB_ERR_INDETERMINATE = -16 /* a Raft propose timed out while the
+                                    appended entry MAY still be replicated
+                                    and committed later (we could not prove
+                                    it un-replicated, so we did NOT truncate
+                                    it — Leader Append-Only).  The caller
+                                    must treat the operation as of-unknown-
+                                    outcome and retry idempotently rather
+                                    than assume failure. */
 } tsdb_err_t;
 
 /* Special positive return from on_replicate hooks: the cluster has
