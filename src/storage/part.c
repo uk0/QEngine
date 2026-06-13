@@ -187,47 +187,63 @@ static int read_block_header(const uint8_t *buf,
 }
 
 /*
- * IdxHeader v3 layout (40 bytes, little-endian):
+ * IdxHeader v4 layout (48 bytes, little-endian):
  *   [0..3]    magic          u32 = TSDB_IDX_MAGIC
  *   [4..7]    count          u32
- *   [8..9]    version        u16 = 3
+ *   [8..9]    version        u16 = 4
  *   [10..11]  _pad           u16
  *   [12..19]  total_rows     u64
  *   [20..27]  file_ts_min    i64   (file-level zone map — v2+)
  *   [28..35]  file_ts_max    i64
  *   [36..37]  entry_size     u16   = TSDB_IDX_ENTRY_SIZE (88)
  *   [38..39]  stats_variant  u16   = 0  (reserved; future stats layouts)
+ *   [40..47]  max_seq        u64   (durable WAL redo checkpoint — v4)
  *
- * V2 header is 36 bytes (no entry_size/variant). V1 is 20 bytes (no zone
- * map). Readers negotiate by version.
+ * V3 header is 40 bytes (no max_seq). V2 is 36 bytes (no entry_size/variant).
+ * V1 is 20 bytes (no zone map). Readers negotiate by version; pre-v4 readers
+ * stop at byte 40 and never see max_seq, so the bump is forward-compatible.
  */
 static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows,
-                               int64_t file_ts_min, int64_t file_ts_max) {
+                               int64_t file_ts_min, int64_t file_ts_max,
+                               uint64_t max_seq) {
+    /* Emit v4 (48 bytes, carries max_seq) ONLY when a WAL redo checkpoint is
+     * present.  With max_seq == 0 (the default flush-on-commit path) emit a
+     * byte-identical v3 header, so default-mode partitions stay unchanged. */
     put_u32le(buf + 0,  TSDB_IDX_MAGIC);
     put_u32le(buf + 4,  count);
-    put_u16le(buf + 8,  TSDB_IDX_VERSION);
-    put_u16le(buf + 10, 0);
     put_u64le(buf + 12, total_rows);
     put_i64le(buf + 20, file_ts_min);
     put_i64le(buf + 28, file_ts_max);
     put_u16le(buf + 36, (uint16_t)TSDB_IDX_ENTRY_SIZE);  /* entry_size */
     put_u16le(buf + 38, 0u);                              /* stats_variant */
+    if (max_seq == 0) {
+        put_u16le(buf + 8,  3);                           /* version = 3 */
+        put_u16le(buf + 10, 0);
+        return TSDB_IDX_HEADER_SIZE_V3;
+    }
+    put_u16le(buf + 8,  4);                               /* version = 4 */
+    put_u16le(buf + 10, 0);
+    put_u64le(buf + 40, max_seq);                         /* WAL redo checkpoint */
     return TSDB_IDX_HEADER_SIZE;
 }
 
 /*
- * Decode an IdxHeader supporting v1 / v2 / v3.
+ * Decode an IdxHeader supporting v1 / v2 / v3 / v4.
  *
  * Returns the number of header bytes consumed (20 for v1, 36 for v2,
- * 40 for v3), or -1 on corruption.  Also reports the per-entry size:
- *   v1/v2 → 40; v3 → value read from header (normally 88).
+ * 40 for v3, 48 for v4), or -1 on corruption.  Also reports the per-entry
+ * size: v1/v2 → 40; v3/v4 → value read from header (normally 88).
+ *
+ * out_max_seq (may be NULL) receives the durable WAL redo checkpoint: the
+ * v4 max_seq field, or 0 for any pre-v4 header (no checkpoint recorded).
  */
 static int read_idx_header_ex(const uint8_t *buf, size_t avail,
                               uint32_t *out_count, uint16_t *out_version,
                               uint64_t *out_total_rows,
                               int64_t  *out_file_ts_min, int64_t *out_file_ts_max,
-                              uint32_t *out_entry_size)
+                              uint32_t *out_entry_size, uint64_t *out_max_seq)
 {
+    if (out_max_seq) *out_max_seq = 0;
     if (avail < TSDB_IDX_HEADER_SIZE_V1) return -1;
     if (get_u32le(buf) != TSDB_IDX_MAGIC) return -1;
     *out_count      = get_u32le(buf + 4);
@@ -248,12 +264,21 @@ static int read_idx_header_ex(const uint8_t *buf, size_t avail,
         return (int)TSDB_IDX_HEADER_SIZE_V2;
     }
     if (*out_version == 3) {
-        if (avail < TSDB_IDX_HEADER_SIZE) return -1;
+        if (avail < TSDB_IDX_HEADER_SIZE_V3) return -1;
         *out_file_ts_min = get_i64le(buf + 20);
         *out_file_ts_max = get_i64le(buf + 28);
         uint16_t esz = get_u16le(buf + 36);
         /* stats_variant @38..39 — unused today */
         *out_entry_size = (esz == 0) ? TSDB_IDX_ENTRY_SIZE : esz;
+        return (int)TSDB_IDX_HEADER_SIZE_V3;
+    }
+    if (*out_version == 4) {
+        if (avail < TSDB_IDX_HEADER_SIZE) return -1;
+        *out_file_ts_min = get_i64le(buf + 20);
+        *out_file_ts_max = get_i64le(buf + 28);
+        uint16_t esz = get_u16le(buf + 36);
+        *out_entry_size = (esz == 0) ? TSDB_IDX_ENTRY_SIZE : esz;
+        if (out_max_seq) *out_max_seq = get_u64le(buf + 40);
         return (int)TSDB_IDX_HEADER_SIZE;
     }
     return -1;   /* unknown version */
@@ -339,6 +364,12 @@ typedef struct {
     size_t   idx_cap;
     size_t   idx_n;
 
+    /* Durable WAL redo checkpoint to stamp into this column's idx header on
+     * close.  Seeded from the existing idx (so a re-flush never lowers it),
+     * then raised to the flush's hwm by tsdb_part_flush_ex2.  0 = leave as-is
+     * (default/non-redo flush path). */
+    uint64_t max_seq;
+
     char     idx_path[4096];
     char     col_path[4096];   /* for rollback-by-path on a failed close */
 
@@ -398,11 +429,13 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
             uint64_t tot = 0;
             int64_t  fmn = INT64_MAX, fmx = INT64_MIN;
             uint32_t esz = 0;
+            uint64_t mseq = 0;
             int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
-                                          &fmn, &fmx, &esz);
+                                          &fmn, &fmx, &esz, &mseq);
             if (hsz > 0 && esz > 0) {
                 w->block_count = cnt;
                 w->total_rows  = tot;
+                w->max_seq     = mseq;  /* preserve prior checkpoint */
                 if (ver >= 2) {
                     w->file_ts_min = fmn;
                     w->file_ts_max = fmx;
@@ -690,8 +723,11 @@ static int col_writer_close(col_writer_t *w) {
                 uint64_t tot = 0;
                 int64_t  fmn = 0, fmx = 0;
                 uint32_t esz = 0;
+                uint64_t mseq = 0;
                 int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
-                                              &fmn, &fmx, &esz);
+                                              &fmn, &fmx, &esz, &mseq);
+                /* Never let a re-flush lower the durable checkpoint. */
+                if (mseq > w->max_seq) w->max_seq = mseq;
                 if (hsz > 0 && esz > 0) {
                     old_count = cnt;
                     if (old_count > 0) {
@@ -756,8 +792,9 @@ static int col_writer_close(col_writer_t *w) {
             int64_t  fmn = w->has_zone ? w->file_ts_min : 0;
             int64_t  fmx = w->has_zone ? w->file_ts_max : 0;
             uint8_t  hdr[TSDB_IDX_HEADER_SIZE];
-            write_idx_header(hdr, total_count, w->total_rows, fmn, fmx);
-            fwrite(hdr, 1, TSDB_IDX_HEADER_SIZE, idx_w);
+            size_t   hdr_sz = write_idx_header(hdr, total_count, w->total_rows,
+                                               fmn, fmx, w->max_seq);
+            fwrite(hdr, 1, hdr_sz, idx_w);
             if (old_count > 0 && old_entries_v3) {
                 fwrite(old_entries_v3, 1,
                        (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_w);
@@ -800,11 +837,18 @@ static int col_writer_close(col_writer_t *w) {
 /* ---- tsdb_part_flush / tsdb_part_flush_ex --------------------------------- */
 
 int tsdb_part_flush(tsdb_schema_t *s, tsdb_memtable_t *m) {
-    return tsdb_part_flush_ex(s, m, NULL, NULL);
+    return tsdb_part_flush_ex2(s, m, NULL, NULL, 0);
 }
 
 int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
                        struct tsdb_db *db, const char *table_name)
+{
+    return tsdb_part_flush_ex2(s, m, db, table_name, 0);
+}
+
+int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
+                        struct tsdb_db *db, const char *table_name,
+                        uint64_t max_seq)
 {
     if (!s || !m) return TSDB_ERR_INVAL;
 
@@ -998,6 +1042,10 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
             int rc = col_writer_open(&w, part_dir, s->cols[ci].name);
             if (rc != TSDB_OK) { free(row_idx); free(days); free(sorted_all); return rc; }
 
+            /* Raise this column's durable checkpoint to the flush hwm (never
+             * lower it — col_writer_open seeded it from the existing idx). */
+            if (max_seq > w.max_seq) w.max_seq = max_seq;
+
             /* Wire up raw-block hook if available. */
             w.raw_block_fn    = raw_fn;
             w.raw_block_ud    = raw_ud;
@@ -1063,6 +1111,32 @@ int tsdb_part_flush_ex(tsdb_schema_t *s, tsdb_memtable_t *m,
     free(days);
     free(sorted_all);
     return TSDB_OK;
+}
+
+uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir) {
+    if (!s || !partition_dir) return 0;
+    uint64_t maxv = 0;
+    /* The flush stamps every column's idx with the same hwm and writes the
+     * ts column last, so reading ts.idx alone would suffice — but taking the
+     * max over all columns is strictly safe (a partial/legacy partition with
+     * a checkpoint on only some columns still yields the right C). */
+    for (int ci = 0; ci < s->ncols; ci++) {
+        char idx_path[4096];
+        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+                 partition_dir, s->cols[ci].name);
+        FILE *f = fopen(idx_path, "rb");
+        if (!f) continue;
+        uint8_t hdr[TSDB_IDX_HEADER_SIZE];
+        size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
+        fclose(f);
+        uint32_t cnt = 0; uint16_t ver = 0; uint64_t tot = 0;
+        int64_t fmn = 0, fmx = 0; uint32_t esz = 0; uint64_t mseq = 0;
+        if (read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
+                               &fmn, &fmx, &esz, &mseq) > 0) {
+            if (mseq > maxv) maxv = mseq;
+        }
+    }
+    return maxv;
 }
 
 /* ---- tsdb_part_t (read side) ------------------------------------------- */
@@ -1132,7 +1206,7 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         int      hdr_size = read_idx_header_ex(idx_hdr, hdr_n,
                                                 &block_count, &idx_version,
                                                 &total_rows_u, &fmn, &fmx,
-                                                &entry_size);
+                                                &entry_size, NULL);
         if (hdr_size < 0 || block_count == 0 || entry_size == 0) {
             fclose(idx_f); continue;
         }

@@ -5,6 +5,7 @@
 #include "memtable.h"
 #include "part.h"
 #include "wal.h"
+#include "../core/symbol.h"
 #include "../../include/tsdb.h"
 #include "../catalog/group.h"
 #include "../catalog/stable.h"
@@ -68,6 +69,24 @@ typedef struct tsdb_table_internal {
      * the cols array during the realloc; ALTER also drains scan_refs to 0
      * first, closing the schema-realloc-vs-lockless-reader race. */
     volatile int         altering;
+
+    /* ---- WAL redo log (TSDB_WAL_ONLY_COMMIT crash-durability) ----
+     * Only meaningful when db->wal_only_commit is set; zero/untouched in the
+     * default flush-on-commit mode.  Guarded by compact_mtx (the same lock the
+     * flush takes) so a commit's redo-append and a flush's checkpoint can
+     * never interleave.
+     *
+     *  commit_seq : per-table monotonic sequence, ++ on every redo record
+     *               written (one per commit, or per forced mid-batch flush).
+     *               The value stamped into a partition's idx on flush is the
+     *               commit_seq at flush time; recovery replays only WAL
+     *               records with seq > that durable checkpoint.
+     *  mem_logged : number of memtable rows already covered by a WAL redo
+     *               record.  Reset to 0 whenever the memtable is cleared by a
+     *               flush.  A commit serialises memtable rows [mem_logged,
+     *               nrows) into the next redo record. */
+    uint64_t             commit_seq;
+    size_t               mem_logged;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -614,6 +633,10 @@ static tsdb_table_internal_t *db_find_table(tsdb_db_t *db, const char *name) {
 /* Defined at end of file; called from create_table_impl and open_table. */
 static void maybe_start_gc_for_table(tsdb_db_t *db, tsdb_table_internal_t *t);
 
+/* WAL redo recovery (defined alongside flush): rebuild a freshly-opened
+ * table's unflushed WAL tail into its memtable.  Called from tsdb_open_table. */
+static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t);
+
 /* Register a freshly-created plain table into the super-table hierarchy as a
  * data-bearing VTable: a super-table whose own same-named storage IS its data
  * (it has no child rows).  This makes every data table uniformly part of
@@ -947,6 +970,12 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
         pthread_mutex_unlock(&db->lock);
         return rc;
     }
+
+    /* Crash recovery: replay this table's unflushed WAL tail into the memtable
+     * (records whose seq a partition checkpoint has not already superseded).
+     * Runs on the FIRST open of an existing table this process, before it is
+     * exposed.  A no-op when the WAL holds only legacy markers or nothing. */
+    redo_recover_table(db, t);
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
@@ -1517,6 +1546,280 @@ int tsdb_batch_begin(tsdb_table_t *tbl, tsdb_batch_t **out) {
  * Only flushes if the memtable has at least one row.
  * skip_replicate=1 suppresses the cluster hook (used for replica-received writes).
  */
+/* ---- WAL redo log (TSDB_WAL_ONLY_COMMIT) -------------------------------- *
+ *
+ * Redo record payload (the CRC32+len framing is added by tsdb_wal_append):
+ *
+ *   [seq    : u64 LE]
+ *   [nrows  : u32 LE]
+ *   nrows × row, each row =
+ *     [ts : i64 LE]                              -- the designated ts column
+ *     then every NON-ts column in ascending schema index order:
+ *       TIMESTAMP / INT64 / FLOAT64 / FLOAT32 : 8 bytes LE (raw i64 / double bits)
+ *       SYMBOL                                 : [len : u32 LE][utf8 bytes]  (string)
+ *
+ * SYMBOL columns log the STRING (not the dict code) so replay re-interns via
+ * tsdb_memtable_row_sym and the symbol-table ids are rebuilt correctly.
+ */
+
+static void redo_put_u32le(uint8_t *p, uint32_t v) {
+    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
+}
+static void redo_put_u64le(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8*i));
+}
+static uint32_t redo_get_u32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static uint64_t redo_get_u64le(const uint8_t *p) {
+    uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8*i); return v;
+}
+
+/* Append a growable byte buffer; returns 0 on success, -1 on OOM. */
+struct redo_buf { uint8_t *p; size_t n, cap; };
+static int redo_buf_reserve(struct redo_buf *b, size_t extra) {
+    if (b->n + extra <= b->cap) return 0;
+    size_t nc = b->cap ? b->cap * 2 : 256;
+    while (nc < b->n + extra) nc *= 2;
+    uint8_t *np = realloc(b->p, nc);
+    if (!np) return -1;
+    b->p = np; b->cap = nc;
+    return 0;
+}
+static int redo_buf_put(struct redo_buf *b, const void *src, size_t n) {
+    if (redo_buf_reserve(b, n) != 0) return -1;
+    memcpy(b->p + b->n, src, n); b->n += n; return 0;
+}
+
+/*
+ * Serialise memtable rows [from, to) of table t into a redo record carrying
+ * `seq`, returning the malloc'd payload in *out / *out_n.  Caller frees *out.
+ * Must be called with the rows stable (compact_mtx held).  Returns TSDB_OK or
+ * TSDB_ERR_NOMEM.
+ */
+static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
+                          size_t from, size_t to,
+                          uint8_t **out, size_t *out_n)
+{
+    tsdb_schema_t *s = t->schema;
+    int ts_ci = s->ts_col_idx;
+    struct redo_buf b = {0};
+    uint8_t hdr[12];
+    redo_put_u64le(hdr + 0, seq);
+    redo_put_u32le(hdr + 8, (uint32_t)(to - from));
+    if (redo_buf_put(&b, hdr, 12) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
+
+    const int64_t *ts_buf = (const int64_t *)tsdb_memtable_col(t->memtable, ts_ci);
+    if (!ts_buf) { free(b.p); return TSDB_ERR_INTERNAL; }
+
+    for (size_t r = from; r < to; r++) {
+        uint8_t tsb[8];
+        redo_put_u64le(tsb, (uint64_t)ts_buf[r]);
+        if (redo_buf_put(&b, tsb, 8) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
+
+        for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci) continue;
+            tsdb_type_t type = s->cols[ci].type;
+            const void *col = tsdb_memtable_col(t->memtable, ci);
+            if (!col) { free(b.p); return TSDB_ERR_INTERNAL; }
+            if (type == TSDB_TYPE_SYMBOL) {
+                uint32_t code = ((const uint32_t *)col)[r];
+                const char *str = s->cols[ci].symtab
+                                    ? tsdb_symtab_str(s->cols[ci].symtab, code) : NULL;
+                if (!str) str = "";
+                uint32_t len = (uint32_t)strlen(str);
+                uint8_t lb[4]; redo_put_u32le(lb, len);
+                if (redo_buf_put(&b, lb, 4) != 0 ||
+                    redo_buf_put(&b, str, len) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
+            } else {
+                /* All fixed types are 8 bytes in memory (i64 / double bits). */
+                uint64_t bits = ((const uint64_t *)col)[r];
+                uint8_t vb[8]; redo_put_u64le(vb, bits);
+                if (redo_buf_put(&b, vb, 8) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
+            }
+        }
+    }
+    *out = b.p; *out_n = b.n;
+    return TSDB_OK;
+}
+
+/*
+ * Write a redo record for the memtable rows committed since the last record
+ * (rows [t->mem_logged, nrows)) and fsync the WAL.  Caller MUST hold
+ * t->compact_mtx.  No-op (TSDB_OK) when there are no new rows or no WAL.
+ * On success advances t->commit_seq and t->mem_logged.
+ */
+static int redo_log_locked(tsdb_table_internal_t *t) {
+    if (!t->wal) return TSDB_OK;
+    size_t nrows = tsdb_memtable_rows(t->memtable);
+    if (nrows <= t->mem_logged) return TSDB_OK;
+
+    uint64_t seq = t->commit_seq + 1;
+    uint8_t *payload = NULL; size_t plen = 0;
+    int rc = redo_serialize(t, seq, t->mem_logged, nrows, &payload, &plen);
+    if (rc != TSDB_OK) return rc;
+
+    rc = tsdb_wal_append(t->wal, payload, plen);
+    free(payload);
+    if (rc != TSDB_OK) return rc;
+
+    rc = tsdb_wal_sync(t->wal);
+    if (rc != TSDB_OK) return rc;
+
+    t->commit_seq = seq;
+    t->mem_logged = nrows;
+    return TSDB_OK;
+}
+
+/* Replay-apply context: holds the open table + the recovery cutoff C. */
+struct redo_replay_ctx {
+    tsdb_table_internal_t *t;
+    uint64_t               cutoff;        /* C: skip records with seq <= cutoff */
+    uint64_t               max_seq;       /* highest seq seen across all records */
+    uint64_t               last_complete; /* seq of the last FULLY-applied record
+                                           * (a clean checkpoint boundary) */
+    int                    applied;       /* 1 if any record was applied */
+};
+
+/* tsdb_wal_replay callback: decode one redo record and apply rows whose
+ * record seq > cutoff into the memtable.  Returns TSDB_OK or an error. */
+static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
+    struct redo_replay_ctx *ctx = (struct redo_replay_ctx *)vctx;
+    const uint8_t *p = (const uint8_t *)rec;
+    if (n < 12) return TSDB_OK;   /* legacy 4-byte WTMC marker or junk — skip */
+
+    uint64_t seq   = redo_get_u64le(p + 0);
+    uint32_t nrows = redo_get_u32le(p + 8);
+    if (seq > ctx->max_seq) ctx->max_seq = seq;
+    /* Already durable in a partition checkpoint — skip (dedup guard). */
+    if (seq <= ctx->cutoff) return TSDB_OK;
+
+    tsdb_table_internal_t *t = ctx->t;
+    tsdb_schema_t *s = t->schema;
+    int ts_ci = s->ts_col_idx;
+    size_t off = 12;
+
+    /* Flush at this CLEAN record boundary if the whole record won't fit the
+     * memtable, so we never split one redo record across a partition (which
+     * would risk dup/loss of the split record on a second crash).  One record
+     * always fits a fresh memtable: the original-write path flushes at the
+     * block-points budget, so no single commit's redo spans more rows than
+     * that.  Stamp the flush with last_complete — the seq of the last record
+     * fully applied — so the partition checkpoint never claims this still-
+     * unapplied record.  (In practice each flush truncates the WAL, so the
+     * replayed tail fits and this never fires; it only matters if a prior
+     * truncate was skipped, which correctness must not depend on.) */
+    int bp_cap = (s->block_points > 0 && s->block_points <= TSDB_BLOCK_POINTS)
+                    ? s->block_points : TSDB_BLOCK_POINTS;
+    if (tsdb_memtable_rows(t->memtable) + nrows > (size_t)bp_cap &&
+        tsdb_memtable_rows(t->memtable) > 0) {
+        t->commit_seq = (ctx->last_complete > t->commit_seq)
+                            ? ctx->last_complete : t->commit_seq;
+        /* flush_and_clear_LOCKED: redo_recover_table holds compact_mtx, so the
+         * re-locking _ex variant would deadlock. */
+        int frc = flush_and_clear_locked(t, /*skip_replicate=*/1);
+        if (frc != TSDB_OK) return frc;
+        t->mem_logged = 0;
+    }
+
+    for (uint32_t r = 0; r < nrows; r++) {
+        if (off + 8 > n) return TSDB_ERR_CORRUPT;
+        int64_t ts = (int64_t)redo_get_u64le(p + off); off += 8;
+
+        int rc = tsdb_memtable_row_begin(t->memtable);
+        if (rc != TSDB_OK) return rc;
+
+        rc = tsdb_memtable_row_ts(t->memtable, ts);
+        if (rc != TSDB_OK) { tsdb_memtable_row_abort(t->memtable); return rc; }
+
+        for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci) continue;
+            tsdb_type_t type = s->cols[ci].type;
+            if (type == TSDB_TYPE_SYMBOL) {
+                if (off + 4 > n) { tsdb_memtable_row_abort(t->memtable); return TSDB_ERR_CORRUPT; }
+                uint32_t len = redo_get_u32le(p + off); off += 4;
+                if (off + len > n) { tsdb_memtable_row_abort(t->memtable); return TSDB_ERR_CORRUPT; }
+                char stackbuf[256];
+                char *str = (len < sizeof(stackbuf)) ? stackbuf : malloc((size_t)len + 1);
+                if (!str) { tsdb_memtable_row_abort(t->memtable); return TSDB_ERR_NOMEM; }
+                memcpy(str, p + off, len); str[len] = '\0'; off += len;
+                rc = tsdb_memtable_row_sym(t->memtable, ci, str);
+                if (str != stackbuf) free(str);
+                if (rc != TSDB_OK) { tsdb_memtable_row_abort(t->memtable); return rc; }
+            } else {
+                if (off + 8 > n) { tsdb_memtable_row_abort(t->memtable); return TSDB_ERR_CORRUPT; }
+                uint64_t bits = redo_get_u64le(p + off); off += 8;
+                if (type == TSDB_TYPE_FLOAT64 || type == TSDB_TYPE_FLOAT32) {
+                    double d; memcpy(&d, &bits, 8);
+                    rc = tsdb_memtable_row_f64(t->memtable, ci, d);
+                } else {
+                    rc = tsdb_memtable_row_i64(t->memtable, ci, (int64_t)bits);
+                }
+                if (rc != TSDB_OK) { tsdb_memtable_row_abort(t->memtable); return rc; }
+            }
+        }
+        rc = tsdb_memtable_row_end(t->memtable);
+        if (rc != TSDB_OK) { tsdb_memtable_row_abort(t->memtable); return rc; }
+        ctx->applied = 1;
+    }
+    ctx->last_complete = seq;   /* this record is now fully applied */
+    return TSDB_OK;
+}
+
+/*
+ * Recover a freshly-opened table's unflushed WAL tail into its memtable.
+ * Computes C = max durable commit-seq checkpoint across this table's
+ * partitions, replays the per-table WAL, and applies only records with
+ * seq > C (records <= C are already durable in partitions).  Sets
+ * commit_seq / mem_logged so subsequent commits continue monotonically.
+ *
+ * Called once, under db->lock, right after the table's wal is opened and
+ * before the table is exposed.  Safe to call unconditionally: a WAL with
+ * only legacy markers (or none) replays to a no-op.
+ */
+static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
+    if (!t->wal || !t->schema) return;
+
+    /* C = max idx checkpoint over all on-disk partitions of this table. */
+    uint64_t cutoff = 0;
+    char tbl_dir[4096];
+    table_dir_db(db, t->name, tbl_dir, sizeof(tbl_dir));
+    DIR *d = opendir(tbl_dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;   /* skip ., .., .trash */
+            char part_dir[5000];
+            snprintf(part_dir, sizeof(part_dir), "%s/%s", tbl_dir, e->d_name);
+            struct stat st;
+            if (stat(part_dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            uint64_t ps = tsdb_part_max_seq(t->schema, part_dir);
+            if (ps > cutoff) cutoff = ps;
+        }
+        closedir(d);
+    }
+
+    struct redo_replay_ctx ctx = { t, cutoff, 0, cutoff, 0 };
+    pthread_mutex_lock(&t->compact_mtx);
+    int rc = tsdb_wal_replay(db->data_dir, t->name, redo_replay_cb, &ctx);
+    /* commit_seq must continue ABOVE every seq that ever existed (durable in
+     * partitions OR replayed) so future commits never reuse a seq. */
+    uint64_t hi = (ctx.max_seq > cutoff) ? ctx.max_seq : cutoff;
+    if (hi > t->commit_seq) t->commit_seq = hi;
+    t->mem_logged = tsdb_memtable_rows(t->memtable);
+    pthread_mutex_unlock(&t->compact_mtx);
+
+    if (rc != TSDB_OK && rc != TSDB_ERR_CORRUPT) {
+        /* Corruption stops replay at the first bad record (a torn tail from a
+         * crash mid-append) — that's expected and safe; anything else is
+         * logged but non-fatal so the table still opens. */
+        fprintf(stderr, "[db] WAL replay for table '%s' returned rc=%d\n",
+                t->name, rc);
+    }
+    if (ctx.applied)
+        tsdb_metric_inc("qengine_wal_recovered_records_total");
+}
+
 /*
  * Internal variant: caller MUST hold t->compact_mtx.
  * Used by alter_table_add_column and by the public flush_and_clear_ex
@@ -1547,21 +1850,34 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
     if (hook_rc == TSDB_SKIP_LOCAL) {
         tsdb_memtable_clear(t->memtable);
         if (t->wal) tsdb_wal_truncate(t->wal);
+        t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
         tsdb_metric_inc("qengine_shard_local_skipped_total");
         return TSDB_OK;
     }
 
+    /* WAL redo checkpoint: the rows about to be flushed are covered by redo
+     * records up to commit_seq, so stamp that seq into every partition idx
+     * this flush publishes.  On reopen, recovery skips WAL records with
+     * seq <= this checkpoint (already durable here), closing the dup window
+     * even if a crash lands between the partition publish and WAL truncate.
+     * In the default (non-wal_only) mode commit_seq stays 0, so hwm == 0 and
+     * tsdb_part_flush_ex2 writes byte-identical v3 idx headers. */
+    uint64_t hwm = t->commit_seq;
+
     /* Raw-block replication is triggered from inside tsdb_part_flush_ex
      * after each block encode — pass db + table_name so the hook has context.
      * For replica-received writes (skip_replicate=1) pass NULL to suppress. */
-    int rc = tsdb_part_flush_ex(t->schema, t->memtable,
-                                 skip_replicate ? NULL : t->db,
-                                 t->name);
+    int rc = tsdb_part_flush_ex2(t->schema, t->memtable,
+                                  skip_replicate ? NULL : t->db,
+                                  t->name, hwm);
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_flushes_total");
         if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
         tsdb_memtable_clear(t->memtable);
-        /* Truncate WAL after successful flush. */
+        t->mem_logged = 0;        /* memtable drained: nothing logged yet */
+        /* Truncate WAL after the partition (with its checkpoint) is durably
+         * published.  Correctness does NOT depend on this — the seq>checkpoint
+         * skip dedups even if truncate is skipped — it only bounds WAL size. */
         if (t->wal) tsdb_wal_truncate(t->wal);
     }
     return rc;
@@ -1665,13 +1981,30 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
         b->in_row = 0;
     }
 
-    /* Replicate (if cluster hook) + flush any remaining rows.
-     * flush_and_clear_ex skips hook when local_only=1 (replica received write).
-     *
-     * With TSDB_WAL_ONLY_COMMIT, skip the per-commit flush; the memtable
-     * drains when it fills via maybe_flush_b().  WAL is still fsynced below
-     * so durability is preserved (replay on crash). */
-    if (!t->db->wal_only_commit) {
+    if (t->db->wal_only_commit) {
+        /* Deferred-flush mode: do NOT flush the memtable here (it drains at
+         * budget via maybe_flush_b).  Durability instead comes from the WAL
+         * redo log: append THIS batch's freshly-committed rows and fsync
+         * before acking.  On a crash the unflushed memtable is rebuilt from
+         * these records (those a partition checkpoint has not superseded).
+         *
+         * Held under compact_mtx so the redo-append + seq/mem_logged bump is
+         * atomic w.r.t. a concurrent flush (which captures commit_seq and
+         * resets mem_logged).  fsync-in-lock is acceptable: deferring the
+         * memtable flush is this mode's whole point, and correctness is the
+         * priority over commit throughput. */
+        pthread_mutex_lock(&t->compact_mtx);
+        int rc = redo_log_locked(t);
+        pthread_mutex_unlock(&t->compact_mtx);
+        if (rc != TSDB_OK) return rc;
+        free(b);
+        return TSDB_OK;
+    }
+
+    /* Default mode: replicate (if cluster hook) + flush remaining rows, then
+     * fsync the WAL sync-point.  flush_and_clear_ex skips the hook when
+     * local_only=1 (replica-received write). */
+    {
         int rc = flush_and_clear_ex(t, b->local_only);
         if (rc != TSDB_OK) return rc;
     }
