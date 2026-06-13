@@ -124,6 +124,15 @@ struct tsdb_db {
      * Relaxed atomic: only the delta over a few-second window matters. */
     volatile uint64_t flush_seq;
 
+    /* Monotonic table-set generation — bumped under db->lock on every table
+     * INSERT (open/create), DROP detach, and ALTER ADD COLUMN.  The steady
+     * write path caches an already-open table handle to skip the db->lock that
+     * tsdb_open_table takes on EVERY WRITE_BATCH; it revalidates the cached
+     * handle by comparing this counter, so a drop/alter that could have freed
+     * or resized the table invalidates every cache without the writer touching
+     * db->lock on the hot path (#168 lever 2).  Relaxed atomic. */
+    volatile uint64_t table_set_gen;
+
     /* Detected storage class — drives write-path defaults (memtable budget,
      * compactor backoff threshold) at open time.  Detection rule lives in
      * src/storage/iopolicy.h; env vars still override individual knobs. */
@@ -728,6 +737,7 @@ static int create_table_impl(tsdb_db_t *db,
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -940,6 +950,7 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
 
     /* Start per-table group-commit if db-level GC is active. */
     maybe_start_gc_for_table(db, t);
@@ -1115,12 +1126,43 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         if (idx >= 0) db->tables[idx]->altering = 1;  /* keep the barrier up across re-find */
     }
 
+    /* Detach the table from the index + tables[] array UNDER db->lock (O(1)
+     * pointer surgery), then free its heavy state AFTER releasing the lock.
+     *
+     * The slow part of a drop — tsdb_group_commit_stop joins a bg fsync thread
+     * (possibly mid-fsync), tsdb_wal_close fsync+close, memtable/schema free —
+     * used to run under db->lock.  In a 2000-child DROP DATABASE cascade
+     * (exec.c loops tsdb_drop_table per child) that serialised 2000 thread-
+     * joins under db->lock, blocking every concurrent WRITE_BATCH's
+     * tsdb_open_table for seconds and starving the 10 ms raft tick → election
+     * storm (#168).  Detach-then-free keeps the per-child lock hold to a few
+     * pointer ops.
+     *
+     * Safe to free unlocked: the drain loop above guaranteed compacting==0 and
+     * scan_refs==0 and raised the `altering` barrier, so no concurrent reader
+     * holds `t`; once it is out of tbl_index + tables[] no NEW reader can find
+     * it.  `t` is therefore solely owned by this thread from here on. */
+    tsdb_table_internal_t *t_detached = NULL;
     if (idx >= 0) {
-        tsdb_table_internal_t *t = db->tables[idx];
+        t_detached = db->tables[idx];
         /* Drop the name-index entry first (writes a tombstone).  The index
          * stores pointers, so the tables[] array-compaction below never
          * invalidates it — only this dropped name must be removed. */
-        tbl_index_remove(db, t->name);
+        tbl_index_remove(db, t_detached->name);
+
+        /* Compact table array. */
+        for (int i = idx; i < db->ntables - 1; i++)
+            db->tables[i] = db->tables[i + 1];
+        db->tables[--db->ntables] = NULL;
+        __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* invalidate write-path handle caches */
+    }
+
+    pthread_mutex_unlock(&db->lock);
+
+    /* --- everything below runs WITHOUT db->lock --- */
+
+    if (t_detached) {
+        tsdb_table_internal_t *t = t_detached;
         /* Stop group-commit bg thread before closing WAL. */
         if (t->gc)       { tsdb_group_commit_stop(t->gc); t->gc = NULL; }
         if (t->wal)      tsdb_wal_close(t->wal);
@@ -1129,11 +1171,6 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
         pthread_mutex_destroy(&t->compact_mtx);
         pthread_mutex_destroy(&t->batch_mu);
         free(t);
-
-        /* Compact table array. */
-        for (int i = idx; i < db->ntables - 1; i++)
-            db->tables[i] = db->tables[i + 1];
-        db->tables[--db->ntables] = NULL;
     }
 
     /* Remove WAL file. */
@@ -1145,8 +1182,6 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     char tbl_dir[4096];
     table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     trash_or_rm(db, tbl_dir);   /* fast O(1) rename to .trash; bg GC reclaims */
-
-    pthread_mutex_unlock(&db->lock);
 
     /* Tear down the super-table + child catalog rows mirrored at create time
      * (after releasing db->lock to keep db→catalog lock ordering clean).
@@ -1455,6 +1490,7 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
 
     pthread_mutex_lock(&db->lock);
     t->altering = 0;
+    __atomic_fetch_add(&db->table_set_gen, 1, __ATOMIC_RELAXED); /* schema->cols realloced — drop cached handles */
     pthread_mutex_unlock(&db->lock);
     return rc;
 }
@@ -1534,6 +1570,11 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
 uint64_t tsdb_db_flush_seq(tsdb_db_t *db) {
     if (!db) return 0;
     return __atomic_load_n(&db->flush_seq, __ATOMIC_RELAXED);
+}
+
+uint64_t tsdb_db_table_set_gen(tsdb_db_t *db) {
+    if (!db) return 0;
+    return __atomic_load_n(&db->table_set_gen, __ATOMIC_RELAXED);
 }
 
 tsdb_iopolicy_t tsdb_db_iopolicy(tsdb_db_t *db) {

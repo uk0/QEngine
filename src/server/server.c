@@ -338,6 +338,13 @@ static unsigned write_lock_hash(const char *s) {
     return h % WRITE_LOCK_BUCKETS;
 }
 
+/* Raw djb2 (unmasked) — for the lever-2 write-handle cache slot index. */
+static unsigned lw_str_hash(const char *s) {
+    unsigned h = 5381;
+    while (*s) h = h * 33 ^ (unsigned char)*s++;
+    return h;
+}
+
 static void write_lock_acquire(write_lock_pool_t *p, const char *table) {
     /* Use hash-based bucket — two tables can collide (serialized together),
      * but that's safe and only costs throughput, not correctness. */
@@ -523,10 +530,60 @@ static void do_local_write(void *arg) {
     /* Per-table write lock — serialises wire writers against each other. */
     write_lock_acquire(&srv->write_locks, table_name);
 
+    /* Cached open-handle fast path (#168 lever 2).  tsdb_open_table takes
+     * db->lock on EVERY WRITE_BATCH even for an already-open table; under a
+     * 12-writer/2000-table storm that db->lock torrent (plus the DROP cascade,
+     * lever 3) starved the 10 ms raft tick and drove an election storm.
+     *
+     * This closure runs single-threaded per accessor: under TSDB_REACTOR on
+     * the one reactor thread that owns the table (its core is a stable hash),
+     * else inline on this connection's handler thread (which, with the loader,
+     * fans a slice of ~tables/threads tables round-robin).  A __thread cache
+     * therefore needs no lock.  Direct-mapped by name hash, sized well above a
+     * worker's table slice so a round-robin write stream warms to a near-100%
+     * hit rate and stops touching db->lock.
+     *
+     * A hit is no weaker than re-opening: the table_set_gen compare proves NO
+     * insert/drop/ALTER touched the table set since the cached open (the gen is
+     * bumped under db->lock at every such mutation), so the cached pointer is
+     * still the live table and its schema is unchanged.  Any miss (empty slot,
+     * different db, name collision, or a bumped gen) falls back to
+     * tsdb_open_table under db->lock and refreshes the slot. */
+#define LW_CACHE_SLOTS 256u   /* pow2; ~20 KiB/thread, holds a worker's slice */
+    typedef struct {
+        tsdb_db_t    *db;
+        tsdb_table_t *tbl;
+        uint64_t      gen;
+        char          name[64];
+    } lw_cache_ent_t;
+    static __thread lw_cache_ent_t lw_cache[LW_CACHE_SLOTS];
+
+    uint64_t cur_gen = tsdb_db_table_set_gen(srv->db);
+    unsigned slot = lw_str_hash(table_name) & (LW_CACHE_SLOTS - 1u);
+    lw_cache_ent_t *ce = &lw_cache[slot];
+
     tsdb_table_t *tbl = NULL;
-    if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
-        write_lock_release(&srv->write_locks, table_name);
-        cx->err = TSDB_ERR_NOTFOUND; cx->msg = "table not found"; return;
+    if (ce->tbl && ce->db == srv->db && ce->gen == cur_gen &&
+        strcmp(ce->name, table_name) == 0) {
+        tbl = ce->tbl;                            /* hit: no db->lock */
+    } else {
+        /* Straddle the open with the gen so a concurrent mutation that races
+         * the open can't leave us caching a freed handle: only cache when the
+         * gen is identical before and after (no insert/drop/ALTER in between). */
+        uint64_t gen_before = cur_gen;
+        if (tsdb_open_table(srv->db, table_name, &tbl) != TSDB_OK || !tbl) {
+            write_lock_release(&srv->write_locks, table_name);
+            cx->err = TSDB_ERR_NOTFOUND; cx->msg = "table not found"; return;
+        }
+        uint64_t gen_after = tsdb_db_table_set_gen(srv->db);
+        if (gen_before == gen_after) {
+            ce->db  = srv->db;
+            ce->tbl = tbl;
+            ce->gen = gen_after;
+            snprintf(ce->name, sizeof(ce->name), "%s", table_name);
+        } else {
+            ce->tbl = NULL;                       /* unstable: don't cache */
+        }
     }
 
     /* Also take the table's batch lock (batch_mu): the pool lock above only
@@ -599,6 +656,7 @@ static void do_local_write(void *arg) {
     write_lock_release(&srv->write_locks, table_name);
     if (write_err != TSDB_OK) { cx->err = write_err; cx->msg = "batch_commit failed"; }
 }
+#undef LW_CACHE_SLOTS
 
 static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                const uint8_t *payload, uint32_t plen) {

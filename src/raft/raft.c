@@ -36,6 +36,11 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>   /* setpriority */
+#include <sys/syscall.h>    /* SYS_gettid */
+#endif
 
 #include "../cluster/rpc.h"
 #include "../../include/tsdb.h"
@@ -1527,8 +1532,62 @@ static void drive_pending_noop(tsdb_raft_t *r) {
 
 /* --- Tick thread ----------------------------------------------------- */
 
+/* Raise the raft tick thread above the storage write/compaction/apply
+ * threads so heartbeats stay timely when the box is CPU-saturated.  The tick
+ * thread both runs CheckQuorum AND sends the leader's AppendEntries heartbeats
+ * (replicate_all); under a 12-writer/2000-table storm the storage threads
+ * starved this 10 ms loop, heartbeat acks landed late, and the CheckQuorum
+ * lease expired into an election storm (#168).  This is the scheduling lever
+ * that complements cutting db->lock contention (levers 2 + 3).
+ *
+ * Best-effort and Linux-only.  The node runs as a non-root `tsdb` user via
+ * runuser, which usually lacks CAP_SYS_NICE, so SCHED_RR and negative nice can
+ * both fail with EPERM — try SCHED_RR, fall back to a small negative nice,
+ * and if neither is permitted log ONCE and continue (the db->lock levers
+ * still apply).  We never raise priority so high we could starve the very
+ * RPC/IO threads that ack heartbeats: SCHED_RR at the minimum RT priority,
+ * or nice -5.  Opt-out with TSDB_RAFT_TICK_PRIO=0. */
+static void raft_elevate_tick_priority(void) {
+#if defined(__linux__)
+    const char *e = getenv("TSDB_RAFT_TICK_PRIO");
+    if (e && e[0] == '0') return;
+
+    /* (1) SCHED_RR at the lowest RT priority — preempts SCHED_OTHER storage
+     * threads but stays at the floor of the RT band so it can't monopolise a
+     * core against other RT work. */
+    struct sched_param sp = { .sched_priority = 0 };
+    int rr_min = sched_get_priority_min(SCHED_RR);
+    if (rr_min >= 0) {
+        sp.sched_priority = rr_min;
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0) {
+            fprintf(stderr, "[raft] tick thread: SCHED_RR prio=%d\n", rr_min);
+            return;
+        }
+    }
+
+    /* (2) Fallback: a modest negative nice on this TID (SCHED_OTHER). */
+    errno = 0;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    if (setpriority(PRIO_PROCESS, (id_t)tid, -5) == 0 && errno == 0) {
+        fprintf(stderr, "[raft] tick thread: nice -5\n");
+        return;
+    }
+
+    /* (3) Neither permitted (likely no CAP_SYS_NICE under runuser tsdb).
+     * Log once; rely on the db->lock contention levers. */
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "[raft] tick thread: could not raise priority "
+                "(SCHED_RR + nice both denied, errno=%d) — "
+                "relying on db->lock contention reduction\n", errno);
+    }
+#endif
+}
+
 static void *tick_thread_main(void *arg) {
     tsdb_raft_t *r = (tsdb_raft_t *)arg;
+    raft_elevate_tick_priority();
     while (r->tick_running) {
         /* Rebuild peer set from the latest gossip view. */
         pthread_mutex_lock(&r->lock);
