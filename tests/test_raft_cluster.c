@@ -92,12 +92,17 @@ static int wait_for_leader(tsdb_raft_t *r, int timeout_ms) {
 }
 
 /* BUG-2 (CheckQuorum): a leader that loses contact with a quorum must
- * step down within ~1 election timeout instead of serving stale reads
- * forever.  Harness: a solo node self-elects (quorum=1), commits its
- * SEED, then we commit a CONFIG_ADD for a SECOND master — this widens
- * the committed quorum to 2.  That peer has no listening socket, so its
- * AppendEntries always fail; within one election timeout the leader can
- * no longer confirm a quorum and demotes to follower (leader_id=0).
+ * step down instead of serving stale reads forever.  Harness: a solo
+ * node self-elects (quorum=1), commits its SEED, then we commit a
+ * CONFIG_ADD for a SECOND master — this widens the committed quorum to 2.
+ * That peer has no listening socket, so its AppendEntries always fail;
+ * once the leader fails QUORUM_MISS_STEPDOWN consecutive CheckQuorum
+ * windows it can no longer confirm a quorum and demotes to follower
+ * (leader_id=0).  The stepdown is now deliberately hysteresis-gated (it
+ * takes a few election timeouts, not one) so a transiently-stalled but
+ * reachable leader does not self-demote and start an election storm under
+ * write load — but a GENUINELY isolated leader like this one fails every
+ * window in a row and still steps down.
  *
  * (The peer must be added through the committed config, not just gossip:
  * once the SEED commits, rebuild_peers_locked treats the committed
@@ -135,12 +140,14 @@ static void t_checkquorum_stepdown(void) {
     printf("  add_master(200) rc=%d → quorum now 2\n", arc);
     assert(arc == TSDB_OK);
 
-    /* Within ~1 election timeout (≤300 ms) plus tick slack the leader
-     * should detect it cannot reach a quorum and step down.  Generous
-     * bound keeps the test robust under CI scheduling jitter. */
+    /* The leader now demotes only after QUORUM_MISS_STEPDOWN (3)
+     * consecutive failed CheckQuorum windows, each ≈ one election timeout
+     * (≤ ELECTION_MAX_MS = 1200 ms).  Worst case ~3×1200 ms; bound at
+     * 6000 ms so the property test stays robust under CI scheduling jitter
+     * while still proving a truly-isolated leader relinquishes leadership. */
     int waited = 0;
     tsdb_raft_state_t s = tsdb_raft_state(r);
-    while (s == TSDB_RAFT_LEADER && waited < 2000) {
+    while (s == TSDB_RAFT_LEADER && waited < 6000) {
         usleep(10 * 1000);
         waited += 10;
         s = tsdb_raft_state(r);
@@ -279,11 +286,91 @@ static void t_last_index_query(void) {
     printf("PASS: last_index queryable (0 on fresh log)\n");
 }
 
+/* CheckQuorum hysteresis: a leader must NOT step down on a SINGLE missed
+ * CheckQuorum window — only after QUORUM_MISS_STEPDOWN (3) consecutive
+ * misses.  This is the anti-storm property: under write load the apply
+ * thread can starve the tick loop and a perfectly-reachable leader misses
+ * one window's worth of acks; the old code demoted it immediately and the
+ * cluster churned through elections.  We can't drive intermittent acks
+ * from an in-process unit test, but we can prove the TWO endpoints of the
+ * hysteresis with timing alone, against a leader whose only peer is
+ * unreachable (so every window misses):
+ *
+ *   (a) After one full max-length election window has elapsed (1300 ms >
+ *       ELECTION_MAX_MS), the leader is STILL leader.  Under the old
+ *       single-window stepdown it would already have demoted — so this
+ *       directly catches a regression back to twitchy behaviour.  At most
+ *       two CheckQuorum windows can have fired by 1300 ms (windows are
+ *       re-rolled to ≥ ELECTION_MIN_MS = 600 ms each, so check #3 cannot
+ *       land before ~1800 ms), so the streak is < 3 and we hold.
+ *
+ *   (b) Given enough consecutive misses (≤ 3 windows ≈ 3×1200 ms), the
+ *       genuinely-isolated leader DOES eventually step down — the
+ *       partition guarantee (BUG-2) is preserved, just lease-delayed.
+ *
+ * Safety: identical to t_checkquorum_stepdown — stepping down only stops
+ * this node acting as leader; it never deletes log or advances commit, so
+ * Leader Append-Only and Log Matching are untouched. */
+static void t_checkquorum_hysteresis(void) {
+    printf("\n[5] leader rides out a single missed window (CheckQuorum hysteresis)\n");
+    const char *dir = "/tmp/tsdb-raft-cqh";
+    rm_rf(dir);
+
+    tsdb_node_manager_t *mgr =
+        tsdb_node_manager_new(500ULL, "127.0.0.1:39501",
+                               "127.0.0.1:39500", TSDB_ROLE_MASTER);
+    assert(mgr);
+    tsdb_replica_mgr_t *rmgr = tsdb_replica_mgr_new(mgr);
+    assert(rmgr);
+
+    tsdb_raft_t *r = tsdb_raft_open(dir, 500ULL, mgr, rmgr, NULL, NULL);
+    assert(r);
+
+    assert(wait_for_leader(r, 4000));
+    usleep(400 * 1000);                       /* SEED commits */
+
+    /* Widen committed quorum to 2 with an unreachable peer: every
+     * CheckQuorum window from here on misses. */
+    int arc = tsdb_raft_add_master(r, 600ULL, "127.0.0.1:39999", 1000);
+    assert(arc == TSDB_OK);
+    printf("  add_master(600) rc=%d → quorum now 2, peer unreachable\n", arc);
+
+    /* (a) One full max-window later, the leader must still be leader.
+     * The old single-window stepdown would have demoted it by now. */
+    usleep(1300 * 1000);
+    tsdb_raft_state_t mid = tsdb_raft_state(r);
+    printf("  at 1300 ms: state=%d (expect still LEADER=%d)\n",
+           mid, TSDB_RAFT_LEADER);
+    assert(mid == TSDB_RAFT_LEADER);   /* survived a transient miss window */
+
+    /* (b) Given the full hysteresis budget, the isolated leader steps
+     * down — partition guarantee intact. */
+    int waited = 1300;
+    tsdb_raft_state_t s = tsdb_raft_state(r);
+    while (s == TSDB_RAFT_LEADER && waited < 6000) {
+        usleep(10 * 1000);
+        waited += 10;
+        s = tsdb_raft_state(r);
+    }
+    uint64_t leader = tsdb_raft_leader_id(r);
+    printf("  eventual: state=%d leader=%llu (%d ms)\n",
+           s, (unsigned long long)leader, waited);
+    assert(s != TSDB_RAFT_LEADER);     /* isolated leader still relinquishes */
+    assert(leader == 0);
+
+    tsdb_raft_close(r);
+    tsdb_node_manager_free(mgr);
+    tsdb_replica_mgr_free(rmgr);
+    rm_rf(dir);
+    printf("PASS: leader tolerates one missed window, demotes after the streak\n");
+}
+
 int main(void) {
     t_solo_stays_follower();
     t_checkquorum_stepdown();
     t_propose_no_quorum_truncates();
     t_last_index_query();
+    t_checkquorum_hysteresis();
     printf("\n=== all raft cluster smoke tests passed ===\n");
     return 0;
 }

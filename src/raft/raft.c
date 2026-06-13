@@ -57,6 +57,18 @@ static const int ELECTION_MAX_MS = 1200;
 /* Heartbeat interval (ms) while leader. */
 static const int HEARTBEAT_MS    = 150;
 
+/* CheckQuorum stepdown threshold: number of CONSECUTIVE CheckQuorum
+ * windows (each ≈ one election timeout) a leader may fail to confirm a
+ * quorum before it demotes itself.  1 == the original behaviour (step
+ * down after a single missed window), which proved too twitchy under
+ * write load and self-amplified into an election storm.  3 gives a
+ * leader an effective lease of ~3 election timeouts (~1.8–3.6 s with the
+ * current window) to ride out a transient apply/CPU stall while still
+ * demoting a leader that is genuinely cut off from a quorum — that
+ * leader misses every window in a row and trips the threshold in
+ * ~3 windows, well inside any operational failover budget. */
+static const int QUORUM_MISS_STEPDOWN = 3;
+
 /* Max masters we track at once.  Catalog consensus clusters are
  * almost always 3 or 5 nodes — picking something well above typical
  * without bloating the state. */
@@ -99,6 +111,21 @@ struct tsdb_raft {
 
     /* Volatile candidate/election state. */
     int                votes_granted;    /* #votes received this election */
+
+    /* CheckQuorum hysteresis (leader only).  Consecutive CheckQuorum
+     * windows in which we failed to confirm contact with a quorum.  A
+     * single missed window is NOT grounds to step down: under write load
+     * the apply thread can starve the 10 ms tick loop (a 2000-child DDL
+     * cascade churns the storage db->lock; the raft log lock is held
+     * across a compaction fsync), so a leader that is perfectly reachable
+     * can still miss ONE window's worth of AppendEntries acks and trip an
+     * over-eager stepdown — that self-inflicted demotion was the engine of
+     * the election storm (term churn under load, single leader at idle).
+     * We require QUORUM_MISS_STEPDOWN consecutive misses before demoting,
+     * which extends the effective leader lease to ~N election timeouts
+     * while still demoting a TRULY isolated leader (it misses every window
+     * in a row).  Reset to 0 the moment a window confirms a quorum. */
+    int                quorum_miss_streak;
 
     /* Peer table (rebuilt from node_mgr each tick) */
     peer_t             peers[MAX_PEERS];
@@ -379,6 +406,7 @@ static void become_leader_locked(tsdb_raft_t *r) {
         r->peers[i].match_index = 0;
         r->peers[i].last_ack_ns = now;
     }
+    r->quorum_miss_streak = 0; /* fresh leader: clear CheckQuorum hysteresis */
     bump_heartbeat_deadline(r);
 
     /* If the config hasn't been initialised yet (fresh cluster, no
@@ -1024,7 +1052,16 @@ static void run_election_unlocked(tsdb_raft_t *r) {
  * Safety: stepping down can never violate Leader Append-Only or Log
  * Matching — it only makes this node STOP acting as leader, so it can
  * no longer append or advance commit.  It is purely a liveness/freshness
- * improvement.  Called under r->lock from the tick thread. */
+ * improvement.  Called under r->lock from the tick thread.
+ *
+ * Hysteresis: a leader only demotes after QUORUM_MISS_STEPDOWN
+ * CONSECUTIVE windows fail the quorum check.  A window that DOES confirm
+ * a quorum resets the streak.  This rides out a transient stall (under
+ * write load the apply thread can starve this very tick loop, so a
+ * reachable leader can miss a single window's acks) without sacrificing
+ * the partition guarantee: a leader genuinely cut off from a quorum
+ * fails every window in a row and still steps down, just after a few
+ * windows instead of one. */
 static void check_quorum_locked(tsdb_raft_t *r) {
     if (r->state != TSDB_RAFT_LEADER) return;
     int64_t now     = now_ns();
@@ -1036,13 +1073,25 @@ static void check_quorum_locked(tsdb_raft_t *r) {
             alive++;
         }
     }
-    if (alive < quorum_needed(r)) {
-        /* Lost contact with a quorum — demote.  leader_id=0 so clients
-         * stop being told we're the leader; reset_election_timer (inside
-         * become_follower_locked) gives surviving peers time to elect a
-         * new leader without us immediately disrupting them. */
-        become_follower_locked(r, tsdb_raft_log_current_term(r->log), 0);
+    if (alive >= quorum_needed(r)) {
+        /* Confirmed a quorum this window — clear the miss streak. */
+        r->quorum_miss_streak = 0;
+        return;
     }
+    /* Missed this window.  Only demote once we've missed
+     * QUORUM_MISS_STEPDOWN in a row — a single miss under load is far
+     * more likely a self-inflicted tick stall than a real partition. */
+    if (++r->quorum_miss_streak < QUORUM_MISS_STEPDOWN) return;
+
+    /* Lost contact with a quorum across the full hysteresis window —
+     * demote.  leader_id=0 so clients stop being told we're the leader;
+     * reset_election_timer (inside become_follower_locked) gives surviving
+     * peers time to elect a new leader without us immediately disrupting
+     * them.  become_follower_locked does not touch quorum_miss_streak, so
+     * reset it here for cleanliness on a future re-election (become_leader
+     * also zeroes it). */
+    r->quorum_miss_streak = 0;
+    become_follower_locked(r, tsdb_raft_log_current_term(r->log), 0);
 }
 
 /* --- Commit advance (leader only) ------------------------------------
