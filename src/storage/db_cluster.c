@@ -683,6 +683,69 @@ int tsdb_cluster_broadcast_catalog_qtl(tsdb_db_t *db,
     return rc;
 }
 
+/* Forward a catalog DDL from a raft FOLLOWER to the current raft LEADER over
+ * the trusted node-to-node RPC channel (TSDB_RPC_DDL_FORWARD).  The leader's
+ * apply path runs the QTL through the full local query (raft propose + catalog
+ * broadcast) and returns its status text, which we copy into out_status.
+ *
+ * leader_id is the raft leader hint (tsdb_raft_leader_id) the caller already
+ * holds; we resolve it to an RPC address via the membership snapshot — the
+ * same master-by-master walk proxy_sql_to_master uses for the raft-less data
+ * node, kept here so the raft-bound follower path reuses one resolution.
+ *
+ * Returns TSDB_OK with out_status populated on a successful round-trip; a
+ * negative tsdb_err_t if the leader is unknown to membership, unreachable, or
+ * answered ERR.  The leader executes locally (its state==LEADER), so a
+ * forwarded DDL never re-forwards — no ping-pong. */
+int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
+                                        uint64_t leader_id,
+                                        const char *qtl,
+                                        char *out_status, size_t cap)
+{
+    if (!db || !qtl || !out_status || cap == 0) return TSDB_ERR_INVAL;
+    if (leader_id == 0) return TSDB_ERR_NOTFOUND;   /* mid-election */
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_ERR_INTERNAL;
+
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    if (!mgr) return TSDB_ERR_INTERNAL;
+
+    /* Resolve leader_id → RPC addr from the membership snapshot. */
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    const char *leader_addr = NULL;
+    for (int i = 0; i < n; i++) {
+        if (snap[i].id == (tsdb_node_id_t)leader_id) {
+            if (snap[i].state == TSDB_NODE_DEAD) break;  /* known but down */
+            leader_addr = snap[i].addr;
+            break;
+        }
+    }
+    if (!leader_addr || !leader_addr[0]) return TSDB_ERR_NOTFOUND;
+
+    size_t qlen = strlen(qtl);
+    if (qlen >= 4096) return TSDB_ERR_INVAL;
+    uint8_t payload[4608];
+    int plen = tsdb_rpc_encode_catalog_qtl(payload, sizeof(payload), qtl);
+    if (plen <= 0) return TSDB_ERR_INTERNAL;
+
+    tsdb_rpc_conn_t *conn = tsdb_rpc_connect(leader_addr, 3000);
+    if (!conn) return TSDB_ERR_IO;
+
+    uint8_t resp[512];
+    uint32_t rlen = 0;
+    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_DDL_FORWARD,
+                                payload, (uint32_t)plen,
+                                resp, sizeof(resp) - 1, &rlen);
+    tsdb_rpc_conn_close(conn);
+    if (rc != TSDB_OK) return rc;
+
+    resp[rlen] = '\0';
+    snprintf(out_status, cap, "%s", (const char *)resp);
+    return TSDB_OK;
+}
+
 /* ---- Anti-entropy resync ------------------------------------------------ */
 
 /* Ask peer `peer_id` for (count, max_ts) of `table_name`.  Returns 0

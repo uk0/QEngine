@@ -2317,9 +2317,13 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
 
     tsdb_table_internal_t *rtbl = tsdb_db_find_table(db, q->asof_table);
     if (!rtbl) {
+        /* Same post-drop normalization as exec_select's FROM resolve: a
+         * dropped/missing right table must surface NOTFOUND uniformly, not
+         * leak tsdb_open_table's disk-state-dependent rc (CORRUPT/IO) that
+         * would diverge across nodes mid teardown. */
         tsdb_table_t *h = NULL;
         rc = tsdb_open_table(db, q->asof_table, &h);
-        if (rc != TSDB_OK) { eset(err, errcap, "ASOF JOIN: right table '%s' not found", q->asof_table); return rc; }
+        if (rc != TSDB_OK) { eset(err, errcap, "ASOF JOIN: right table '%s' not found", q->asof_table); return TSDB_ERR_NOTFOUND; }
         rtbl = tsdb_db_find_table(db, q->asof_table);
         if (!rtbl) { eset(err, errcap, "ASOF JOIN: right table '%s' not found", q->asof_table); return TSDB_ERR_NOTFOUND; }
     }
@@ -4422,10 +4426,17 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     tsdb_table_internal_t *tbl = tsdb_db_find_table(db, q->from);
     if (!tbl) {
-        /* Try open */
+        /* Not in the live index — try to open from disk.  A failure here
+         * means the table isn't readable: it was dropped (its dir is gone
+         * or being trashed) or never existed.  Normalize ALL such failures
+         * to NOTFOUND rather than returning tsdb_open_table's specific rc:
+         * during/after a DROP DATABASE different nodes see different on-disk
+         * states (schema.bin already removed → NOTFOUND vs. a residual
+         * half-torn file → CORRUPT/IO), and the read path must surface ONE
+         * clean code cluster-wide instead of leaking an "internal error". */
         tsdb_table_t *h = NULL;
         int rc = tsdb_open_table(db, q->from, &h);
-        if (rc != TSDB_OK) { eset(err, errcap, "table '%s' not found", q->from); return rc; }
+        if (rc != TSDB_OK) { eset(err, errcap, "table '%s' not found", q->from); return TSDB_ERR_NOTFOUND; }
         tbl = tsdb_db_find_table(db, q->from);
         if (!tbl) { eset(err, errcap, "table '%s' not found", q->from); return TSDB_ERR_NOTFOUND; }
     }
@@ -6198,11 +6209,32 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         tsdb_arena_free(&a);
         tsdb_raft_state_t s = tsdb_raft_state(raft);
         if (s != TSDB_RAFT_LEADER) {
-            /* Not leader — surface leader hint as a status row.  Return
-             * TSDB_OK (not PERMISSION) so the HTTP layer renders the
-             * hint in `rows` instead of flattening to a generic
-             * "permission denied" error body; clients that want to
-             * auto-retry can detect the "ERR: not raft leader" prefix. */
+            /* Not leader.  When we know who the leader is, transparently
+             * forward the catalog QTL to it over the trusted RPC channel
+             * and return its status — so CREATE/DROP issued against a
+             * follower on an all-master cluster "just work" instead of
+             * bouncing the client with a leader hint.  The leader runs the
+             * statement locally (its state==LEADER), so a forwarded DDL
+             * never re-forwards. */
+            uint64_t leader = tsdb_raft_leader_id(raft);
+            if (leader != 0) {
+                char fwd[256];
+                int frc = tsdb_cluster_forward_ddl_to_leader(
+                    db, leader, qtl, fwd, sizeof(fwd));
+                if (frc == TSDB_OK) {
+                    result_status(r, fwd);
+                    *out = r;
+                    return TSDB_OK;
+                }
+                /* Forward failed (leader unknown to membership, down, or a
+                 * transport error) — fall through to the retry hint below. */
+            }
+            /* No known leader (mid-election) or forward failed — surface the
+             * leader hint as a status row.  Return TSDB_OK (not PERMISSION)
+             * so the HTTP layer renders the hint in `rows` instead of
+             * flattening to a generic "permission denied" error body;
+             * clients that want to auto-retry can detect the
+             * "ERR: not raft leader" prefix. */
             char msg[160];
             snprintf(msg, sizeof(msg),
                      "ERR: not raft leader (self=%llu, leader=%llu) — "

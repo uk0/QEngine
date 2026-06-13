@@ -107,6 +107,24 @@ int tsdb_cluster_broadcast_catalog_qtl_to_data(tsdb_db_t *db,
                                                  int *out_acked_peers,
                                                  int *out_total_peers);
 
+/* Follower → leader catalog-DDL forward over the trusted RPC channel.
+ * On an all-master Raft cluster a CREATE/DROP that lands on a FOLLOWER must
+ * transparently reach the LEADER instead of bouncing the client with a
+ * "not raft leader" hint.  exec.c calls this when it holds a non-zero
+ * leader hint (tsdb_raft_leader_id); the helper resolves leader_id to an
+ * RPC addr from membership and ships the QTL via TSDB_RPC_DDL_FORWARD,
+ * copying the leader's status text into out_status.
+ *
+ * Returns TSDB_OK with out_status set on a completed round-trip.  Returns
+ * TSDB_ERR_NOTFOUND when leader_id is 0 (mid-election) or unknown/down in
+ * membership — the caller should then fall back to the retry hint.  Other
+ * negative codes signal a transport/encode failure.  No forward loop: the
+ * leader's state==LEADER so it executes locally and never re-forwards. */
+int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
+                                        uint64_t leader_id,
+                                        const char *qtl,
+                                        char *out_status, size_t cap);
+
 /* Anti-entropy resync.  Pulls missing rows (ts > local_max_ts) from
  * the peer that holds the most up-to-date copy of `table_name`.  The
  * pulled rows are applied with the local-only flag so they do not
