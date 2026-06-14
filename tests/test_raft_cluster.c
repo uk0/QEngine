@@ -365,12 +365,148 @@ static void t_checkquorum_hysteresis(void) {
     printf("PASS: leader tolerates one missed window, demotes after the streak\n");
 }
 
+/* COLD-START SPLIT-BRAIN FIX, part A (joiner-defer).
+ *
+ * A node started WITH gossip seeds (a "joiner") must NOT bootstrap a
+ * group of its own while config.bin is still uninitialised: if it self-
+ * elected and sealed a rival SEED={self}, two cold-start nodes would
+ * form disjoint single-node groups whose later merge truncates one
+ * side's committed log (data loss).  So a joiner with an uninitialised
+ * config stays a FOLLOWER and waits to be added by the seedless
+ * bootstrap leader.
+ *
+ * Harness: open a node, mark it a joiner, give it NO peers (gossip view
+ * is just self).  A SEEDLESS node in this exact situation self-elects
+ * (proven by [1]); the joiner must NOT.  We wait well past the startup
+ * grace AND several election windows, then assert it never became
+ * leader, never bumped its term (it never even campaigned), and never
+ * sealed a config (committed member count stays 0).
+ *
+ * This is the directly-unit-testable half of the fix on a single
+ * instance — it isolates the gating decision with zero transport. */
+static void t_joiner_defers_seed(void) {
+    printf("\n[6] joiner with uninitialised config stays follower (no rival seed)\n");
+    const char *dir = "/tmp/tsdb-raft-joiner-defer";
+    rm_rf(dir);
+
+    tsdb_node_manager_t *mgr =
+        tsdb_node_manager_new(800ULL, "127.0.0.1:39801",
+                               "127.0.0.1:39800", TSDB_ROLE_MASTER);
+    assert(mgr);
+    tsdb_replica_mgr_t *rmgr = tsdb_replica_mgr_new(mgr);
+    assert(rmgr);
+
+    tsdb_raft_t *r = tsdb_raft_open(dir, 800ULL, mgr, rmgr, NULL, NULL);
+    assert(r);
+    /* Mark as a seeded joiner BEFORE the grace window expires so the
+     * very first post-grace election decision sees the flag. */
+    tsdb_raft_set_joiner(r, 1);
+
+    /* Sleep past grace (1500 ms) + at least two full max-length election
+     * windows (2×1200 ms): a seedless node would be leader many times
+     * over by now.  4500 ms gives comfortable margin under CI jitter. */
+    usleep(4500 * 1000);
+
+    tsdb_raft_state_t s = tsdb_raft_state(r);
+    uint64_t term   = tsdb_raft_current_term(r);
+    uint64_t leader = tsdb_raft_leader_id(r);
+    tsdb_raft_cfg_member_t mems[16];
+    int nmem = tsdb_raft_config_members(r, mems, 16);
+    printf("  state=%d term=%llu leader=%llu committed_members=%d\n",
+           s, (unsigned long long)term, (unsigned long long)leader, nmem);
+
+    assert(s == TSDB_RAFT_FOLLOWER);   /* did NOT self-elect            */
+    assert(s != TSDB_RAFT_LEADER);
+    assert(leader == 0);               /* advertises no leader           */
+    assert(term == 0);                 /* never campaigned → term unbumped */
+    assert(nmem == 0);                 /* never sealed a rival SEED       */
+
+    tsdb_raft_close(r);
+    tsdb_node_manager_free(mgr);
+    tsdb_replica_mgr_free(rmgr);
+    rm_rf(dir);
+    printf("PASS: joiner deferred — no self-election, no rival seed\n");
+}
+
+/* COLD-START SPLIT-BRAIN FIX, part A — the OTHER endpoint of the gate.
+ *
+ * The defer is strictly scoped to the cold-start window (config NOT yet
+ * initialised).  Once the config IS initialised — because this member
+ * was added, OR because this is a restart of an already-established
+ * member — a node that happens to be a "joiner" (started with seeds)
+ * MUST campaign normally, or an established cluster could never fail
+ * over to a restarted member that was launched with --seeds.
+ *
+ * Single-instance harness for this: let a SEEDLESS solo node self-elect
+ * and seal its SEED, which persists config.bin (is_initialised → true).
+ * Close it, then REOPEN THE SAME data dir as a JOINER.  On reopen the
+ * persisted config loads → is_initialised() is true → the joiner gate is
+ * inert → the node must self-elect again exactly like the established-
+ * restart case.  This is the closest faithful reproduction of "seeded
+ * member, established config, must still win an election" available
+ * without multi-node transport.  (The "added then campaigns" variant
+ * needs a real leader on the wire to deliver the CONFIG_ADD, which the
+ * single-instance harness cannot provide — documented here.) */
+static void t_joiner_with_initialised_config_elects(void) {
+    printf("\n[7] joiner with INITIALISED config (restart) campaigns normally\n");
+    const char *dir = "/tmp/tsdb-raft-joiner-restart";
+    rm_rf(dir);
+
+    /* Phase 1: seedless solo bootstraps + seals SEED (persists config). */
+    tsdb_node_manager_t *mgr1 =
+        tsdb_node_manager_new(900ULL, "127.0.0.1:39901",
+                               "127.0.0.1:39900", TSDB_ROLE_MASTER);
+    assert(mgr1);
+    tsdb_replica_mgr_t *rmgr1 = tsdb_replica_mgr_new(mgr1);
+    assert(rmgr1);
+    tsdb_raft_t *r1 = tsdb_raft_open(dir, 900ULL, mgr1, rmgr1, NULL, NULL);
+    assert(r1);
+    assert(wait_for_leader(r1, 4000));       /* seedless self-elects     */
+    usleep(500 * 1000);                       /* SEED commits + persists  */
+    tsdb_raft_cfg_member_t m1[16];
+    int n1 = tsdb_raft_config_members(r1, m1, 16);
+    printf("  phase1: became leader, committed_members=%d (config sealed)\n", n1);
+    assert(n1 >= 1);                          /* config is now initialised */
+    tsdb_raft_close(r1);
+    tsdb_node_manager_free(mgr1);
+    tsdb_replica_mgr_free(rmgr1);
+
+    /* Phase 2: REOPEN same dir as a JOINER.  Persisted config → gate
+     * inert → must campaign + win like an established-member restart. */
+    tsdb_node_manager_t *mgr2 =
+        tsdb_node_manager_new(900ULL, "127.0.0.1:39901",
+                               "127.0.0.1:39900", TSDB_ROLE_MASTER);
+    assert(mgr2);
+    tsdb_replica_mgr_t *rmgr2 = tsdb_replica_mgr_new(mgr2);
+    assert(rmgr2);
+    tsdb_raft_t *r2 = tsdb_raft_open(dir, 900ULL, mgr2, rmgr2, NULL, NULL);
+    assert(r2);
+    tsdb_raft_set_joiner(r2, 1);              /* seeded, but config exists */
+
+    int won = wait_for_leader(r2, 4000);
+    tsdb_raft_state_t s = tsdb_raft_state(r2);
+    uint64_t leader = tsdb_raft_leader_id(r2);
+    printf("  phase2: reopened as joiner → state=%d leader=%llu won=%d\n",
+           s, (unsigned long long)leader, won);
+    assert(won);                              /* failover/restart works    */
+    assert(s == TSDB_RAFT_LEADER);
+    assert(leader == 900ULL);
+
+    tsdb_raft_close(r2);
+    tsdb_node_manager_free(mgr2);
+    tsdb_replica_mgr_free(rmgr2);
+    rm_rf(dir);
+    printf("PASS: joiner with initialised config campaigns + wins (failover intact)\n");
+}
+
 int main(void) {
     t_solo_stays_follower();
     t_checkquorum_stepdown();
     t_propose_no_quorum_truncates();
     t_last_index_query();
     t_checkquorum_hysteresis();
+    t_joiner_defers_seed();
+    t_joiner_with_initialised_config_elects();
     printf("\n=== all raft cluster smoke tests passed ===\n");
     return 0;
 }

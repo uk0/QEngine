@@ -202,6 +202,41 @@ struct tsdb_raft {
      * term-3 leader took over. */
     int                pending_noop;
 
+    /* Set iff this node was started WITH gossip seeds (a follower that
+     * is meant to JOIN an existing/forming cluster, not bootstrap one).
+     * Plumbed in via tsdb_raft_set_joiner from the node main after open.
+     *
+     * Purpose: on a fresh cold start, peers can come up seconds-to-
+     * minutes apart (compose depends_on + healthcheck stagger).  The
+     * designated bootstrap node (seedless) wins a quorum-of-1 election
+     * and seals SEED={self}; if a seeded peer that started slightly
+     * earlier ALSO self-elected and sealed its own SEED, the cluster
+     * would split into rival single-node groups whose later merge would
+     * truncate one side's committed log = data loss.  To prevent rival
+     * groups from ever forming, a joiner DEFERS: while config.bin is
+     * still uninitialised it will NOT campaign and will NOT set
+     * pending_seed; it stays a follower and waits to be added by the
+     * bootstrap leader (which absorbs it via drive_pending_add →
+     * CONFIG_ADD → AppendEntries).  The defer applies ONLY in the
+     * cold-start window: once config IS initialised (this node was
+     * added, or this is a restart of an already-established member) the
+     * flag is inert and the node campaigns normally so failover works. */
+    int                is_joiner;
+
+    /* Ids that have been REMOVEd from the config (observed by the apply
+     * thread when a CFG_OP_REMOVE commits — both during live operation
+     * and on log replay at restart, as long as the REMOVE is still in
+     * the log).  drive_pending_add (leader auto-add of late gossip
+     * masters) consults this so it never re-adds a member an operator
+     * explicitly removed: removal does NOT evict the node from gossip,
+     * so a removed-but-still-alive master would otherwise look like a
+     * brand-new joiner and the leader would re-add it every tick.  A
+     * small wrap-around set is plenty — the count of distinct masters
+     * ever removed over a cluster's life is tiny. */
+    uint64_t           removed_ids[64];
+    int                removed_count;   /* number of valid entries (<=64) */
+    int                removed_next;    /* wrap-around write cursor */
+
     /* Per-index apply-outcome ring.
      *
      * Pre-fix the apply thread cast apply_fn's rc to void and bumped
@@ -372,6 +407,23 @@ static int config_has_member_locked(const tsdb_raft_t *r, uint64_t id) {
     return 0;
 }
 
+/* Removed-id memo (see struct removed_ids).  Both helpers run under
+ * r->lock.  record is idempotent; was_removed is a linear scan over a
+ * tiny set. */
+static int was_removed_locked(const tsdb_raft_t *r, uint64_t id) {
+    for (int i = 0; i < r->removed_count; i++) {
+        if (r->removed_ids[i] == id) return 1;
+    }
+    return 0;
+}
+
+static void record_removed_locked(tsdb_raft_t *r, uint64_t id) {
+    if (was_removed_locked(r, id)) return;
+    r->removed_ids[r->removed_next] = id;
+    r->removed_next = (r->removed_next + 1) % 64;
+    if (r->removed_count < 64) r->removed_count++;
+}
+
 /* --- State transitions (all under r->lock) --------------------------- */
 
 static void become_follower_locked(tsdb_raft_t *r, uint64_t new_term,
@@ -418,8 +470,18 @@ static void become_leader_locked(tsdb_raft_t *r) {
      * prior SEED entry in any peer's log), mark that we need to emit
      * one.  The tick thread owns the actual propose call because it
      * needs to drop r->lock before calling tsdb_raft_propose (which
-     * re-acquires the lock internally).  See tick_thread_main. */
-    if (r->config && !tsdb_raft_config_is_initialised(r->config)) {
+     * re-acquires the lock internally).  See tick_thread_main.
+     *
+     * Belt-and-suspenders for the joiner-defer invariant: a seeded node
+     * must never SEAL the initial cluster config on its own (that is the
+     * bootstrap node's job; a joiner sealing a rival SEED is the split-
+     * brain we are preventing).  The tick gate already stops a joiner
+     * from reaching leadership while config is uninitialised, so in
+     * practice this branch is only entered by the seedless bootstrap
+     * node — but guard the seal here too so the invariant holds at the
+     * exact point of effect regardless of how leadership was reached. */
+    if (r->config && !tsdb_raft_config_is_initialised(r->config) &&
+        !r->is_joiner) {
         r->pending_seed = 1;
     }
 
@@ -1509,6 +1571,72 @@ static void drive_pending_seed(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
 }
 
+/* Leader-only membership GROWTH.  Called by the tick thread OUTSIDE
+ * r->lock, right after drive_pending_seed.
+ *
+ * Why it exists: the joiner-defer fix stops late cold-start peers from
+ * forming rival groups, but it leaves the bootstrap leader sitting in a
+ * sealed solo config ({self}) while those peers wait silently to be
+ * added.  Something has to GROW the committed membership to absorb them
+ * once gossip reveals them — that is this function.  Together the two
+ * halves converge a staggered cold start onto ONE raft group: deferred
+ * joiners never split off, and the leader pulls each one in as it
+ * appears.
+ *
+ * Logic (mirrors drive_pending_seed's discipline — snapshot under the
+ * lock, release, then propose):
+ *   - only act when LEADER and the config IS initialised (the
+ *     uninitialised window is drive_pending_seed's job);
+ *   - scan the gossip snapshot for the FIRST alive MASTER (role==MASTER,
+ *     state!=DEAD, not self) that is NOT already in the committed config
+ *     and was NOT previously removed by an operator;
+ *   - add exactly that ONE via tsdb_raft_add_master(...,500).
+ *
+ * Single-server-at-a-time safety (Raft §6): we never batch.  At most one
+ * add is proposed per tick, and tsdb_raft_add_master itself refuses
+ * (TSDB_ERR_BUSY) while any earlier CONFIG entry is still in the
+ * (last_applied, last_index] window — so a second add cannot even be
+ * issued until the first has committed AND applied.  BUSY / timeout are
+ * ignored here; the next tick retries.  This is exactly the one-add-
+ * committed-before-the-next discipline §6 requires, with no joint-config
+ * machinery. */
+static void drive_pending_add(tsdb_raft_t *r) {
+    uint64_t add_id   = 0;
+    char     add_addr[80] = {0};
+
+    pthread_mutex_lock(&r->lock);
+    /* Only a leader with an already-sealed config grows membership. */
+    if (r->state != TSDB_RAFT_LEADER ||
+        !r->config || !tsdb_raft_config_is_initialised(r->config)) {
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int ns = tsdb_node_manager_snapshot(r->node_mgr, snap,
+                                         TSDB_CLUSTER_MAX_NODES);
+    for (int i = 0; i < ns; i++) {
+        if (snap[i].id == r->self_id) continue;
+        if (snap[i].role != TSDB_ROLE_MASTER) continue;
+        if (snap[i].state == TSDB_NODE_DEAD) continue;
+        if (config_has_member_locked(r, snap[i].id)) continue; /* already in */
+        if (was_removed_locked(r, snap[i].id)) continue;       /* operator-removed */
+        add_id = snap[i].id;
+        snprintf(add_addr, sizeof(add_addr), "%s", snap[i].addr);
+        break;  /* ONE per tick — §6 single-server change */
+    }
+    pthread_mutex_unlock(&r->lock);
+
+    if (add_id == 0) return;  /* nothing to absorb this tick */
+
+    /* add_master self-serialises via has_pending_config_locked: returns
+     * TSDB_ERR_BUSY if a prior CONFIG change is still in flight, which
+     * we treat as "try again next tick".  TSDB_OK means this member is
+     * now committed cluster-wide; any other rc (timeout / IO / stepdown)
+     * is also a benign retry — the config is unchanged on failure. */
+    (void)tsdb_raft_add_master(r, add_id, add_addr, 500);
+}
+
 /* Propose a zero-payload NOOP in the leader's own term so commit can
  * advance past entries from prior terms (§5.4.2).  Structurally
  * identical to drive_pending_seed: snapshot state, drop lock, propose,
@@ -1597,6 +1725,16 @@ static void *tick_thread_main(void *arg) {
         int64_t hb             = r->next_heartbeat_ns;
         int     np             = r->npeers;
         int64_t grace_until    = r->startup_grace_until_ns;
+        /* Joiner-defer gate (cold-start split-brain prevention): a node
+         * started WITH seeds must not bootstrap a group of its own while
+         * the committed config is still uninitialised — it waits to be
+         * added by the seedless bootstrap leader.  Strictly the
+         * cold-start window: clears the instant config is initialised
+         * (added, or established-member restart), after which the joiner
+         * campaigns normally so failover is unaffected. */
+        int     joiner_defer   = r->is_joiner &&
+                                 r->config &&
+                                 !tsdb_raft_config_is_initialised(r->config);
         pthread_mutex_unlock(&r->lock);
 
         int64_t now = now_ns();
@@ -1635,6 +1773,7 @@ static void *tick_thread_main(void *arg) {
 
             drive_pending_noop(r);
             drive_pending_seed(r);
+            drive_pending_add(r);
 
             if (now >= hb) {
                 /* One AppendEntries sweep per peer — carries entries
@@ -1655,6 +1794,22 @@ static void *tick_thread_main(void *arg) {
              * is the normal shape of a 1-master topology — and the
              * lone master must elect itself to make progress. */
             if (now < grace_until) {
+                pthread_mutex_lock(&r->lock);
+                reset_election_timer(r);
+                pthread_mutex_unlock(&r->lock);
+            } else if (joiner_defer) {
+                /* Seeded node, config not yet initialised: DEFER instead
+                 * of campaigning, so two cold-start nodes can't each seal
+                 * a rival single-node SEED (a later merge of the two
+                 * groups would truncate one side's committed log = data
+                 * loss).  We hold as a follower and keep the election
+                 * timer fresh; the bootstrap leader will add us via a
+                 * committed CONFIG_ADD that arrives over AppendEntries,
+                 * at which point config becomes initialised, joiner_defer
+                 * goes false, and we resume normal election behaviour
+                 * (failover works thereafter).  This cannot deadlock a
+                 * genuinely single-node cluster: that node is seedless
+                 * (is_joiner==0) so it never enters this branch. */
                 pthread_mutex_lock(&r->lock);
                 reset_election_timer(r);
                 pthread_mutex_unlock(&r->lock);
@@ -1811,6 +1966,13 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     pthread_mutex_destroy(&r->conn_lock);
     pthread_mutex_destroy(&r->lock);
     free(r);
+}
+
+void tsdb_raft_set_joiner(tsdb_raft_t *r, int is_joiner) {
+    if (!r) return;
+    pthread_mutex_lock(&r->lock);
+    r->is_joiner = is_joiner ? 1 : 0;
+    pthread_mutex_unlock(&r->lock);
 }
 
 uint64_t tsdb_raft_self_id(tsdb_raft_t *r)      { return r ? r->self_id : 0; }
@@ -2020,6 +2182,19 @@ static void *apply_thread_main(void *arg) {
                                 (void)tsdb_raft_config_add(r->config, id, addr);
                             else
                                 (void)tsdb_raft_config_remove(r->config, id);
+
+                            /* Remember this removal so the leader's
+                             * auto-add (drive_pending_add) never resurrects
+                             * a member an operator removed — removal does
+                             * NOT evict the node from gossip, so without
+                             * this memo a removed-but-alive master would be
+                             * re-added every tick.  Recorded on live apply
+                             * AND on restart log-replay. */
+                            if (op == TSDB_RAFT_CFG_OP_REMOVE) {
+                                pthread_mutex_lock(&r->lock);
+                                record_removed_locked(r, id);
+                                pthread_mutex_unlock(&r->lock);
+                            }
 
                             /* Stepdown on committed self-removal (§6).
                              * Once a REMOVE for our own id has

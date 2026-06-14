@@ -85,6 +85,19 @@ void tsdb_raft_set_snapshot_handlers(tsdb_raft_t *r,
 
 void tsdb_raft_close(tsdb_raft_t *r);
 
+/* Mark whether this node was started WITH gossip seeds (a "joiner") or
+ * WITHOUT (the designated bootstrap node).  A joiner must NOT seal the
+ * initial cluster config on its own: while config.bin is still
+ * uninitialised it stays a follower and waits to be added by the
+ * bootstrap leader, which prevents a late-arriving peer from forming a
+ * rival single-node group.  Once config IS initialised (the node has
+ * been added, or this is a restart of an established member) the flag
+ * has no effect — the node campaigns normally so failover still works.
+ * A seedless node (is_joiner==0) is unaffected and may seal the SEED,
+ * so a genuinely single-node cluster still bootstraps.  Call once after
+ * tsdb_raft_open, before the cluster does any real work. */
+void tsdb_raft_set_joiner(tsdb_raft_t *r, int is_joiner);
+
 /* ---- Introspection (for /raft JSON and tests) --------------------------- */
 
 typedef enum {
