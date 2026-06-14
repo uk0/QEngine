@@ -1247,10 +1247,23 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
             free(entries); close(fd); continue;
         }
 
-        /* Writer ordering guarantee: data durable before idx publish.
-         * If this trips, the partition is mid-catastrophe — skip column. */
+        /* Writer ordering guarantee: data durable before idx publish, so in the
+         * normal flush path st.st_size >= max_end always holds.  When it does
+         * NOT (a .col torn shorter than the idx references — e.g. a crash mid
+         * flush, or an interrupted/racing anti-entropy truncate+re-pull), do
+         * NOT drop the whole column and read 0 rows for an entire partition
+         * that still has durable data: the per-block filter below already skips
+         * any block whose end exceeds the mapped size, so falling through reads
+         * the intact durable prefix and discards only the torn tail.  Returning
+         * 0 for a partition whose .idx header counts millions of rows is the
+         * worse failure — a SELECT silently loses on-disk data. */
         if ((uint64_t)st.st_size < max_end) {
-            free(entries); close(fd); continue;
+            fprintf(stderr,
+                    "[part] %s/%s.col torn (size=%llu < idx max_end=%llu); "
+                    "reading durable prefix only\n",
+                    partition_dir, s->cols[ci].name,
+                    (unsigned long long)st.st_size,
+                    (unsigned long long)max_end);
         }
 
         void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
