@@ -27,6 +27,7 @@ FROM ubuntu:${DEBIAN_VERSION} AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         make \
+        clang \
         pkg-config \
         libssl-dev \
         libreadline-dev \
@@ -42,8 +43,13 @@ RUN find . -name '*.o' -delete && rm -rf build
 # run on heterogeneous hardware. Set ARCH via build-arg to enable avx2 on
 # a known Intel fleet, e.g. --build-arg ARCH="-march=x86-64-v3".
 ARG ARCH="-O2 -g -fno-omit-frame-pointer"
+# Compiler is overridable: default gcc (canonical linux/amd64 fleet build), but
+# a native linux/arm64 build needs clang — gcc-aarch64 rejects the NEON
+# intrinsic signedness in src/exec/simd.h.  Build native arm64 with:
+#   docker build --build-arg CC_BIN=clang -t qengine/tsdb:dev .
+ARG CC_BIN=gcc
 
-RUN make CC=gcc \
+RUN make CC=${CC_BIN} \
          CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" \
          tcp_cli server_cli cluster_node
 

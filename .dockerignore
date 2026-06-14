@@ -1,0 +1,19 @@
+# Build-context hygiene: the Dockerfile does `COPY . .` from the repo root,
+# so keep local-only dev state, VCS metadata, and build artifacts OUT of the
+# context (faster builds, smaller layers, no stale checkouts in the image).
+.git
+.claude
+docs
+build
+**/*.o
+**/.DS_Store
+*.bak
+# JS/dashboard deps are not needed for the C image build.
+dashboard/node_modules
+node_modules
+# Secrets / local runtime state (never bake into an image).
+.env
+.env.*
+proxy
+userdata
+session
