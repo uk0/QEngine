@@ -1214,6 +1214,14 @@ int main(int argc, char **argv) {
                                          raft_apply_cb, db);
                 if (raft_h) {
                     tsdb_db_bind_raft(db, raft_h);
+                    /* Cold-start split-brain guard: a node started WITH
+                     * --seeds is a JOINER — it must not seal its own
+                     * cluster config while uninitialised (it waits to be
+                     * added by the seedless bootstrap node).  A seedless
+                     * node is the designated bootstrap and keeps the
+                     * default behaviour, so a genuine single-node cluster
+                     * still forms.  See tsdb_raft_set_joiner. */
+                    tsdb_raft_set_joiner(raft_h, (seeds && *seeds) ? 1 : 0);
                     tsdb_raft_set_snapshot_handlers(raft_h,
                                                      raft_snapshot_write_cb,
                                                      raft_snapshot_restore_cb,
