@@ -775,10 +775,33 @@ static int peer_table_stats(tsdb_cluster_t *c,
         return -1;
     }
 
+    /* Read count / max_ts by COLUMN NAME, not positional index.  The peer's
+     * result (especially across a mixed old/new binary cluster, or any path
+     * that emits aggregate columns in a different order than this SELECT) is
+     * NOT guaranteed to put count at index 0.  Reading by index there once
+     * delivered a max_ts-scale value as "count" (~1.3e12 vs a 3.6M row count),
+     * which the anti-entropy reconcile then mistook for a peer that strictly
+     * dominates us and truncated durable local data.  Match the count column
+     * by the substring "count" (covers "count(ts)" / "count(*)" / "count")
+     * and the max(ts) column by "max(ts)".  Fall back to the timestamp-typed
+     * column for max, and to positional index only if naming fails entirely. */
     int ok = 0;
     if (tsdb_result_next(res)) {
-        *out_count  = (uint64_t)tsdb_result_i64(res, 0);
-        *out_max_ts = tsdb_result_ts(res, 1);
+        int ci_count = tsdb_result_col_index_by_name(res, "count");
+        int ci_max   = tsdb_result_col_index_by_name(res, "max(ts)");
+        if (ci_max < 0) ci_max = tsdb_result_col_index_by_name(res, "max");
+        if (ci_max < 0) {
+            /* No name match — take the first TIMESTAMP column as max_ts. */
+            int n = tsdb_result_ncols(res);
+            for (int i = 0; i < n; i++) {
+                if (tsdb_result_col_type(res, i) == TSDB_TYPE_TIMESTAMP) { ci_max = i; break; }
+            }
+        }
+        if (ci_count < 0) ci_count = 0;          /* last-resort positional */
+        if (ci_max   < 0) ci_max   = 1;
+
+        *out_count  = (uint64_t)tsdb_result_i64(res, ci_count);
+        *out_max_ts = tsdb_result_ts(res, ci_max);
         ok = 1;
     }
     tsdb_result_free(res);
@@ -879,6 +902,46 @@ static int pull_table_delta(tsdb_db_t *db,
     return pulled;
 }
 
+/* Pure anti-entropy reconcile decision (exposed for unit testing).
+ *
+ * INVARIANT enforced here: anti-entropy must NEVER reduce a node's durable row
+ * count for a table based solely on a peer count comparison.  The old recovery
+ * truncated the local table and re-pulled from the peer on any "middle gap"
+ * (equal max_ts, higher peer count) — so a bogus peer count, or a peer that
+ * genuinely held fewer rows, permanently destroyed durable local data.  A
+ * corrupt peer count (the count column read as a max_ts-scale value across a
+ * mixed old/new binary cluster) turned every reconcile into a destructive
+ * wipe.  Decisions:
+ *
+ *   - best_max_ts > local_max_ts        -> TAIL_PULL  (pull ts > local_max_ts)
+ *   - best_count >= 1e11                 -> SKIP_UNSAFE (timestamp-scale count
+ *                                          is corrupt; never act on it)
+ *   - equal max_ts, best_count>local,
+ *       local_count > 0                  -> SKIP_UNSAFE (peer not provably a
+ *                                          strict superset; refuse to wipe)
+ *   - equal max_ts, best_count>local,
+ *       local_count == 0                 -> FULL_PULL  (nothing to lose)
+ *   - otherwise                          -> UP_TO_DATE */
+tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
+                                         int64_t  local_max_ts,
+                                         uint64_t best_count,
+                                         int64_t  best_max_ts)
+{
+    /* A plausible row count can never reach timestamp scale (ns-epoch values
+     * are ~1.7e18 today; even ms-epoch is ~1.7e12). */
+    const uint64_t IMPLAUSIBLE_COUNT = 100000000000ULL; /* 1e11 */
+
+    if (best_max_ts > local_max_ts) return TSDB_AE_TAIL_PULL;
+
+    /* From here best_max_ts == local_max_ts (peers with a lower max_ts never
+     * become "best").  Only a strictly higher peer count is a candidate gap. */
+    if (best_count <= local_count) return TSDB_AE_UP_TO_DATE;
+
+    if (best_count >= IMPLAUSIBLE_COUNT) return TSDB_AE_SKIP_UNSAFE;
+    if (local_count > 0)                 return TSDB_AE_SKIP_UNSAFE;
+    return TSDB_AE_FULL_PULL;
+}
+
 int tsdb_cluster_resync_table(tsdb_db_t *db,
                                const char *table_name,
                                int *out_rows_pulled)
@@ -941,46 +1004,61 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
 
     if (best == 0) return TSDB_OK; /* already up-to-date */
 
-    /* Gap classification:
+    /* Gap classification + safety guard (see tsdb_antientropy_decide):
      *
-     *   tail gap   — best_max_ts > local_max_ts.  We missed recent
-     *                writes; pulling everything past local_max_ts
-     *                catches up cheaply.
+     *   tail gap   — best_max_ts > local_max_ts.  We missed recent writes;
+     *                pulling everything past local_max_ts catches up cheaply.
      *
-     *   middle gap — best_max_ts == local_max_ts but best_count >
-     *                local_count.  We were down for some interval in
-     *                the middle of the burst (e.g. chaos kill+restart),
-     *                missed those rows, but were back in time to receive
-     *                later batches that include the highest-ts row.
-     *                A tail-only pull (ts > local_max_ts) returns 0 rows
-     *                and the gap stays open forever — observed during
-     *                consistency_audit phase 3.
-     *
-     * For the middle-gap case fall back to a simple but correct
-     * recovery: truncate the local table and pull the entire dataset
-     * from the peer.  This is cheap on the test scale and converges
-     * deterministically; for production-scale tables a partition-level
-     * Merkle is the right answer (tracked separately). */
+     *   middle gap — equal max_ts but a higher peer count.  A tail-only pull
+     *                returns 0 rows, so the old code truncated + full re-pulled.
+     *                That was the data-loss bug: a bogus/smaller peer count
+     *                wiped durable local rows.  We now refuse to truncate a
+     *                populated table (and refuse a timestamp-scale "count"
+     *                outright); only an EMPTY local table is safely full-pulled.
+     *                A true middle-gap backfill needs row-level reconciliation
+     *                (partition Merkle), tracked separately — it must not be
+     *                faked with a destructive wipe. */
     int pulled = 0;
-    if (best_max_ts > local_max_ts) {
+    tsdb_ae_action_t act = tsdb_antientropy_decide(local_count, local_max_ts,
+                                                   best_count, best_max_ts);
+    switch (act) {
+    case TSDB_AE_TAIL_PULL:
         pulled = pull_table_delta(db, c, best, table_name, local_max_ts);
-    } else {
-        /* Middle gap — tail pull won't catch this.  Reset + full pull. */
+        break;
+
+    case TSDB_AE_FULL_PULL:
+        /* local empty — truncate is a no-op; full pull lets a fresh node
+         * converge.  since_ts = 0 catches every row (ns-epoch ts are > 0). */
         fprintf(stderr,
-                "[anti-entropy] %s: middle-gap detected "
-                "(local=%llu/peer=%llu, equal max_ts %lld); "
-                "truncate + full re-pull\n",
+                "[anti-entropy] %s: empty local, full pull from peer "
+                "(peer=%llu, max_ts %lld)\n",
                 table_name,
-                (unsigned long long)local_count,
                 (unsigned long long)best_count,
                 (long long)local_max_ts);
         if (tsdb_truncate_table(db, table_name) != TSDB_OK) {
             return TSDB_ERR_IO;
         }
-        /* since_ts = 0 catches every row in this DB — nano-second epoch
-         * timestamps are always > 0, so the > 0 predicate is equivalent
-         * to "all rows". */
         pulled = pull_table_delta(db, c, best, table_name, 0);
+        break;
+
+    case TSDB_AE_SKIP_UNSAFE:
+        /* Would shrink durable data on a peer-count comparison — refuse. */
+        fprintf(stderr,
+                "[anti-entropy] %s: middle-gap (local=%llu/peer=%llu, "
+                "equal max_ts %lld) — peer not provably a superset%s; "
+                "skipping destructive truncate to preserve local rows\n",
+                table_name,
+                (unsigned long long)local_count,
+                (unsigned long long)best_count,
+                (long long)local_max_ts,
+                best_count >= 100000000000ULL ? " (timestamp-scale count)" : "");
+        if (out_rows_pulled) *out_rows_pulled = 0;
+        return TSDB_OK;
+
+    case TSDB_AE_UP_TO_DATE:
+    default:
+        if (out_rows_pulled) *out_rows_pulled = 0;
+        return TSDB_OK;
     }
 
     if (pulled < 0) return TSDB_ERR_IO;

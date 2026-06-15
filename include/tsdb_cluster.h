@@ -142,6 +142,24 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                                const char *table_name,
                                int *out_rows_pulled);
 
+/* Anti-entropy reconcile decision (exposed for unit testing).
+ *
+ * Given the local (count, max_ts) and the best peer's (count, max_ts), decide
+ * what recovery action is SAFE.  The hard invariant: anti-entropy must never
+ * reduce a node's durable row count for a table based solely on a peer count
+ * comparison — so a populated local table is never truncated here. */
+typedef enum {
+    TSDB_AE_UP_TO_DATE = 0, /* peer adds nothing — no action          */
+    TSDB_AE_TAIL_PULL,      /* peer has newer rows — pull ts > local   */
+    TSDB_AE_FULL_PULL,      /* local empty — safe truncate + full pull */
+    TSDB_AE_SKIP_UNSAFE     /* would shrink durable data — refuse      */
+} tsdb_ae_action_t;
+
+tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
+                                         int64_t  local_max_ts,
+                                         uint64_t best_count,
+                                         int64_t  best_max_ts);
+
 /* Phase γ — read-side shard forwarding.
  *
  * If TSDB_SHARD_REPLICA_N > 0 and this node is NOT in the owner set

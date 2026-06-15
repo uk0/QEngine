@@ -7542,6 +7542,35 @@ tsdb_type_t tsdb_result_col_type(tsdb_result_t *r, int i) {
     return r->col_types[i];
 }
 
+/* Case-insensitive substring search (strcasestr is a non-portable GNU/BSD
+ * extension; this keeps the by-name lookup buildable everywhere). */
+static const char *result_ci_strstr(const char *hay, const char *needle) {
+    if (!hay || !needle) return NULL;
+    if (!*needle) return hay;
+    for (; *hay; hay++) {
+        const char *h = hay, *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+            h++; n++;
+        }
+        if (!*n) return hay;
+    }
+    return NULL;
+}
+
+/* Return the index of the first column whose name contains `substr`
+ * (case-insensitive), or -1 if none.  Callers that must read a specific
+ * aggregate column (e.g. anti-entropy reading count / max(ts) from a peer)
+ * use this instead of a positional index so the read survives column-order
+ * differences between code paths or a mixed old/new binary cluster. */
+int tsdb_result_col_index_by_name(tsdb_result_t *r, const char *substr) {
+    if (!r || !substr || !*substr) return -1;
+    for (int i = 0; i < r->ncols; i++) {
+        const char *name = r->col_names ? r->col_names[i] : NULL;
+        if (name && result_ci_strstr(name, substr)) return i;
+    }
+    return -1;
+}
+
 int tsdb_result_next(tsdb_result_t *r) {
     if (!r) return 0;
     r->cur++;
