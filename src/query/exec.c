@@ -4074,6 +4074,28 @@ static int exec_select_child(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     return rc;
 }
 
+/* Does on-disk storage physically exist for a same-named table?  Probes every
+ * striped data dir for <data_dir>/<name>/ holding at least one partition dir.
+ * Used to tell a genuinely empty super-table (no storage → empty result is
+ * correct) apart from a data-bearing one whose fallback open failed (storage
+ * present → returning an empty result would be the task #174 silent 0-row lie). */
+static int stable_self_storage_exists(tsdb_db_t *db, const char *name) {
+    int ndirs = tsdb_db_data_dir_count(db);   /* always >= 1 */
+    for (int i = 0; i < ndirs; i++) {
+        const char *dd = tsdb_db_data_dir_at(db, i);
+        if (!dd) continue;
+        char tdir[4096];
+        snprintf(tdir, sizeof(tdir), "%s/%s", dd, name);
+        char **parts = NULL; size_t nparts = 0;
+        if (list_partitions(tdir, &parts, &nparts) == TSDB_OK) {
+            for (size_t p = 0; p < nparts; p++) free(parts[p]);
+            free(parts);
+            if (nparts > 0) return 1;
+        }
+    }
+    return 0;
+}
+
 /* exec_select is forward-declared at line ~130; exec_stable_select follows: */
 static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                                const tsdb_stable_t *st,
@@ -4120,7 +4142,37 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
      * result, exactly as before. */
     if (nchildren == 0) {
         tsdb_table_t *self_h = NULL;
-        if (tsdb_open_table(db, st->name, &self_h) == TSDB_OK && self_h) {
+        int self_rc = tsdb_open_table(db, st->name, &self_h);
+
+        /* Task #174: the fallback open FAILED, yet this table may physically
+         * have partition data on disk — the cluster state of a node that
+         * received the table's partition .col/.idx (raw-block replication) and
+         * the stable mirror (catalog-sync) but never the schema.bin that
+         * tsdb_open_table needs (a missed/late SCHEMA_SYNC).  Compute once. */
+        int has_storage = (self_rc != TSDB_OK) && stable_self_storage_exists(db, st->name);
+
+        /* Recover: the stable record carries the full column definition, so
+         * rebuild the local schema from it and retry the open — turning the
+         * silent 0-row result into the actual rows.  Only when storage really
+         * exists, so a genuinely empty super-table still yields empty. */
+        if (has_storage &&
+            st->ncols > 0 && st->ncols <= TSDB_MAX_COLS &&
+            st->ts_col_idx >= 0 && st->ts_col_idx < st->ncols) {
+            tsdb_col_t rcols[TSDB_MAX_COLS];
+            for (int ci = 0; ci < st->ncols; ci++) {
+                /* tsdb_col_t.name is a const char *; point it at the stable's
+                 * own column name, which outlives this call. */
+                rcols[ci].name = st->cols[ci].name;
+                rcols[ci].type = st->cols[ci].type;
+            }
+            const char *ts_name = st->cols[st->ts_col_idx].name;
+            if (tsdb_create_table_local(db, st->name, rcols,
+                                        (size_t)st->ncols, ts_name) == TSDB_OK) {
+                self_rc = tsdb_open_table(db, st->name, &self_h);
+            }
+        }
+
+        if (self_rc == TSDB_OK && self_h) {
             free(children);
             children = (tsdb_child_table_t *)calloc(1, sizeof(tsdb_child_table_t));
             if (children) {
@@ -4129,6 +4181,18 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 children[0].ntags = 0;
                 nchildren = 1;
             }
+        } else if (has_storage) {
+            /* Storage exists but the table still could not be opened even after
+             * schema recovery.  Falling through would leave nchildren==0 and
+             * return TSDB_OK with an EMPTY result set — the silent 0-row lie the
+             * caller cannot distinguish from "no data".  Surface the real error
+             * instead, so the query fails loudly (and any read-forwarding /
+             * retry can act) rather than reporting zero rows for live data. */
+            free(children);
+            eset(err, errcap,
+                 "table '%s' has on-disk data but could not be opened: %s",
+                 st->name, tsdb_errstr(self_rc));
+            return self_rc;
         }
     }
 
