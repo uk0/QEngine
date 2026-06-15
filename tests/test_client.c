@@ -94,33 +94,27 @@ static void handle_query(tsdb_conn_t *c, const tsdb_msg_t *req) {
     *p++ = TSDB_TYPE_FLOAT64;
     mock_send(c, MSG_QUERY_RESULT_HDR, 0, req->hdr.req_id, hdr_buf, (uint32_t)(p - hdr_buf));
 
-    /* ROWS: columnar RAW, 2 rows */
+    /* ROWS: this MUST match the production server's emit_query_chunk()
+     * (src/server/server.c).  Layout:
+     *   [nrows u32][ncols u16]
+     *   per column, by ColType (the reader already has types from the HDR):
+     *     numeric: nrows * 8 bytes (LE, 8-byte stride)
+     *     SYMBOL : [blocklen u32] then nrows * ([len u16][bytes])
+     * No table name, no per-column name/type/codec/csz inside the chunk —
+     * those live only in the HDR.  A drift here (or in decode_query_rows)
+     * regresses the empty-result bug fixed in this change. */
     uint8_t rows_buf[256];
     p = rows_buf;
-    /* table name */
-    const char *tbl = "trades";
-    *p++ = (uint8_t)strlen(tbl);
-    memcpy(p, tbl, strlen(tbl)); p += strlen(tbl);
-    put_u16(p, 2); p += 2;    /* ncols */
     put_u32(p, 2); p += 4;    /* nrows */
+    put_u16(p, 2); p += 2;    /* ncols */
 
-    /* col 0: ts — 2 timestamps */
-    *p++ = (uint8_t)strlen(cn0);
-    memcpy(p, cn0, strlen(cn0)); p += strlen(cn0);
-    *p++ = TSDB_TYPE_TIMESTAMP;
-    *p++ = TSDB_CODEC_RAW;
-    put_u32(p, 16); p += 4;  /* 2 * 8 bytes */
+    /* col 0: ts — 2 timestamps, raw 8-byte stride */
     int64_t ts0 = 1735689600000000000LL; /* 2026-01-01 */
     int64_t ts1 = ts0 + 1000000000LL;
     put_u64(p, (uint64_t)ts0); p += 8;
     put_u64(p, (uint64_t)ts1); p += 8;
 
-    /* col 1: price — 2 floats */
-    *p++ = (uint8_t)strlen(cn1);
-    memcpy(p, cn1, strlen(cn1)); p += strlen(cn1);
-    *p++ = TSDB_TYPE_FLOAT64;
-    *p++ = TSDB_CODEC_RAW;
-    put_u32(p, 16); p += 4;
+    /* col 1: price — 2 floats, raw 8-byte stride */
     double f0 = 100.5, f1 = 101.0;
     uint64_t raw0, raw1;
     memcpy(&raw0, &f0, 8); memcpy(&raw1, &f1, 8);
@@ -432,6 +426,36 @@ static void test_query(void) {
     ASSERT(rc == 0, "QUERY_RESULT_ROWS received");
     ASSERT(rows_msg.hdr.type == MSG_QUERY_RESULT_ROWS, "type is QUERY_RESULT_ROWS");
     ASSERT((rows_msg.hdr.flags & TSDB_FLAG_FIN) != 0, "FIN flag set on last rows frame");
+
+    /* Decode the chunk exactly as the production client (decode_query_rows)
+     * does and verify the row VALUES round-trip.  The previous client used a
+     * [tlen][table][ncols u16][nrows u32]+per-col-meta layout that did not
+     * match emit_query_chunk's [nrows u32][ncols u16]+raw layout, so a count(*)
+     * over real data decoded to zero rows on cluster nodes.  These value
+     * asserts are the regression guard. */
+    {
+        const uint8_t *rp  = rows_msg.payload;
+        const uint8_t *rend = rp + rows_msg.hdr.payload_len;
+        ASSERT(rp + 6 <= rend, "rows chunk has nrows+ncols header");
+        uint32_t nrows = get_u32(rp); rp += 4;
+        uint16_t ncols = get_u16(rp); rp += 2;
+        ASSERT(nrows == 2, "decoded nrows == 2");
+        ASSERT(ncols == 2, "decoded ncols == 2");
+        /* col 0: TIMESTAMP, 2*8 raw */
+        const uint8_t *ts_col = rp; rp += (size_t)nrows * 8;
+        /* col 1: FLOAT64, 2*8 raw */
+        const uint8_t *px_col = rp; rp += (size_t)nrows * 8;
+        ASSERT(rp == rend, "rows chunk fully consumed");
+        int64_t got_ts0 = (int64_t)get_u64(ts_col);
+        int64_t got_ts1 = (int64_t)get_u64(ts_col + 8);
+        ASSERT(got_ts0 == 1735689600000000000LL, "row0 ts matches");
+        ASSERT(got_ts1 == 1735689600000000000LL + 1000000000LL, "row1 ts matches");
+        double got_px0, got_px1;
+        uint64_t b0 = get_u64(px_col), b1 = get_u64(px_col + 8);
+        memcpy(&got_px0, &b0, 8); memcpy(&got_px1, &b1, 8);
+        ASSERT(got_px0 == 100.5, "row0 price matches");
+        ASSERT(got_px1 == 101.0, "row1 price matches");
+    }
     msg_free(&rows_msg);
 }
 
