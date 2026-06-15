@@ -226,6 +226,9 @@ void tsdb_result_free(tsdb_result_t *r);
 int tsdb_result_ncols(tsdb_result_t *r);
 const char  *tsdb_result_col_name(tsdb_result_t *r, int i);
 tsdb_type_t  tsdb_result_col_type(tsdb_result_t *r, int i);
+/* First column whose name contains `substr` (case-insensitive), or -1.
+ * Lets callers read a named column by index regardless of column order. */
+int          tsdb_result_col_index_by_name(tsdb_result_t *r, const char *substr);
 int          tsdb_result_next(tsdb_result_t *r);
 tsdb_ts_t    tsdb_result_ts(tsdb_result_t *r, int col);
 int64_t      tsdb_result_i64(tsdb_result_t *r, int col);
