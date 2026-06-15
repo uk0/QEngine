@@ -165,51 +165,16 @@ static void rawblk_write_header(uint8_t *hdr,
     rb_put_u32(hdr + 28, data_size);
 }
 
-/* ---- IDX helpers (mirrors part.c's v2 layout) ------------------------------
+/* ---- IDX helpers -----------------------------------------------------------
  *
- * IdxHeader v2 (36 bytes): magic(4) + count(4) + version(2) + pad(2) +
- *                          total_rows(8) + file_ts_min(8) + file_ts_max(8).
- * We accept v1 (20 bytes) on read for backward compatibility and always
- * write v2 on apply. Zone-map fields are inherited from any prior apply
- * and extended with the new block's [ts_min, ts_max]. */
+ * The idx HEADER is now stamped by the ONE shared encoder in the storage
+ * layer (tsdb_part_write_idx_header), so the replication path and the flush
+ * path produce byte-identical headers and select V3/V4 identically (carrying
+ * max_seq forward via tsdb_part_idx_probe).  Only the per-block ENTRY tail is
+ * still written here — its 88-byte V3 layout mirrors part.c's BlockIndexEntry
+ * so the replica idx is byte-equivalent to the primary's. */
 
-#define RAWBLK_IDX_MAGIC       0x31584449u /* "IDX1" */
-#define RAWBLK_IDX_VER         3
-#define RAWBLK_IDX_HDR_SIZE_V1 20u
-#define RAWBLK_IDX_HDR_SIZE_V2 36u
-#define RAWBLK_IDX_HDR_SIZE    40u   /* V3 — what this path WRITES */
-#define RAWBLK_IDX_HDR_SIZE_V4 48u   /* V4 — written by the standalone WAL-redo
-                                      * flush path (max_seq tail); rawblock only
-                                      * needs to READ past it correctly */
-#define RAWBLK_IDX_HDR_SIZE_MAX 48u  /* read buffer = largest known header */
-#define RAWBLK_IDX_ENT_SIZE_V2 40u
 #define RAWBLK_IDX_ENT_SIZE    88u   /* V3/V4 entries */
-
-/* Header byte size for a given idx version (v3 default for unknown). */
-static size_t rawblk_idx_hdr_size(uint16_t ver) {
-    switch (ver) {
-    case 1: return RAWBLK_IDX_HDR_SIZE_V1;
-    case 2: return RAWBLK_IDX_HDR_SIZE_V2;
-    case 4: return RAWBLK_IDX_HDR_SIZE_V4;
-    default: return RAWBLK_IDX_HDR_SIZE;   /* v3 */
-    }
-}
-
-static void rawblk_write_idx_header(uint8_t *buf, uint32_t count,
-                                    uint64_t total_rows,
-                                    int64_t  file_ts_min,
-                                    int64_t  file_ts_max) {
-    memset(buf, 0, RAWBLK_IDX_HDR_SIZE);
-    rb_put_u32(buf + 0,  RAWBLK_IDX_MAGIC);
-    rb_put_u32(buf + 4,  count);
-    rb_put_u16(buf + 8,  RAWBLK_IDX_VER);
-    rb_put_u16(buf + 10, 0);
-    for (int i = 0; i < 8; i++) buf[12+i] = (uint8_t)((total_rows >> (i*8)) & 0xFF);
-    rb_put_i64(buf + 20, file_ts_min);
-    rb_put_i64(buf + 28, file_ts_max);
-    rb_put_u16(buf + 36, (uint16_t)RAWBLK_IDX_ENT_SIZE);   /* entry_size */
-    rb_put_u16(buf + 38, 0);                                /* stats_variant */
-}
 
 /* Forward the primary's stats block verbatim.  When the caller doesn't
  * have a meta handy (e.g. v2 replication) `stats_src` is NULL and the
@@ -271,43 +236,38 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
 
-    /* --- Idempotency: skip if last idx entry matches. Handles v1/v2/v3. */
+    /* --- Idempotency: skip if last idx entry matches.  Use the storage
+     * probe so the last-entry offset is correct even on a V3/V4-mongrel
+     * header (a wrong header size here would mis-locate the last entry, miss
+     * the match, and double-append the block). */
     {
-        FILE *idx_r = fopen(idx_path, "rb");
-        if (idx_r) {
-            uint8_t hdr[RAWBLK_IDX_HDR_SIZE_MAX];
-            size_t  hdr_n = fread(hdr, 1, RAWBLK_IDX_HDR_SIZE_MAX, idx_r);
-            if (hdr_n >= RAWBLK_IDX_HDR_SIZE_V1
-                && rb_get_u32(hdr) == RAWBLK_IDX_MAGIC) {
-                uint32_t cnt = rb_get_u32(hdr + 4);
-                uint16_t ver = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);
-                size_t   hsz = rawblk_idx_hdr_size(ver);
-                size_t   esz = (ver >= 3 && hdr_n >= RAWBLK_IDX_HDR_SIZE)
-                               ? (size_t)((uint16_t)hdr[36]
-                                          | ((uint16_t)hdr[37] << 8))
-                               : (size_t)RAWBLK_IDX_ENT_SIZE_V2;
-                if (esz == 0) esz = RAWBLK_IDX_ENT_SIZE_V2;
-                if (cnt > 0) {
-                    long off = (long)(hsz + (uint64_t)(cnt - 1) * esz);
-                    if (fseek(idx_r, off, SEEK_SET) == 0) {
-                        uint8_t ent[RAWBLK_IDX_ENT_SIZE];
-                        if (fread(ent, 1, esz, idx_r) == esz) {
-                            uint32_t e_size  = rb_get_u32(ent + 8);
-                            uint32_t e_count = rb_get_u32(ent + 12);
-                            int64_t  e_tmin  = rb_get_i64(ent + 16);
-                            int64_t  e_tmax  = rb_get_i64(ent + 24);
-                            if (e_size == r->block_bytes_len &&
-                                e_count == r->count &&
-                                e_tmin  == r->ts_min &&
-                                e_tmax  == r->ts_max) {
-                                fclose(idx_r);
-                                return TSDB_OK; /* already applied */
-                            }
+        uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
+        uint64_t ptot = 0, pmseq = 0;
+        int64_t  pfmn = 0, pfmx = 0;
+        int phsz = tsdb_part_idx_probe(idx_path, &pver, &pcnt, &pesz,
+                                       &ptot, &pfmn, &pfmx, &pmseq);
+        if (phsz > 0 && pesz > 0 && pcnt > 0) {
+            FILE *idx_r = fopen(idx_path, "rb");
+            if (idx_r) {
+                long off = (long)((uint64_t)phsz + (uint64_t)(pcnt - 1) * pesz);
+                if (fseek(idx_r, off, SEEK_SET) == 0) {
+                    uint8_t ent[RAWBLK_IDX_ENT_SIZE];
+                    if (fread(ent, 1, pesz, idx_r) == pesz) {
+                        uint32_t e_size  = rb_get_u32(ent + 8);
+                        uint32_t e_count = rb_get_u32(ent + 12);
+                        int64_t  e_tmin  = rb_get_i64(ent + 16);
+                        int64_t  e_tmax  = rb_get_i64(ent + 24);
+                        if (e_size == r->block_bytes_len &&
+                            e_count == r->count &&
+                            e_tmin  == r->ts_min &&
+                            e_tmax  == r->ts_max) {
+                            fclose(idx_r);
+                            return TSDB_OK; /* already applied */
                         }
                     }
                 }
+                fclose(idx_r);
             }
-            fclose(idx_r);
         }
     }
 
@@ -356,81 +316,78 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
 
     fclose(col_fp);
 
-    /* --- Rewrite .idx (always write v2). Read either v1 or v2 existing. */
+    /* --- Rewrite .idx --------------------------------------------------------
+     * Read the existing idx (if any) via the storage layer's probe so we (a)
+     * locate old entries at the right offset even on a V3/V4-mongrel header,
+     * and (b) PRESERVE the partition's idx version + carry its max_seq forward.
+     * Pre-fix this path hardcoded a V3 40-byte header, so applying a raw block
+     * to a V4 partition silently downgraded it to V3 (dropping the WAL redo
+     * checkpoint) and — racing the flush writer — could leave a header size /
+     * version / entry-offset mongrel that makes a SELECT read 0 rows. */
     uint8_t *old_entries = NULL;
     uint32_t old_count   = 0;
     uint64_t old_total   = 0;
     int64_t  old_fmn     = INT64_MAX;
     int64_t  old_fmx     = INT64_MIN;
     int      have_old_zone = 0;
+    uint64_t old_max_seq = 0;     /* carried forward so a V4 partition stays V4 */
 
     {
-        FILE *idx_r = fopen(idx_path, "rb");
-        if (idx_r) {
-            uint8_t ih[RAWBLK_IDX_HDR_SIZE_MAX];
-            size_t  ih_n = fread(ih, 1, RAWBLK_IDX_HDR_SIZE_MAX, idx_r);
-            if (ih_n >= RAWBLK_IDX_HDR_SIZE_V1
-                && rb_get_u32(ih) == RAWBLK_IDX_MAGIC) {
-                old_count = rb_get_u32(ih + 4);
-                uint16_t ver = (uint16_t)ih[8] | ((uint16_t)ih[9] << 8);
-                size_t   hsz = rawblk_idx_hdr_size(ver);
-                size_t   esz = (ver >= 3 && ih_n >= RAWBLK_IDX_HDR_SIZE)
-                               ? (size_t)((uint16_t)ih[36]
-                                          | ((uint16_t)ih[37] << 8))
-                               : (size_t)RAWBLK_IDX_ENT_SIZE_V2;
-                if (esz == 0) esz = RAWBLK_IDX_ENT_SIZE_V2;
-
-                uint64_t tr = 0;
-                for (int i = 7; i >= 0; i--) tr = (tr << 8) | ih[12+i];
-                old_total = tr;
-                if (ver >= 2 && ih_n >= RAWBLK_IDX_HDR_SIZE_V2) {
-                    old_fmn = rb_get_i64(ih + 20);
-                    old_fmx = rb_get_i64(ih + 28);
-                    have_old_zone = (old_count > 0);
-                }
-                if (old_count > 0) {
-                    if (fseek(idx_r, (long)hsz, SEEK_SET) == 0) {
-                        /* Read old entries at their native size then widen
-                         * to V3 so the resulting file is uniform. */
-                        size_t raw_sz = (size_t)old_count * esz;
-                        uint8_t *raw = malloc(raw_sz);
-                        if (raw && fread(raw, 1, raw_sz, idx_r) == raw_sz) {
-                            old_entries = calloc((size_t)old_count,
-                                                  RAWBLK_IDX_ENT_SIZE);
-                            if (old_entries) {
-                                size_t copy_prefix = (esz < RAWBLK_IDX_ENT_SIZE)
-                                                     ? esz : RAWBLK_IDX_ENT_SIZE;
+        uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
+        uint64_t ptot = 0, pmseq = 0;
+        int64_t  pfmn = INT64_MAX, pfmx = INT64_MIN;
+        /* probe returns >0 only when the magic + version are valid, so a
+         * missing/short/corrupt-magic idx falls through to a fresh write. */
+        int phsz = tsdb_part_idx_probe(idx_path, &pver, &pcnt, &pesz,
+                                       &ptot, &pfmn, &pfmx, &pmseq);
+        if (phsz > 0 && pesz > 0) {
+            old_count   = pcnt;
+            old_total   = ptot;
+            old_max_seq = pmseq;          /* 0 for V3, the checkpoint for V4 */
+            if (pver >= 2 && pcnt > 0) {
+                old_fmn = pfmn;
+                old_fmx = pfmx;
+                have_old_zone = 1;
+            }
+            if (old_count > 0) {
+                FILE *idx_r = fopen(idx_path, "rb");
+                if (idx_r && fseek(idx_r, (long)phsz, SEEK_SET) == 0) {
+                    /* Read old entries at their native size then widen to V3
+                     * so the resulting file is uniform 88-byte entries. */
+                    size_t raw_sz = (size_t)old_count * pesz;
+                    uint8_t *raw = malloc(raw_sz);
+                    if (raw && fread(raw, 1, raw_sz, idx_r) == raw_sz) {
+                        old_entries = calloc((size_t)old_count, RAWBLK_IDX_ENT_SIZE);
+                        if (old_entries) {
+                            size_t copy_prefix = (pesz < RAWBLK_IDX_ENT_SIZE)
+                                                 ? pesz : RAWBLK_IDX_ENT_SIZE;
+                            for (uint32_t b = 0; b < old_count; b++) {
+                                memcpy(old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE,
+                                       raw + (size_t)b * pesz,
+                                       copy_prefix);
+                            }
+                            if (!have_old_zone) {
                                 for (uint32_t b = 0; b < old_count; b++) {
-                                    memcpy(old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE,
-                                           raw + (size_t)b * esz,
-                                           copy_prefix);
+                                    uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
+                                    int64_t mn = rb_get_i64(e + 16);
+                                    int64_t mx = rb_get_i64(e + 24);
+                                    if (mn < old_fmn) old_fmn = mn;
+                                    if (mx > old_fmx) old_fmx = mx;
                                 }
-                                if (!have_old_zone) {
-                                    for (uint32_t b = 0; b < old_count; b++) {
-                                        uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
-                                        int64_t mn = rb_get_i64(e + 16);
-                                        int64_t mx = rb_get_i64(e + 24);
-                                        if (mn < old_fmn) old_fmn = mn;
-                                        if (mx > old_fmx) old_fmx = mx;
-                                    }
-                                    have_old_zone = 1;
-                                }
-                            } else {
-                                old_count = 0;
+                                have_old_zone = 1;
                             }
                         } else {
                             old_count = 0;
                         }
-                        free(raw);
+                    } else {
+                        old_count = 0;
                     }
+                    free(raw);
                 }
+                if (idx_r) fclose(idx_r);
             }
-            fclose(idx_r);
         }
     }
-
-    FILE *idx_w = fopen(idx_path, "wb");
-    if (!idx_w) { free(old_entries); return TSDB_ERR_IO; }
 
     uint32_t new_count = old_count + 1;
     uint64_t new_total = old_total + r->count;
@@ -440,13 +397,6 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     int64_t  new_fmx = have_old_zone ? old_fmx : r->ts_max;
     if (r->ts_min < new_fmn) new_fmn = r->ts_min;
     if (r->ts_max > new_fmx) new_fmx = r->ts_max;
-
-    uint8_t ih[RAWBLK_IDX_HDR_SIZE];
-    rawblk_write_idx_header(ih, new_count, new_total, new_fmn, new_fmx);
-    fwrite(ih, 1, RAWBLK_IDX_HDR_SIZE, idx_w);
-
-    if (old_count > 0 && old_entries)
-        fwrite(old_entries, 1, (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_w);
 
     /* New entry — forward the stats carried by the wire push so the
      * replica's idx is byte-equivalent to the primary's. */
@@ -463,10 +413,39 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     rawblk_write_idx_entry(ent, (uint64_t)col_offset,
                            r->block_bytes_len, r->count,
                            r->ts_min, r->ts_max, &stats);
-    fwrite(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_w);
 
+    /* Header via the SHARED storage writer so flush + replication stamp
+     * byte-identical headers; preserving old_max_seq keeps a V4 partition V4
+     * (and a fresh replica-only partition V3, since old_max_seq stays 0). */
+    uint8_t ih[TSDB_IDX_HEADER_SIZE];
+    size_t  hdr_sz = tsdb_part_write_idx_header(ih, new_count, new_total,
+                                                new_fmn, new_fmx, old_max_seq);
+
+    /* Atomic publish: write <idx>.tmp, fflush + fsync, then rename onto the
+     * real path so a concurrent reader never observes a torn header (matches
+     * the flush path's temp+fsync+rename in part.c col_writer_close). */
+    char tmp_path[4200];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", idx_path);
+    FILE *idx_w = fopen(tmp_path, "wb");
+    if (!idx_w) { free(old_entries); return TSDB_ERR_IO; }
+
+    int io_ok = 1;
+    if (fwrite(ih, 1, hdr_sz, idx_w) != hdr_sz) io_ok = 0;
+    if (io_ok && old_count > 0 && old_entries &&
+        fwrite(old_entries, 1, (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_w)
+            != (size_t)old_count * RAWBLK_IDX_ENT_SIZE) io_ok = 0;
+    if (io_ok && fwrite(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_w)
+            != RAWBLK_IDX_ENT_SIZE) io_ok = 0;
+    if (io_ok && fflush(idx_w) != 0) io_ok = 0;
+    if (io_ok) {
+        int fd = fileno(idx_w);
+        if (fd >= 0) (void)fsync(fd);   /* durable before rename */
+    }
     fclose(idx_w);
     free(old_entries);
+
+    if (!io_ok) { unlink(tmp_path); return TSDB_ERR_IO; }
+    if (rename(tmp_path, idx_path) != 0) { unlink(tmp_path); return TSDB_ERR_IO; }
     return TSDB_OK;
 }
 

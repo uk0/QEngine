@@ -228,6 +228,22 @@ static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows
 }
 
 /*
+ * Public idx-header writer — the ONE canonical encoder, shared by the flush
+ * path (col_writer_close) and the raw-block replication path (rawblock.c) so
+ * both stamp byte-identical headers and select V3/V4 the same way.  `buf` must
+ * hold at least TSDB_IDX_HEADER_SIZE bytes.  Returns the header size written
+ * (40 for V3 when max_seq==0, 48 for V4 when max_seq>0).
+ */
+size_t tsdb_part_write_idx_header(uint8_t *buf, uint32_t count,
+                                  uint64_t total_rows,
+                                  int64_t file_ts_min, int64_t file_ts_max,
+                                  uint64_t max_seq)
+{
+    return write_idx_header(buf, count, total_rows,
+                            file_ts_min, file_ts_max, max_seq);
+}
+
+/*
  * Decode an IdxHeader supporting v1 / v2 / v3 / v4.
  *
  * Returns the number of header bytes consumed (20 for v1, 36 for v2,
@@ -282,6 +298,136 @@ static int read_idx_header_ex(const uint8_t *buf, size_t avail,
         return (int)TSDB_IDX_HEADER_SIZE;
     }
     return -1;   /* unknown version */
+}
+
+/*
+ * Recover the true idx header size for a mixed-writer "mongrel" idx file.
+ *
+ * Two writers stamp idx headers: the flush path (write_idx_header — V3 40
+ * bytes when max_seq==0, V4 48 bytes when max_seq>0) and the raw-block
+ * replication path (rawblk_write_idx_header).  If a single partition is
+ * touched by BOTH and they disagree on the header size, the file can end up
+ * with a version byte whose IMPLIED header size does not match where the
+ * fixed-size entries actually begin — e.g. a V4-sized body (entries at 48)
+ * carrying a V3 version byte, so a reader keying off the version reads
+ * entry0 at offset 40 (garbage) and filters every block → 0 rows for a
+ * partition full of durable data.
+ *
+ * The on-disk entry array is fixed-stride, so the layout is self-checking:
+ * for the correct header size H, (idx_file_size - H) is an exact multiple of
+ * entry_size AND equals block_count*entry_size.  Given the version-derived
+ * header size `hdr_size`, verify that invariant; if it fails, try the only
+ * other header size a stats-bearing idx uses (V3 40 <-> V4 48) and return
+ * whichever fits.  Returns the chosen header size, or `hdr_size` unchanged
+ * when neither candidate is a clean fit (leave the existing behaviour).
+ *
+ * `idx_file_size` is the total byte length of the .idx file.  Logs once to
+ * stderr when a recovery actually changes the header size.
+ */
+static int idx_recover_header_size(int hdr_size, uint32_t entry_size,
+                                   uint32_t block_count, uint64_t idx_file_size,
+                                   const char *where)
+{
+    if (hdr_size <= 0 || entry_size == 0 || block_count == 0) return hdr_size;
+
+    uint64_t want = (uint64_t)block_count * entry_size;
+
+    /* Candidate 1: the version-derived header size. */
+    if (idx_file_size >= (uint64_t)hdr_size &&
+        idx_file_size - (uint64_t)hdr_size == want) {
+        return hdr_size;   /* self-consistent — the common case */
+    }
+
+    /* Candidate 2: the alternate stats-era header size (40 <-> 48).  Only
+     * V3/V4 carry 88-byte stats entries, which is the only case that can
+     * mongrel (V1/V2 use 40-byte entries and a distinct size). */
+    if (entry_size == TSDB_IDX_ENTRY_SIZE) {
+        int alt = (hdr_size == (int)TSDB_IDX_HEADER_SIZE)      /* 48 -> 40 */
+                      ? (int)TSDB_IDX_HEADER_SIZE_V3
+                  : (hdr_size == (int)TSDB_IDX_HEADER_SIZE_V3) /* 40 -> 48 */
+                      ? (int)TSDB_IDX_HEADER_SIZE
+                      : 0;
+        if (alt > 0 && idx_file_size >= (uint64_t)alt &&
+            idx_file_size - (uint64_t)alt == want) {
+            fprintf(stderr,
+                    "[part] %s: idx header size %d inconsistent with file "
+                    "(size=%llu count=%u esz=%u); recovering as %d\n",
+                    where ? where : "?", hdr_size,
+                    (unsigned long long)idx_file_size, block_count, entry_size,
+                    alt);
+            return alt;
+        }
+    }
+
+    return hdr_size;   /* no clean alternate — caller keeps prior behaviour */
+}
+
+/*
+ * Probe an existing idx file's header: report its version, per-entry size,
+ * file-level zone map, total rows, and durable max_seq checkpoint — applying
+ * the mixed-writer header-size recovery so a V3/V4-mongrel reports the values
+ * that match where its entries actually live.  Returns the (recovered) header
+ * size, 0 if the file is absent/too short, or -1 on a corrupt magic/version.
+ *
+ * The raw-block writer uses this to PRESERVE an existing partition's idx
+ * version and carry its max_seq forward, instead of silently downgrading a
+ * V4 partition to V3 (which would drop the WAL redo checkpoint).
+ */
+int tsdb_part_idx_probe(const char *idx_path,
+                        uint16_t *out_version, uint32_t *out_count,
+                        uint32_t *out_entry_size, uint64_t *out_total_rows,
+                        int64_t *out_file_ts_min, int64_t *out_file_ts_max,
+                        uint64_t *out_max_seq)
+{
+    if (out_version)     *out_version     = 0;
+    if (out_count)       *out_count       = 0;
+    if (out_entry_size)  *out_entry_size  = 0;
+    if (out_total_rows)  *out_total_rows  = 0;
+    if (out_file_ts_min) *out_file_ts_min = INT64_MAX;
+    if (out_file_ts_max) *out_file_ts_max = INT64_MIN;
+    if (out_max_seq)     *out_max_seq     = 0;
+
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return 0;
+
+    uint8_t hdr[TSDB_IDX_HEADER_SIZE];
+    size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
+
+    uint32_t cnt = 0, esz = 0;
+    uint16_t ver = 0;
+    uint64_t tot = 0, mseq = 0;
+    int64_t  fmn = INT64_MAX, fmx = INT64_MIN;
+    int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
+                                  &fmn, &fmx, &esz, &mseq);
+    if (hsz > 0 && esz > 0 && cnt > 0) {
+        struct stat ist;
+        if (fstat(fileno(f), &ist) == 0 && ist.st_size > 0) {
+            int rhsz = idx_recover_header_size(hsz, esz, cnt,
+                                               (uint64_t)ist.st_size, idx_path);
+            /* If recovery moved us to a V4 header, re-read max_seq from the
+             * (now correct) header offset so a mongrel's checkpoint survives. */
+            if (rhsz != hsz && rhsz == (int)TSDB_IDX_HEADER_SIZE &&
+                (size_t)ist.st_size >= TSDB_IDX_HEADER_SIZE) {
+                ver  = 4;
+                mseq = get_u64le(hdr + 40);
+            } else if (rhsz != hsz && rhsz == (int)TSDB_IDX_HEADER_SIZE_V3) {
+                ver  = 3;
+                mseq = 0;
+            }
+            hsz = rhsz;
+        }
+    }
+    fclose(f);
+
+    if (hsz <= 0) return hsz;
+    if (out_version)     *out_version     = ver;
+    if (out_count)       *out_count       = cnt;
+    if (out_entry_size)  *out_entry_size  = esz;
+    if (out_total_rows)  *out_total_rows  = tot;
+    if (out_file_ts_min) *out_file_ts_min = fmn;
+    if (out_file_ts_max) *out_file_ts_max = fmx;
+    if (out_max_seq)     *out_max_seq     = mseq;
+    return hsz;
 }
 
 
@@ -728,6 +874,16 @@ static int col_writer_close(col_writer_t *w) {
                                               &fmn, &fmx, &esz, &mseq);
                 /* Never let a re-flush lower the durable checkpoint. */
                 if (mseq > w->max_seq) w->max_seq = mseq;
+                /* Mixed-writer recovery: re-derive the header size from the
+                 * idx length so a V3/V4-mongrel's old entries are read from
+                 * their real offset, not widened from garbage. */
+                if (hsz > 0 && esz > 0 && cnt > 0) {
+                    struct stat ist;
+                    if (fstat(fileno(idx_r), &ist) == 0 && ist.st_size > 0)
+                        hsz = idx_recover_header_size(hsz, esz, cnt,
+                                                      (uint64_t)ist.st_size,
+                                                      w->idx_path);
+                }
                 if (hsz > 0 && esz > 0) {
                     old_count = cnt;
                     if (old_count > 0) {
@@ -1209,6 +1365,22 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                                                 &entry_size, NULL);
         if (hdr_size < 0 || block_count == 0 || entry_size == 0) {
             fclose(idx_f); continue;
+        }
+
+        /* Mixed-writer recovery: if the version-derived header size does not
+         * match where the fixed-stride entries actually start (a V3/V4 header
+         * mongrel produced by the flush + raw-block writers disagreeing), the
+         * entries would be read at the wrong offset → garbage offsets → every
+         * block filtered → 0 rows.  Re-derive the header size from the idx
+         * file length so entry0 is read where it really lives. */
+        {
+            struct stat ist;
+            if (fstat(fileno(idx_f), &ist) == 0 && ist.st_size > 0) {
+                hdr_size = idx_recover_header_size(hdr_size, entry_size,
+                                                   block_count,
+                                                   (uint64_t)ist.st_size,
+                                                   idx_path);
+            }
         }
 
         if (fseek(idx_f, (long)hdr_size, SEEK_SET) != 0) {

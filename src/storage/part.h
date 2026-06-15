@@ -161,6 +161,31 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
  */
 uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir);
 
+/*
+ * The ONE canonical idx-header encoder, shared by the flush path and the
+ * raw-block replication path so both stamp byte-identical headers and select
+ * V3 (max_seq==0, 40 bytes) vs V4 (max_seq>0, 48 bytes) the same way.  `buf`
+ * must hold at least TSDB_IDX_HEADER_SIZE bytes.  Returns the header size.
+ */
+size_t tsdb_part_write_idx_header(uint8_t *buf, uint32_t count,
+                                  uint64_t total_rows,
+                                  int64_t file_ts_min, int64_t file_ts_max,
+                                  uint64_t max_seq);
+
+/*
+ * Probe an existing idx file's header (version, entry size, zone map, total
+ * rows, durable max_seq), applying the mixed-writer header-size recovery so a
+ * V3/V4-mongrel reports values consistent with where its entries live.
+ * Returns the (recovered) header size, 0 if absent/short, -1 if corrupt.
+ * Out-params may be NULL.  The raw-block writer uses this to PRESERVE a
+ * partition's idx version and carry its max_seq forward (no silent downgrade).
+ */
+int tsdb_part_idx_probe(const char *idx_path,
+                        uint16_t *out_version, uint32_t *out_count,
+                        uint32_t *out_entry_size, uint64_t *out_total_rows,
+                        int64_t *out_file_ts_min, int64_t *out_file_ts_max,
+                        uint64_t *out_max_seq);
+
 /* Opaque partition handle (for reading). */
 typedef struct tsdb_part tsdb_part_t;
 
