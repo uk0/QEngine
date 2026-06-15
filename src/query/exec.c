@@ -4180,6 +4180,17 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 snprintf(children[0].stable_name, sizeof(children[0].stable_name), "%s", st->name);
                 children[0].ntags = 0;
                 nchildren = 1;
+            } else {
+                /* Task #174 L4: the self table opened cleanly (its data is
+                 * readable), but the one-element child array could not be
+                 * allocated.  Falling through here would leave nchildren==0 and
+                 * hit the terminal `return TSDB_OK` below — a silent EMPTY
+                 * result set for a table whose data is on disk, the exact 0-row
+                 * lie the rest of this fix exists to prevent.  Surface NOMEM. */
+                eset(err, errcap,
+                     "out of memory materialising self-child for stable '%s'",
+                     st->name);
+                return TSDB_ERR_NOMEM;
             }
         } else if (has_storage) {
             /* Storage exists but the table still could not be opened even after
@@ -4326,9 +4337,26 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     if (saved_where) q->where = saved_where;
     free(children);
 
-    /* If no children matched, return empty result with 0 rows. */
-    /* r->ncols == 0 means no child ran; that is a valid 0-row result. */
+    /* Terminal guard (task #174 L4).  Reaching here with r->ncols == 0 means no
+     * child ever ran — for a genuinely empty super-table (no same-named storage)
+     * that is the correct 0-row result.  But if the same-named table physically
+     * HAS data on disk, returning TSDB_OK with an empty result set is the silent
+     * 0-row lie this task exists to kill: a node holding the partition would
+     * report no rows for live data, indistinguishable from "no data".  This
+     * backstops every way the nchildren==0 recovery above can fail to set up the
+     * self-child (e.g. a storage probe that missed, or an open that returned a
+     * handle the merge then dropped) — surface a real error instead so the read
+     * fails loudly rather than silently empty.  PARTITION BY tbname is exempt:
+     * it legitimately emits zero rows when no child matches. */
+    if (r->ncols == 0 && !orig_pb_tbname &&
+        stable_self_storage_exists(db, st->name)) {
+        eset(err, errcap,
+             "table '%s' has on-disk data but produced no result rows "
+             "(stable-mirror self-child setup failed)", st->name);
+        return TSDB_ERR_CORRUPT;
+    }
 
+    /* No same-named storage: a genuinely empty super-table → valid 0-row result. */
     return TSDB_OK;
 }
 
