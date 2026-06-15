@@ -185,6 +185,117 @@ static int decode_query_hdr(result_set_t *rs,
     return 0;
 }
 
+/* Render one 8-byte raw value into out[] according to the column type.
+ * Column types come from the QUERY_RESULT_HDR (rs->cols[c].type). */
+static void render_query_cell(char *out, size_t outcap,
+                              uint8_t type, uint64_t raw) {
+    switch (type) {
+    case TSDB_TYPE_TIMESTAMP: {
+        time_t secs = (time_t)((int64_t)raw / 1000000000LL);
+        long  nsec  = (long)((int64_t)raw % 1000000000LL);
+        struct tm tm;
+        gmtime_r(&secs, &tm);
+        snprintf(out, outcap, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec, nsec / 1000000);
+        break;
+    }
+    case TSDB_TYPE_INT64:
+        snprintf(out, outcap, "%lld", (long long)(int64_t)raw);
+        break;
+    case TSDB_TYPE_FLOAT64: {
+        double d; memcpy(&d, &raw, 8);
+        snprintf(out, outcap, "%.6g", d);
+        break;
+    }
+    default:
+        snprintf(out, outcap, "%llu", (unsigned long long)raw);
+    }
+}
+
+/*
+ * Decode a QUERY_RESULT_ROWS chunk produced by the server's
+ * emit_query_chunk().  Column types are taken from rs->cols[] (set earlier
+ * by decode_query_hdr); the chunk itself carries no per-column metadata.
+ *
+ * Wire layout (matches src/server/server.c:emit_query_chunk):
+ *   [nrows u32][ncols u16]
+ *   per column c (by rs->cols[c].type):
+ *     SYMBOL: [blocklen u32] then nrows × ([len u16][bytes])
+ *     other : nrows × 8 bytes (little-endian, 8-byte stride)
+ *
+ * Appends decoded rows to rs.  Returns 0 on success, -1 on a malformed frame.
+ */
+static int decode_query_rows(result_set_t *rs,
+                             const uint8_t *p, uint32_t plen) {
+    const uint8_t *end = p + plen;
+    if (p + 6 > end) return -1;
+
+    uint32_t nrows = get_u32(p); p += 4;
+    uint16_t ncols = get_u16(p); p += 2;
+    if (nrows == 0) return 0;
+    if (ncols == 0 || ncols > MAX_COLS) return -1;
+    /* The chunk's ncols must agree with the header we already parsed. */
+    if (rs->ncols > 0 && (int)ncols != rs->ncols) return -1;
+
+    /* Per-column cursor into the chunk body. */
+    struct qcol { uint8_t type; const uint8_t *num; const uint8_t *sym; const uint8_t *symend; };
+    struct qcol cols[MAX_COLS];
+
+    for (uint16_t c = 0; c < ncols; c++) {
+        cols[c].type = (uint8_t)rs->cols[c].type;
+        if (cols[c].type == TSDB_TYPE_SYMBOL) {
+            if (p + 4 > end) return -1;
+            uint32_t bl = get_u32(p); p += 4;
+            if (p + bl > end) return -1;
+            cols[c].sym    = p;
+            cols[c].symend = p + bl;
+            cols[c].num    = NULL;
+            p += bl;
+        } else {
+            size_t need = (size_t)nrows * 8;
+            if (p + need > end) return -1;
+            cols[c].num    = p;
+            cols[c].sym    = NULL;
+            cols[c].symend = NULL;
+            p += need;
+        }
+    }
+
+    /* Row-major emit.  Each cell gets its own buffer so symbol strings of
+     * varying length survive until rs_add_row copies them. */
+    char  cellbuf[MAX_COLS][512];
+    char *vals[MAX_COLS];
+    for (uint32_t r = 0; r < nrows; r++) {
+        for (uint16_t c = 0; c < ncols; c++) {
+            if (cols[c].type == TSDB_TYPE_SYMBOL) {
+                /* Walk the length-prefixed block to the r-th string. */
+                const uint8_t *sp = cols[c].sym;
+                int ok = 1;
+                for (uint32_t k = 0; k < r; k++) {
+                    if (sp + 2 > cols[c].symend) { ok = 0; break; }
+                    uint16_t l = get_u16(sp); sp += 2 + l;
+                }
+                if (!ok || sp + 2 > cols[c].symend) {
+                    snprintf(cellbuf[c], sizeof(cellbuf[c]), "?");
+                } else {
+                    uint16_t l = get_u16(sp); sp += 2;
+                    if (sp + l > cols[c].symend) l = (uint16_t)(cols[c].symend - sp);
+                    size_t cp = l < sizeof(cellbuf[c]) - 1 ? l : sizeof(cellbuf[c]) - 1;
+                    memcpy(cellbuf[c], sp, cp);
+                    cellbuf[c][cp] = '\0';
+                }
+            } else {
+                uint64_t raw = get_u64(cols[c].num + (size_t)r * 8);
+                render_query_cell(cellbuf[c], sizeof(cellbuf[c]), cols[c].type, raw);
+            }
+            vals[c] = cellbuf[c];
+        }
+        rs_add_row(rs, vals);
+    }
+    return 0;
+}
+
 /*
  * Decode a QUERY_RESULT_ROWS / WRITE_BATCH / SUB_EVENT columnar payload.
  * Appends rows to rs.
@@ -411,7 +522,7 @@ static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
             decode_query_hdr(rs, msg.payload, msg.hdr.payload_len);
         } else if (msg.hdr.type == MSG_QUERY_RESULT_ROWS) {
             if (got_hdr)
-                decode_columnar_rows(rs, msg.payload, msg.hdr.payload_len);
+                decode_query_rows(rs, msg.payload, msg.hdr.payload_len);
         }
 
         bool fin = (msg.hdr.flags & TSDB_FLAG_FIN) != 0;
