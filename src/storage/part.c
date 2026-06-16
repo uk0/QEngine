@@ -1333,6 +1333,18 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
     for (int i = 0; i < s->ncols; i++)
         p->col_maps[i].fd = -1;
 
+    /* Per-column block count DECLARED by the idx header (before the per-block
+     * size filter below drops any block whose .col bytes are torn off the
+     * tail).  The alignment pass uses this to tell two different "fewer blocks
+     * than ts" situations apart: a genuinely later-added column (its idx has
+     * fewer entries → ALTER ADD COLUMN, prepend zero-fill sentinels) vs a
+     * column whose idx declares the SAME blocks as ts but whose .col was torn
+     * (idx count equal, filtered meta fewer → the missing blocks are the TAIL,
+     * NOT the front; prepending would mis-pair surviving rows with the wrong
+     * ts and silently return wrong values). */
+    uint32_t idx_decl_count[TSDB_MAX_COLS];
+    for (int i = 0; i < s->ncols; i++) idx_decl_count[i] = 0;
+
     for (int ci = 0; ci < s->ncols; ci++) {
         /* ── Parquet-footer open order ──────────────────────────────────
          * 1. Read idx fully into a scratch buffer (idx is the atomic
@@ -1396,6 +1408,10 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                              (size_t)block_count, idx_f);
         fclose(idx_f);
         if (nread == 0) { free(entries); continue; }
+
+        /* Record how many blocks this column's idx declares (what the writer
+         * published), independent of how many survive the .col size filter. */
+        idx_decl_count[ci] = (uint32_t)nread;
 
         uint64_t max_end = 0;
         for (size_t i = 0; i < nread; i++) {
@@ -1510,20 +1526,80 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         }
     }
 
+    /* ─── Torn non-ts column: clamp the partition to its durable block prefix ─
+     * A non-ts column whose idx declares the SAME block count as ts but whose
+     * .col was truncated (crash mid-flush, or an interrupted/racing
+     * anti-entropy truncate+re-pull on one file) loses its TAIL blocks to the
+     * per-block size filter above.  Those rows have no recoverable value for
+     * that column.  Prepending sentinels (the ALTER path below) would be WRONG
+     * here: it assumes the missing blocks are the column's leading/oldest ones,
+     * so it would shift the surviving real blocks to align with the LAST ts
+     * blocks and zero-fill the front — silently returning wrong values for
+     * every row (count stays right; the cells are mis-paired).
+     *
+     * Correct behaviour, matching the torn-ts case (tsdb_part_open already
+     * reads only the durable .col prefix for ts): expose only the block prefix
+     * for which EVERY column is durable.  Blocks are appended in ts order, so
+     * a tail truncation drops the highest-offset (newest) blocks; the durable
+     * prefix is the first K blocks, K = min readable block count over columns
+     * whose idx is fully present.  Clamp ts (the block enumerator) and every
+     * such column to K. */
+    int ts_ci = s->ts_col_idx;
+    if (ts_ci >= 0 && ts_ci < s->ncols && p->col_meta_n[ts_ci] > 0) {
+        size_t durable_prefix = p->col_meta_n[ts_ci];
+        for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci) continue;
+            /* Only columns whose idx is at least as long as ts's idx can be
+             * "torn": a shorter idx means the column was genuinely added later
+             * (ALTER ADD COLUMN) and is handled by the sentinel pass below. */
+            if (idx_decl_count[ci] >= idx_decl_count[ts_ci] &&
+                p->col_meta_n[ci] < durable_prefix) {
+                durable_prefix = p->col_meta_n[ci];
+            }
+        }
+        if (durable_prefix < p->col_meta_n[ts_ci]) {
+            fprintf(stderr,
+                    "[part] %s: a non-ts column is torn shorter than ts; "
+                    "clamping partition to durable block prefix (%zu of %zu "
+                    "blocks) to avoid mis-paired rows\n",
+                    partition_dir, durable_prefix, p->col_meta_n[ts_ci]);
+            /* Clamp ts and every column whose idx matched ts (the fully-present
+             * columns) down to the durable prefix.  A genuinely-shorter ALTER
+             * column keeps its own (smaller) count and is padded below. */
+            p->col_meta_n[ts_ci] = durable_prefix;
+            for (int ci = 0; ci < s->ncols; ci++) {
+                if (ci == ts_ci) continue;
+                if (idx_decl_count[ci] >= idx_decl_count[ts_ci] &&
+                    p->col_meta_n[ci] > durable_prefix) {
+                    p->col_meta_n[ci] = durable_prefix;
+                }
+            }
+        }
+    }
+
     /* ─── ALTER TABLE ADD COLUMN support ───────────────────────────────────
      * Columns added after earlier flushes have fewer (or zero) blocks than
      * the TS column for this partition. Pad the front with synthetic
      * block-meta records so readers that walk TS-aligned blocks always
      * find a matching entry. Sentinel: offset=0, codec=TSDB_CODEC_NONE,
      * no col file mapped for the synthesised block range.
-     * tsdb_part_read_block zero-fills when it sees the sentinel. */
-    int ts_ci = s->ts_col_idx;
+     * tsdb_part_read_block zero-fills when it sees the sentinel.
+     *
+     * Only a column whose IDX genuinely declares fewer blocks than ts is an
+     * ALTER-added column; a same-idx-count column that merely lost tail blocks
+     * to a tear was already clamped (handled above), so it can't reach here
+     * with a short count and be mistaken for a late add. */
     if (ts_ci >= 0 && ts_ci < s->ncols && p->col_meta_n[ts_ci] > 0) {
         size_t nb_ts = p->col_meta_n[ts_ci];
         for (int ci = 0; ci < s->ncols; ci++) {
             if (ci == ts_ci)                  continue;
             size_t nb_col = p->col_meta_n[ci];
             if (nb_col >= nb_ts)              continue;   /* already aligned */
+            /* Skip a torn (not late-added) column: its idx is as long as ts's,
+             * so the shortfall is a tail tear, not missing leading blocks.
+             * The clamp above already bounded the partition to the prefix
+             * these blocks live in. */
+            if (idx_decl_count[ci] >= idx_decl_count[ts_ci]) continue;
 
             size_t nmiss = nb_ts - nb_col;
             tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
