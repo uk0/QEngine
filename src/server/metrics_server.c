@@ -989,14 +989,18 @@ static void *handle_connection(void *arg) {
         int n = snprintf(body, AUD_CAP, "{\"rows\":[");
         int wrote = 0;
         if (g_audit_tail_fn) {
-            char raw[1024 * 1024];
-            int got = g_audit_tail_fn(g_audit_tail_ud, nrows,
-                                       raw, sizeof(raw));
-            if (got > 0) {
+            /* 1 MiB scratch for the raw JSONL tail — on the heap, not the
+             * stack: these handler threads run on the default (small) thread
+             * stack and a 1 MiB local here risks a guard-page overflow. */
+            const size_t RAW_CAP = 1024 * 1024;
+            char *raw = malloc(RAW_CAP);
+            int got = raw ? g_audit_tail_fn(g_audit_tail_ud, nrows,
+                                            raw, (int)RAW_CAP) : 0;
+            if (raw && got > 0) {
                 /* raw is newline-separated JSONL; rewrap as JSON array. */
                 int first = 1;
                 char *p = raw, *line_end;
-                raw[got < (int)sizeof(raw) ? got : (int)sizeof(raw) - 1] = '\0';
+                raw[got < (int)RAW_CAP ? got : (int)RAW_CAP - 1] = '\0';
                 while ((line_end = strchr(p, '\n')) != NULL) {
                     *line_end = '\0';
                     if (*p) {
@@ -1011,6 +1015,7 @@ static void *handle_connection(void *arg) {
                     p = line_end + 1;
                 }
             }
+            free(raw);
         }
         n += snprintf(body + n, AUD_CAP - (size_t)n,
                       "],\"nrows\":%d}\n", wrote);
