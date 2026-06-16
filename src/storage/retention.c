@@ -283,10 +283,15 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
     int deleted = 0;
     uint64_t bytes = 0;
 
-    /* Reload conf on each sweep so operators can update it without restart. */
-    retention_conf_t conf;
-    memset(&conf, 0, sizeof(conf));
-    retention_conf_load(r->conf_path, &conf);
+    /* Reload conf on each sweep so operators can update it without restart.
+     * conf is ~66 KB (256 rules × 264 B); keep it off the stack so this
+     * function is safe to call from threads with a small stack — e.g. the
+     * metrics-server HTTP handler that backs POST /retention/sweep, whose
+     * frame already reserves large buffers.  A stack-resident conf overflowed
+     * the handler thread's guard page → SIGBUS on the memset below. */
+    retention_conf_t *conf = calloc(1, sizeof(*conf));
+    if (!conf) return TSDB_ERR_NOMEM;
+    retention_conf_load(r->conf_path, conf);
 
     int64_t now_ns = now_realtime_ns();
 
@@ -294,6 +299,7 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
     if (!root) {
         TSDB_LOG_WARN("retention", "cannot open data_dir '%s': %s",
                       r->data_dir, strerror(errno));
+        free(conf);
         return TSDB_ERR_IO;
     }
 
@@ -315,7 +321,7 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
         const char *table_name = tde->d_name;
 
         /* Look up retention policy for this table. */
-        int64_t retention_ns = retention_conf_lookup(&conf, table_name);
+        int64_t retention_ns = retention_conf_lookup(conf, table_name);
         if (retention_ns <= 0) {
             /* No rule → skip. */
             continue;
@@ -433,6 +439,7 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
     TSDB_LOG_INFO("retention",
                   "sweep done: %d partitions removed, %.1f MB reclaimed",
                   deleted, (double)bytes / (1024.0 * 1024.0));
+    free(conf);
     return TSDB_OK;
 }
 
