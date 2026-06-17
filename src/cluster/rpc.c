@@ -798,6 +798,47 @@ struct tsdb_rpc_server {
     volatile int         running;
 };
 
+/* ---- TCP keepalive ------------------------------------------------------- */
+
+/* Enable SO_KEEPALIVE + per-platform idle/intvl/cnt on a connected fd so a
+ * peer that dies silently (power loss, severed link) is detected and the
+ * socket torn down, instead of a half-open connection wedging an RPC slot.
+ * Gated on TSDB_TCP_KEEPALIVE (default on; "0" disables); idle/intvl/cnt come
+ * from TSDB_TCP_KEEPALIVE_IDLE_S / _INTVL_S / _CNT.  Per-option setsockopt
+ * failures are non-fatal — an older kernel/SDK may lack a given knob. */
+static void set_tcp_keepalive(int fd) {
+    const char *en = getenv("TSDB_TCP_KEEPALIVE");
+    if (en && strcmp(en, "0") == 0) return;
+
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) return;
+
+    const char *ei = getenv("TSDB_TCP_KEEPALIVE_IDLE_S");
+    const char *ev = getenv("TSDB_TCP_KEEPALIVE_INTVL_S");
+    const char *ec = getenv("TSDB_TCP_KEEPALIVE_CNT");
+    int idle  = (ei && *ei) ? atoi(ei) : 30;
+    int intvl = (ev && *ev) ? atoi(ev) : 10;
+    int cnt   = (ec && *ec) ? atoi(ec) : 3;
+
+#ifdef __linux__
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#elif defined(__APPLE__)
+#  ifdef TCP_KEEPALIVE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle,  sizeof(idle));
+#  endif
+#  ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#  endif
+#  ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#  endif
+#else
+    (void)idle; (void)intvl; (void)cnt;
+#endif
+}
+
 static void *accept_loop(void *arg) {
     tsdb_rpc_server_t *srv = (tsdb_rpc_server_t *)arg;
 
@@ -815,6 +856,8 @@ static void *accept_loop(void *arg) {
         /* Disable Nagle for low-latency. */
         int one = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        set_tcp_keepalive(client_fd);
 
         /* Iter 10: enlarge the receive buffer on the replication-accept
          * side so a peer can absorb a burst of WRITE_BATCH frames without
@@ -948,6 +991,8 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    set_tcp_keepalive(fd);
 
     /* Iter 10: enlarge the send buffer on the leader→peer replication
      * link.  perf on a virgin cluster put tcp_sendmsg at 7.27% of leader
