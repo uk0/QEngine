@@ -11,9 +11,27 @@ import (
 )
 
 // Client is a high-level wrapper on Conn with session + auth state.
+//
+// The client retains everything needed to transparently re-establish the
+// session after a mid-session connection drop (peer restart, network blip):
+// the server address, the dial timeout, and — once Login is called — the
+// credentials.  On a transport error during Query/WriteBatch the client
+// re-dials and re-handshakes automatically; see MaxReconnect.
 type Client struct {
 	Conn  *Conn
 	token string // set after Login
+
+	// Retained reconnect state.
+	addr     string        // server address passed to Open
+	timeout  time.Duration // dial timeout passed to Open
+	user     string        // login username (set by Login)
+	pass     string        // login password (set by Login)
+	loggedIn bool          // true once Login succeeded; re-Login on reconnect
+
+	// MaxReconnect bounds automatic reconnect attempts on a dropped
+	// connection.  Zero (the default) means auto-reconnect is ON with 2
+	// attempts.  A negative value disables auto-reconnect entirely.
+	MaxReconnect int
 }
 
 // Open dials + sends HELLO.
@@ -22,7 +40,7 @@ func Open(addr string, timeout time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl := &Client{Conn: conn}
+	cl := &Client{Conn: conn, addr: addr, timeout: timeout}
 	if _, err := conn.Send(MsgHello, 0, 0, nil); err != nil {
 		conn.Close()
 		return nil, err
@@ -45,6 +63,8 @@ func (c *Client) Close() error { return c.Conn.Close() }
 // Login performs AUTH_LOGIN.  On success the token is attached to the
 // connection server-side; no further work is needed from the client.
 func (c *Client) Login(user, pass string) error {
+	// Retain credentials so a reconnect can re-authenticate the fresh socket.
+	c.user, c.pass = user, pass
 	var buf bytes.Buffer
 	buf.WriteByte(byte(len(user)))
 	buf.WriteString(user)
@@ -67,6 +87,7 @@ func (c *Client) Login(user, pass string) error {
 		return fmt.Errorf("bad token length: %d", len(f.Payload))
 	}
 	c.token = string(f.Payload)
+	c.loggedIn = true
 	return nil
 }
 
@@ -207,12 +228,50 @@ func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, er
 	if err != nil {
 		return 0, err
 	}
+
+	// WriteBatch idempotency: a WRITE_BATCH is NOT idempotent — the server
+	// appends rows, so a blind resend could double-write.  We split the
+	// round-trip into a send phase and a receive phase and auto-retry ONLY the
+	// send phase:
+	//   - A Send/dial failure means the request frame never landed (or landed
+	//     incomplete and is rejected on CRC), so re-sending after reconnect is
+	//     safe — we reconnect and resend once.
+	//   - A failure on Recv() happens AFTER the frame was fully written; the
+	//     server may have already applied the batch, so resending could
+	//     duplicate rows.  We reconnect (so the next call uses a live socket)
+	//     but do NOT auto-retry; the underlying error is returned for the
+	//     caller to decide whether to resend.
+	acked, err := c.writeBatchOnce(payload)
+	if err == nil || !isConnError(err) || c.maxReconnect() <= 0 {
+		return acked, err
+	}
+	sentBytes := errors.Is(err, errAfterSend)
+	if rcErr := c.reconnect(); rcErr != nil {
+		return 0, err // surface the original transport error
+	}
+	if sentBytes {
+		// Post-send drop: reconnected, but resending may duplicate. Return.
+		return 0, errors.Unwrap(err)
+	}
+	return c.writeBatchOnce(payload)
+}
+
+// errAfterSend tags a transport error that occurred while awaiting the ack
+// (after the request frame was fully written), distinguishing it from a
+// send/dial failure where nothing reached the server.
+var errAfterSend = errors.New("connection dropped after request was sent")
+
+// writeBatchOnce performs a single WRITE_BATCH round-trip.  A Recv-phase
+// transport error is wrapped to satisfy errors.Is(err, errAfterSend) while
+// still unwrapping (via the wrapped chain) to the original conn error so
+// isConnError matches.
+func (c *Client) writeBatchOnce(payload []byte) (uint32, error) {
 	if _, err := c.Conn.Send(MsgWriteBatch, 0, 0, payload); err != nil {
-		return 0, err
+		return 0, err // send/dial failure: nothing landed, safe to retry
 	}
 	f, err := c.Conn.Recv()
 	if err != nil {
-		return 0, err
+		return 0, afterSendError{err}
 	}
 	if f.Type == MsgError {
 		return 0, decodeError(f.Payload)
@@ -225,6 +284,14 @@ func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, er
 	}
 	return binary.LittleEndian.Uint32(f.Payload[:4]), nil
 }
+
+// afterSendError wraps a post-send transport error so that it matches both
+// errors.Is(err, errAfterSend) (retry-suppression) and isConnError (reconnect).
+type afterSendError struct{ err error }
+
+func (e afterSendError) Error() string        { return e.err.Error() }
+func (e afterSendError) Unwrap() error        { return e.err }
+func (e afterSendError) Is(target error) bool { return target == errAfterSend }
 
 // PipelineWriter streams WRITE_BATCH frames without blocking on each ack, up to
 // a bounded in-flight window, so bulk-load throughput is governed by bandwidth
@@ -338,7 +405,23 @@ type QueryResult struct {
 }
 
 // Query runs a QTL string and returns the full result set.
+//
+// Query is read-only and therefore safe to auto-retry: on a mid-flight
+// transport drop the client reconnects and re-runs the whole query once (the
+// result set is rebuilt from scratch, so a partially-drained prior attempt
+// cannot corrupt it).  Auto-retry is governed by MaxReconnect.
 func (c *Client) Query(qtl string) (*QueryResult, error) {
+	var qr *QueryResult
+	err := c.withReconnect(true, func() error {
+		var qerr error
+		qr, qerr = c.queryOnce(qtl)
+		return qerr
+	})
+	return qr, err
+}
+
+// queryOnce performs a single QUERY round-trip and full result drain.
+func (c *Client) queryOnce(qtl string) (*QueryResult, error) {
 	if _, err := c.Conn.Send(MsgQuery, 0, 0, []byte(qtl)); err != nil {
 		return nil, err
 	}
