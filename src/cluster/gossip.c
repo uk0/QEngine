@@ -83,11 +83,17 @@ static int addr_to_sin(const char *addr, struct sockaddr_in *out) {
     out->sin_family = AF_INET;
     out->sin_port   = htons((uint16_t)port);
 
-    /* Try numeric first, then resolve. */
+    /* Try numeric first, then resolve.  getaddrinfo (not gethostbyname) is
+     * thread-safe — addr_to_sin runs from gossip threads.  AF_INET keeps the
+     * sockaddr_in contract; the goal here is thread-safety, not IPv6. */
     if (inet_aton(host, &out->sin_addr) == 0) {
-        struct hostent *h = gethostbyname(host);
-        if (!h || !h->h_addr_list[0]) return -1;
-        memcpy(&out->sin_addr, h->h_addr_list[0], sizeof(out->sin_addr));
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+        out->sin_addr = sin->sin_addr;
+        freeaddrinfo(res);
     }
     return 0;
 }

@@ -1000,6 +1000,47 @@ static void rpc_conn_track_remove(struct tsdb_rpc_server *s, int fd) {
     pthread_mutex_unlock(&s->conn_mu);
 }
 
+/* ---- TCP keepalive ------------------------------------------------------- */
+
+/* Enable SO_KEEPALIVE + per-platform idle/intvl/cnt on a connected fd so a
+ * peer that dies silently (power loss, severed link) is detected and the
+ * socket torn down, instead of a half-open connection wedging an RPC slot.
+ * Gated on TSDB_TCP_KEEPALIVE (default on; "0" disables); idle/intvl/cnt come
+ * from TSDB_TCP_KEEPALIVE_IDLE_S / _INTVL_S / _CNT.  Per-option setsockopt
+ * failures are non-fatal — an older kernel/SDK may lack a given knob. */
+static void set_tcp_keepalive(int fd) {
+    const char *en = getenv("TSDB_TCP_KEEPALIVE");
+    if (en && strcmp(en, "0") == 0) return;
+
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) return;
+
+    const char *ei = getenv("TSDB_TCP_KEEPALIVE_IDLE_S");
+    const char *ev = getenv("TSDB_TCP_KEEPALIVE_INTVL_S");
+    const char *ec = getenv("TSDB_TCP_KEEPALIVE_CNT");
+    int idle  = (ei && *ei) ? atoi(ei) : 30;
+    int intvl = (ev && *ev) ? atoi(ev) : 10;
+    int cnt   = (ec && *ec) ? atoi(ec) : 3;
+
+#ifdef __linux__
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#elif defined(__APPLE__)
+#  ifdef TCP_KEEPALIVE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle,  sizeof(idle));
+#  endif
+#  ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#  endif
+#  ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#  endif
+#else
+    (void)idle; (void)intvl; (void)cnt;
+#endif
+}
+
 static void *accept_loop(void *arg) {
     tsdb_rpc_server_t *srv = (tsdb_rpc_server_t *)arg;
 
@@ -1017,6 +1058,8 @@ static void *accept_loop(void *arg) {
         /* Disable Nagle for low-latency. */
         int one = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        set_tcp_keepalive(client_fd);
 
         /* Iter 10: enlarge the receive buffer on the replication-accept
          * side so a peer can absorb a burst of WRITE_BATCH frames without
@@ -1166,36 +1209,46 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
     if (timeout_ms <= 0) timeout_ms = 2000;
 
+    /* Dual-stack: AF_UNSPEC lets getaddrinfo return both v4 and v6 results;
+     * iterate and try each until one connects, applying the non-blocking
+     * connect + poll timeout per attempt (mirrors the CLI tcp_connect). */
     struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family   = AF_INET;
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
     if (getaddrinfo(host, portstr, &hints, &res) != 0) return NULL;
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return NULL; }
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
 
-    /* Set non-blocking for connect with timeout. */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        /* Set non-blocking for connect with timeout. */
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    connect(fd, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
-    struct pollfd pfd = { fd, POLLOUT, 0 };
-    if (poll(&pfd, 1, timeout_ms) <= 0 || !(pfd.revents & POLLOUT)) {
-        close(fd); return NULL;
+        int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (cr < 0 && errno != EINPROGRESS) {
+            close(fd); fd = -1; continue;
+        }
+        if (cr != 0) {
+            struct pollfd pfd = { fd, POLLOUT, 0 };
+            if (poll(&pfd, 1, timeout_ms) <= 0 || !(pfd.revents & POLLOUT)) {
+                close(fd); fd = -1; continue;
+            }
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+            if (err) { close(fd); fd = -1; continue; }
+        }
+        /* Restore blocking. */
+        fcntl(fd, F_SETFL, flags);
+        break;
     }
-
-    /* Check for connect error. */
-    int err = 0;
-    socklen_t errlen = sizeof(err);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
-    if (err) { close(fd); return NULL; }
-
-    /* Restore blocking. */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    freeaddrinfo(res);
+    if (fd < 0) return NULL;
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -1221,6 +1274,8 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         }
     }
+
+    set_tcp_keepalive(fd);
 
     /* Iter 10: enlarge the send buffer on the leader→peer replication
      * link.  perf on a virgin cluster put tcp_sendmsg at 7.27% of leader

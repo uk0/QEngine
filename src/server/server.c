@@ -1463,6 +1463,44 @@ typedef struct {
     int            fd;
 } accept_arg_t;
 
+/* SO_KEEPALIVE + per-platform idle/intvl/cnt on an accepted client socket so a
+ * silently-dead client (crashed app, severed link) is reaped instead of the
+ * connection lingering half-open.  Gated on TSDB_TCP_KEEPALIVE (default on; "0"
+ * disables); tunables TSDB_TCP_KEEPALIVE_IDLE_S / _INTVL_S / _CNT.  Per-option
+ * setsockopt failures are non-fatal. */
+static void set_tcp_keepalive(int fd) {
+    const char *en = getenv("TSDB_TCP_KEEPALIVE");
+    if (en && strcmp(en, "0") == 0) return;
+
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) return;
+
+    const char *ei = getenv("TSDB_TCP_KEEPALIVE_IDLE_S");
+    const char *ev = getenv("TSDB_TCP_KEEPALIVE_INTVL_S");
+    const char *ec = getenv("TSDB_TCP_KEEPALIVE_CNT");
+    int idle  = (ei && *ei) ? atoi(ei) : 30;
+    int intvl = (ev && *ev) ? atoi(ev) : 10;
+    int cnt   = (ec && *ec) ? atoi(ec) : 3;
+
+#ifdef __linux__
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#elif defined(__APPLE__)
+#  ifdef TCP_KEEPALIVE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle,  sizeof(idle));
+#  endif
+#  ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#  endif
+#  ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#  endif
+#else
+    (void)idle; (void)intvl; (void)cnt;
+#endif
+}
+
 static void *accept_loop(void *arg) {
     accept_arg_t *aa = (accept_arg_t *)arg;
     tsdb_server_t *srv = aa->srv;
@@ -1486,6 +1524,8 @@ static void *accept_loop(void *arg) {
         /* Disable Nagle for lower latency. */
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        set_tcp_keepalive(cfd);
 
         conn_ctx_t *ctx = (conn_ctx_t *)malloc(sizeof(*ctx));
         if (!ctx) { close(cfd); continue; }
