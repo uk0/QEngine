@@ -167,13 +167,19 @@ static void send_disk_sync(struct tsdb_gossip *g, const char *dest_addr) {
 
 static void send_ping(struct tsdb_gossip *g, const char *dest_addr,
                       tsdb_node_id_t target_id) {
-    uint8_t payload[8];
+    /* [target_id u64][sender_id u64].  The sender id (bytes 8..15) lets the
+     * receiver mark the SENDER alive — receiving a PING proves the sender is
+     * up.  Older peers send only the 8-byte target; newer receivers fall back
+     * gracefully (see the PING handler).  16 bytes fits frame[64]. */
+    uint8_t payload[16];
     memcpy(payload, &target_id, 8);
+    tsdb_node_id_t self = tsdb_node_manager_local_id(g->node_mgr);
+    memcpy(payload + 8, &self, 8);
 
     uint8_t frame[64];
     int flen = tsdb_gossip_encode(frame, sizeof(frame),
                                   TSDB_GOSSIP_PING,
-                                  payload, 8);
+                                  payload, 16);
     if (flen <= 0) return;
 
     struct sockaddr_in sa;
@@ -224,10 +230,19 @@ static void *recv_loop(void *arg) {
             if (plen >= 8) {
                 tsdb_node_id_t target;
                 memcpy(&target, payload, 8);
-                /* ACK back the ping. */
+                /* ACK back the ping (the pinger confirms `target` is alive
+                 * when it sees this ACK). */
                 send_ack(g, &src, srclen, target);
-                /* Also update heartbeat for the sender. */
-                tsdb_node_manager_alive(g->node_mgr, target, 0);
+                /* Mark the SENDER alive — receiving its PING proves liveness.
+                 * The sender id rides in bytes 8..15 of a newer PING; an older
+                 * 8-byte PING carries no sender id, so skip rather than mark
+                 * the wrong node (the old code wrongly refreshed `target`,
+                 * which could keep a dead node falsely ALIVE). */
+                if (plen >= 16) {
+                    tsdb_node_id_t sender;
+                    memcpy(&sender, payload + 8, 8);
+                    tsdb_node_manager_alive(g->node_mgr, sender, 0);
+                }
             }
             break;
 
