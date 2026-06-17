@@ -19,8 +19,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../src/server/server.h"
-#include "../src/storage/db.h"   /* tsdb_db_set_group_commit */
+#include "../src/storage/db.h"   /* tsdb_db_set_group_commit, retention/audit/pitr/catalog/backup hooks */
 #include "../src/storage/compaction.h"
+#include "../src/storage/retention.h"
+#include "../src/catalog/audit.h"
 #include "../src/server/config.h"
 #include "../src/server/log.h"
 #include "../src/server/influx_line.h"
@@ -167,6 +169,93 @@ static int server_main_sql_exec_cb(void *ud, const char *q, size_t qlen,
                   "],\"nrows\":%d,\"truncated\":%s,\"ms\":%d}",
                   nrows, truncated ? "true" : "false", srv_now_ms() - t0);
     return w;
+}
+
+/* ─── management-plane trampolines (standalone) ─────────────────────────
+ *
+ * The cluster node (src/cluster/tsdb_node_main.c) registers a full set of
+ * dashboard providers; the standalone server historically wired only /sql,
+ * so /retention/sweep, /audit, /pitr and the dashboard login returned
+ * "provider not registered" (503) in single-node mode.  These trampolines
+ * mirror the node ones but bind to the standalone `db` from tsdb_open. */
+
+static int srv_retention_sweep_trampoline(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    struct tsdb_retention *r = tsdb_db_retention(db);
+    if (!r) return -1;
+    int deleted = 0;
+    int rc = tsdb_retention_sweep_once(r, &deleted);
+    return rc == TSDB_OK ? deleted : -1;
+}
+
+static int srv_audit_tail_trampoline(void *ud, int max_rows,
+                                     char *buf, size_t cap) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    tsdb_audit_t *a = tsdb_db_audit(db);
+    if (!a) return 0;
+    return tsdb_audit_tail(a, max_rows, buf, cap);
+}
+
+static int srv_pitr_trim_trampoline(void *ud, int64_t ts_ns) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    int removed = 0;
+    int rc = tsdb_pitr_trim_to(db, ts_ns, &removed);
+    return rc == TSDB_OK ? removed : -1;
+}
+
+static int srv_auth_login_trampoline(void *ud, const char *user,
+                                     const char *pass, char *out, size_t cap) {
+    return tsdb_auth_authenticate((tsdb_db_t *)ud, user, pass, out, cap);
+}
+
+static int srv_auth_check_trampoline(void *ud, const char *token) {
+    return tsdb_auth_check((tsdb_db_t *)ud, token, TSDB_PRIV_SELECT, "*");
+}
+
+/* Register the full management-plane provider set on the metrics server,
+ * bound to the standalone `db`.  Mirrors the cluster node's wiring so a
+ * dockerized single-node ships the same dashboard surface.  Non-static so
+ * the parity test can drive these endpoints without booting a cluster. */
+void tsdb_server_wire_metrics_providers(tsdb_db_t *db) {
+    /* Retention GC: arm the background sweeper (honours
+     * <data_dir>/retention.conf), then expose a manual /retention/sweep.
+     * TSDB_RETENTION_SWEEP_MS / TSDB_RETENTION_DRY_RUN mirror the node. */
+    tsdb_retention_opts_t ropts = { .sweep_interval_ns = 0, .dry_run = 0 };
+    const char *sweep_ms = getenv("TSDB_RETENTION_SWEEP_MS");
+    if (sweep_ms && *sweep_ms) {
+        long long ms = atoll(sweep_ms);
+        if (ms > 0) ropts.sweep_interval_ns = (int64_t)ms * 1000000LL;
+    }
+    const char *dry = getenv("TSDB_RETENTION_DRY_RUN");
+    if (dry && *dry && *dry != '0') ropts.dry_run = 1;
+    tsdb_db_set_retention(db, NULL, &ropts);
+    tsdb_metrics_server_set_retention_sweep_provider(
+        srv_retention_sweep_trampoline, db);
+
+    /* /audit?n=N — tail the append-only audit log. */
+    tsdb_metrics_server_set_audit_provider(srv_audit_tail_trampoline, db);
+
+    /* POST /pitr?ts=<ns> — point-in-time recovery trim. */
+    tsdb_metrics_server_set_pitr_provider(srv_pitr_trim_trampoline, db);
+
+    /* GET /catalog/check — read-only catalog consistency report. */
+    tsdb_metrics_server_set_catalog_check_provider(
+        (tsdb_catalog_check_fn)tsdb_catalog_check, db);
+
+    /* Backup-manifest emitter invoked by /backup before tarring. */
+    tsdb_metrics_server_set_backup_manifest_provider(
+        (tsdb_backup_manifest_fn)tsdb_backup_emit_manifest_file, db);
+
+    /* Dashboard auth (only enforced when TSDB_DASHBOARD_AUTH=1). */
+    tsdb_metrics_server_set_auth_provider(
+        srv_auth_login_trampoline,
+        srv_auth_check_trampoline,
+        db);
+
+    /* /tree has no standalone provider in libtsdb — the cluster node's
+     * tree_json_cb reaches into the node manager, which doesn't exist in
+     * single-node mode.  Left unwired; /tree returns its built-in empty
+     * shape, which the dashboard tolerates. */
 }
 
 static void on_signal(int sig) {
@@ -368,6 +457,10 @@ int main(int argc, char **argv) {
          * a backup_restore.sh sidecar) returned "sql provider not
          * installed" for every /sql POST. */
         tsdb_metrics_server_set_sql_provider(server_main_sql_exec_cb, db);
+        /* Bring the rest of the management plane (retention sweep, audit,
+         * PITR, catalog-check, backup-manifest, dashboard auth) to parity
+         * with the cluster node so single-node ships the same dashboard. */
+        tsdb_server_wire_metrics_providers(db);
         rc = tsdb_metrics_server_start(cfg.metrics_bind, &ms);
         if (rc != 0) {
             TSDB_LOG_ERROR("main", "metrics server start(%s) failed", cfg.metrics_bind);
