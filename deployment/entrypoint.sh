@@ -33,9 +33,11 @@ ulimit -n 1048576 2>/dev/null || true
 
 case "$TSDB_ROLE" in
   server)
-    echo "[entrypoint] mode=server  data=$TSDB_DATA_DIR  bind=$TSDB_BIND"
-    exec runuser -u tsdb -- sh -c 'ulimit -n 1048576; exec tsdb-server --data-dir "$1" --bind "$2"' _ \
-         "$TSDB_DATA_DIR" "$TSDB_BIND"
+    : "${TSDB_METRICS_BIND:=0.0.0.0:28094}"
+    : "${TSDB_INFLUX_BIND:=0.0.0.0:28092}"
+    echo "[entrypoint] mode=server  data=$TSDB_DATA_DIR  bind=$TSDB_BIND  metrics=$TSDB_METRICS_BIND  influx=$TSDB_INFLUX_BIND"
+    exec runuser -u tsdb -- sh -c 'ulimit -n 1048576; exec tsdb-server --data-dir "$1" --bind "$2" --metrics-bind "$3" --influx-bind "$4"' _ \
+         "$TSDB_DATA_DIR" "$TSDB_BIND" "$TSDB_METRICS_BIND" "$TSDB_INFLUX_BIND"
     ;;
 
   cluster-node)
