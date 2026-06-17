@@ -3,8 +3,10 @@ package com.tsdb.client;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -62,23 +64,62 @@ public class TsdbClient implements AutoCloseable {
     public static final byte T_FLOAT64   = 3;
     public static final byte T_SYMBOL    = 4;
 
-    private final Socket socket;
-    private final DataInputStream  in;
-    private final DataOutputStream out;
+    /* Live socket + streams.  Non-final: {@link #reconnect()} swaps them for a
+     * fresh connection after a mid-session drop. */
+    private Socket socket;
+    private DataInputStream  in;
+    private DataOutputStream out;
     private long nextReq = 1;
     private String token = "";
+
+    /* ----- Retained reconnect state -----
+     * Everything needed to transparently re-establish the session after a
+     * transport drop (peer restart, network blip): the address, the connect
+     * timeout, and — once login() succeeds — the credentials. */
+    private final String host;
+    private final int    port;
+    private final int    timeoutMs;
+    private String  loginUser;
+    private String  loginPass;
+    private boolean loggedIn = false;
+
+    /**
+     * Bounds automatic reconnect attempts on a dropped connection.  The
+     * default (2) means auto-reconnect is ON.  Set to 0 (or any value &lt;= 0)
+     * to opt out, in which case a transport drop surfaces the IOException
+     * instead of re-connecting.  See {@link #setMaxReconnect(int)}.
+     */
+    private int maxReconnect = 2;
+
+    /* Per-attempt backoff (ms) before re-opening the socket.  Index i is used
+     * before attempt i+1.  Kept short: a peer restart usually recovers within a
+     * few hundred ms. */
+    private static final int[] RECONNECT_BACKOFF_MS = { 100, 300 };
 
     public TsdbClient(String host, int port) throws IOException {
         this(host, port, 10_000);
     }
 
     public TsdbClient(String host, int port, int timeoutMs) throws IOException {
-        this.socket = new Socket();
-        this.socket.connect(new java.net.InetSocketAddress(host, port), timeoutMs);
-        this.socket.setTcpNoDelay(true);
-        this.in  = new DataInputStream(socket.getInputStream());
-        this.out = new DataOutputStream(socket.getOutputStream());
+        this.host      = host;
+        this.port      = port;
+        this.timeoutMs = timeoutMs;
+        openSocket();
         hello();
+    }
+
+    /**
+     * Opens (or re-opens) the socket to the retained host/port and rebuilds
+     * the data streams, applying the same socket options the original connect
+     * used.  Shared by the constructor and {@link #reconnect()}.
+     */
+    private void openSocket() throws IOException {
+        Socket s = new Socket();
+        s.connect(new java.net.InetSocketAddress(host, port), timeoutMs);
+        s.setTcpNoDelay(true);
+        this.socket = s;
+        this.in  = new DataInputStream(s.getInputStream());
+        this.out = new DataOutputStream(s.getOutputStream());
     }
 
     @Override public void close() throws IOException {
@@ -86,6 +127,15 @@ public class TsdbClient implements AutoCloseable {
     }
 
     public String token() { return token; }
+
+    /**
+     * Maximum automatic reconnect attempts after a dropped connection.
+     * Default 2 (auto-reconnect ON).  Pass 0 to opt out entirely — a
+     * transport drop will then surface the IOException to the caller.
+     */
+    public void setMaxReconnect(int n) { this.maxReconnect = n; }
+
+    public int getMaxReconnect() { return maxReconnect; }
 
     /* ----- Frame I/O ----- */
 
@@ -159,7 +209,109 @@ public class TsdbClient implements AutoCloseable {
         if (f.type != MSG_HELLO_OK) throw new IOException("unexpected HELLO response type=" + f.type);
     }
 
+    /* ----- Reconnect ----- */
+
+    /**
+     * Reports whether {@code e} is a transport-level failure that warrants a
+     * reconnect — the peer went away or the socket broke — as opposed to a
+     * server application error (a decoded MSG_ERROR frame, surfaced by
+     * {@link #decodeError}) or a frame-integrity error (e.g. "crc mismatch"),
+     * neither of which must trigger a reconnect.
+     *
+     * <p>Reconnect-worthy: {@link EOFException} (readFully hit a closed
+     * socket mid-frame), or a {@link SocketException} whose message names a
+     * dropped/reset/closed/refused connection or a broken pipe.
+     */
+    static boolean isTransportError(IOException e) {
+        if (e instanceof EOFException) return true;
+        if (e instanceof SocketException) {
+            String m = e.getMessage();
+            if (m == null) return true; // a bare SocketException is transport-level
+            m = m.toLowerCase();
+            return m.contains("broken pipe")
+                || m.contains("connection reset")
+                || m.contains("connection closed")
+                || m.contains("connection refused")
+                || m.contains("socket closed")
+                || m.contains("socket is closed")
+                || m.contains("connection abort");
+        }
+        return false;
+    }
+
+    /**
+     * Tears down the dead socket and re-establishes a fresh session on the
+     * retained host/port: re-open the socket (same options), re-send HELLO
+     * exactly as the constructor did, and — if the original session
+     * authenticated — re-run login() with the retained credentials so the new
+     * socket carries a valid server-side token.  Retries up to
+     * {@code maxReconnect} times with a short backoff.
+     *
+     * @param trigger the transport error that prompted the reconnect; rethrown
+     *                (with the last reconnect failure attached) if all attempts
+     *                fail, so the caller still sees the original cause.
+     */
+    private void reconnect(IOException trigger) throws IOException {
+        try { socket.close(); } catch (IOException ignore) { /* already dead */ }
+        IOException last = null;
+        for (int i = 0; i < maxReconnect; i++) {
+            int d = i < RECONNECT_BACKOFF_MS.length ? i : RECONNECT_BACKOFF_MS.length - 1;
+            try { Thread.sleep(RECONNECT_BACKOFF_MS[d]); }
+            catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("reconnect interrupted", ie);
+            }
+            try {
+                dialAndHandshake();
+                return;
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        // All attempts failed: surface the original transport error, with the
+        // final reconnect failure (if any) as a suppressed cause.
+        if (last != null) trigger.addSuppressed(last);
+        throw trigger;
+    }
+
+    /** Reconnect on a best-effort basis, swallowing failure.  Used on the
+     *  post-send WriteBatch path where we re-establish the socket for future
+     *  calls but the original error is rethrown regardless. */
+    private void reconnectQuietly() {
+        try {
+            try { socket.close(); } catch (IOException ignore) {}
+            for (int i = 0; i < maxReconnect; i++) {
+                int d = i < RECONNECT_BACKOFF_MS.length ? i : RECONNECT_BACKOFF_MS.length - 1;
+                Thread.sleep(RECONNECT_BACKOFF_MS[d]);
+                try { dialAndHandshake(); return; }
+                catch (IOException ignore) { /* try again */ }
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** One full open: re-open socket + HELLO + (optional) re-login.  On any
+     *  failure the partial socket is closed and the error is propagated. */
+    private void dialAndHandshake() throws IOException {
+        openSocket();
+        try {
+            hello();
+            // Re-establish auth on the fresh socket: the prior token died with
+            // the old socket, so a new login() is mandatory, not optional.
+            if (loggedIn) login(loginUser, loginPass);
+        } catch (IOException e) {
+            try { socket.close(); } catch (IOException ignore) {}
+            throw e;
+        }
+    }
+
     public void login(String user, String pass) throws IOException {
+        // Retain credentials so a reconnect can re-authenticate the fresh
+        // socket: the server attaches the token to the connection, so the old
+        // token dies with the old socket and a new login() is mandatory.
+        this.loginUser = user;
+        this.loginPass = pass;
         byte[] u = user.getBytes("UTF-8");
         byte[] p = pass.getBytes("UTF-8");
         ByteBuffer buf = ByteBuffer.allocate(2 + u.length + p.length);
@@ -171,6 +323,7 @@ public class TsdbClient implements AutoCloseable {
         if (f.type != MSG_AUTH_OK) throw new IOException("unexpected AUTH type=" + f.type);
         if (f.payload.length != 32) throw new IOException("bad token len " + f.payload.length);
         token = new String(f.payload, "UTF-8");
+        loggedIn = true;
     }
 
     /* ----- DDL ----- */
@@ -223,6 +376,17 @@ public class TsdbClient implements AutoCloseable {
      * Wire format mirrors the cluster RPC WRITE_BATCH receiver:
      * fixed-width columns carry n*8 raw bytes; SYMBOL columns carry
      * `[u32 total_bytes][u16 len][bytes]…`.
+     *
+     * <p><b>Reconnect idempotency.</b>  A WRITE_BATCH is NOT idempotent — the
+     * server appends rows, so a blind resend could double-write.  Auto-retry
+     * therefore covers ONLY the send/connect phase: if the failure happens
+     * while writing the request frame (or on a dead socket before any byte
+     * lands), the request provably never reached the server, so the client
+     * reconnects and resends once.  If the failure happens AFTER the frame was
+     * fully sent (a transport drop while awaiting the ack), the server may have
+     * already applied the batch; the client reconnects so the next call lands
+     * on a live socket but RETHROWS the original error so the caller decides
+     * whether to resend.  Set {@link #setMaxReconnect(int)} to 0 to disable.
      *
      * @return number of rows the server confirmed it persisted.
      */
@@ -285,12 +449,55 @@ public class TsdbClient implements AutoCloseable {
             }
         }
 
-        send(MSG_WRITE_BATCH, (short) 0, out.toByteArray());
-        Frame f = recv();
+        byte[] payload = out.toByteArray();
+        try {
+            return writeBatchOnce(payload);
+        } catch (PostSendException e) {
+            // Frame was fully sent before the drop: the server may have applied
+            // it.  Reconnect for future calls but do NOT auto-resend (would risk
+            // duplicate rows); rethrow the underlying transport error.
+            if (maxReconnect > 0) reconnectQuietly();
+            throw e.cause;
+        } catch (IOException e) {
+            // Send/connect-phase failure (nothing landed) — safe to retry once.
+            if (!isTransportError(e) || maxReconnect <= 0) throw e;
+            reconnect(e);
+            return writeBatchOnce(payload);
+        }
+    }
+
+    /**
+     * One WRITE_BATCH round-trip.  A transport failure on the SEND phase
+     * propagates as a plain IOException (nothing reached the server, safe to
+     * retry).  A transport failure on the RECV phase — after the frame was
+     * fully written — is wrapped in {@link PostSendException} so the caller can
+     * distinguish it and suppress auto-resend.
+     */
+    private int writeBatchOnce(byte[] payload) throws IOException {
+        // Send phase: a failure here (incl. a dead socket) propagates as a
+        // plain IOException — the request never reached the server, safe to retry.
+        send(MSG_WRITE_BATCH, (short) 0, payload);
+        Frame f;
+        try {
+            f = recv();
+        } catch (IOException e) {
+            // Recv phase: the frame was fully written, so a transport drop here
+            // is post-send — tag it so the caller suppresses auto-resend.
+            if (isTransportError(e)) throw new PostSendException(e);
+            throw e;
+        }
         if (f.type == MSG_ERROR) throw decodeError(f.payload);
         if (f.type != MSG_WRITE_ACK) throw new IOException("unexpected WRITE response type=" + f.type);
         if (f.payload.length < 4) throw new IOException("short WRITE_ACK");
         return ByteBuffer.wrap(f.payload, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    /** Tags a transport error that occurred after the request frame was fully
+     *  sent (while awaiting the ack), so writeBatch suppresses auto-resend. */
+    private static final class PostSendException extends IOException {
+        private static final long serialVersionUID = 1L;
+        final IOException cause;
+        PostSendException(IOException cause) { super(cause); this.cause = cause; }
     }
 
     private static void writeU32LE(DataOutputStream o, int v) throws IOException {
@@ -311,7 +518,28 @@ public class TsdbClient implements AutoCloseable {
         public List<Object[]> rows = new ArrayList<>();
     }
 
+    /**
+     * Runs a QTL/SQL query and returns the full result set.
+     *
+     * <p>Query is read-only and therefore safe to auto-retry: on a mid-flight
+     * transport drop the client reconnects and re-runs the whole query once
+     * (the result set is rebuilt from scratch, so a partially-drained prior
+     * attempt cannot corrupt it).  Auto-retry is governed by
+     * {@link #setMaxReconnect(int)}.  A server-side error frame is NOT a
+     * transport failure and is rethrown without reconnecting.
+     */
     public QueryResult query(String qtl) throws IOException {
+        try {
+            return queryOnce(qtl);
+        } catch (IOException e) {
+            if (!isTransportError(e) || maxReconnect <= 0) throw e;
+            // read-only → safe to reconnect and re-run the whole query once.
+            reconnect(e);
+            return queryOnce(qtl);
+        }
+    }
+
+    private QueryResult queryOnce(String qtl) throws IOException {
         byte[] q = qtl.getBytes("UTF-8");
         send(MSG_QUERY, (short) 0, q);
         Frame f = recv();
