@@ -958,36 +958,46 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
 
     if (timeout_ms <= 0) timeout_ms = 2000;
 
+    /* Dual-stack: AF_UNSPEC lets getaddrinfo return both v4 and v6 results;
+     * iterate and try each until one connects, applying the non-blocking
+     * connect + poll timeout per attempt (mirrors the CLI tcp_connect). */
     struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family   = AF_INET;
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
     if (getaddrinfo(host, portstr, &hints, &res) != 0) return NULL;
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return NULL; }
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
 
-    /* Set non-blocking for connect with timeout. */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        /* Set non-blocking for connect with timeout. */
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    connect(fd, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
-    struct pollfd pfd = { fd, POLLOUT, 0 };
-    if (poll(&pfd, 1, timeout_ms) <= 0 || !(pfd.revents & POLLOUT)) {
-        close(fd); return NULL;
+        int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (cr < 0 && errno != EINPROGRESS) {
+            close(fd); fd = -1; continue;
+        }
+        if (cr != 0) {
+            struct pollfd pfd = { fd, POLLOUT, 0 };
+            if (poll(&pfd, 1, timeout_ms) <= 0 || !(pfd.revents & POLLOUT)) {
+                close(fd); fd = -1; continue;
+            }
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+            if (err) { close(fd); fd = -1; continue; }
+        }
+        /* Restore blocking. */
+        fcntl(fd, F_SETFL, flags);
+        break;
     }
-
-    /* Check for connect error. */
-    int err = 0;
-    socklen_t errlen = sizeof(err);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
-    if (err) { close(fd); return NULL; }
-
-    /* Restore blocking. */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    freeaddrinfo(res);
+    if (fd < 0) return NULL;
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
