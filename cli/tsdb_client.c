@@ -1403,6 +1403,12 @@ int main(int argc, char **argv) {
     const char *tls_ca       = NULL;
     int         tls_insecure = 0;
 
+    /* A write to a peer that vanished (server restart / network drop) raises
+     * SIGPIPE, whose default action KILLS the process before frame_send can
+     * report EPIPE and trigger auto-reconnect.  Ignore it so the failure
+     * surfaces as a -1 return that conn_reconnect can handle. */
+    signal(SIGPIPE, SIG_IGN);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             host = argv[++i];
