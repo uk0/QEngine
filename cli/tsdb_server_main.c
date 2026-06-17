@@ -278,6 +278,8 @@ static void usage(const char *prog) {
         "  --tls-cert PATH        PEM server certificate (enables TLS)\n"
         "  --tls-key  PATH        PEM server private key  (required with --tls-cert)\n"
         "  --tls-ca   PATH        PEM CA bundle for mutual TLS client auth (optional)\n"
+        "  --metrics-bind ADDR    metrics + dashboard HTTP listen address (e.g. 0.0.0.0:28094)\n"
+        "  --influx-bind  ADDR    InfluxDB line-protocol HTTP listen address (e.g. 0.0.0.0:28092)\n"
         "  --show-config          dump effective config and exit\n"
         "  --help                 show this help\n"
         "\n"
@@ -292,14 +294,16 @@ int main(int argc, char **argv) {
     /* Ignore SIGPIPE so a client disconnect mid-write cannot kill us. */
     signal(SIGPIPE, SIG_IGN);
 
-    const char *cfg_arg           = NULL;
-    const char *override_data_dir = NULL;
-    const char *override_bind     = NULL;
-    const char *override_level    = NULL;
-    const char *override_debug    = NULL;
-    const char *override_tls_cert = NULL;
-    const char *override_tls_key  = NULL;
-    const char *override_tls_ca   = NULL;
+    const char *cfg_arg             = NULL;
+    const char *override_data_dir   = NULL;
+    const char *override_bind       = NULL;
+    const char *override_level      = NULL;
+    const char *override_debug      = NULL;
+    const char *override_tls_cert   = NULL;
+    const char *override_tls_key    = NULL;
+    const char *override_tls_ca     = NULL;
+    const char *override_metrics_bind = NULL;
+    const char *override_influx_bind  = NULL;
     int show_config = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -315,6 +319,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tls-cert") && i + 1 < argc) override_tls_cert = argv[++i];
         else if (!strcmp(argv[i], "--tls-key")  && i + 1 < argc) override_tls_key  = argv[++i];
         else if (!strcmp(argv[i], "--tls-ca")   && i + 1 < argc) override_tls_ca   = argv[++i];
+        else if (!strcmp(argv[i], "--metrics-bind") && i + 1 < argc) override_metrics_bind = argv[++i];
+        else if (!strcmp(argv[i], "--influx-bind")  && i + 1 < argc) override_influx_bind  = argv[++i];
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -348,6 +354,8 @@ int main(int argc, char **argv) {
     if (override_tls_cert) snprintf(cfg.tls_cert,   sizeof(cfg.tls_cert),   "%s", override_tls_cert);
     if (override_tls_key)  snprintf(cfg.tls_key,    sizeof(cfg.tls_key),    "%s", override_tls_key);
     if (override_tls_ca)   snprintf(cfg.tls_ca,     sizeof(cfg.tls_ca),     "%s", override_tls_ca);
+    if (override_metrics_bind) snprintf(cfg.metrics_bind, sizeof(cfg.metrics_bind), "%s", override_metrics_bind);
+    if (override_influx_bind)  snprintf(cfg.influx_bind,  sizeof(cfg.influx_bind),  "%s", override_influx_bind);
     /* Recompute derived flag. */
     cfg.tls_enabled = (cfg.tls_cert[0] != '\0' && cfg.tls_key[0] != '\0');
     if (override_level) {
