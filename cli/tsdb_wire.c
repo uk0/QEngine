@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/socket.h>
@@ -355,6 +356,57 @@ int send_recv(tsdb_conn_t *c,
 
 /* ─── TLS connect ────────────────────────────────────────────────────────── */
 
+/* Non-blocking connect with a poll(POLLOUT) timeout, mirroring tcp_connect in
+ * tsdb_client.c (which is static there, so we keep a local copy rather than a
+ * shared header).  Resolves host/port (AF_INET, matching the TLS path) and
+ * tries every address until one connects within timeout_ms.  Returns a
+ * connected blocking fd, or -1 with errno set on timeout/refusal.  Exported
+ * (non-static) so the timeout test can dial a black hole directly. */
+int tsdb_wire_nb_connect(const char *host, int port, int timeout_ms)
+{
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    struct addrinfo hints = {0};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+        errno = ENOENT; return -1;
+    }
+
+    int fd = -1;
+    int last_errno = ETIMEDOUT;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) { last_errno = errno; continue; }
+
+        /* Non-blocking connect with timeout. */
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (cr < 0 && errno != EINPROGRESS) {
+            last_errno = errno; close(fd); fd = -1; continue;
+        }
+        if (cr != 0) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int pr = poll(&pfd, 1, timeout_ms);
+            if (pr <= 0 || !(pfd.revents & POLLOUT)) {
+                last_errno = (pr == 0) ? ETIMEDOUT : errno;
+                close(fd); fd = -1; continue;
+            }
+            int soerr = 0; socklen_t sl = sizeof(soerr);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+            if (soerr) { last_errno = soerr; close(fd); fd = -1; continue; }
+        }
+        /* Restore blocking. */
+        fcntl(fd, F_SETFL, flags);
+        break;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) errno = last_errno;
+    return fd;
+}
+
 int tsdb_conn_connect_tls(const char *host, int port,
                           const char *ca_path, int skip_verify,
                           tsdb_conn_t *conn)
@@ -366,28 +418,13 @@ int tsdb_conn_connect_tls(const char *host, int port,
         errno = ENOTSUP; return -1;
     }
 
-    /* Resolve and connect. */
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-    struct addrinfo hints = {0};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
-        errno = ENOENT; return -1;
-    }
-
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        int e = errno;
-        freeaddrinfo(res);
-        close(fd);
-        errno = e;
+    /* Resolve and connect with a bounded (non-blocking + poll) timeout so a
+     * dead/black-holed host fails fast instead of blocking on the OS SYN
+     * timeout (~127s). */
+    int fd = tsdb_wire_nb_connect(host, port, 5000);
+    if (fd < 0) {
         return -1;
     }
-    freeaddrinfo(res);
 
     /* TLS wrap. */
     struct tsdb_cli_tls_conn *tls = cli_tls_connect(host, fd, ca_path, skip_verify);
