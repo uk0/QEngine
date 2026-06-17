@@ -188,6 +188,13 @@ typedef struct {
     int      timeout_ms;   /* recv/send timeout, default 10000 */
     /* TLS state — NULL for plaintext connections */
     struct tsdb_cli_tls_conn *tls;
+    /* Auto-reconnect state — retained so a dropped session can re-dial the
+     * same endpoint with the same credentials.  auto_reconnect=0 disables it. */
+    const char *token;          /* auth token (may be NULL) */
+    int         use_tls;        /* re-dial over TLS */
+    const char *tls_ca;         /* PEM CA bundle (TLS only) */
+    int         tls_insecure;   /* skip cert verification (TLS only) */
+    int         auto_reconnect; /* 1 = re-dial idempotent ops on conn death */
 } tsdb_conn_t;
 
 /* ─── Received message ───────────────────────────────────────────────────── */

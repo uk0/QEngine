@@ -521,7 +521,36 @@ static int do_hello(tsdb_conn_t *c, const char *token) {
 
 /* ─── QUERY ───────────────────────────────────────────────────────────────── */
 
-static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
+/* Re-establish a dropped plaintext connection to the same endpoint with the
+ * same credentials: close the dead fd, re-dial with backoff, re-run HELLO.
+ * Returns 0 on success, -1 if every attempt failed.  TLS sessions are not
+ * auto-reconnected (no client-side TLS teardown is wired). */
+static int conn_reconnect(tsdb_conn_t *c) {
+    if (c->tls) return -1;                  /* TLS reconnect unsupported */
+    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
+
+    static const int backoff_ms[] = { 200, 500, 1000 };
+    for (int i = 0; i < 3; i++) {
+        struct timespec ts = { .tv_sec  = backoff_ms[i] / 1000,
+                               .tv_nsec = (long)(backoff_ms[i] % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        fprintf(stderr, "[reconnecting to %s:%d (%d/3)]\n", c->host, c->port, i + 1);
+        int fd = tcp_connect(c->host, c->port, 5000);
+        if (fd < 0) continue;
+        c->fd = fd;
+        if (do_hello(c, c->token) == 0) {
+            fprintf(stderr, "[reconnected]\n");
+            return 0;
+        }
+        close(c->fd); c->fd = -1;           /* HELLO failed; retry */
+    }
+    return -1;
+}
+
+/* One query attempt.  Returns 0 on success, -1 on a server/protocol error (do
+ * NOT reconnect), or -2 when the transport died (send error or read EOF/reset)
+ * — the caller may reconnect and retry, a SELECT being idempotent. */
+static int do_query_once(tsdb_conn_t *c, const char *qtl, bool vertical) {
     size_t qlen = strlen(qtl);
     if (qlen > 65535) { fprintf(stderr, "query too long\n"); return -1; }
 
@@ -532,7 +561,7 @@ static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
     /* Send QUERY, expect QUERY_RESULT_HDR */
     uint64_t req_id = c->next_req_id++;
     if (frame_send(c, MSG_QUERY, 0, req_id, buf, (uint32_t)(qlen + 2)) < 0) {
-        perror("send query"); return -1;
+        return -2;                          /* peer gone before/while sending */
     }
 
     result_set_t *rs = rs_new();
@@ -542,10 +571,11 @@ static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
         tsdb_msg_t msg = {0};
         int rc = frame_recv(c, &msg);
         if (rc < 0) {
+            rs_free(rs);
+            if (rc == -1) return -2;        /* EOF / reset / timeout */
             fprintf(stderr, "recv error: %s\n",
-                    rc == -2 ? "CRC mismatch" :
-                    rc == -3 ? "bad magic" : strerror(errno));
-            rs_free(rs); return -1;
+                    rc == -2 ? "CRC mismatch" : "bad magic");
+            return -1;
         }
 
         if (msg.hdr.type == MSG_ERROR) {
@@ -576,6 +606,18 @@ static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
     rs_print(rs, vertical);
     rs_free(rs);
     return 0;
+}
+
+/* Run a query, transparently re-dialing ONCE if the connection died mid-flight
+ * (server restart, network blip).  A SELECT is idempotent, so a single retry
+ * after a successful reconnect is safe. */
+static int do_query(tsdb_conn_t *c, const char *qtl, bool vertical) {
+    int rc = do_query_once(c, qtl, vertical);
+    if (rc == -2 && c->auto_reconnect && !c->tls && conn_reconnect(c) == 0)
+        rc = do_query_once(c, qtl, vertical);
+    if (rc == -2)
+        fprintf(stderr, "connection lost (%s:%d)\n", c->host, c->port);
+    return rc == 0 ? 0 : -1;
 }
 
 /* ─── STATS ───────────────────────────────────────────────────────────────── */
@@ -1413,6 +1455,14 @@ int main(int argc, char **argv) {
         conn.timeout_ms = 10000;
         strncpy(conn.host, host, sizeof(conn.host) - 1);
     }
+
+    /* Retain reconnect parameters; auto-reconnect plaintext sessions only
+     * (no client-side TLS teardown is wired for a clean TLS re-dial). */
+    conn.token          = token;
+    conn.use_tls        = use_tls;
+    conn.tls_ca         = tls_ca;
+    conn.tls_insecure   = tls_insecure;
+    conn.auto_reconnect = use_tls ? 0 : 1;
 
     if (do_hello(&conn, token) < 0) {
         if (conn.tls) { /* tsdb_tls_close equivalent for client */ }
