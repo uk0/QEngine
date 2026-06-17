@@ -19,6 +19,58 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+/* ---- Connection-stability helpers ---------------------------------------- *
+ *
+ * Tiny pure functions kept near the top so they are unit-testable in
+ * isolation (see tests/test_replica_backoff.c, which links them via the
+ * TSDB_TEST wrapper at the bottom of this file).
+ */
+
+/*
+ * Whether we should bother dialing a peer in the given gossip state.
+ *
+ * A hard-DEAD peer is skipped: gossip's failure detector has already
+ * concluded it is down, so a connect attempt only burns the connect
+ * timeout and never succeeds.  It resyncs via anti-entropy once it
+ * rejoins, so dropping its replica writes here is safe.  SUSPECT stays
+ * dialable — a suspected peer may merely have missed a probe and is
+ * worth one more try; only hard-DEAD is filtered.
+ */
+static int replica_peer_dialable(tsdb_node_state_t state)
+{
+    return state == TSDB_NODE_DEAD ? 0 : 1;
+}
+
+/*
+ * Exponential backoff between connect/RPC retries against a single peer.
+ *
+ * Schedule (base 20 ms, doubling, capped at 500 ms), returned in
+ * nanoseconds:
+ *
+ *   attempt 0 ->  20 ms
+ *   attempt 1 ->  40 ms
+ *   attempt 2 ->  80 ms
+ *   attempt 3 -> 160 ms
+ *   attempt 4 -> 320 ms
+ *   attempt 5+-> 500 ms (cap)
+ *
+ * Replaces the old fixed 5 ms / 50 ms sleeps so a flapping or
+ * slow-to-listen peer is retried with progressively longer gaps rather
+ * than a tight fixed-delay loop.
+ */
+static long replica_backoff_ns(int attempt)
+{
+    const long base_ms = 20;
+    const long cap_ms  = 500;
+    if (attempt < 0) attempt = 0;
+    /* Clamp the shift so 1L << attempt can't overflow; 20 ms << 5 already
+     * exceeds the cap, so anything past that clamps to cap_ms anyway. */
+    if (attempt > 5) attempt = 5;
+    long ms = base_ms * (1L << attempt);
+    if (ms > cap_ms) ms = cap_ms;
+    return ms * 1000000L;
+}
+
 /* ---- Connection pool ----------------------------------------------------- */
 
 /*
@@ -135,6 +187,13 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
      * threads can use already-established conns in the same peer. */
     tsdb_node_info_t info = {0};
     if (tsdb_node_manager_get(rmgr->node_mgr, node_id, &info) < 0) {
+        pthread_mutex_unlock(&rmgr->lock);
+        return NULL;
+    }
+    /* Gossip says this peer is hard-DEAD — don't dial.  tsdb_rpc_connect
+     * would otherwise sit on the full 2 s connect timeout for nothing; the
+     * peer resyncs via anti-entropy when it rejoins. */
+    if (!replica_peer_dialable(info.state)) {
         pthread_mutex_unlock(&rmgr->lock);
         return NULL;
     }
@@ -297,30 +356,45 @@ static void *fanout_worker(void *arg) {
      *   - Dial failure (conn == NULL): peer's RPC server isn't
      *     accepting yet — typical during a cluster cold start where
      *     gossip marks the peer ALIVE a moment before the listen
-     *     socket binds, or right after a container restart.  Back
-     *     off a little longer here (50 ms) to let the listener come
-     *     up, then try again.  Without this, bench startups show
-     *     dozens to hundreds of dial_fails on the first fanout wave
-     *     that actually landed cleanly on retry.
+     *     socket binds, or right after a container restart.  Back off
+     *     with replica_backoff_ns() so the listener has time to come up
+     *     before the next try.  Without this, bench startups show dozens
+     *     to hundreds of dial_fails on the first fanout wave that
+     *     actually landed cleanly on retry.
      *
      *   - RPC-level failure (rc != OK): the socket was good but the
      *     peer's handler returned TSDB_RPC_ERR (e.g. receive-side
      *     batch_commit failed) or the call timed out.  Evict the
-     *     (possibly poisoned) conn from the pool and retry with a
-     *     short 5 ms wait so a peer's in-flight table-lock has a
-     *     chance to drain.
+     *     (possibly poisoned) conn from the pool and back off (same
+     *     schedule) so a peer's in-flight table-lock has a chance to
+     *     drain.
      *
      * MAX_ATTEMPTS stays small so a permanently-dead peer doesn't
      * wedge the dispatcher forever — the quorum waiter still
      * returns as soon as enough other peers have acked. */
     const int MAX_ATTEMPTS = 3;
     int rc = TSDB_ERR_IO;
+
+    /* Skip a gossip-DEAD peer entirely: get_conn would already refuse to
+     * dial it (returns NULL), so spending all MAX_ATTEMPTS + backoff here
+     * only delays this worker's done_count bump and the quorum waiter.
+     * One up-front state check; ALIVE/SUSPECT peers fall through and retry
+     * with backoff exactly as before. */
+    {
+        tsdb_node_info_t pinfo = {0};
+        if (tsdb_node_manager_get(ctx->rmgr->node_mgr, nid, &pinfo) == 0 &&
+            !replica_peer_dialable(pinfo.state)) {
+            goto done;
+        }
+    }
+
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(ctx->rmgr, nid);
         if (!conn) {
             rc = TSDB_ERR_IO;
             if (attempt + 1 < MAX_ATTEMPTS) {
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000000 };
+                struct timespec ts = { .tv_sec = 0,
+                                       .tv_nsec = replica_backoff_ns(attempt) };
                 nanosleep(&ts, NULL);
             }
             continue;
@@ -329,10 +403,12 @@ static void *fanout_worker(void *arg) {
         if (rc == TSDB_OK) break;
         evict_one_conn(ctx->rmgr, nid, conn);
         if (attempt + 1 < MAX_ATTEMPTS) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 5 * 1000000 };
+            struct timespec ts = { .tv_sec = 0,
+                                   .tv_nsec = replica_backoff_ns(attempt) };
             nanosleep(&ts, NULL);
         }
     }
+done:
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_replicate_ack_total");
     } else {
@@ -691,3 +767,15 @@ int tsdb_replica_broadcast_delete_range(tsdb_replica_mgr_t *rmgr,
     if (out_acked_peers) *out_acked_peers = peer_acks;
     return TSDB_OK;
 }
+
+#ifdef TSDB_TEST
+/* Non-static shims so tests/test_replica_backoff.c can exercise the
+ * connection-stability helpers above without #include-ing this whole TU
+ * (which would clash with the libtsdb objects the test also links). */
+int  replica_peer_dialable_test(tsdb_node_state_t state) {
+    return replica_peer_dialable(state);
+}
+long replica_backoff_ns_test(int attempt) {
+    return replica_backoff_ns(attempt);
+}
+#endif /* TSDB_TEST */
