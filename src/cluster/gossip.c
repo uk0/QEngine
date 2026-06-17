@@ -286,22 +286,17 @@ static void *recv_loop(void *arg) {
 
         case TSDB_GOSSIP_STATE_SYNC:
             if (plen > 0) {
+                /* Merge the peer's membership view (higher-version-wins).
+                 * Do NOT reset our per-node probe-fail counters from this
+                 * merged view: a peer relaying a STALE "X is ALIVE" must not
+                 * wipe our own DIRECT probe evidence that X is unreachable.
+                 * That reset was a convergence DEADLOCK — a stopped node
+                 * stayed ALIVE forever because no node ever reached
+                 * SUSPECT_THRESHOLD (every peer's stale STATE_SYNC reset the
+                 * count each tick).  A genuinely-alive node clears its own
+                 * fail count by ACKing our next direct probe (see the ACK
+                 * handler), which is real liveness evidence, not a relay. */
                 tsdb_node_manager_decode(g->node_mgr, payload, plen);
-
-                /* Receiving STATE_SYNC from anyone is also evidence that
-                 * the sender is alive.  Reset per-node probe-fail counts
-                 * for any node we now observe as ALIVE — this lets a
-                 * peer that flapped recover without waiting for SUSPECT
-                 * timeout to run down. */
-                pthread_mutex_lock(&g->probe_lock);
-                for (int i = 0; i < g->nprobe_ids; i++) {
-                    tsdb_node_info_t ni = {0};
-                    if (tsdb_node_manager_get(g->node_mgr, g->probe_ids[i], &ni) == 0 &&
-                        ni.state == TSDB_NODE_ALIVE) {
-                        g->probe_fails[i] = 0;
-                    }
-                }
-                pthread_mutex_unlock(&g->probe_lock);
             }
             break;
 
