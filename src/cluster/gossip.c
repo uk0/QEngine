@@ -122,6 +122,17 @@ struct tsdb_gossip {
     int                  probe_fails[TSDB_CLUSTER_MAX_NODES];  /* per-node fail count */
     tsdb_node_id_t       probe_ids[TSDB_CLUSTER_MAX_NODES];
     int                  nprobe_ids;
+
+    /* Indirect-probe ACK relay (SWIM): when we forward a PING_REQ for a target
+     * on behalf of a requester, remember (target -> requester addr) so the
+     * target's ACK can be relayed back, completing the indirect-probe path.
+     * Touched only by the recv thread (PING_REQ + ACK handlers) -> no lock. */
+    struct {
+        tsdb_node_id_t     target;
+        struct sockaddr_in requester;
+        int64_t            expiry_ns;
+    }                    relay[TSDB_CLUSTER_MAX_NODES];
+    int                  nrelay;
 };
 
 /* ---- Send helpers -------------------------------------------------------- */
@@ -201,6 +212,47 @@ static void send_ack(struct tsdb_gossip *g, struct sockaddr_in *dest,
            (struct sockaddr *)dest, dest_len);
 }
 
+/* ---- Indirect-probe ACK relay (recv-thread-only) ------------------------- */
+
+/* Record that `requester` asked us to indirectly probe `target`; the entry
+ * lives until expiry_ns, by when the requester has stopped waiting.  Evicts
+ * expired entries and any prior entry for the same target. */
+static void relay_add(struct tsdb_gossip *g, tsdb_node_id_t target,
+                      const struct sockaddr_in *requester, int64_t expiry_ns) {
+    int64_t now = mono_ns();
+    int w = 0;
+    for (int i = 0; i < g->nrelay; i++) {
+        if (g->relay[i].expiry_ns > now && g->relay[i].target != target)
+            g->relay[w++] = g->relay[i];
+    }
+    g->nrelay = w;
+    int cap = (int)(sizeof(g->relay) / sizeof(g->relay[0]));
+    if (g->nrelay < cap) {
+        g->relay[g->nrelay].target    = target;
+        g->relay[g->nrelay].requester = *requester;
+        g->relay[g->nrelay].expiry_ns = expiry_ns;
+        g->nrelay++;
+    }
+}
+
+/* On receiving an ACK from `acked`, relay an ACK back to every pending
+ * requester that asked us to probe it (completing the indirect path), and
+ * drop those entries.  Keeps non-matching, non-expired entries. */
+static void relay_flush(struct tsdb_gossip *g, tsdb_node_id_t acked) {
+    int64_t now = mono_ns();
+    int w = 0;
+    for (int i = 0; i < g->nrelay; i++) {
+        if (g->relay[i].expiry_ns <= now) continue;          /* drop expired */
+        if (g->relay[i].target == acked) {
+            send_ack(g, &g->relay[i].requester,
+                     sizeof(g->relay[i].requester), acked);  /* relay + consume */
+        } else {
+            g->relay[w++] = g->relay[i];
+        }
+    }
+    g->nrelay = w;
+}
+
 /* ---- Recv thread --------------------------------------------------------- */
 
 static void *recv_loop(void *arg) {
@@ -266,20 +318,27 @@ static void *recv_loop(void *arg) {
                     }
                 }
                 pthread_mutex_unlock(&g->probe_lock);
+
+                /* Relay this ACK to any requester that asked us to indirectly
+                 * probe acked_id — completes the SWIM indirect-probe path so a
+                 * peer reachable only via a third node isn't falsely SUSPECTed
+                 * when our direct PINGs are lost. */
+                relay_flush(g, acked_id);
             }
             break;
 
         case TSDB_GOSSIP_PING_REQ:
-            /* Indirect ping: forward a PING to the target and relay ACK back.
-             * For simplicity: we ping the target directly, then if we get ACK
-             * we send an ACK back to the requester (src). */
+            /* Indirect ping: requester `src` asked us to probe `target`.
+             * Forward a PING to target and remember (target -> src) so the
+             * target's ACK is relayed back to the requester (relay_flush). */
             if (plen >= 8) {
                 tsdb_node_id_t target;
                 memcpy(&target, payload, 8);
                 tsdb_node_info_t info = {0};
                 if (tsdb_node_manager_get(g->node_mgr, target, &info) == 0) {
+                    relay_add(g, target, &src,
+                              mono_ns() + 2LL * PING_TIMEOUT_MS * 1000000LL);
                     send_ping(g, info.gossip_addr, target);
-                    /* TODO: relay ACK back to src if we receive it */
                 }
             }
             break;
