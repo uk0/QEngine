@@ -229,6 +229,41 @@ int main(void) {
         printf("  PASS: rc=%d (NOTFOUND) with descriptive error, not 0 rows\n", rc);
     }
 
+    /* Phase 10 — UDF runtime error aborts the SELECT (not rows-of-zero) */
+    printf("\n[10] UDF returning an error rc aborts the query\n");
+    {
+        snprintf(sql, sizeof(sql),
+            "CREATE FUNCTION fail42(INT64) RETURNS INT64 "
+            "FROM '%s' SYMBOL 'udf_fail42';", SO_PATH);
+        run_ok(db, sql);
+
+        /* rows in ab carry a = 10, 11, 12 — no 42 → passes through. */
+        tsdb_result_t *r = NULL;
+        OK(tsdb_query(db, "SELECT fail42(a) FROM ab", &r));
+        int nr = 0;
+        while (tsdb_result_next(r)) {
+            ASSERT(tsdb_result_i64(r, 0) == 10 + nr);
+            nr++;
+        }
+        ASSERT(nr == 3);
+        tsdb_result_free(r);
+
+        /* Insert the magic failure value; the SELECT must now error. */
+        OK(tsdb_open_table(db, "ab", &ab));
+        tsdb_batch_t *b3; OK(tsdb_batch_begin(ab, &b3));
+        OK(tsdb_batch_row_ts(b3, (tsdb_ts_t)9000000000LL));
+        OK(tsdb_batch_row_i64(b3, 1, 42));
+        OK(tsdb_batch_row_i64(b3, 2, 0));
+        OK(tsdb_batch_row_end(b3));
+        OK(tsdb_batch_commit(b3));
+
+        r = NULL;
+        int rc = tsdb_query(db, "SELECT fail42(a) FROM ab", &r);
+        ASSERT(rc == TSDB_ERR_INTERNAL);
+        if (r) tsdb_result_free(r);
+        printf("  PASS: rc=%d (INTERNAL) — query aborted, not zeros\n", rc);
+    }
+
     tsdb_close(db);
     rm_rf(dir);
     printf("\n=== ALL UDF TESTS PASSED ===\n");

@@ -857,6 +857,7 @@ typedef struct {
     int               udf_arg_cols[8];  /* source column index per UDF arg    */
     tsdb_udf_type_t   udf_arg_types[8];
     tsdb_udf_type_t   udf_ret_type;
+    char              udf_name[TSDB_UDF_NAME_MAX]; /* for runtime error msgs  */
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
@@ -1221,6 +1222,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             arr[n].udf_fn       = ue->fn;
             arr[n].udf_nargs    = ue->nargs;
             arr[n].udf_ret_type = ue->ret_type;
+            snprintf(arr[n].udf_name, sizeof(arr[n].udf_name), "%s", ue->name);
             arr[n].out_type     = (tsdb_type_t)ue->ret_type;
             arr[n].col          = arr[n].udf_arg_cols[0]; /* used by scan gather */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
@@ -5546,7 +5548,20 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         uint64_t out_bits = 0;
                         tsdb_udf_ctx_t ctx = { .abi_version = TSDB_UDF_ABI_V1 };
                         int urc = p->udf_fn(&ctx, argp, 1, &out_bits);
-                        if (urc != TSDB_UDF_OK) out_bits = 0;
+                        if (urc != TSDB_UDF_OK) {
+                            /* A failing UDF aborts the whole query.  Per
+                             * the ABI contract in tsdb_udf.h the batch
+                             * result is discarded and the caller sees
+                             * TSDB_ERR_INTERNAL — never rows of zeros. */
+                            eset(err, errcap, "UDF '%s' failed (rc=%d)",
+                                 p->udf_name, urc);
+                            free(bm);
+                            for (int c2 = 0; c2 < s->ncols; c2++)
+                                if (!src->mem && bufs[c2]) free(bufs[c2]);
+                            free(bufs); free(syms);
+                            rc = TSDB_ERR_INTERNAL;
+                            goto done;
+                        }
                         result_append_cell(r, pi, out_bits);
                     }
                 }
