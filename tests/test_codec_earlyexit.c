@@ -89,9 +89,13 @@ static void check(const char *label, const double *v, size_t n, int want_lz) {
     /* A. dropping CHIMP128 cost zero bytes: best-of-2 result equals best-of-3.
      *    (When LZ is applied the wrapped size can only be <= domain, so compare
      *    the plain domain size by re-deriving it: with LZ off, nb is the domain
-     *    size directly; with LZ on, the win only makes nb smaller — still <= b3.) */
-    if (!has_lz) ASSERT((size_t)nb == b3);
-    else         ASSERT((size_t)nb <= b3);
+     *    size directly; with LZ on, the win only makes nb smaller — still <= b3.)
+     *    RAW: when every XOR codec EXPANDS past 8 B/value the adaptive path now
+     *    stores the block raw (zero-copy-readable) — strictly smaller than b3,
+     *    so dropping CHIMP128 still cost nothing. */
+    if (codec == TSDB_CODEC_RAW) ASSERT((size_t)nb == n * 8 && (size_t)nb <= b3);
+    else if (!has_lz)            ASSERT((size_t)nb == b3);
+    else                         ASSERT((size_t)nb <= b3);
     /* B. LZ decision matches expectation. */
     ASSERT(has_lz == want_lz);
 }

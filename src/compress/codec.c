@@ -327,6 +327,24 @@ int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
     *out_codec  = codec;
     *out_flags  = 0;
 
+    /* Step 1.5: FLOAT64 raw fallback.  On high-entropy blocks BOTH float
+     * XOR codecs EXPAND (up to ~+12.5% over the plain 8 B/value), so
+     * storing the doubles verbatim is strictly smaller — and a RAW block
+     * is eligible for the reader's zero-copy mmap fast path (pointer
+     * handoff, no decode, no memcpy; see tsdb_part_read_block_ref).
+     * '>=': ties go to RAW for the cheaper read.  Data this incompressible
+     * gains nothing from the outer LZ wrap either, so return without the
+     * LZ pass.  Kept out of tsdb_codec_encode: legacy callers assert the
+     * XOR-codec choice there. */
+    if (type == TSDB_TYPE_FLOAT64 && in_count > 0) {
+        size_t raw_bytes = in_count * 8;
+        if ((size_t)domain_bytes >= raw_bytes && raw_bytes <= out_cap) {
+            memcpy(out, in, raw_bytes);
+            *out_codec = TSDB_CODEC_RAW;
+            return (int)raw_bytes;
+        }
+    }
+
     /* Early-exit: skip the outer LZ pass for a dense float block.  When a float
      * XOR codec's output already reaches FLOAT_LZ_SKIP_PCT% of the raw double
      * size, byte-level lzlite cannot find matches and the wrapper is rejected for
