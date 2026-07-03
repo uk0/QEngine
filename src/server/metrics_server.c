@@ -427,9 +427,12 @@ static void *handle_connection(void *arg) {
     else if (strncmp(req, "POST /pitr", 10) == 0 ||
              strncmp(req, "GET /pitr",  9) == 0)          route_pitr    = 1;
     else if (strncmp(req, "GET /catalog/check", 18) == 0) route_cat_check = 1;
-    else if (strncmp(req, "POST /retention/sweep", 21) == 0 ||
-             strncmp(req, "GET /retention/sweep",  20) == 0)
+    /* /retention/sweep mutates state — POST only.  GET still routes here
+     * (so the auth gate applies to probes) but is answered with 405. */
+    else if (strncmp(req, "POST /retention/sweep", 21) == 0)
                                                           route_ret_sweep = 1;
+    else if (strncmp(req, "GET /retention/sweep",  20) == 0)
+                                                          route_ret_sweep = 2;
     else if (strncmp(req, "POST /sql", 9) == 0 ||
              strncmp(req, "GET /sql",  8) == 0)          route_sql     = 1;
     else if (strncmp(req, "GET / ", 6) == 0 ||
@@ -954,6 +957,16 @@ static void *handle_connection(void *arg) {
         pclose(tar);
         tsdb_metric_add("qengine_backup_bytes_streamed_total", total);
     } else if (route_ret_sweep) {
+        if (route_ret_sweep == 2) {
+            /* GET on a mutating op — reject with a hint. */
+            const char *r = "HTTP/1.1 405 Method Not Allowed\r\n"
+                            "Allow: POST\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: 21\r\nConnection: close\r\n\r\n"
+                            "{\"error\":\"use POST\"}\n";
+            write_all(fd, r, strlen(r));
+            goto done;
+        }
         int deleted = -1;
         if (g_ret_sweep_fn) deleted = g_ret_sweep_fn(g_ret_sweep_ud);
         char body[128];

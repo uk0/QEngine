@@ -260,6 +260,13 @@ int main(void) {
     CHECK(strstr(http_body(resp), "\"partitions_deleted\":0") != NULL,
           "POST /retention/sweep deleted 0 on empty data dir");
 
+    /* GET /retention/sweep must be rejected — the sweep mutates state. */
+    code = http_do(port, "GET", "/retention/sweep", "", NULL,
+                   resp, sizeof(resp));
+    CHECK(code == 405, "GET /retention/sweep -> 405 Method Not Allowed");
+    CHECK(strstr(http_body(resp), "use POST") != NULL,
+          "GET /retention/sweep body hints use POST");
+
     /* POST /pitr?ts=... */
     code = http_do(port, "POST", "/pitr?ts=9000000000000000000", "", NULL,
                    resp, sizeof(resp));
