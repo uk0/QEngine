@@ -825,6 +825,7 @@ typedef struct {
     double      agg_min_f, agg_max_f;
     int64_t     agg_min_i, agg_max_i;
     uint64_t    agg_count;
+    int         agg_ovf;            /* int64 SUM/AVG accumulation overflowed */
     /* T-digest state for PROJ_AGG_P50/P90/P99/PERCENTILE/STDDEV */
     tsdb_tdigest_t *tdigest;        /* NULL unless this is a tdigest kind */
     double          percentile_q;   /* q for PROJ_AGG_PERCENTILE [0,1] */
@@ -1354,7 +1355,12 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
         case PROJ_AGG_AVG: {
             int64_t out; uint64_t ncnt;
             tsdb_agg_sum_i64(src, cn, NULL, &out, &ncnt);
-            p->agg_sum_i += out;
+            /* The SIMD kernel sums the block with wrapping adds; the
+             * fold into the running total is overflow-checked.  (A wrap
+             * that cancels itself out inside a single block is not
+             * detected — the kernel stays branch-free by design.) */
+            if (__builtin_add_overflow(p->agg_sum_i, out, &p->agg_sum_i))
+                p->agg_ovf = 1;
             p->agg_count += cn;
             break;
         }
@@ -1622,7 +1628,9 @@ static void agg_apply_stats(proj_t *p, tsdb_schema_t *s,
                 double v; memcpy(&v, &meta->stats_sum, 8);
                 p->agg_sum_f += v;
             } else {
-                p->agg_sum_i += meta->stats_sum;
+                if (__builtin_add_overflow(p->agg_sum_i, meta->stats_sum,
+                                           &p->agg_sum_i))
+                    p->agg_ovf = 1;
             }
             p->agg_count += row_count;
             return;
@@ -2725,12 +2733,18 @@ static int gb_merge_into(gb_slot_t **dst_tbl, size_t *dst_cap, size_t *dst_nused
                 break;
             case PROJ_AGG_SUM:
                 dp->agg_sum_f  += sp->agg_sum_f;
-                dp->agg_sum_i  += sp->agg_sum_i;
+                if (__builtin_add_overflow(dp->agg_sum_i, sp->agg_sum_i,
+                                           &dp->agg_sum_i))
+                    dp->agg_ovf = 1;
+                dp->agg_ovf   |= sp->agg_ovf;
                 dp->agg_count  += sp->agg_count;
                 break;
             case PROJ_AGG_AVG:
                 dp->agg_sum_f  += sp->agg_sum_f;
-                dp->agg_sum_i  += sp->agg_sum_i;
+                if (__builtin_add_overflow(dp->agg_sum_i, sp->agg_sum_i,
+                                           &dp->agg_sum_i))
+                    dp->agg_ovf = 1;
+                dp->agg_ovf   |= sp->agg_ovf;
                 dp->agg_count  += sp->agg_count;
                 break;
             case PROJ_AGG_MIN:
@@ -3192,6 +3206,15 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 grc = result_reserve_rows(r, r->nrows + 1);
                 if (grc != TSDB_OK) break;
 
+                /* Refuse to emit a group with a wrapped int64 sum. */
+                for (int p = 0; p < nprojs && grc == TSDB_OK; p++) {
+                    if (slot->state[p].agg_ovf) {
+                        eset(err, errcap, "sum(int64) overflow");
+                        grc = TSDB_ERR_OVERFLOW;
+                    }
+                }
+                if (grc != TSDB_OK) break;
+
                 for (int p = 0; p < nprojs; p++) {
                     proj_t *mp = &projs[p];
                     if (mp->kind == PROJ_COL) {
@@ -3448,6 +3471,15 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
 
         rc = result_reserve_rows(r, r->nrows + 1);
         if (rc != TSDB_OK) break;
+
+        /* Refuse to emit a group with a wrapped int64 sum. */
+        for (int p = 0; p < nprojs; p++) {
+            if (slot->state[p].agg_ovf) {
+                eset(err, errcap, "sum(int64) overflow");
+                rc = TSDB_ERR_OVERFLOW;
+                goto out;
+            }
+        }
 
         for (int p = 0; p < nprojs; p++) {
             proj_t *mp = &projs[p];
@@ -4796,13 +4828,21 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         break;
                     case PROJ_AGG_SUM:
                         mp->agg_sum_f += pp->agg_sum_f;
-                        mp->agg_sum_i += pp->agg_sum_i;
+                        if (__builtin_add_overflow(mp->agg_sum_i,
+                                                   pp->agg_sum_i,
+                                                   &mp->agg_sum_i))
+                            mp->agg_ovf = 1;
+                        mp->agg_ovf   |= pp->agg_ovf;
                         mp->agg_count += pp->agg_count;
                         break;
                     case PROJ_AGG_AVG:
                         /* Merge sum+count; agg_write divides at end. */
                         mp->agg_sum_f += pp->agg_sum_f;
-                        mp->agg_sum_i += pp->agg_sum_i;
+                        if (__builtin_add_overflow(mp->agg_sum_i,
+                                                   pp->agg_sum_i,
+                                                   &mp->agg_sum_i))
+                            mp->agg_ovf = 1;
+                        mp->agg_ovf   |= pp->agg_ovf;
                         mp->agg_count += pp->agg_count;
                         break;
                     case PROJ_AGG_MIN:
@@ -4838,8 +4878,16 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             }
             free(tasks);
 
+            /* Refuse to emit a wrapped int64 sum. */
+            for (int pi = 0; pi < nprojs && rc == TSDB_OK; pi++) {
+                if (projs[pi].agg_ovf) {
+                    eset(err, errcap, "sum(int64) overflow");
+                    rc = TSDB_ERR_OVERFLOW;
+                }
+            }
+
             /* Write merged aggregates to result. */
-            rc = result_reserve_rows(r, 1);
+            if (rc == TSDB_OK) rc = result_reserve_rows(r, 1);
             if (rc == TSDB_OK) {
                 for (int pi = 0; pi < nprojs; pi++) agg_write(&projs[pi], s, r, pi);
                 r->nrows = 1;
@@ -5580,6 +5628,14 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 post_scan:
     /* Write aggregates or final bucket flush. */
     if (has_agg && !has_sample && !q->has_adv_window) {
+        /* Refuse to emit a wrapped int64 sum. */
+        for (int pi = 0; pi < nprojs; pi++) {
+            if (projs[pi].agg_ovf) {
+                eset(err, errcap, "sum(int64) overflow");
+                rc = TSDB_ERR_OVERFLOW;
+                goto done;
+            }
+        }
         rc = result_reserve_rows(r, 1);
         if (rc != TSDB_OK) goto done;
         for (int pi = 0; pi < nprojs; pi++) agg_write(&projs[pi], s, r, pi);
