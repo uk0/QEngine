@@ -2,8 +2,9 @@
  *
  * Tests:
  *  1. SUBSCRIBE → HELLO_OK with sub_id
- *  2. Write batch → subscriber receives SUB_EVENT with correct nrows / ncols
- *  3. UNSUBSCRIBE → no further SUB_EVENTs
+ *  2. Write batch (conn B) → subscriber (conn A) receives SUB_EVENT in the
+ *     WRITE_BATCH columnar shape whose decoded rows match the written batch
+ *  3. UNSUBSCRIBE (payload = SUBSCRIBE req_id) → no further SUB_EVENTs
  *  4. Column filter: subscriber only receives rows matching filter
  *  5. Deadlock safety: slow subscriber does not block writer
  *  6. Multiple subscribers to same table all receive events
@@ -273,22 +274,55 @@ static void test_write_triggers_event(void) {
     CHECK(hdr.type == TSDB_MT_SUB_EVENT, "type == SUB_EVENT");
     CHECK((hdr.flags & TSDB_FLAG_STREAM) != 0, "STREAM flag set");
 
-    /* Parse SUB_EVENT payload:
-     *   [table_len u8][table][nrows u32][ncols u16][col headers][col data] */
+    /* Parse SUB_EVENT payload — the WRITE_BATCH columnar shape (tsdb_wire.h):
+     *   [table_len u8][table][ncols u16][nrows u32]
+     *   per col: [name_len u8][name][type u8][codec u8][csz u32][data] */
     if (rc == TSDB_OK && pl && hdr.payload_len >= 1) {
         const uint8_t *pp = pl;
+        const uint8_t *pe = pl + hdr.payload_len;
         uint8_t tlen = *pp++;
         char ev_table[64] = {0};
-        if (tlen < 64) { memcpy(ev_table, pp, tlen); pp += tlen; }
-        else { pp += tlen; }
-        uint32_t ev_nrows = 0;
-        memcpy(&ev_nrows, pp, 4); pp += 4;
+        if (tlen < 64) memcpy(ev_table, pp, tlen);
+        pp += tlen;
         uint16_t ev_ncols = 0;
         memcpy(&ev_ncols, pp, 2); pp += 2;
+        uint32_t ev_nrows = 0;
+        memcpy(&ev_nrows, pp, 4); pp += 4;
 
         CHECK(strcmp(ev_table, "sensor") == 0, "SUB_EVENT table == sensor");
         CHECK(ev_nrows == 5, "SUB_EVENT nrows == 5");
         CHECK(ev_ncols == 3, "SUB_EVENT ncols == 3");
+
+        /* Decode all three columns; row values must match what conn B wrote
+         * (build_write_sensor: ts_start + i*1000, val = i, device = 42). */
+        int ts_ok = 1, val_ok = 1, dev_ok = 1, shape_ok = 1;
+        for (int c = 0; c < ev_ncols; c++) {
+            if (pp + 1 > pe) { shape_ok = 0; break; }
+            uint8_t nl = *pp++;
+            char cname[64] = {0};
+            if (pp + nl + 2 + 4 > pe) { shape_ok = 0; break; }
+            memcpy(cname, pp, nl < 63 ? nl : 63); pp += nl;
+            pp++;                                  /* type */
+            pp++;                                  /* codec */
+            uint32_t csz = 0;
+            memcpy(&csz, pp, 4); pp += 4;
+            if (pp + csz > pe || csz < (size_t)ev_nrows * 8) { shape_ok = 0; break; }
+            const uint8_t *data = pp;
+            pp += csz;
+            for (uint32_t r = 0; r < ev_nrows; r++) {
+                int64_t v;
+                memcpy(&v, data + (size_t)r * 8, 8);
+                if (strcmp(cname, "ts") == 0 &&
+                    v != 2000000000000LL + (int64_t)r * 1000) ts_ok = 0;
+                if (strcmp(cname, "val") == 0 && v != (int64_t)r) val_ok = 0;
+                if (strcmp(cname, "device") == 0 && v != 42)      dev_ok = 0;
+            }
+        }
+        CHECK(shape_ok, "SUB_EVENT per-column headers well-formed");
+        CHECK(pp == pe, "SUB_EVENT payload fully consumed");
+        CHECK(ts_ok,  "SUB_EVENT ts column matches written batch");
+        CHECK(val_ok, "SUB_EVENT val column matches written batch");
+        CHECK(dev_ok, "SUB_EVENT device column matches written batch");
     }
     free(pl);
 
@@ -316,9 +350,11 @@ static void test_unsubscribe(void) {
 
     usleep(5000);
 
-    /* Unsubscribe. */
+    /* Unsubscribe.  Payload is the req_id of the original SUBSCRIBE (30),
+     * per the wire spec — NOT the server-internal sub_id from the ack. */
     uint8_t uid_buf[8];
-    for (int i = 0; i < 8; i++) uid_buf[i] = (uint8_t)(sub_id >> (i * 8));
+    uint64_t sub_req = 30;
+    for (int i = 0; i < 8; i++) uid_buf[i] = (uint8_t)(sub_req >> (i * 8));
     tsdb_proto_send(sub_fd, TSDB_MT_UNSUBSCRIBE, 0, 31, uid_buf, 8);
     tsdb_proto_recv(sub_fd, &hdr, &pl); free(pl); pl = NULL;
 

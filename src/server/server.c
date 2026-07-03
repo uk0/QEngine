@@ -124,19 +124,27 @@ static uint64_t sub_list_add(tsdb_sub_list_t *sl, const char *table,
     return id;
 }
 
-static void sub_list_remove_by_id(tsdb_sub_list_t *sl, uint64_t sub_id) {
+/* Remove the subscription that conn_fd created with SUBSCRIBE req_id.
+ * The wire spec (tsdb_wire.h, UNSUBSCRIBE payload) identifies a subscription
+ * by the req_id of the original SUBSCRIBE — a per-connection id space, so the
+ * conn fd must participate in the match.  Returns 1 if one was removed. */
+static int sub_list_remove_by_req(tsdb_sub_list_t *sl, int conn_fd,
+                                   uint64_t req_id) {
+    int removed = 0;
     pthread_mutex_lock(&sl->lock);
     for (int i = 0; i < sl->nsubs; i++) {
-        if (sl->subs[i].sub_id == sub_id) {
+        if (sl->subs[i].conn_fd == conn_fd && sl->subs[i].req_id == req_id) {
             pthread_mutex_lock(&sl->subs[i].lock);
             sl->subs[i].conn_fd = -1;
             sl->subs[i].sub_id  = 0;
             pthread_mutex_unlock(&sl->subs[i].lock);
             atomic_fetch_sub(&sl->active, 1);
+            removed = 1;
             break;
         }
     }
     pthread_mutex_unlock(&sl->lock);
+    return removed;
 }
 
 static void sub_list_remove_by_fd(tsdb_sub_list_t *sl, int conn_fd) {
@@ -195,23 +203,27 @@ static int sub_list_snapshot(tsdb_sub_list_t *sl, const char *table,
 /*
  * Build a structured SUB_EVENT payload and fan it out to matching subscribers.
  *
- * SUB_EVENT payload layout (little-endian):
+ * SUB_EVENT payload is the WRITE_BATCH columnar payload (tsdb_wire.h:
+ * "SUB_EVENT payload: same columnar format as WRITE_BATCH payload"):
  *   [table_len u8]  [table utf8]
- *   [nrows u32]
- *   [ncols u16]
- *   for each col: [name_len u8][name utf8][type u8]
- *   for each col: [nrows * 8 bytes, columnar]
+ *   [ncols u16 LE]  [nrows u32 LE]
+ *   for each col:
+ *     [name_len u8][name utf8][type u8][codec u8]
+ *     [compressed_size u32 LE][compressed bytes]
+ *   Fixed-width cols carry nrows*8 raw LE bytes; SYMBOL cols carry the wire
+ *   form [u32 total][u16 len][bytes]... straight from the incoming batch.
  *
  * Per-subscriber column filter: if filter_col is non-empty, only fans out
  * if at least one row in the batch matches filter_val for that column.
- * For SYMBOL columns: exact string match.
- * For INT64 columns: decimal parse and compare.
+ * For SYMBOL columns: exact string match against the wire strings.
+ * For INT64 columns: decimal render and compare.
  * Unresolved columns: filter ignored (all rows pass).
  */
 typedef struct {
     const char    *col_name;
     uint8_t        col_type;    /* tsdb_type_t */
-    const uint8_t *data;        /* nrows * 8 bytes */
+    const uint8_t *data;        /* column bytes as received on the wire */
+    uint32_t       size;        /* byte count at data */
 } fanout_col_t;
 
 static int fanout_row_matches(const fanout_col_t *cols, int ncols, int row,
@@ -219,19 +231,26 @@ static int fanout_row_matches(const fanout_col_t *cols, int ncols, int row,
     if (!filter_col || filter_col[0] == '\0') return 1; /* no filter */
     for (int c = 0; c < ncols; c++) {
         if (strcmp(cols[c].col_name, filter_col) != 0) continue;
-        const uint8_t *ptr = cols[c].data + (size_t)row * 8;
-        if (cols[c].col_type == TSDB_TYPE_INT64) {
-            int64_t v;
-            memcpy(&v, ptr, 8);
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
-            return strcmp(tmp, filter_val) == 0;
+        if (cols[c].col_type == TSDB_TYPE_SYMBOL) {
+            /* Wire SYMBOL block: [u32 total][u16 len][bytes]... — walk to
+             * the row-th string and compare it with filter_val. */
+            const uint8_t *sp  = cols[c].data;
+            const uint8_t *end = sp + cols[c].size;
+            if (sp + 4 > end) return 0;
+            sp += 4;
+            for (int r = 0; r < row; r++) {
+                if (sp + 2 > end) return 0;
+                uint16_t l; memcpy(&l, sp, 2);
+                sp += 2 + l;
+            }
+            if (sp + 2 > end) return 0;
+            uint16_t l; memcpy(&l, sp, 2); sp += 2;
+            if (sp + l > end) return 0;
+            return strlen(filter_val) == l && memcmp(sp, filter_val, l) == 0;
         }
-        /* For SYMBOL or other types: compare first 8 bytes as a string length field.
-         * Symbol data in the write-batch is encoded as sym_id (4 bytes); we can't
-         * resolve sym strings here without the symtab.  Treat as int compare. */
+        if ((size_t)(row + 1) * 8 > cols[c].size) return 0;
         int64_t v;
-        memcpy(&v, ptr, 8);
+        memcpy(&v, cols[c].data + (size_t)row * 8, 8);
         char tmp[32];
         snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
         return strcmp(tmp, filter_val) == 0;
@@ -246,39 +265,36 @@ static void sub_list_fanout_event(tsdb_sub_list_t *sl, const char *table,
     int nsubs = sub_list_snapshot(sl, table, snaps, SUBS_MAX);
     if (nsubs == 0) return;
 
-    /* Build SUB_EVENT payload once (before per-sub filter check). */
-    size_t tlen   = strlen(table);
-    size_t hdr_sz = 1 + tlen + 4 + 2; /* table_len + table + nrows + ncols */
-    for (int c = 0; c < ncols; c++)
-        hdr_sz += 1 + strlen(cols[c].col_name) + 1; /* name_len + name + type */
-    size_t data_sz = (size_t)ncols * (size_t)nrows * 8;
-    size_t total   = hdr_sz + data_sz;
+    /* Build the WRITE_BATCH-shaped SUB_EVENT payload once. */
+    size_t tlen  = strlen(table);
+    uint8_t tlen8 = (uint8_t)(tlen < 255 ? tlen : 255);
+    size_t total = 1 + (size_t)tlen8 + 2 + 4;
+    for (int c = 0; c < ncols; c++) {
+        size_t cnl = strlen(cols[c].col_name);
+        total += 1 + (cnl < 255 ? cnl : 255) + 1 + 1 + 4 + cols[c].size;
+    }
 
     uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) return;
 
     uint8_t *p = buf;
     /* table name */
-    uint8_t tlen8 = (uint8_t)(tlen < 255 ? tlen : 255);
     *p++ = tlen8;
     memcpy(p, table, tlen8); p += tlen8;
-    /* nrows */
-    memcpy(p, &nrows, 4); p += 4;
-    /* ncols */
+    /* ncols, nrows */
     uint16_t nc16 = (uint16_t)ncols;
     memcpy(p, &nc16, 2); p += 2;
-    /* column headers */
+    memcpy(p, &nrows, 4); p += 4;
+    /* per-column header + data */
     for (int c = 0; c < ncols; c++) {
         size_t cnl = strlen(cols[c].col_name);
         uint8_t cnl8 = (uint8_t)(cnl < 255 ? cnl : 255);
         *p++ = cnl8;
         memcpy(p, cols[c].col_name, cnl8); p += cnl8;
         *p++ = cols[c].col_type;
-    }
-    /* columnar data */
-    for (int c = 0; c < ncols; c++) {
-        memcpy(p, cols[c].data, (size_t)nrows * 8);
-        p += (size_t)nrows * 8;
+        *p++ = 0;                       /* codec = RAW */
+        memcpy(p, &cols[c].size, 4); p += 4;
+        memcpy(p, cols[c].data, cols[c].size); p += cols[c].size;
     }
 
     /* Fan out to each subscriber — I/O happens outside any lock. */
@@ -667,7 +683,7 @@ static void do_local_write(void *arg) {
 
 static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
                                const uint8_t *payload, uint32_t plen) {
-    int fd = io->fd;
+    int fd = io->fd; (void)fd;
     const uint8_t *p = payload;
     const uint8_t *end = payload + plen;
 
@@ -750,66 +766,33 @@ static int handle_write_batch(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     tsdb_metric_add("qengine_bytes_written_total", plen);
     tsdb_metric_observe("qengine_ingest_batch_size", (double)nrows);
 
-    /* Fan-out subscriptions with structured SUB_EVENT payload.
-     *
-     * SUB_EVENT requires 8 bytes per value in every column.  Fixed-width
-     * cols (INT64, FLOAT64, TIMESTAMP) point directly into col_data.
-     * SYMBOL cols arrive as the variable-length wire format described
-     * above; we walk the per-row records and write the locally-interned
-     * symbol code (resolved against the receiver's symtab) into a
-     * scratch 8-byte buffer.  That code is what subscribers can pass
-     * back to tsdb_symtab_str() if they share the same db handle.
+    /* Fan-out subscriptions with the WRITE_BATCH-shaped SUB_EVENT payload.
+     * Columns are forwarded byte-for-byte as they arrived on the wire:
+     * fixed-width cols as nrows*8 raw bytes, SYMBOL cols as their
+     * [u32 total][u16 len][bytes]... block (both already validated by
+     * do_local_write, which ran before this point).
      *
      * Fast path: with zero active subscriptions (the common case) this whole
-     * block is pure waste — skip the find_table scan, the per-SYMBOL scratch
-     * alloc, and the per-row intern walk. */
+     * block is pure waste — skip it. */
     if (atomic_load(&srv->subs.active) > 0) {
         fanout_col_t fcols[TSDB_MAX_COLS];
-        uint8_t *sym_scratch[TSDB_MAX_COLS];
-        memset(sym_scratch, 0, sizeof(sym_scratch));
-        int fanout_ok = 1;
-        tsdb_table_internal_t *ti = tsdb_db_find_table(srv->db, table_name);
-        tsdb_schema_t *sch = ti ? tsdb_tbl_schema(ti) : NULL;
-
-        for (int c = 0; c < ncols && fanout_ok; c++) {
+        for (int c = 0; c < ncols; c++) {
             fcols[c].col_name = col_names[c];
             fcols[c].col_type = (uint8_t)col_types[c];
-            if (col_types[c] != TSDB_TYPE_SYMBOL) {
-                fcols[c].data = col_data[c];
-                continue;
+            fcols[c].data     = col_data[c];
+            if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                /* Forward exactly [u32 total] + total bytes (col_sizes[c]
+                 * may carry trailing slack past the encoded strings). */
+                uint32_t sym_total = (uint32_t)col_data[c][0]
+                    | ((uint32_t)col_data[c][1] <<  8)
+                    | ((uint32_t)col_data[c][2] << 16)
+                    | ((uint32_t)col_data[c][3] << 24);
+                fcols[c].size = 4 + sym_total;
+            } else {
+                fcols[c].size = nrows * 8;
             }
-            sym_scratch[c] = (uint8_t *)calloc(nrows, 8);
-            if (!sym_scratch[c]) { fanout_ok = 0; break; }
-            const uint8_t *p_sym = col_data[c] + 4;  /* skip [u32 total] */
-            const uint8_t *end_sym = col_data[c] + col_sizes[c];
-            tsdb_symtab_t *st = NULL;
-            if (sch) {
-                int sci = -1;
-                for (int j = 0; j < sch->ncols; j++)
-                    if (strcmp(sch->cols[j].name, col_names[c]) == 0) { sci = j; break; }
-                if (sci >= 0) st = sch->cols[sci].symtab;
-            }
-            for (uint32_t r = 0; r < nrows && p_sym + 2 <= end_sym; r++) {
-                uint16_t l16; memcpy(&l16, p_sym, 2); p_sym += 2;
-                if (p_sym + l16 > end_sym) break;
-                char sbuf[260];
-                int len = l16 < 256 ? l16 : 255;
-                memcpy(sbuf, p_sym, len); sbuf[len] = '\0';
-                p_sym += l16;
-                uint64_t code = 0;
-                if (st) code = (uint64_t)tsdb_symtab_intern(st, sbuf);
-                memcpy(sym_scratch[c] + r * 8, &code, 8);
-            }
-            fcols[c].data = sym_scratch[c];
         }
-
-        if (fanout_ok) {
-            sub_list_fanout_event(&srv->subs, table_name, fcols, ncols, nrows);
-        }
-
-        for (int c = 0; c < ncols; c++) {
-            if (sym_scratch[c]) free(sym_scratch[c]);
-        }
+        sub_list_fanout_event(&srv->subs, table_name, fcols, ncols, nrows);
     }
 
     return send_write_ack(io, req_id, nrows);
@@ -1315,11 +1298,17 @@ static int handle_unsubscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
                                const uint8_t *payload, uint32_t plen) {
     int fd = io->fd;
     if (plen >= 8) {
-        uint64_t sub_id;
-        memcpy(&sub_id, payload, 8);
-        sub_list_remove_by_id(&srv->subs, sub_id);
-        uint64_t cur = atomic_load(&srv->stat_subs_active);
-        if (cur > 0) atomic_fetch_sub(&srv->stat_subs_active, 1);
+        /* Payload: [sub_req_id u64 LE] — the req_id of the original SUBSCRIBE
+         * (tsdb_wire.h), which is what the CLI sends.  The old code compared
+         * it against the server-internal sub_id counter — a different id
+         * space — so client unsubscribes silently no-opped and SUB_EVENTs
+         * kept flowing until the connection died. */
+        uint64_t sub_req_id;
+        memcpy(&sub_req_id, payload, 8);
+        if (sub_list_remove_by_req(&srv->subs, fd, sub_req_id)) {
+            uint64_t cur = atomic_load(&srv->stat_subs_active);
+            if (cur > 0) atomic_fetch_sub(&srv->stat_subs_active, 1);
+        }
     }
     return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
 }

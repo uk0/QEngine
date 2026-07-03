@@ -302,25 +302,25 @@ static int decode_query_rows(result_set_t *rs,
 }
 
 /*
- * Decode a QUERY_RESULT_ROWS / WRITE_BATCH / SUB_EVENT columnar payload.
- * Appends rows to rs.
+ * Decode and print a SUB_EVENT payload, one line per row, as events arrive.
  *
- * Columnar payload (when used for result rows):
+ * SUB_EVENT carries the WRITE_BATCH columnar payload (tsdb_wire.h) — NOT the
+ * QUERY_RESULT_ROWS chunk shape decode_query_rows parses:
  *   [table_name_len u8][table_name]
- *   [ncols u16][nrows u32]
+ *   [ncols u16 LE][nrows u32 LE]
  *   for each col:
  *     [name_len u8][name][type u8][codec u8]
- *     [compressed_size u32][compressed bytes — codec=RAW means 8 bytes/row]
+ *     [compressed_size u32 LE][bytes]
+ *   Fixed cols: nrows × 8 raw LE bytes (codec RAW).
+ *   SYMBOL cols: [u32 total] then nrows × ([u16 len][bytes]).
  *
- * For simplicity the RAW codec is assumed (8 bytes per value, LE).
- * Gorilla/DoD decoding is left as a production extension.
+ * Returns rows printed, or -1 on a malformed frame.
  */
-static int decode_columnar_rows(result_set_t *rs,
-                                const uint8_t *p, uint32_t plen) {
+static int print_sub_event(const uint8_t *p, uint32_t plen) {
     const uint8_t *end = p + plen;
     if (p >= end) return -1;
 
-    /* table name */
+    /* table name (not echoed per row) */
     uint8_t tlen = *p++;
     if (p + tlen > end) return -1;
     p += tlen;
@@ -328,76 +328,65 @@ static int decode_columnar_rows(result_set_t *rs,
     if (p + 6 > end) return -1;
     uint16_t ncols = get_u16(p); p += 2;
     uint32_t nrows = get_u32(p); p += 4;
-    if (ncols == 0 || nrows == 0) return 0;
-    if (ncols > MAX_COLS) return -1;
+    if (ncols == 0 || ncols > MAX_COLS) return -1;
 
-    /* Read per-column compressed bytes */
-    /* We store columns: col_data[c] = array of nrows raw bytes (8 each) */
-    struct colbuf { uint8_t type; const uint8_t *data; uint32_t csz; };
-    struct colbuf cols[MAX_COLS];
+    struct subcol {
+        char           name[128];
+        uint8_t        type;
+        const uint8_t *data;
+        uint32_t       csz;
+    } cols[MAX_COLS];
 
     for (uint16_t c = 0; c < ncols; c++) {
         if (p >= end) return -1;
         uint8_t nl = *p++;
         if (p + nl + 2 + 4 > end) return -1;
-        p += nl;               /* col name */
-        cols[c].type = *p++;   /* col_type */
-        uint8_t codec = *p++;  /* codec */
-        (void)codec;           /* only RAW supported in this client */
+        size_t cp = nl < sizeof(cols[c].name) - 1 ? nl : sizeof(cols[c].name) - 1;
+        memcpy(cols[c].name, p, cp);
+        cols[c].name[cp] = '\0';
+        p += nl;
+        cols[c].type = *p++;
+        p++;                            /* codec — RAW only */
         cols[c].csz  = get_u32(p); p += 4;
-        cols[c].data = p;
         if (p + cols[c].csz > end) return -1;
+        cols[c].data = p;
         p += cols[c].csz;
     }
 
-    /* Decode and add rows */
-    char val_buf[64];
-    char *vals[MAX_COLS];
     for (uint32_t r = 0; r < nrows; r++) {
         for (uint16_t c = 0; c < ncols; c++) {
-            /* Each RAW value is 8 bytes; stride = 8 * nrows */
-            const uint8_t *vp = cols[c].data + (size_t)r * 8;
-            if (vp + 8 > cols[c].data + cols[c].csz) {
-                val_buf[0] = '?'; val_buf[1] = '\0';
-            } else {
-                uint64_t raw = get_u64(vp);
-                switch (cols[c].type) {
-                case TSDB_TYPE_TIMESTAMP:
-                    /* nanoseconds → "YYYY-MM-DD HH:MM:SS.nnn" */
-                    {
-                        time_t secs = (time_t)((int64_t)raw / 1000000000LL);
-                        long  nsec  = (long)((int64_t)raw % 1000000000LL);
-                        struct tm tm;
-                        gmtime_r(&secs, &tm);
-                        snprintf(val_buf, sizeof(val_buf),
-                                 "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
-                                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                                 tm.tm_hour, tm.tm_min, tm.tm_sec,
-                                 nsec / 1000000);
+            char cell[512];
+            if (cols[c].type == TSDB_TYPE_SYMBOL) {
+                /* Walk the length-prefixed block to the r-th string. */
+                const uint8_t *sp = cols[c].data;
+                const uint8_t *se = sp + cols[c].csz;
+                snprintf(cell, sizeof(cell), "?");
+                if (sp + 4 <= se) {
+                    sp += 4;            /* skip [u32 total] */
+                    for (uint32_t k = 0; sp + 2 <= se; k++) {
+                        uint16_t l = get_u16(sp); sp += 2;
+                        if (sp + l > se) break;
+                        if (k == r) {
+                            size_t sc = l < sizeof(cell) - 1 ? l : sizeof(cell) - 1;
+                            memcpy(cell, sp, sc);
+                            cell[sc] = '\0';
+                            break;
+                        }
+                        sp += l;
                     }
-                    break;
-                case TSDB_TYPE_INT64:
-                    snprintf(val_buf, sizeof(val_buf), "%lld", (long long)(int64_t)raw);
-                    break;
-                case TSDB_TYPE_FLOAT64:
-                    {
-                        double d;
-                        memcpy(&d, &raw, 8);
-                        snprintf(val_buf, sizeof(val_buf), "%.6g", d);
-                    }
-                    break;
-                case TSDB_TYPE_SYMBOL:
-                    snprintf(val_buf, sizeof(val_buf), "%llu", (unsigned long long)raw);
-                    break;
-                default:
-                    snprintf(val_buf, sizeof(val_buf), "?%llu", (unsigned long long)raw);
                 }
+            } else if ((size_t)(r + 1) * 8 <= cols[c].csz) {
+                uint64_t raw = get_u64(cols[c].data + (size_t)r * 8);
+                render_query_cell(cell, sizeof(cell), cols[c].type, raw);
+            } else {
+                snprintf(cell, sizeof(cell), "?");
             }
-            vals[c] = val_buf;
+            printf("%s%s=%s", c ? ", " : "", cols[c].name, cell);
         }
-        rs_add_row(rs, vals);
+        printf("\n");
     }
-    return 0;
+    fflush(stdout);
+    return (int)nrows;
 }
 
 /* ─── TCP connect ─────────────────────────────────────────────────────────── */
@@ -1179,30 +1168,35 @@ static int do_subscribe(tsdb_conn_t *c, const char *line) {
             break;
         }
         if (pfds[1].revents & POLLIN || g_sigint) {
-            /* Ctrl-C: send UNSUBSCRIBE */
+            /* Ctrl-C: send UNSUBSCRIBE (payload = the original SUBSCRIBE
+             * req_id, per tsdb_wire.h), then drain until its ack so the
+             * reply doesn't linger and desync the next REPL command.
+             * SUB_EVENTs still in flight are discarded. */
             printf("\nUnsubscribing...\n");
             uint8_t ubuf[8]; put_u64(ubuf, sub_req_id);
-            frame_send(c, MSG_UNSUBSCRIBE, 0, c->next_req_id++, ubuf, 8);
+            uint64_t unsub_req_id = c->next_req_id++;
+            if (frame_send(c, MSG_UNSUBSCRIBE, 0, unsub_req_id, ubuf, 8) == 0) {
+                int saved_timeout = c->timeout_ms;
+                c->timeout_ms = 2000;
+                for (;;) {
+                    tsdb_msg_t ack = {0};
+                    if (frame_recv(c, &ack) < 0) break;
+                    int done = (ack.hdr.req_id == unsub_req_id);
+                    msg_free(&ack);
+                    if (done) break;
+                }
+                c->timeout_ms = saved_timeout;
+            }
             break;
         }
         if (pfds[0].revents & POLLIN) {
             tsdb_msg_t msg = {0};
             if (frame_recv(c, &msg) < 0) break;
             if (msg.hdr.type == MSG_SUB_EVENT) {
-                /* Decode and print single row inline */
-                result_set_t *rs = rs_new();
-                /* SUB_EVENT has no schema embedded - use previously known schema */
-                /* For now: use decode_columnar_rows which extracts col names */
-                rs->ncols = 0; /* will be filled from payload */
-                decode_columnar_rows(rs, msg.payload, msg.hdr.payload_len);
-                for (int r = 0; r < rs->nrows; r++) {
-                    for (int c2 = 0; c2 < rs->ncols; c2++) {
-                        if (c2) printf(", ");
-                        printf("%s", rs->cells[r * rs->ncols + c2]);
-                    }
-                    printf("\n");
-                }
-                rs_free(rs);
+                /* SUB_EVENT is WRITE_BATCH-shaped and self-describing
+                 * (column names + types travel in the payload). */
+                if (print_sub_event(msg.payload, msg.hdr.payload_len) < 0)
+                    fprintf(stderr, "malformed SUB_EVENT frame\n");
             }
             msg_free(&msg);
         }
