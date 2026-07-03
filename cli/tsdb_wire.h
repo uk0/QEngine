@@ -191,6 +191,14 @@ typedef struct {
     /* Auto-reconnect state — retained so a dropped session can re-dial the
      * same endpoint with the same credentials.  auto_reconnect=0 disables it. */
     const char *token;          /* auth token (may be NULL) */
+    /* AUTH_LOGIN state.  user[0]=='\0' means "no credentials"; auth_token
+     * holds the 32-hex session token from AUTH_OK ("" = not authenticated).
+     * Retained so a reconnect can re-login after re-HELLO (the AUTH_OK token
+     * is per-connection and dies with the socket).  Buffer sizes mirror the
+     * server-side handle_auth_login limits. */
+    char        user[64];
+    char        pass[128];
+    char        auth_token[33];
     int         use_tls;        /* re-dial over TLS */
     const char *tls_ca;         /* PEM CA bundle (TLS only) */
     int         tls_insecure;   /* skip cert verification (TLS only) */

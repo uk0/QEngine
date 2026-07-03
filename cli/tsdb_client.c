@@ -1,11 +1,12 @@
 /* tsdb_client.c — TCP client REPL for tsdb-server.
  *
  * Usage:
- *   tsdb-cli [--host HOST] [--port PORT] [--token TOKEN]
+ *   tsdb-cli [--host HOST] [--port PORT] [--user USER --pass PASS] [--token TOKEN]
  *   Default: host=127.0.0.1, port=28090
  *
  * Commands (case-insensitive):
- *   SELECT / CREATE / DROP / LIST / WRITE / SUBSCRIBE / STATS / EXIT / QUIT / \q
+ *   SELECT / CREATE / DROP / LIST / WRITE / SUBSCRIBE / LOGIN / STATS /
+ *   EXIT / QUIT / \q
  *
  * Build:
  *   clang -std=c11 -O2 -Icli -o build/tsdb-cli cli/tsdb_client.c cli/tsdb_wire.c
@@ -519,6 +520,48 @@ static int do_hello(tsdb_conn_t *c, const char *token) {
     return 0;
 }
 
+/* ─── AUTH_LOGIN ──────────────────────────────────────────────────────────── */
+
+/* Send MSG_AUTH_LOGIN — [u8 ulen][user][u8 plen][pass], the same shape the
+ * Go/Java SDKs use — then store the AUTH_OK session token plus the
+ * credentials on the conn so conn_reconnect can re-authenticate a re-dialed
+ * socket.  Prints "authenticated as <user>" on success. */
+static int do_login(tsdb_conn_t *c, const char *user, const char *pass) {
+    size_t ulen = strlen(user);
+    size_t plen = strlen(pass);
+    if (ulen == 0 || ulen >= sizeof(c->user) || plen >= sizeof(c->pass)) {
+        fprintf(stderr, "login: user/pass too long (max %zu/%zu chars)\n",
+                sizeof(c->user) - 1, sizeof(c->pass) - 1);
+        return -1;
+    }
+
+    uint8_t buf[512];
+    uint8_t *p = buf;
+    *p++ = (uint8_t)ulen; memcpy(p, user, ulen); p += ulen;
+    *p++ = (uint8_t)plen; memcpy(p, pass, plen); p += plen;
+
+    tsdb_msg_t resp = {0};
+    if (send_recv(c, MSG_AUTH_LOGIN, 0, buf, (uint32_t)(p - buf),
+                  MSG_AUTH_OK, &resp) < 0)
+        return -1;
+
+    /* AUTH_OK payload: 32 hex chars, no NUL.  The server binds the token to
+     * this connection; nothing else is needed client-side for later ops. */
+    size_t tl = resp.hdr.payload_len;
+    if (tl >= sizeof(c->auth_token)) tl = sizeof(c->auth_token) - 1;
+    if (tl > 0) memcpy(c->auth_token, resp.payload, tl);
+    c->auth_token[tl] = '\0';
+    msg_free(&resp);
+
+    /* Retain credentials for reconnect re-login (skip the self-copy when the
+     * caller passed c->user / c->pass directly). */
+    if (user != c->user) snprintf(c->user, sizeof(c->user), "%s", user);
+    if (pass != c->pass) snprintf(c->pass, sizeof(c->pass), "%s", pass);
+
+    printf("authenticated as %s\n", user);
+    return 0;
+}
+
 /* ─── QUERY ───────────────────────────────────────────────────────────────── */
 
 /* Re-establish a dropped plaintext connection to the same endpoint with the
@@ -539,6 +582,13 @@ static int conn_reconnect(tsdb_conn_t *c) {
         if (fd < 0) continue;
         c->fd = fd;
         if (do_hello(c, c->token) == 0) {
+            /* The AUTH_OK token is per-connection: a re-dialed socket must
+             * re-login or an authed session would silently degrade to
+             * unauthenticated.  Treat a failed re-login as a failed dial. */
+            if (c->user[0] && do_login(c, c->user, c->pass) != 0) {
+                close(c->fd); c->fd = -1;
+                continue;
+            }
             fprintf(stderr, "[reconnected]\n");
             return 0;
         }
@@ -1338,6 +1388,25 @@ static bool do_command(tsdb_conn_t *c, const char *cmd) {
     }
     if (strcasecmp(line, "STATS") == 0) {
         do_stats(c);
+    } else if (strncasecmp(line, "LOGIN", 5) == 0 &&
+               (line[5] == '\0' || isspace((unsigned char)line[5]))) {
+        /* LOGIN <user> <pass> — whitespace-separated, no quoting. */
+        char user[64], pass[128];
+        const char *p = line + 5;
+        size_t w = 0;
+        while (isspace((unsigned char)*p)) p++;
+        while (*p && !isspace((unsigned char)*p) && w < sizeof(user) - 1)
+            user[w++] = *p++;
+        user[w] = '\0';
+        while (isspace((unsigned char)*p)) p++;
+        w = 0;
+        while (*p && !isspace((unsigned char)*p) && w < sizeof(pass) - 1)
+            pass[w++] = *p++;
+        pass[w] = '\0';
+        if (!user[0] || !pass[0])
+            fprintf(stderr, "usage: LOGIN <user> <pass>\n");
+        else
+            do_login(c, user, pass);
     } else if (strcasecmp(line, "LIST GROUPS") == 0) {
         do_list_groups(c);
     } else if (strncasecmp(line, "LIST DEVICES", 12) == 0) {
@@ -1399,6 +1468,8 @@ int main(int argc, char **argv) {
     const char *host         = "127.0.0.1";
     int         port         = 28090;
     const char *token        = NULL;
+    const char *login_user   = NULL;
+    const char *login_pass   = NULL;
     int         use_tls      = 0;
     const char *tls_ca       = NULL;
     int         tls_insecure = 0;
@@ -1416,6 +1487,10 @@ int main(int argc, char **argv) {
             port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc)
             token = argv[++i];
+        else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc)
+            login_user = argv[++i];
+        else if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
+            login_pass = argv[++i];
         else if (strcmp(argv[i], "--tls") == 0)
             use_tls = 1;
         else if (strcmp(argv[i], "--tls-ca") == 0 && i + 1 < argc) {
@@ -1430,6 +1505,8 @@ int main(int argc, char **argv) {
             printf("usage: tsdb-cli [options]\n"
                    "  --host HOST          server hostname (default 127.0.0.1)\n"
                    "  --port PORT          server port    (default 28090)\n"
+                   "  --user USER          login username (AUTH_LOGIN after HELLO)\n"
+                   "  --pass PASS          login password\n"
                    "  --token TOKEN        auth token\n"
                    "  --tls                enable TLS\n"
                    "  --tls-ca FILE        PEM CA bundle for server cert verification\n"
@@ -1473,6 +1550,19 @@ int main(int argc, char **argv) {
     if (do_hello(&conn, token) < 0) {
         if (conn.tls) { /* tsdb_tls_close equivalent for client */ }
         else close(conn.fd);
+        return 1;
+    }
+
+    /* Authenticate when credentials were given.  A failed explicit login is
+     * fatal — silently continuing unauthenticated would be a lie. */
+    if (login_user && login_pass) {
+        if (do_login(&conn, login_user, login_pass) < 0) {
+            if (!conn.tls) close(conn.fd);
+            return 1;
+        }
+    } else if (login_user || login_pass) {
+        fprintf(stderr, "--user and --pass must be given together\n");
+        if (!conn.tls) close(conn.fd);
         return 1;
     }
 
