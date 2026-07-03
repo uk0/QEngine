@@ -529,6 +529,33 @@ static void test_bad_magic(int port) {
     close(fd);
 }
 
+/* ---- Test 8: group/device DDL → UNSUPPORTED ------------------------------ */
+/* These handlers used to be no-op stubs that ACKed success; they must now
+ * answer an honest ERROR/TSDB_ERR_UNSUPPORTED. */
+static void test_group_ddl_unsupported(int port) {
+    int fd = client_connect(port);
+    CHECK(fd >= 0, "connect for group DDL");
+    if (fd < 0) return;
+
+    /* CREATE_GROUP payload: [name_len u8]["g1"][nprops u8 = 0] */
+    uint8_t pl_out[4] = { 2, 'g', '1', 0 };
+    int rc = tsdb_proto_send(fd, TSDB_MT_CREATE_GROUP, 0, 7, pl_out, 4);
+    CHECK(rc == TSDB_OK, "send CREATE_GROUP");
+
+    tsdb_frame_hdr_t hdr;
+    uint8_t *pl = NULL;
+    rc = recv_frame(fd, &hdr, &pl);
+    CHECK(rc == TSDB_OK, "recv CREATE_GROUP response");
+    CHECK(hdr.type == TSDB_MT_ERROR, "group DDL answers ERROR, not fake OK");
+    if (pl && hdr.payload_len >= 4) {
+        int32_t ec;
+        memcpy(&ec, pl, 4);
+        CHECK(ec == TSDB_ERR_UNSUPPORTED, "err code is TSDB_ERR_UNSUPPORTED");
+    }
+    free(pl);
+    close(fd);
+}
+
 /* ---- CRC32C self-test ---------------------------------------------------- */
 static void test_crc32c(void) {
     /* Known vector: crc32c("123456789") == 0xE3069283 */
@@ -844,6 +871,9 @@ int main(void) {
 
     printf("\n--- Test 7: Bad magic → connection close ---\n");
     test_bad_magic(port);
+
+    printf("\n--- Test 8: group/device DDL unsupported ---\n");
+    test_group_ddl_unsupported(port);
 
     printf("\n--- Benchmarks (single connection) ---\n");
     bench_write(port);

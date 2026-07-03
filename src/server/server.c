@@ -1424,13 +1424,20 @@ static void *connection_handler(void *arg) {
             handle_unsubscribe(srv, io, hdr.req_id, payload, hdr.payload_len);
             break;
 
-        case TSDB_MT_CLUSTER_STATS:
         case TSDB_MT_CREATE_GROUP:
         case TSDB_MT_LIST_GROUPS:
         case TSDB_MT_DROP_GROUP:
         case TSDB_MT_CREATE_DEVICE:
         case TSDB_MT_LIST_DEVICES:
         case TSDB_MT_DROP_DEVICE:
+            /* Not implemented: an honest error beats the former no-op stub
+             * that ACKed success (and bypassed the auth gate) while writing
+             * nothing. */
+            send_error(io, hdr.req_id, TSDB_ERR_UNSUPPORTED,
+                       "group/device DDL not implemented");
+            break;
+
+        case TSDB_MT_CLUSTER_STATS:
         case TSDB_MT_SCHEMA:
             /* Stub: ACK */
             tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN,
