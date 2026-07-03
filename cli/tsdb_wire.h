@@ -59,9 +59,9 @@ typedef enum {
     MSG_DROP_TABLE        = 21,
     MSG_SCHEMA            = 22,
     MSG_WRITE_BATCH       = 30,
-    MSG_WRITE_STREAM_OPEN = 31,
-    MSG_WRITE_STREAM_DATA = 32,
-    MSG_WRITE_STREAM_END  = 33,
+    MSG_WRITE_STREAM_OPEN = 31,  /* reserved, never implemented server-side */
+    MSG_WRITE_STREAM_DATA = 32,  /* reserved, never implemented server-side */
+    MSG_WRITE_STREAM_END  = 33,  /* reserved, never implemented server-side */
     MSG_WRITE_ACK         = 34,
     MSG_QUERY             = 40,
     MSG_QUERY_RESULT_HDR  = 41,
@@ -132,17 +132,17 @@ typedef enum {
  * QUERY_RESULT_ROWS payload: columnar chunk (same format as WRITE_BATCH).
  *   Last chunk has FLAG_FIN set.
  *
- * WRITE_BATCH / WRITE_STREAM_DATA columnar payload:
+ * WRITE_BATCH columnar payload:
  *   [table_name_len u8] [table_name utf8]
  *   [ncols u16 LE] [nrows u32 LE]
  *   for each col:
  *     [col_name_len u8][col_name utf8][col_type u8][codec u8]
  *     [compressed_size u32 LE][compressed bytes]
+ *   SYMBOL col bytes: [u32 total LE] then nrows × ([u16 len LE][bytes])
  *
- * WRITE_STREAM_OPEN payload:
- *   [table_name_len u8] [table_name utf8]
- *
- * WRITE_STREAM_END payload: empty (nrows=0 signal)
+ * WRITE_STREAM_OPEN / DATA / END (31-33): reserved, never implemented
+ *   server-side — do not send (the server answers ERROR "unknown message
+ *   type").  Bulk ingest chunks rows into WRITE_BATCH frames instead.
  *
  * WRITE_ACK payload:
  *   [rows_accepted u32 LE]

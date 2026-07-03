@@ -907,17 +907,89 @@ static int do_list_devices(tsdb_conn_t *c, const char *line) {
 /*
  * CSV ingestion:
  *  1. Read header line → column names
- *  2. WRITE_STREAM_OPEN to table
- *  3. Accumulate 10000 rows at a time → send WRITE_STREAM_DATA (RAW codec)
- *  4. WRITE_STREAM_END + print summary
+ *  2. Accumulate up to BATCH_ROWS rows per chunk
+ *  3. Send each chunk as one MSG_WRITE_BATCH frame (RAW codec), read the
+ *     u32 WRITE_ACK it draws, then print a summary
  *
  * Column types: all treated as FLOAT64 unless name is "ts"/"time"/"timestamp"
- * (treated as TIMESTAMP). Symbols are not auto-detected from CSV.
+ * (treated as TIMESTAMP; values parsed as integer nanoseconds).  Symbols are
+ * not auto-detected from CSV.
+ *
+ * The previous implementation spoke MSG_WRITE_STREAM_OPEN/DATA/END (31-33),
+ * message types the server never implemented: every frame drew ERROR
+ * "unknown message type" and the unread replies desynced the connection.
  */
 
-#define BATCH_ROWS 10000
+#define BATCH_ROWS 8192
 
-static int do_write_stream(tsdb_conn_t *c, const char *table, FILE *fp) {
+/* Encode + send one MSG_WRITE_BATCH frame for nrows accumulated rows, then
+ * read the single reply it draws (WRITE_ACK or ERROR) so the connection
+ * stays in sync frame-for-frame.  col_buf holds raw 8-byte cell images
+ * (int64 for TIMESTAMP, double bits otherwise), column-major with a
+ * BATCH_ROWS stride.  Returns rows acked by the server, or -1 on error. */
+static int64_t write_batch_send(tsdb_conn_t *c, const char *table,
+                                char col_names[][128], const uint8_t *col_types,
+                                int ncols, const uint64_t *col_buf, int nrows) {
+    size_t tlen = strlen(table);
+    if (tlen > 255) tlen = 255;
+    size_t csz = (size_t)nrows * 8;
+    size_t cap = 1 + tlen + 2 + 4 + (size_t)ncols * (1 + 128 + 1 + 1 + 4 + csz);
+    uint8_t *buf = malloc(cap);
+    if (!buf) return -1;
+
+    uint8_t *p = buf;
+    *p++ = (uint8_t)tlen;
+    memcpy(p, table, tlen); p += tlen;
+    put_u16(p, (uint16_t)ncols); p += 2;
+    put_u32(p, (uint32_t)nrows); p += 4;
+    for (int ci = 0; ci < ncols; ci++) {
+        uint8_t clen = (uint8_t)strlen(col_names[ci]);
+        *p++ = clen; memcpy(p, col_names[ci], clen); p += clen;
+        *p++ = col_types[ci];
+        *p++ = TSDB_CODEC_RAW;
+        put_u32(p, (uint32_t)csz); p += 4;
+        for (int r = 0; r < nrows; r++) {
+            put_u64(p, col_buf[(size_t)ci * BATCH_ROWS + (size_t)r]);
+            p += 8;
+        }
+    }
+
+    uint64_t req_id = c->next_req_id++;
+    int rc = frame_send(c, MSG_WRITE_BATCH, 0, req_id, buf, (uint32_t)(p - buf));
+    free(buf);
+    if (rc < 0) { perror("write"); return -1; }
+
+    tsdb_msg_t resp = {0};
+    rc = frame_recv(c, &resp);
+    if (rc < 0) {
+        fprintf(stderr, "write: %s\n",
+                rc == -2 ? "CRC mismatch" : rc == -3 ? "bad magic" : "recv failed");
+        return -1;
+    }
+    int64_t acked = -1;
+    if (resp.hdr.type == MSG_WRITE_ACK) {
+        /* Canonical WRITE_ACK: [rows_accepted u32 LE]. */
+        acked = (resp.hdr.payload_len >= 4) ? (int64_t)get_u32(resp.payload) : 0;
+    } else if (resp.hdr.type == MSG_ERROR) {
+        const uint8_t *ep = resp.payload;
+        uint32_t em = resp.hdr.payload_len;
+        if (em >= 6) {
+            int32_t ec = (int32_t)get_u32(ep);
+            uint16_t ml = get_u16(ep + 4);
+            fprintf(stderr, "write error %d: %.*s\n", ec,
+                    (int)(ml < em - 6 ? ml : em - 6), (const char *)(ep + 6));
+        } else {
+            fprintf(stderr, "write error (empty)\n");
+        }
+    } else {
+        fprintf(stderr, "write: unexpected response type %u\n",
+                (unsigned)resp.hdr.type);
+    }
+    msg_free(&resp);
+    return acked;
+}
+
+static int do_write_batches(tsdb_conn_t *c, const char *table, FILE *fp) {
     char line_buf[65536];
 
     /* Read header */
@@ -954,27 +1026,17 @@ static int do_write_stream(tsdb_conn_t *c, const char *table, FILE *fp) {
     }
     if (ncols == 0) { fprintf(stderr, "no columns in CSV header\n"); return -1; }
 
-    /* WRITE_STREAM_OPEN */
-    size_t tlen = strlen(table);
-    {
-        uint8_t obuf[256]; obuf[0] = (uint8_t)(tlen > 255 ? 255 : tlen);
-        memcpy(obuf + 1, table, obuf[0]);
-        uint64_t req_id = c->next_req_id++;
-        if (frame_send(c, MSG_WRITE_STREAM_OPEN, 0, req_id, obuf, 1 + obuf[0]) < 0) {
-            perror("write stream open"); return -1;
-        }
-        /* No ack expected for OPEN in this protocol; server buffers until DATA */
-    }
-
-    /* Accumulate and send batches */
-    double  *col_buf = calloc((size_t)(ncols * BATCH_ROWS), sizeof(double));
+    /* Accumulate rows, one MSG_WRITE_BATCH frame per BATCH_ROWS chunk. */
+    uint64_t *col_buf = calloc((size_t)ncols * BATCH_ROWS, sizeof(uint64_t));
     if (!col_buf) return -1;
 
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
 
-    int64_t total_rows = 0;
-    int64_t batch_rows = 0;
+    int64_t total_rows  = 0;
+    int64_t total_acked = 0;
+    int     batch_rows  = 0;
+    int     err         = 0;
 
     while (fgets(line_buf, sizeof(line_buf), fp)) {
         ln = strlen(line_buf);
@@ -984,110 +1046,45 @@ static int do_write_stream(tsdb_conn_t *c, const char *table, FILE *fp) {
         /* Parse CSV row */
         char *tok = strtok(line_buf, ",");
         for (int c2 = 0; c2 < ncols; c2++) {
-            double val = tok ? atof(tok) : 0.0;
-            col_buf[(size_t)c2 * BATCH_ROWS + (size_t)batch_rows] = val;
+            uint64_t raw;
+            if (col_types[c2] == TSDB_TYPE_TIMESTAMP) {
+                int64_t tv = tok ? strtoll(tok, NULL, 10) : 0;
+                raw = (uint64_t)tv;
+            } else {
+                double dv = tok ? atof(tok) : 0.0;
+                memcpy(&raw, &dv, 8);
+            }
+            col_buf[(size_t)c2 * BATCH_ROWS + (size_t)batch_rows] = raw;
             if (tok) tok = strtok(NULL, ",");
         }
         batch_rows++;
         total_rows++;
 
         if (batch_rows >= BATCH_ROWS) {
-            /* Build and send WRITE_STREAM_DATA payload */
-            size_t csz_per_col = (size_t)batch_rows * 8;
-            size_t cap = 1 + tlen + 2 + 4 +
-                         (size_t)ncols * (1 + 127 + 1 + 1 + 4 + csz_per_col);
-            uint8_t *dbuf = malloc(cap);
-            if (!dbuf) { free(col_buf); return -1; }
-            uint8_t *dp = dbuf;
-            *dp++ = (uint8_t)(tlen > 255 ? 255 : tlen);
-            memcpy(dp, table, *dbuf); dp += *dbuf;
-            put_u16(dp, (uint16_t)ncols); dp += 2;
-            put_u32(dp, (uint32_t)batch_rows); dp += 4;
-            for (int ci = 0; ci < ncols; ci++) {
-                uint8_t clen = (uint8_t)strlen(col_names[ci]);
-                *dp++ = clen; memcpy(dp, col_names[ci], clen); dp += clen;
-                *dp++ = col_types[ci];
-                *dp++ = TSDB_CODEC_RAW;
-                put_u32(dp, (uint32_t)csz_per_col); dp += 4;
-                for (int r = 0; r < batch_rows; r++) {
-                    uint64_t raw;
-                    double dv = col_buf[(size_t)ci * BATCH_ROWS + (size_t)r];
-                    memcpy(&raw, &dv, 8);
-                    put_u64(dp, raw); dp += 8;
-                }
-            }
-            uint64_t req_id = c->next_req_id++;
-            frame_send(c, MSG_WRITE_STREAM_DATA, 0, req_id, dbuf, (uint32_t)(dp - dbuf));
-            free(dbuf);
-            /* batch sent */
+            int64_t acked = write_batch_send(c, table, col_names, col_types,
+                                             ncols, col_buf, batch_rows);
+            if (acked < 0) { err = 1; break; }
+            total_acked += acked;
             batch_rows = 0;
         }
     }
 
     /* Flush remaining rows */
-    if (batch_rows > 0) {
-        size_t csz_per_col = (size_t)batch_rows * 8;
-        size_t cap = 1 + tlen + 2 + 4 +
-                     (size_t)ncols * (1 + 128 + 1 + 1 + 4 + csz_per_col);
-        uint8_t *dbuf = malloc(cap);
-        if (dbuf) {
-            uint8_t *dp = dbuf;
-            uint8_t tl = (uint8_t)(tlen > 255 ? 255 : tlen);
-            *dp++ = tl; memcpy(dp, table, tl); dp += tl;
-            put_u16(dp, (uint16_t)ncols); dp += 2;
-            put_u32(dp, (uint32_t)batch_rows); dp += 4;
-            for (int ci = 0; ci < ncols; ci++) {
-                uint8_t clen = (uint8_t)strlen(col_names[ci]);
-                *dp++ = clen; memcpy(dp, col_names[ci], clen); dp += clen;
-                *dp++ = col_types[ci];
-                *dp++ = TSDB_CODEC_RAW;
-                put_u32(dp, (uint32_t)csz_per_col); dp += 4;
-                for (int r = 0; r < batch_rows; r++) {
-                    uint64_t raw;
-                    double dv = col_buf[(size_t)ci * BATCH_ROWS + (size_t)r];
-                    memcpy(&raw, &dv, 8);
-                    put_u64(dp, raw); dp += 8;
-                }
-            }
-            uint64_t req_id = c->next_req_id++;
-            frame_send(c, MSG_WRITE_STREAM_DATA, 0, req_id, dbuf, (uint32_t)(dp - dbuf));
-            free(dbuf);
-            /* batch sent */
-        }
+    if (!err && batch_rows > 0) {
+        int64_t acked = write_batch_send(c, table, col_names, col_types,
+                                         ncols, col_buf, batch_rows);
+        if (acked < 0) err = 1;
+        else total_acked += acked;
     }
     free(col_buf);
+    if (err) return -1;
 
-    /* WRITE_STREAM_END */
-    {
-        uint64_t req_id = c->next_req_id++;
-        tsdb_msg_t resp = {0};
-        /* Re-use frame_send + frame_recv pattern */
-        if (frame_send(c, MSG_WRITE_STREAM_END, TSDB_FLAG_FIN, req_id, NULL, 0) == 0) {
-            /* Wait for WRITE_ACK */
-            int rc2 = frame_recv(c, &resp);
-            if (rc2 == 0 && resp.hdr.type == MSG_WRITE_ACK) {
-                /* Canonical WRITE_ACK: [rows_accepted u32 LE]. */
-                uint32_t rows_acc = 0;
-                if (resp.hdr.payload_len >= 4)
-                    rows_acc = get_u32(resp.payload);
-                gettimeofday(&t1, NULL);
-                double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
-                                 (double)(t1.tv_usec - t0.tv_usec) / 1e6;
-                double rate = elapsed > 0 ? (double)total_rows / elapsed / 1e6 : 0;
-                printf("wrote %lld rows in %.2fs (%.2f M rows/sec), "
-                       "server accepted %u\n",
-                       (long long)total_rows, elapsed, rate,
-                       (unsigned)rows_acc);
-                msg_free(&resp);
-            } else if (rc2 == 0) {
-                gettimeofday(&t1, NULL);
-                double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
-                                 (double)(t1.tv_usec - t0.tv_usec) / 1e6;
-                printf("wrote %lld rows in %.2fs\n", (long long)total_rows, elapsed);
-                msg_free(&resp);
-            }
-        }
-    }
+    gettimeofday(&t1, NULL);
+    double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                     (double)(t1.tv_usec - t0.tv_usec) / 1e6;
+    double rate = elapsed > 0 ? (double)total_rows / elapsed / 1e6 : 0;
+    printf("wrote %lld rows in %.2fs (%.2f M rows/sec), server accepted %lld\n",
+           (long long)total_rows, elapsed, rate, (long long)total_acked);
     return 0;
 }
 
@@ -1127,7 +1124,7 @@ static int do_write(tsdb_conn_t *c, const char *line) {
         if (!fp) { perror(path); return -1; }
     }
 
-    int rc = do_write_stream(c, table, fp);
+    int rc = do_write_batches(c, table, fp);
     if (fp != stdin) fclose(fp);
     return rc;
 }

@@ -8,7 +8,7 @@
  *   3. WRITE_BATCH / WRITE_ACK
  *   4. LIST_GROUPS / (text response)
  *   5. CLUSTER_STATS / (kv response)
- *   6. WRITE_STREAM_OPEN + WRITE_STREAM_DATA + WRITE_STREAM_END / WRITE_ACK
+ *   6. Chunked WRITE_BATCH stream (one ack per frame, no desync)
  *
  * Verifies:
  *   - MAGIC present and correct
@@ -165,23 +165,6 @@ static void handle_cluster_stats(tsdb_conn_t *c, const tsdb_msg_t *req) {
     mock_send(c, MSG_HELLO_OK, 0, req->hdr.req_id, buf, (uint32_t)(p - buf));
 }
 
-static void handle_write_stream_open(tsdb_conn_t *c, const tsdb_msg_t *req) {
-    /* No ack for OPEN; just record and proceed */
-    (void)c; (void)req;
-    /* In a real server we'd start a stream session */
-}
-
-static void handle_write_stream_data(tsdb_conn_t *c, const tsdb_msg_t *req) {
-    /* Accumulate silently; no per-chunk ack */
-    (void)c; (void)req;
-}
-
-static void handle_write_stream_end(tsdb_conn_t *c, const tsdb_msg_t *req) {
-    uint8_t ack[4];
-    put_u32(ack, 42);  /* rows_accepted */
-    mock_send(c, MSG_WRITE_ACK, 0, req->hdr.req_id, ack, 4);
-}
-
 /* ─── Mock server connection handler ───────────────────────────────────────── */
 
 static void mock_handle_conn(int fd) {
@@ -201,9 +184,8 @@ static void mock_handle_conn(int fd) {
         case MSG_WRITE_BATCH:       handle_write_batch(&c, &msg);         break;
         case MSG_LIST_GROUPS:       handle_list_groups(&c, &msg);         break;
         case MSG_CLUSTER_STATS:     handle_cluster_stats(&c, &msg);       break;
-        case MSG_WRITE_STREAM_OPEN: handle_write_stream_open(&c, &msg);   break;
-        case MSG_WRITE_STREAM_DATA: handle_write_stream_data(&c, &msg);   break;
-        case MSG_WRITE_STREAM_END:  handle_write_stream_end(&c, &msg);    break;
+        /* MSG_WRITE_STREAM_* (31-33) intentionally unhandled — like the real
+         * server they fall through to the ERROR default. */
         default:
             /* Send ERROR for unknown types */
             {
@@ -511,49 +493,47 @@ static void test_cluster_stats(void) {
     msg_free(&resp);
 }
 
-static void test_write_stream(void) {
-    printf("\n--- test WRITE_STREAM (OPEN+DATA+END) ---\n");
+/*
+ * Mirror the CLI WRITE path (do_write_batches): several MSG_WRITE_BATCH
+ * frames on one connection, exactly one WRITE_ACK read per frame, rows
+ * summed from the u32 ack payloads.  Then prove the connection is NOT
+ * desynced by running a full QUERY round-trip on the same conn.
+ */
+static void test_write_batch_chunks(void) {
+    printf("\n--- test chunked WRITE_BATCH (ack per frame, no desync) ---\n");
 
-    /* WRITE_STREAM_OPEN */
-    const char *tbl = "readings";
-    uint8_t obuf[64];
-    obuf[0] = (uint8_t)strlen(tbl);
-    memcpy(obuf + 1, tbl, strlen(tbl));
-    uint64_t open_id = g_conn.next_req_id++;
-    int rc = frame_send(&g_conn, MSG_WRITE_STREAM_OPEN, 0, open_id, obuf, 1 + (uint32_t)strlen(tbl));
-    ASSERT(rc == 0, "WRITE_STREAM_OPEN sent");
+    const int chunks[3] = {3, 2, 1};
+    uint32_t total_acked = 0;
 
-    /* WRITE_STREAM_DATA: 1 col, 3 rows */
-    uint8_t dbuf[256];
-    uint8_t *p = dbuf;
-    *p++ = (uint8_t)strlen(tbl); memcpy(p, tbl, strlen(tbl)); p += strlen(tbl);
-    put_u16(p, 1); p += 2;
-    put_u32(p, 3); p += 4;
-    const char *cn = "temp";
-    *p++ = (uint8_t)strlen(cn); memcpy(p, cn, strlen(cn)); p += strlen(cn);
-    *p++ = TSDB_TYPE_FLOAT64; *p++ = TSDB_CODEC_RAW;
-    put_u32(p, 24); p += 4;
-    double vs[3] = {20.0, 21.5, 22.0};
-    for (int i = 0; i < 3; i++) {
-        uint64_t rv; memcpy(&rv, &vs[i], 8); put_u64(p, rv); p += 8;
+    for (int k = 0; k < 3; k++) {
+        uint8_t buf[512];
+        uint8_t *p = buf;
+        const char *tbl = "readings";
+        *p++ = (uint8_t)strlen(tbl); memcpy(p, tbl, strlen(tbl)); p += strlen(tbl);
+        put_u16(p, 1); p += 2;                        /* ncols */
+        put_u32(p, (uint32_t)chunks[k]); p += 4;      /* nrows */
+        const char *cn = "temp";
+        *p++ = (uint8_t)strlen(cn); memcpy(p, cn, strlen(cn)); p += strlen(cn);
+        *p++ = TSDB_TYPE_FLOAT64; *p++ = TSDB_CODEC_RAW;
+        put_u32(p, (uint32_t)(chunks[k] * 8)); p += 4;
+        for (int i = 0; i < chunks[k]; i++) {
+            double v = 20.0 + i;
+            uint64_t rv; memcpy(&rv, &v, 8);
+            put_u64(p, rv); p += 8;
+        }
+
+        tsdb_msg_t resp = {0};
+        int rc = send_recv(&g_conn, MSG_WRITE_BATCH, 0, buf, (uint32_t)(p - buf),
+                           MSG_WRITE_ACK, &resp);
+        ASSERT(rc == 0, "chunk WRITE_BATCH acked");
+        if (rc == 0 && resp.hdr.payload_len >= 4)
+            total_acked += get_u32(resp.payload);
+        msg_free(&resp);
     }
-    uint64_t data_id = g_conn.next_req_id++;
-    rc = frame_send(&g_conn, MSG_WRITE_STREAM_DATA, 0, data_id, dbuf, (uint32_t)(p - dbuf));
-    ASSERT(rc == 0, "WRITE_STREAM_DATA sent");
+    ASSERT(total_acked == 6, "u32 acks sum to 6 rows");
 
-    /* WRITE_STREAM_END + expect WRITE_ACK */
-    tsdb_msg_t resp = {0};
-    uint64_t end_id = g_conn.next_req_id++;
-    rc = frame_send(&g_conn, MSG_WRITE_STREAM_END, TSDB_FLAG_FIN, end_id, NULL, 0);
-    ASSERT(rc == 0, "WRITE_STREAM_END sent");
-    rc = frame_recv(&g_conn, &resp);
-    ASSERT(rc == 0, "WRITE_ACK received");
-    ASSERT(resp.hdr.type == MSG_WRITE_ACK, "type is WRITE_ACK");
-    if (rc == 0 && resp.hdr.payload_len >= 4) {
-        uint32_t rows_acc = get_u32(resp.payload);
-        ASSERT(rows_acc == 42, "mock server acked 42 rows");
-    }
-    msg_free(&resp);
+    /* No desync: a follow-up QUERY on the same connection still works. */
+    test_query();
 }
 
 /* ─── main ──────────────────────────────────────────────────────────────────── */
@@ -594,7 +574,7 @@ int main(void) {
     test_write_batch();
     test_list_groups();
     test_cluster_stats();
-    test_write_stream();
+    test_write_batch_chunks();
 
     close(g_conn.fd);
     close(ctx.listen_fd);
