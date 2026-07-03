@@ -88,6 +88,9 @@ typedef enum {
     QTOK_INTO,
     QTOK_VALUES,
 
+    /* GROUP BY ... HAVING <cond> */
+    QTOK_HAVING,
+
     QTOK_ERR
 } qtok_kind_t;
 

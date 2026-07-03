@@ -446,6 +446,18 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
         if (parse_ident_list(&p, &q->group_by, &q->ngroup_by) != TSDB_OK) return TSDB_ERR_PARSE;
     }
 
+    /* HAVING <cond> — only meaningful after GROUP BY.  Checked here (not
+     * via the trailing-token catch-all) so the error is clean. */
+    if (p.tok.kind == QTOK_HAVING) {
+        advance(&p);
+        if (q->ngroup_by == 0) {
+            perr(&p, "HAVING requires GROUP BY");
+            return TSDB_ERR_PARSE;
+        }
+        q->having = parse_expr(&p);
+        if (!q->having) return TSDB_ERR_PARSE;
+    }
+
     if (accept(&p, QTOK_ORDER)) {
         if (expect(&p, QTOK_BY) != TSDB_OK) return TSDB_ERR_PARSE;
         if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected identifier after ORDER BY"); return TSDB_ERR_PARSE; }

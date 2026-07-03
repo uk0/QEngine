@@ -3054,6 +3054,280 @@ static void tsdb_gbpar_scan_task(void *arg) {
     }
 }
 
+/* ---- HAVING ------------------------------------------------------------- */
+/*
+ * HAVING <cond> filters the rows GROUP BY emits.  Supported condition forms
+ * are what the WHERE expression parser already builds — comparisons
+ * (= != < <= > >=) combined with AND / OR / NOT — over these leaves:
+ *
+ *   - an aggregate call that ALSO appears in the SELECT list
+ *     (sum(x), count(*), avg(x), percentile(x, q), ...).  The call is mapped
+ *     onto the projection's output column; referencing an aggregate that is
+ *     not projected is an error (documented limitation),
+ *   - a grouped column, by name or by projection alias,
+ *   - int / float literals; string literals compare (=, !=) against SYMBOL
+ *     group columns.
+ *
+ * Evaluation runs against the OUTPUT row just materialised at r->nrows,
+ * before the row is committed (nrows++), so the serial and parallel emit
+ * loops share the same filter.  A group only exists if it has rows, so
+ * HAVING never sees empty-group aggregate state.
+ */
+
+/* Derive the proj kind an aggregate call name maps to; -1 if not an
+ * aggregate name.  Mirrors build_projections' mapping. */
+static int having_call_kind(const char *name) {
+    if (strcasecmp(name, "sum") == 0)        return PROJ_AGG_SUM;
+    if (strcasecmp(name, "avg") == 0)        return PROJ_AGG_AVG;
+    if (strcasecmp(name, "min") == 0)        return PROJ_AGG_MIN;
+    if (strcasecmp(name, "max") == 0)        return PROJ_AGG_MAX;
+    if (strcasecmp(name, "spread") == 0)     return PROJ_AGG_SPREAD;
+    if (strcasecmp(name, "count") == 0)      return PROJ_AGG_COUNT;
+    if (strcasecmp(name, "p50") == 0)        return PROJ_AGG_P50;
+    if (strcasecmp(name, "p90") == 0)        return PROJ_AGG_P90;
+    if (strcasecmp(name, "p99") == 0)        return PROJ_AGG_P99;
+    if (strcasecmp(name, "percentile") == 0) return PROJ_AGG_PERCENTILE;
+    if (strcasecmp(name, "stddev") == 0)     return PROJ_AGG_STDDEV;
+    if (strcasecmp(name, "first") == 0)      return PROJ_AGG_TS_FIRST;
+    if (strcasecmp(name, "last") == 0)       return PROJ_AGG_TS_LAST;
+    if (strcasecmp(name, "last_row") == 0)   return PROJ_AGG_TS_LAST_ROW;
+    if (strcasecmp(name, "twa") == 0)        return PROJ_AGG_TS_TWA;
+    return -1;
+}
+
+/* Map an aggregate call in HAVING onto a projection index; -1 if absent. */
+static int having_find_agg_proj(const qast_expr_t *e, proj_t *projs,
+                                int nprojs, tsdb_schema_t *s)
+{
+    int k = having_call_kind(e->v.s);
+    if (k < 0) return -1;
+    int col = -1;
+    if (e->nargs >= 1 && e->args[0]->kind == QAST_IDENT)
+        col = resolve_col(s, e->args[0]->v.s);
+    for (int i = 0; i < nprojs; i++) {
+        if ((int)projs[i].kind != k) continue;
+        if (k == PROJ_AGG_COUNT) {
+            /* count(*) / count() match any COUNT proj; count(col) must
+             * match the projected column when one was named. */
+            if (col >= 0 && projs[i].col != col) continue;
+            return i;
+        }
+        if (col < 0 || projs[i].col != col) continue;
+        if (k == PROJ_AGG_PERCENTILE && e->nargs == 2) {
+            double q = 0.0;
+            if (e->args[1]->kind == QAST_LIT_FLOAT)    q = e->args[1]->v.f;
+            else if (e->args[1]->kind == QAST_LIT_INT) q = (double)e->args[1]->v.i;
+            if (q < 0.0) q = 0.0;
+            if (q > 1.0) q = 1.0;
+            if (q != projs[i].percentile_q) continue;
+        }
+        return i;
+    }
+    return -1;
+}
+
+/* Map a bare ident in HAVING onto a projection index (alias first, then
+ * grouped-column name); -1 if absent. */
+static int having_find_ident_proj(const char *name, proj_t *projs,
+                                  int nprojs, tsdb_schema_t *s)
+{
+    for (int i = 0; i < nprojs; i++)
+        if (strcasecmp(name, projs[i].name) == 0) return i;
+    int col = resolve_col(s, name);
+    if (col < 0) return -1;
+    for (int i = 0; i < nprojs; i++)
+        if (projs[i].kind == PROJ_COL && projs[i].col == col) return i;
+    return -1;
+}
+
+/* Read output cell (ci, row) as a double.  INT64/TIMESTAMP cells widen. */
+static double having_cell_num(tsdb_result_t *r, size_t row, int ci) {
+    uint64_t bits = ((const uint64_t *)r->col_data[ci])[row];
+    if (r->col_types[ci] == TSDB_TYPE_FLOAT64) {
+        double d; memcpy(&d, &bits, 8); return d;
+    }
+    int64_t v; memcpy(&v, &bits, 8);
+    return (double)v;
+}
+
+/* Validate a HAVING expression against the projections (as_bool: 1 when the
+ * node must produce a truth value).  Runs once before the emit loop so a
+ * zero-group result still surfaces reference errors. */
+static int having_validate(const qast_expr_t *e, proj_t *projs, int nprojs,
+                           tsdb_schema_t *s, int as_bool,
+                           char *err, size_t errcap)
+{
+    if (!e) { eset(err, errcap, "HAVING: empty expression"); return TSDB_ERR_PARSE; }
+    if (as_bool) {
+        switch (e->kind) {
+        case QAST_AND: case QAST_OR: {
+            int rc = having_validate(e->lhs, projs, nprojs, s, 1, err, errcap);
+            if (rc != TSDB_OK) return rc;
+            return having_validate(e->rhs, projs, nprojs, s, 1, err, errcap);
+        }
+        case QAST_NOT:
+            return having_validate(e->lhs, projs, nprojs, s, 1, err, errcap);
+        case QAST_EQ: case QAST_NE: case QAST_LT:
+        case QAST_LE: case QAST_GT: case QAST_GE: {
+            /* SYMBOL group column vs string literal: only = / != . */
+            const qast_expr_t *sides[2] = { e->lhs, e->rhs };
+            int sym_side = -1, str_side = -1;
+            for (int i = 0; i < 2; i++) {
+                if (sides[i]->kind == QAST_IDENT) {
+                    int pi = having_find_ident_proj(sides[i]->v.s, projs, nprojs, s);
+                    if (pi >= 0 && projs[pi].out_type == TSDB_TYPE_SYMBOL)
+                        sym_side = i;
+                }
+                if (sides[i]->kind == QAST_LIT_STR) str_side = i;
+            }
+            if (sym_side >= 0 || str_side >= 0) {
+                if (sym_side < 0 || str_side < 0 || sym_side == str_side ||
+                    (e->kind != QAST_EQ && e->kind != QAST_NE)) {
+                    eset(err, errcap,
+                         "HAVING: SYMBOL columns support only = / != against "
+                         "a string literal");
+                    return TSDB_ERR_UNSUPPORTED;
+                }
+                /* both sides accounted for */
+                return TSDB_OK;
+            }
+            int rc = having_validate(e->lhs, projs, nprojs, s, 0, err, errcap);
+            if (rc != TSDB_OK) return rc;
+            return having_validate(e->rhs, projs, nprojs, s, 0, err, errcap);
+        }
+        default:
+            eset(err, errcap, "HAVING: expected a comparison");
+            return TSDB_ERR_PARSE;
+        }
+    }
+    /* value node */
+    switch (e->kind) {
+    case QAST_LIT_INT: case QAST_LIT_FLOAT: case QAST_LIT_TS:
+        return TSDB_OK;
+    case QAST_NEG:
+        return having_validate(e->lhs, projs, nprojs, s, 0, err, errcap);
+    case QAST_ADD: case QAST_SUB: case QAST_MUL: case QAST_DIV: case QAST_MOD: {
+        int rc = having_validate(e->lhs, projs, nprojs, s, 0, err, errcap);
+        if (rc != TSDB_OK) return rc;
+        return having_validate(e->rhs, projs, nprojs, s, 0, err, errcap);
+    }
+    case QAST_CALL: {
+        if (having_call_kind(e->v.s) < 0) {
+            eset(err, errcap, "HAVING: '%s' is not an aggregate", e->v.s);
+            return TSDB_ERR_UNSUPPORTED;
+        }
+        if (having_find_agg_proj(e, projs, nprojs, s) < 0) {
+            eset(err, errcap,
+                 "HAVING references aggregate '%s(...)' that is not in the "
+                 "SELECT list", e->v.s);
+            return TSDB_ERR_SCHEMA;
+        }
+        return TSDB_OK;
+    }
+    case QAST_IDENT: {
+        int pi = having_find_ident_proj(e->v.s, projs, nprojs, s);
+        if (pi < 0) {
+            eset(err, errcap,
+                 "HAVING references '%s' which is not in the SELECT list",
+                 e->v.s);
+            return TSDB_ERR_SCHEMA;
+        }
+        if (projs[pi].out_type == TSDB_TYPE_SYMBOL) {
+            eset(err, errcap,
+                 "HAVING: SYMBOL column '%s' is only comparable with = / != "
+                 "against a string literal", e->v.s);
+            return TSDB_ERR_UNSUPPORTED;
+        }
+        return TSDB_OK;
+    }
+    default:
+        eset(err, errcap, "HAVING: unsupported expression");
+        return TSDB_ERR_UNSUPPORTED;
+    }
+}
+
+/* Numeric value of a validated HAVING value-node for output row `row`. */
+static double having_num(const qast_expr_t *e, tsdb_result_t *r, size_t row,
+                         proj_t *projs, int nprojs, tsdb_schema_t *s)
+{
+    switch (e->kind) {
+    case QAST_LIT_INT:   return (double)e->v.i;
+    case QAST_LIT_FLOAT: return e->v.f;
+    case QAST_LIT_TS:    return (double)e->v.ts;
+    case QAST_NEG:       return -having_num(e->lhs, r, row, projs, nprojs, s);
+    case QAST_ADD: return having_num(e->lhs, r, row, projs, nprojs, s) +
+                          having_num(e->rhs, r, row, projs, nprojs, s);
+    case QAST_SUB: return having_num(e->lhs, r, row, projs, nprojs, s) -
+                          having_num(e->rhs, r, row, projs, nprojs, s);
+    case QAST_MUL: return having_num(e->lhs, r, row, projs, nprojs, s) *
+                          having_num(e->rhs, r, row, projs, nprojs, s);
+    case QAST_DIV: return having_num(e->lhs, r, row, projs, nprojs, s) /
+                          having_num(e->rhs, r, row, projs, nprojs, s);
+    case QAST_MOD: {
+        double a = having_num(e->lhs, r, row, projs, nprojs, s);
+        double b = having_num(e->rhs, r, row, projs, nprojs, s);
+        return fmod(a, b);
+    }
+    case QAST_CALL: {
+        int pi = having_find_agg_proj(e, projs, nprojs, s);
+        return (pi >= 0) ? having_cell_num(r, row, pi) : (0.0 / 0.0);
+    }
+    case QAST_IDENT: {
+        int pi = having_find_ident_proj(e->v.s, projs, nprojs, s);
+        return (pi >= 0) ? having_cell_num(r, row, pi) : (0.0 / 0.0);
+    }
+    default: return 0.0 / 0.0;
+    }
+}
+
+/* Evaluate a validated HAVING condition for output row `row` → 0/1. */
+static int having_eval(const qast_expr_t *e, tsdb_result_t *r, size_t row,
+                       proj_t *projs, int nprojs, tsdb_schema_t *s)
+{
+    switch (e->kind) {
+    case QAST_AND:
+        return having_eval(e->lhs, r, row, projs, nprojs, s) &&
+               having_eval(e->rhs, r, row, projs, nprojs, s);
+    case QAST_OR:
+        return having_eval(e->lhs, r, row, projs, nprojs, s) ||
+               having_eval(e->rhs, r, row, projs, nprojs, s);
+    case QAST_NOT:
+        return !having_eval(e->lhs, r, row, projs, nprojs, s);
+    case QAST_EQ: case QAST_NE: case QAST_LT:
+    case QAST_LE: case QAST_GT: case QAST_GE: {
+        /* SYMBOL vs string literal (validated: = / != only). */
+        const qast_expr_t *sides[2] = { e->lhs, e->rhs };
+        int sym_pi = -1, str_i = -1;
+        for (int i = 0; i < 2; i++) {
+            if (sides[i]->kind == QAST_IDENT) {
+                int pi = having_find_ident_proj(sides[i]->v.s, projs, nprojs, s);
+                if (pi >= 0 && projs[pi].out_type == TSDB_TYPE_SYMBOL) sym_pi = pi;
+            }
+            if (sides[i]->kind == QAST_LIT_STR) str_i = i;
+        }
+        if (sym_pi >= 0 && str_i >= 0) {
+            uint32_t code = (uint32_t)((const uint64_t *)r->col_data[sym_pi])[row];
+            const char *sv = r->col_symtab[sym_pi]
+                ? tsdb_symtab_str(r->col_symtab[sym_pi], code) : NULL;
+            int eq = (sv && strcmp(sv, sides[str_i]->v.s) == 0);
+            return (e->kind == QAST_EQ) ? eq : !eq;
+        }
+        double a = having_num(e->lhs, r, row, projs, nprojs, s);
+        double b = having_num(e->rhs, r, row, projs, nprojs, s);
+        switch (e->kind) {
+        case QAST_EQ: return a == b;
+        case QAST_NE: return a != b;
+        case QAST_LT: return a <  b;
+        case QAST_LE: return a <= b;
+        case QAST_GT: return a >  b;
+        default:      return a >= b;   /* QAST_GE */
+        }
+    }
+    default:
+        return 0;
+    }
+}
+
 static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                          qast_query_t *q, tsdb_result_t *r,
                          proj_t *projs, int nprojs,
@@ -3086,6 +3360,13 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 return TSDB_ERR_SCHEMA;
             }
         }
+    }
+
+    /* Validate HAVING references up front so a zero-group result still
+     * surfaces a bad aggregate/column reference. */
+    if (q->having) {
+        int hrc = having_validate(q->having, projs, nprojs, s, 1, err, errcap);
+        if (hrc != TSDB_OK) return hrc;
     }
 
     /* Build scan plan (with zone-map prune). */
@@ -3226,6 +3507,11 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                         agg_write(&slot->state[p], s, r, p);
                     }
                 }
+                /* HAVING: drop the just-materialised row (next group
+                 * overwrites it) when the condition is false. */
+                if (q->having &&
+                    !having_eval(q->having, r, r->nrows, projs, nprojs, s))
+                    continue;
                 r->nrows++;
             }
         }
@@ -3494,6 +3780,10 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 agg_write(&slot->state[p], s, r, p);
             }
         }
+        /* HAVING: keep the row only when the condition holds. */
+        if (q->having &&
+            !having_eval(q->having, r, r->nrows, projs, nprojs, s))
+            continue;
         r->nrows++;
     }
 
@@ -4621,6 +4911,15 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         eset(err, errcap,
              "window functions (diff/derivative/csum/mavg) cannot be combined with "
              "aggregates, GROUP BY, SAMPLE BY, LATEST ON, or ASOF JOIN");
+        return TSDB_ERR_UNSUPPORTED;
+    }
+
+    /* HAVING is only executed by the GROUP BY hash-aggregate path.  The
+     * parser already requires GROUP BY; this guards combinations that
+     * route elsewhere (e.g. GROUP BY + SAMPLE BY). */
+    if (q->having && !(q->ngroup_by > 0 && !q->has_sample_by)) {
+        if (projs) { for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]); free(projs); }
+        eset(err, errcap, "HAVING requires GROUP BY (without SAMPLE BY)");
         return TSDB_ERR_UNSUPPORTED;
     }
 

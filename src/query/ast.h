@@ -8,7 +8,7 @@
  *                [ SAMPLE BY interval [ FILL (fill) ] ]
  *                [ SESSION(ts_col, gap) | STATE_WINDOW(col) | EVENT_WINDOW(start,end) ]
  *                [ LATEST ON ident [ PARTITION BY ident_list ] ]
- *                [ GROUP BY ident_list ]
+ *                [ GROUP BY ident_list [ HAVING cond ] ]
  *                [ ORDER BY ident [ ASC | DESC ] ]
  *                [ LIMIT N ]
  *   sel_list  := sel_item ( ',' sel_item )*
@@ -138,6 +138,10 @@ typedef struct {
 
     char           **group_by;
     int              ngroup_by;
+
+    /* HAVING <cond> — post-aggregation filter over the GROUP BY output.
+     * NULL when absent.  Only valid with GROUP BY. */
+    qast_expr_t     *having;
 
     /* Top-level PARTITION BY tbname — STable per-child dimension.
      * Valid only when FROM is a super-table; forces row-union result
