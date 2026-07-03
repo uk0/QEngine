@@ -368,6 +368,51 @@ public class TsdbClient implements AutoCloseable {
         if (f.type == MSG_ERROR) throw decodeError(f.payload);
     }
 
+    /* ----- UDF registration ----- */
+
+    /** Maps a wire column type byte to its CREATE FUNCTION keyword. */
+    private static String udfTypeKeyword(byte t) {
+        switch (t) {
+            case 1: return "TIMESTAMP";
+            case 2: return "INT64";
+            case 3: return "FLOAT64";
+            default:
+                throw new IllegalArgumentException(
+                    "UDF v1 supports TIMESTAMP/INT64/FLOAT64, got type byte " + t);
+        }
+    }
+
+    /**
+     * Registers a scalar UDF by issuing
+     * {@code CREATE FUNCTION name(argTypes...) RETURNS retType FROM 'soPath' SYMBOL 'symbol'}
+     * over the standard query channel.
+     *
+     * <p>Types use the wire bytes (1 = TIMESTAMP, 2 = INT64, 3 = FLOAT64).
+     * {@code symbol} may be null or empty — the server then defaults the
+     * exported symbol to the function name.  Registration is metadata-only
+     * on the server (dlopen happens lazily at first call), so the .so must
+     * be present at {@code soPath} on every server node before the
+     * function's first use.  Requires an ADMIN session when auth is enabled.
+     */
+    public void registerUdf(String name, byte[] argTypes, byte retType,
+                            String soPath, String symbol) throws IOException {
+        StringBuilder sb = new StringBuilder("CREATE FUNCTION ").append(name).append('(');
+        for (int i = 0; i < argTypes.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(udfTypeKeyword(argTypes[i]));
+        }
+        sb.append(") RETURNS ").append(udfTypeKeyword(retType))
+          .append(" FROM '").append(soPath).append('\'');
+        if (symbol != null && !symbol.isEmpty())
+            sb.append(" SYMBOL '").append(symbol).append('\'');
+        query(sb.toString());
+    }
+
+    /** Unregisters a scalar UDF: {@code DROP FUNCTION name}. */
+    public void dropUdf(String name) throws IOException {
+        query("DROP FUNCTION " + name);
+    }
+
     /* ----- Columnar WRITE_BATCH ----- */
 
     /**
