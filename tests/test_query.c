@@ -260,6 +260,42 @@ int main(void) {
     printf("  p90=%.4f\n", p90_all);
     assert(p90_all > 580.0 && p90_all < 720.0);
 
+    /* --- Test 15: stddev/percentile over EMPTY input error (no silent NaN).
+     * avg() keeps its documented NaN-on-empty; count(*) keeps returning 0. */
+    printf("\n[15] stddev/percentile on empty input error instead of NaN\n");
+    {
+        tsdb_col_t ecols[] = {
+            {"ts", TSDB_TYPE_TIMESTAMP},
+            {"v",  TSDB_TYPE_FLOAT64},
+        };
+        OK(tsdb_create_table(db, "empty_t", ecols, 2, "ts"));
+
+        tsdb_result_t *er = NULL;
+        int erc = tsdb_query(db, "SELECT stddev(v) FROM empty_t", &er);
+        assert(erc != TSDB_OK);
+        printf("  stddev(empty) rc=%d (%s)\n", erc, tsdb_errstr(erc));
+
+        erc = tsdb_query(db, "SELECT p50(v) FROM empty_t", &er);
+        assert(erc != TSDB_OK);
+        erc = tsdb_query(db, "SELECT percentile(v, 0.9) FROM empty_t", &er);
+        assert(erc != TSDB_OK);
+
+        /* WHERE that filters everything out is also empty input. */
+        erc = tsdb_query(db, "SELECT p99(price) FROM trades WHERE price > 1e12", &er);
+        assert(erc != TSDB_OK);
+
+        /* avg() on empty stays NaN (documented), count stays 0. */
+        OK(tsdb_query(db, "SELECT avg(v) FROM empty_t", &er));
+        assert(tsdb_result_next(er));
+        assert(isnan(tsdb_result_f64(er, 0)));
+        tsdb_result_free(er);
+        OK(tsdb_query(db, "SELECT count(*) FROM empty_t", &er));
+        assert(tsdb_result_next(er));
+        assert(tsdb_result_i64(er, 0) == 0);
+        tsdb_result_free(er);
+        printf("  empty-input: stddev/p50/percentile/p99 error, avg=NaN, count=0\n");
+    }
+
     tsdb_set_query_parallel(1); /* restore parallel default */
 
     tsdb_close(db);

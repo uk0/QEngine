@@ -1452,6 +1452,33 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     }
 }
 
+/* Guard for t-digest aggregate emission (stddev / percentile / p50/p90/p99).
+ *
+ * Distinguishes the two states agg_write's NaN fallback used to conflate:
+ *   - tdigest == NULL     → allocation (or worker clone) failed → NOMEM,
+ *     never a silent NaN cell;
+ *   - tdigest count == 0  → aggregate over EMPTY input.  Only reachable in
+ *     the whole-table (no GROUP BY) shape: a GROUP BY group exists only if
+ *     at least one row hit it, so callers pass check_empty=0 there.
+ * avg() keeps its documented NaN-on-empty behaviour — this guard covers
+ * only the t-digest kinds.  Returns TSDB_OK when emission may proceed. */
+static int tdigest_emit_guard(const proj_t *p, int check_empty,
+                              char *err, size_t errcap)
+{
+    if (p->kind < PROJ_AGG_TDIGEST_FIRST || p->kind >= PROJ_AGG_TS_KIND_FIRST)
+        return TSDB_OK;
+    const char *fn = (p->kind == PROJ_AGG_STDDEV) ? "stddev" : "percentile";
+    if (!p->tdigest) {
+        eset(err, errcap, "%s(): t-digest allocation failed", fn);
+        return TSDB_ERR_NOMEM;
+    }
+    if (check_empty && tsdb_tdigest_count(p->tdigest) == 0.0) {
+        eset(err, errcap, "%s() over empty input", fn);
+        return TSDB_ERR_INVAL;
+    }
+    return TSDB_OK;
+}
+
 static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx) {
     tsdb_type_t src_t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
     double out_f = 0.0;
@@ -3494,6 +3521,10 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                         grc = TSDB_ERR_OVERFLOW;
                     }
                 }
+                /* A group always has rows (never "empty input"), but a failed
+                 * worker-side tdigest clone must be NOMEM, not a NaN cell. */
+                for (int p = 0; p < nprojs && grc == TSDB_OK; p++)
+                    grc = tdigest_emit_guard(&slot->state[p], 0, err, errcap);
                 if (grc != TSDB_OK) break;
 
                 for (int p = 0; p < nprojs; p++) {
@@ -3765,6 +3796,12 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 rc = TSDB_ERR_OVERFLOW;
                 goto out;
             }
+        }
+        /* A group always has rows (never "empty input"), but a lost tdigest
+         * (failed clone during grow/merge) must be NOMEM, not a NaN cell. */
+        for (int p = 0; p < nprojs; p++) {
+            rc = tdigest_emit_guard(&slot->state[p], 0, err, errcap);
+            if (rc != TSDB_OK) goto out;
         }
 
         for (int p = 0; p < nprojs; p++) {
@@ -5185,6 +5222,10 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 }
             }
 
+            /* stddev/percentile: error on empty input or lost digest. */
+            for (int pi = 0; pi < nprojs && rc == TSDB_OK; pi++)
+                rc = tdigest_emit_guard(&projs[pi], 1, err, errcap);
+
             /* Write merged aggregates to result. */
             if (rc == TSDB_OK) rc = result_reserve_rows(r, 1);
             if (rc == TSDB_OK) {
@@ -5934,6 +5975,11 @@ post_scan:
                 rc = TSDB_ERR_OVERFLOW;
                 goto done;
             }
+        }
+        /* stddev/percentile: error on empty input or lost digest. */
+        for (int pi = 0; pi < nprojs; pi++) {
+            rc = tdigest_emit_guard(&projs[pi], 1, err, errcap);
+            if (rc != TSDB_OK) goto done;
         }
         rc = result_reserve_rows(r, 1);
         if (rc != TSDB_OK) goto done;
