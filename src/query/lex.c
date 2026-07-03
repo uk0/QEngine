@@ -68,6 +68,7 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"into",         QTOK_INTO},
     {"values",       QTOK_VALUES},
     {"having",       QTOK_HAVING},
+    {"distinct",     QTOK_DISTINCT},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -142,6 +143,7 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_INTO:         return "INTO";
     case QTOK_VALUES:       return "VALUES";
     case QTOK_HAVING:       return "HAVING";
+    case QTOK_DISTINCT:     return "DISTINCT";
     case QTOK_ERR: return "<error>";
     }
     return "?";

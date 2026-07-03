@@ -91,6 +91,9 @@ typedef enum {
     /* GROUP BY ... HAVING <cond> */
     QTOK_HAVING,
 
+    /* SELECT DISTINCT col[, col...] */
+    QTOK_DISTINCT,
+
     QTOK_ERR
 } qtok_kind_t;
 

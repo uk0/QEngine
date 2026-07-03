@@ -2,7 +2,7 @@
  *
  * QTL (Query Time-series Language) grammar:
  *
- *   query     := SELECT sel_list FROM ident
+ *   query     := SELECT [ DISTINCT ] sel_list FROM ident
  *                [ ASOF JOIN ident ON key=key [, key=key]* ]
  *                [ WHERE expr ]
  *                [ SAMPLE BY interval [ FILL (fill) ] ]
@@ -138,6 +138,11 @@ typedef struct {
 
     char           **group_by;
     int              ngroup_by;
+
+    /* SELECT DISTINCT a, b — parser-level rewrite to GROUP BY a, b with
+     * key-only projection (group_by/ngroup_by are populated from the
+     * select list).  The flag only blocks an explicit GROUP BY clause. */
+    int              has_distinct;
 
     /* HAVING <cond> — post-aggregation filter over the GROUP BY output.
      * NULL when absent.  Only valid with GROUP BY. */

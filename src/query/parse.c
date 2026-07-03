@@ -284,7 +284,28 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
     if (advance(&p) != TSDB_OK) return TSDB_ERR_PARSE;
 
     if (!accept(&p, QTOK_SELECT)) { perr(&p, "expected SELECT"); return TSDB_ERR_PARSE; }
+    int distinct = accept(&p, QTOK_DISTINCT);
     if (parse_sel_list(&p, q) != TSDB_OK) return TSDB_ERR_PARSE;
+
+    /* SELECT DISTINCT a, b == GROUP BY a, b projecting only the keys —
+     * rewritten here so the executor's hash-aggregate path dedupes.
+     * v1 restriction: plain columns only. */
+    if (distinct) {
+        char **gb = tsdb_arena_alloc(p.arena, sizeof(char *) * (size_t)q->nsel);
+        if (!gb) return TSDB_ERR_NOMEM;
+        for (int i = 0; i < q->nsel; i++) {
+            qast_sel_item_t *si = &q->sel[i];
+            if (si->is_star || !si->expr || si->expr->kind != QAST_IDENT) {
+                perr(&p, "SELECT DISTINCT supports plain columns only "
+                         "(aggregates, expressions and * are not supported)");
+                return TSDB_ERR_PARSE;
+            }
+            gb[i] = si->expr->v.s;
+        }
+        q->group_by = gb;
+        q->ngroup_by = q->nsel;
+        q->has_distinct = 1;
+    }
 
     if (expect(&p, QTOK_FROM) != TSDB_OK) return TSDB_ERR_PARSE;
     if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected table name"); return TSDB_ERR_PARSE; }
@@ -442,6 +463,10 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
     }
 
     if (accept(&p, QTOK_GROUP)) {
+        if (q->has_distinct) {
+            perr(&p, "DISTINCT cannot be combined with GROUP BY");
+            return TSDB_ERR_PARSE;
+        }
         if (expect(&p, QTOK_BY) != TSDB_OK) return TSDB_ERR_PARSE;
         if (parse_ident_list(&p, &q->group_by, &q->ngroup_by) != TSDB_OK) return TSDB_ERR_PARSE;
     }
