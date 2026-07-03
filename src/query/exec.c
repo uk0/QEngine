@@ -6040,6 +6040,14 @@ static int is_catalog_ddl(qast_stmt_kind_t k) {
     case QAST_STMT_CREATE_CHILD_TABLE:
     case QAST_STMT_CREATE_TABLE:
     case QAST_STMT_DROP_TABLE:
+    /* UDF DDL is catalog state like any other and must replicate:
+     * raft apply re-runs the verbatim QTL on every master (and fans it
+     * out to data nodes).  CREATE FUNCTION never dlopens at create time
+     * (lazy, first call), so the apply succeeds on nodes where the .so
+     * is absent — the .so must be present at the same path on every
+     * node before the function's first use there. */
+    case QAST_STMT_CREATE_FUNCTION:
+    case QAST_STMT_DROP_FUNCTION:
         return 1;
     default:
         return 0;
@@ -7148,6 +7156,13 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         }
         e.ret_type   = (tsdb_udf_type_t)stmt.u.create_function.ret_type;
         e.created_at = tsdb_now_ns();
+        /* Registration is metadata-only: no dlopen happens here (lazy,
+         * first call), so CREATE FUNCTION succeeds even if so_path does
+         * not exist on this node yet.  On a cluster the statement is
+         * replicated verbatim (raft apply / catalog broadcast), so the
+         * .so must be present at the same path on every node before the
+         * function is first called there — a missing library surfaces
+         * as TSDB_ERR_NOTFOUND at lookup time, never as zero rows. */
         rc = tsdb_udf_catalog_create(udfcat, &e);
         if (rc == TSDB_OK)                  rc = result_status(r, "OK: function created");
         else if (rc == TSDB_ERR_EXISTS)   { result_status(r, "ERR: function exists or shadows builtin"); rc = TSDB_ERR_EXISTS; }
@@ -7331,6 +7346,8 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_CREATE_CHILD_TABLE:
     case QAST_STMT_CREATE_TABLE:
     case QAST_STMT_DROP_TABLE:
+    case QAST_STMT_CREATE_FUNCTION:
+    case QAST_STMT_DROP_FUNCTION:
         try_broadcast_catalog_qtl(db, qtl, rc);
         break;
     default:
