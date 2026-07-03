@@ -608,7 +608,14 @@ public class TsdbClient implements AutoCloseable {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
         int rc = b.getInt();
         String msg = "";
-        if (payload.length > 4) {
+        if (payload.length >= 6) {
+            // Spec shape: [i32 code][u16 msg_len][msg]. Older servers sent
+            // the message raw after the code; accept both via the length.
+            int n = (payload[4] & 0xFF) | ((payload[5] & 0xFF) << 8);
+            int off = (6 + n == payload.length) ? 6 : 4;
+            msg = new String(payload, off, payload.length - off,
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } else if (payload.length > 4) {
             msg = new String(payload, 4, payload.length - 4,
                     java.nio.charset.StandardCharsets.UTF_8);
         }

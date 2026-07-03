@@ -433,15 +433,22 @@ static int send_write_ack(tsdb_io_t *io, uint64_t req_id, uint32_t nrows) {
 }
 
 static int send_error(tsdb_io_t *io, uint64_t req_id, int err_code, const char *msg) {
+    /* Spec shape (tsdb_wire.h): [err_code i32 LE][msg_len u16 LE][msg utf8].
+     * The u16 length was historically omitted, so spec-conform parsers (the
+     * CLI) swallowed the first two message bytes ("query failed" rendered
+     * as "ery failed"). */
     size_t mlen = msg ? strlen(msg) : 0;
-    size_t total = 4 + mlen;
+    if (mlen > 65535) mlen = 65535;
+    size_t total = 4 + 2 + mlen;
     uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) return TSDB_ERR_NOMEM;
     buf[0] = (uint8_t)(err_code);
     buf[1] = (uint8_t)((err_code) >> 8);
     buf[2] = (uint8_t)((err_code) >> 16);
     buf[3] = (uint8_t)((err_code) >> 24);
-    if (mlen > 0) memcpy(buf + 4, msg, mlen);
+    buf[4] = (uint8_t)(mlen);
+    buf[5] = (uint8_t)(mlen >> 8);
+    if (mlen > 0) memcpy(buf + 6, msg, mlen);
     int rc = tsdb_proto_send_io(io, TSDB_MT_ERROR, TSDB_FLAG_FIN, req_id, buf, total);
     free(buf);
     return rc;

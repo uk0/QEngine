@@ -581,7 +581,15 @@ func decodeError(p []byte) error {
 	}
 	rc := int32(binary.LittleEndian.Uint32(p[0:4]))
 	msg := ""
-	if len(p) > 4 {
+	if len(p) >= 6 {
+		// Spec shape: [i32 code][u16 msg_len][msg]. Older servers sent the
+		// message raw after the code; accept both by validating the length.
+		if n := int(binary.LittleEndian.Uint16(p[4:6])); 6+n == len(p) {
+			msg = string(p[6:])
+		} else {
+			msg = string(p[4:])
+		}
+	} else if len(p) > 4 {
 		msg = string(p[4:])
 	}
 	return fmt.Errorf("server error rc=%d: %s", rc, msg)
