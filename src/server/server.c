@@ -1324,6 +1324,44 @@ static int handle_unsubscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
     return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);
 }
 
+/* ---- CLUSTER_STATS -------------------------------------------------------- */
+/*
+ * Serialize the live server counters in the kv format the CLI's STATS
+ * command parses (tsdb_wire.h "CLUSTER_STATS response"):
+ *   [kv_count u16 LE] then per kv [klen u8][key][vlen u8][val]
+ * Values are decimal strings; response type is TSDB_MT_HELLO_OK as the
+ * wire spec allows.  bytes_out_total reads 0 for now: nothing increments
+ * stat_bytes_out because tsdb_proto_send_io has no server backref.
+ */
+static int handle_cluster_stats(tsdb_server_t *srv, tsdb_io_t *io,
+                                uint64_t req_id)
+{
+    const struct { const char *k; uint64_t v; } kv[] = {
+        { "connections_active", atomic_load(&srv->stat_conns) },
+        { "queries_total",      atomic_load(&srv->stat_queries) },
+        { "rows_written_total", atomic_load(&srv->stat_rows_written) },
+        { "subs_active",        atomic_load(&srv->stat_subs_active) },
+        { "bytes_in_total",     atomic_load(&srv->stat_bytes_in) },
+        { "bytes_out_total",    atomic_load(&srv->stat_bytes_out) },
+    };
+    const int nkv = (int)(sizeof(kv) / sizeof(kv[0]));
+
+    uint8_t buf[512];
+    uint8_t *p = buf;
+    *p++ = (uint8_t)(nkv);
+    *p++ = (uint8_t)(nkv >> 8);
+    for (int i = 0; i < nkv; i++) {
+        char val[24];
+        int vl = snprintf(val, sizeof(val), "%llu",
+                          (unsigned long long)kv[i].v);
+        uint8_t kl = (uint8_t)strlen(kv[i].k);
+        *p++ = kl; memcpy(p, kv[i].k, kl); p += kl;
+        *p++ = (uint8_t)vl; memcpy(p, val, (size_t)vl); p += vl;
+    }
+    return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN,
+                              req_id, buf, (size_t)(p - buf));
+}
+
 /* ---- Main connection handler --------------------------------------------- */
 
 /* Track a live connection so stop() can kick + drain it.  inflight is
@@ -1438,6 +1476,9 @@ static void *connection_handler(void *arg) {
             break;
 
         case TSDB_MT_CLUSTER_STATS:
+            handle_cluster_stats(srv, io, hdr.req_id);
+            break;
+
         case TSDB_MT_SCHEMA:
             /* Stub: ACK */
             tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN,

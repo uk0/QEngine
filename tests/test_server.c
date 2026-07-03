@@ -556,6 +556,56 @@ static void test_group_ddl_unsupported(int port) {
     close(fd);
 }
 
+/* ---- Test 9: CLUSTER_STATS → kv counters --------------------------------- */
+/* Response: HELLO_OK with [kv_count u16] then [klen u8][key][vlen u8][val],
+ * values as decimal strings.  By this point the suite has run writes and
+ * queries, so the counters must be present (queries_total, rows_written). */
+static void test_cluster_stats(int port) {
+    int fd = client_connect(port);
+    CHECK(fd >= 0, "connect for CLUSTER_STATS");
+    if (fd < 0) return;
+
+    int rc = tsdb_proto_send(fd, TSDB_MT_CLUSTER_STATS, 0, 8, NULL, 0);
+    CHECK(rc == TSDB_OK, "send CLUSTER_STATS");
+
+    tsdb_frame_hdr_t hdr;
+    uint8_t *pl = NULL;
+    rc = recv_frame(fd, &hdr, &pl);
+    CHECK(rc == TSDB_OK, "recv CLUSTER_STATS response");
+    CHECK(hdr.type == TSDB_MT_HELLO_OK, "stats response type is HELLO_OK");
+    CHECK(hdr.payload_len >= 2, "stats payload non-empty");
+
+    int found_queries = 0;
+    long long rows_written = -1;
+    if (pl && hdr.payload_len >= 2) {
+        const uint8_t *p   = pl;
+        const uint8_t *end = pl + hdr.payload_len;
+        uint16_t nkv = (uint16_t)(p[0] | (p[1] << 8));
+        p += 2;
+        CHECK(nkv >= 5, "stats has at least 5 kv pairs");
+        for (uint16_t i = 0; i < nkv && p < end; i++) {
+            uint8_t kl = *p++;
+            if (p + kl > end) break;
+            char key[64] = {0};
+            memcpy(key, p, kl < 63 ? kl : 63);
+            p += kl;
+            if (p >= end) break;
+            uint8_t vl = *p++;
+            if (p + vl > end) break;
+            char val[32] = {0};
+            memcpy(val, p, vl < 31 ? vl : 31);
+            p += vl;
+            if (strcmp(key, "queries_total") == 0)      found_queries = 1;
+            if (strcmp(key, "rows_written_total") == 0) rows_written = atoll(val);
+        }
+    }
+    CHECK(found_queries, "stats contains queries_total");
+    CHECK(rows_written >= 1100, "rows_written_total counts prior writes");
+
+    free(pl);
+    close(fd);
+}
+
 /* ---- CRC32C self-test ---------------------------------------------------- */
 static void test_crc32c(void) {
     /* Known vector: crc32c("123456789") == 0xE3069283 */
@@ -874,6 +924,9 @@ int main(void) {
 
     printf("\n--- Test 8: group/device DDL unsupported ---\n");
     test_group_ddl_unsupported(port);
+
+    printf("\n--- Test 9: CLUSTER_STATS ---\n");
+    test_cluster_stats(port);
 
     printf("\n--- Benchmarks (single connection) ---\n");
     bench_write(port);
