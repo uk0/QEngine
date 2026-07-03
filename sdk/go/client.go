@@ -32,6 +32,11 @@ type Client struct {
 	// connection.  Zero (the default) means auto-reconnect is ON with 2
 	// attempts.  A negative value disables auto-reconnect entirely.
 	MaxReconnect int
+
+	// pipeline is non-nil while a WritePipeline is open on this client.  The
+	// pipeline owns the connection until Close: Query/WriteBatch check this
+	// and refuse to interleave frames with pipelined writes.
+	pipeline *WritePipeline
 }
 
 // Open dials + sends HELLO.
@@ -219,8 +224,12 @@ func encodeBatch(table string, cols []Column, rows []Row) ([]byte, error) {
 // WriteBatch synchronously writes rows and waits for the server's ack,
 // returning the accepted row count.  One round-trip per call: throughput over
 // a high-latency link is bounded by 1/RTT.  For bulk loads over a network use
-// NewPipelineWriter, which keeps many batches in flight.
+// NewWritePipeline (bounded FIFO window, per-batch error reporting) or
+// NewPipelineWriter (background ack reader), which keep many batches in flight.
 func (c *Client) WriteBatch(table string, cols []Column, rows []Row) (uint32, error) {
+	if c.pipeline != nil {
+		return 0, errPipelineActive
+	}
 	if len(rows) == 0 {
 		return 0, nil
 	}
@@ -411,6 +420,9 @@ type QueryResult struct {
 // result set is rebuilt from scratch, so a partially-drained prior attempt
 // cannot corrupt it).  Auto-retry is governed by MaxReconnect.
 func (c *Client) Query(qtl string) (*QueryResult, error) {
+	if c.pipeline != nil {
+		return nil, errPipelineActive
+	}
 	var qr *QueryResult
 	err := c.withReconnect(true, func() error {
 		var qerr error
