@@ -734,6 +734,25 @@ static int col_writer_write_block(col_writer_t *w,
                        (uint32_t)count, ts_min, ts_max,
                        (uint32_t)comp_bytes);
 
+    /* Pad the block start to an 8-byte boundary.  BlockHeader is 32 B, so
+     * the payload then starts 8-aligned too — the precondition for the
+     * zero-copy read path handing out direct int64/double pointers into
+     * the mmap (tsdb_part_read_block_ref).  The pad lives in the gap
+     * BETWEEN blocks: readers address blocks only through idx-entry
+     * offsets, so mixed padded/unpadded files (older writers, appended
+     * legacy tails) stay fully readable — an unaligned legacy block just
+     * takes the copy path. */
+    {
+        uint32_t pad = (uint32_t)(-(int64_t)w->col_offset & 7);
+        if (pad) {
+            static const uint8_t zpad[8] = {0};
+            if (fwrite(zpad, 1, pad, w->col_fp) != pad) {
+                free(comp_buf); return TSDB_ERR_IO;
+            }
+            w->col_offset += pad;
+        }
+    }
+
     if (fwrite(hdr, 1, TSDB_BLOCK_HEADER_SIZE, w->col_fp) != TSDB_BLOCK_HEADER_SIZE) {
         free(comp_buf); return TSDB_ERR_IO;
     }
@@ -1316,7 +1335,23 @@ struct tsdb_part {
     int64_t            zone_ts_min;
     int64_t            zone_ts_max;
     int                zone_valid;
+
+    /* Zero-copy read gate, latched from env TSDB_ZEROCOPY_READ at open
+     * (default ON; "0" disables).  Per-handle so an in-process setenv
+     * takes effect on the next open, never mid-scan. */
+    int                zerocopy;
 };
+
+/* Process-wide zero-copy read counters (stats/tests only; relaxed). */
+static uint64_t g_zerocopy_hits;
+static uint64_t g_zerocopy_fallbacks;
+
+void tsdb_part_zerocopy_stats(uint64_t *out_hits, uint64_t *out_fallbacks) {
+    if (out_hits)
+        *out_hits = __atomic_load_n(&g_zerocopy_hits, __ATOMIC_RELAXED);
+    if (out_fallbacks)
+        *out_fallbacks = __atomic_load_n(&g_zerocopy_fallbacks, __ATOMIC_RELAXED);
+}
 
 int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out) {
     if (!s || !partition_dir || !out) return TSDB_ERR_INVAL;
@@ -1329,6 +1364,10 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
     p->zone_ts_min = INT64_MAX;
     p->zone_ts_max = INT64_MIN;
     p->zone_valid  = 0;
+    {
+        const char *zc = getenv("TSDB_ZEROCOPY_READ");
+        p->zerocopy = !(zc && zc[0] == '0' && zc[1] == '\0');
+    }
 
     for (int i = 0; i < s->ncols; i++)
         p->col_maps[i].fd = -1;
@@ -1655,22 +1694,20 @@ int tsdb_part_col_blocks(tsdb_part_t *p, int col_idx,
     return TSDB_OK;
 }
 
-int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
-                         const tsdb_block_meta_t *meta, void *out_buf)
+/*
+ * Locate + validate one block inside the column mmap: bounds-check the
+ * idx-derived meta against the mapping, parse the 32-byte block header,
+ * cross-check it, and verify the CRC32C trailer when the writer marked
+ * one.  On success, *out_data and *out_dsize describe the (still encoded)
+ * payload bytes INSIDE the mapping.  Shared by the copying reader
+ * (tsdb_part_read_block) and the zero-copy reader
+ * (tsdb_part_read_block_ref) so both enforce identical integrity checks.
+ */
+static int part_block_locate(tsdb_part_t *p, int col_idx,
+                             const tsdb_block_meta_t *meta,
+                             uint8_t *out_codec, uint16_t *out_flags,
+                             const uint8_t **out_data, uint32_t *out_dsize)
 {
-    if (!p || col_idx < 0 || col_idx >= p->schema->ncols || !meta || !out_buf)
-        return TSDB_ERR_INVAL;
-
-    /* ALTER TABLE ADD COLUMN sentinel: offset == UINT64_MAX marks a block
-     * that pre-dates the column's creation — zero-fill with the type's
-     * default value. Works whether the column file is mapped or not. */
-    if (meta->offset == UINT64_MAX) {
-        tsdb_type_t type = p->schema->cols[col_idx].type;
-        size_t w = tsdb_type_width(type);
-        memset(out_buf, 0, (size_t)meta->count * w);
-        return TSDB_OK;
-    }
-
     if (!p->col_maps[col_idx].map) return TSDB_ERR_NOTFOUND;
 
     uint64_t off    = meta->offset;
@@ -1692,19 +1729,20 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
      * emits both from the same values, so a mismatch means the caller's
      * idx snapshot is paired with a different generation of the .col
      * file (truncate + re-pull or a compactor swap replaced the pair
-     * between the idx read and the col mmap).  out_buf is sized from
-     * meta->count; decoding header `count` values into it would overrun
-     * the heap — same class the compactor read loop already guards. */
+     * between the idx read and the col mmap).  The output buffer is sized
+     * from meta->count; decoding header `count` values into it would
+     * overrun the heap — same class the compactor read loop already
+     * guards. */
     if (count != meta->count || data_size != meta->size)
         return TSDB_ERR_CORRUPT;
 
     if (off + TSDB_BLOCK_HEADER_SIZE + data_size > map_sz) return TSDB_ERR_CORRUPT;
 
     const uint8_t *data_ptr = hdr_ptr + TSDB_BLOCK_HEADER_SIZE;
-    tsdb_type_t type = p->schema->cols[col_idx].type;
 
     /* Verify trailing CRC32C when the writer marked it.  Old blocks
-     * without the flag pass through unverified for backward compat. */
+     * without the flag pass through unverified for backward compat.
+     * Verification reads the mapping in place — no copy either way. */
     if (flags & TSDB_BLOCK_FLAG_HAS_CRC) {
         if (off + TSDB_BLOCK_HEADER_SIZE + data_size + TSDB_BLOCK_CRC_TRAILER_SIZE
             > map_sz)
@@ -1716,9 +1754,110 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
         if (expected != stored) return TSDB_ERR_CORRUPT;
     }
 
-    return tsdb_codec_decode_adaptive((tsdb_codec_t)codec, type, flags,
+    *out_codec = codec;
+    *out_flags = flags;
+    *out_data  = data_ptr;
+    *out_dsize = data_size;
+    return TSDB_OK;
+}
+
+int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
+                         const tsdb_block_meta_t *meta, void *out_buf)
+{
+    if (!p || col_idx < 0 || col_idx >= p->schema->ncols || !meta || !out_buf)
+        return TSDB_ERR_INVAL;
+
+    /* ALTER TABLE ADD COLUMN sentinel: offset == UINT64_MAX marks a block
+     * that pre-dates the column's creation — zero-fill with the type's
+     * default value. Works whether the column file is mapped or not. */
+    if (meta->offset == UINT64_MAX) {
+        tsdb_type_t type = p->schema->cols[col_idx].type;
+        size_t w = tsdb_type_width(type);
+        memset(out_buf, 0, (size_t)meta->count * w);
+        return TSDB_OK;
+    }
+
+    uint8_t  codec = 0;
+    uint16_t flags = 0;
+    const uint8_t *data_ptr = NULL;
+    uint32_t data_size = 0;
+    int rc = part_block_locate(p, col_idx, meta,
+                               &codec, &flags, &data_ptr, &data_size);
+    if (rc != TSDB_OK) return rc;
+
+    return tsdb_codec_decode_adaptive((tsdb_codec_t)codec,
+                                      p->schema->cols[col_idx].type, flags,
                                       data_ptr, data_size,
-                                      out_buf, count);
+                                      out_buf, meta->count);
+}
+
+int tsdb_part_read_block_ref(tsdb_part_t *p, int col_idx,
+                             const tsdb_block_meta_t *meta,
+                             const void **out_data, void **out_owned)
+{
+    if (!p || col_idx < 0 || col_idx >= p->schema->ncols || !meta ||
+        !out_data || !out_owned)
+        return TSDB_ERR_INVAL;
+
+    *out_data  = NULL;
+    *out_owned = NULL;
+
+    tsdb_type_t type = p->schema->cols[col_idx].type;
+    size_t w = tsdb_type_width(type);
+    if (w == 0) return TSDB_ERR_UNSUPPORTED;
+    size_t need = (size_t)meta->count * w;
+
+    /* ALTER ADD COLUMN sentinel: there are no on-disk bytes to point at —
+     * materialise the zero-fill into an owned buffer. */
+    if (meta->offset == UINT64_MAX) {
+        void *buf = calloc(1, need ? need : 1);
+        if (!buf) return TSDB_ERR_NOMEM;
+        *out_owned = buf;
+        *out_data  = buf;
+        return TSDB_OK;
+    }
+
+    uint8_t  codec = 0;
+    uint16_t flags = 0;
+    const uint8_t *data_ptr = NULL;
+    uint32_t data_size = 0;
+    int rc = part_block_locate(p, col_idx, meta,
+                               &codec, &flags, &data_ptr, &data_size);
+    if (rc != TSDB_OK) return rc;
+
+    /* Zero-copy fast path: a RAW block's payload IS the decoded column
+     * slice, so hand out a pointer into the mmap instead of memcpy'ing
+     * into a scratch buffer.  Gates:
+     *   - codec RAW/NONE and no outer-LZ wrap (bytes are verbatim values);
+     *   - payload covers all meta->count values;
+     *   - payload naturally aligned for the type (w is 4 or 8): blocks
+     *     from the current writer start 8-aligned (see the pad in
+     *     col_writer_write_block); unaligned legacy blocks fall back to
+     *     the copy below rather than risking misaligned typed loads.
+     * LIFETIME: the pointer aliases p's PROT_READ MAP_PRIVATE mapping and
+     * is valid until tsdb_part_close(p).  The query executor consumes
+     * block buffers strictly before scan_plan_free() closes the plan's
+     * partitions (workers are pool_wait()ed first — see exec.c), which is
+     * what makes the handoff safe there. */
+    if (p->zerocopy &&
+        (codec == TSDB_CODEC_RAW || codec == TSDB_CODEC_NONE) &&
+        !(flags & TSDB_BF_OUTER_LZ) &&
+        (size_t)data_size >= need &&
+        ((uintptr_t)data_ptr & (w - 1)) == 0) {
+        __atomic_fetch_add(&g_zerocopy_hits, 1, __ATOMIC_RELAXED);
+        *out_data = data_ptr;
+        return TSDB_OK;
+    }
+
+    void *buf = malloc(need ? need : 1);
+    if (!buf) return TSDB_ERR_NOMEM;
+    rc = tsdb_codec_decode_adaptive((tsdb_codec_t)codec, type, flags,
+                                    data_ptr, data_size, buf, meta->count);
+    if (rc != TSDB_OK) { free(buf); return rc; }
+    __atomic_fetch_add(&g_zerocopy_fallbacks, 1, __ATOMIC_RELAXED);
+    *out_owned = buf;
+    *out_data  = buf;
+    return TSDB_OK;
 }
 
 void tsdb_part_col_map(const tsdb_part_t *p, int col_idx,

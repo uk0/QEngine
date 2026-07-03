@@ -210,6 +210,35 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
                          const tsdb_block_meta_t *meta, void *out_buf);
 
 /*
+ * Zero-copy variant of tsdb_part_read_block.
+ *
+ * On success *out_data points at meta->count decoded values:
+ *   - *out_owned == NULL: the block was served ZERO-COPY — *out_data points
+ *     straight into the partition's PROT_READ mmap of the .col file (RAW
+ *     codec, no outer-LZ wrap, payload naturally aligned for the column
+ *     type).  The pointer is read-only and valid only until
+ *     tsdb_part_close(p); the caller must keep the partition open across
+ *     consumption and must NOT write through or free it.
+ *   - *out_owned != NULL: the block needed decoding (or the zero-copy gate
+ *     rejected it); *out_owned == *out_data is a malloc'd buffer the caller
+ *     frees after use.
+ *
+ * Integrity checks (header cross-check, CRC trailer) are identical to
+ * tsdb_part_read_block.  The fast path is disabled process-wide by setting
+ * env TSDB_ZEROCOPY_READ=0 (latched at tsdb_part_open time; default ON).
+ */
+int tsdb_part_read_block_ref(tsdb_part_t *p, int col_idx,
+                             const tsdb_block_meta_t *meta,
+                             const void **out_data, void **out_owned);
+
+/*
+ * Process-wide zero-copy read counters (monotonic, relaxed): blocks served
+ * as direct mmap pointers vs. blocks that fell back to a decode/copy.
+ * Test/observability aid; either out-param may be NULL.
+ */
+void tsdb_part_zerocopy_stats(uint64_t *out_hits, uint64_t *out_fallbacks);
+
+/*
  * Return a read-only pointer to the mmap'd .col file for a column.
  * *out_map / *out_len are set to NULL/0 if the column file is not mapped.
  * Caller must NOT free the returned pointer — it is owned by the partition.
