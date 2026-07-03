@@ -97,7 +97,7 @@ public class TsdbResultSet implements ResultSet {
                     case TsdbClient.T_TIMESTAMP: return Types.TIMESTAMP;
                     case TsdbClient.T_INT64:     return Types.BIGINT;
                     case TsdbClient.T_FLOAT64:   return Types.DOUBLE;
-                    case TsdbClient.T_SYMBOL:    return Types.INTEGER;
+                    case TsdbClient.T_SYMBOL:    return Types.VARCHAR;
                 }
                 return Types.OTHER;
             }

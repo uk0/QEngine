@@ -580,29 +580,53 @@ public class TsdbClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Decodes one QUERY_RESULT_ROWS payload.  Columns are laid out
+     * sequentially (see server emit_query_chunk): fixed-width columns
+     * (TIMESTAMP/INT64/FLOAT64) occupy nrows*8 bytes; SYMBOL columns carry
+     * {@code [u32 blocklen]} followed by nrows × {@code [u16 len][bytes]}
+     * records — the server sends the resolved strings, not dict IDs — so
+     * SYMBOL cells decode to {@link String}, matching the Go SDK and the
+     * HTTP driver.
+     */
     private static void parseRowsChunk(QueryResult qr, byte[] payload) throws IOException {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
         int nrows = b.getInt();
         int ncols = b.getShort() & 0xFFFF;
         if (ncols != qr.colNames.length) throw new IOException("col mismatch");
-        int colLen = nrows * 8;
-        byte[][] cols = new byte[ncols][];
+        Object[][] colVals = new Object[ncols][];
         for (int ci = 0; ci < ncols; ci++) {
-            cols[ci] = new byte[colLen];
-            b.get(cols[ci]);
+            colVals[ci] = new Object[nrows];
+            if (qr.colTypes[ci] == T_SYMBOL) {
+                if (b.remaining() < 4) throw new IOException("short symbol block header");
+                int blockLen = b.getInt();
+                if (blockLen < 0 || b.remaining() < blockLen)
+                    throw new IOException("short symbol block data");
+                int end = b.position() + blockLen;
+                for (int ri = 0; ri < nrows; ri++) {
+                    if (end - b.position() < 2) throw new IOException("truncated symbol len");
+                    int l = b.getShort() & 0xFFFF;
+                    if (end - b.position() < l) throw new IOException("truncated symbol bytes");
+                    byte[] sb = new byte[l];
+                    b.get(sb);
+                    colVals[ci][ri] = new String(sb, java.nio.charset.StandardCharsets.UTF_8);
+                }
+                b.position(end);
+            } else {
+                if (b.remaining() < (long) nrows * 8) throw new IOException("short column data");
+                for (int ri = 0; ri < nrows; ri++) {
+                    long raw = b.getLong();
+                    switch (qr.colTypes[ci]) {
+                        case T_TIMESTAMP: colVals[ci][ri] = raw; break;
+                        case T_INT64:     colVals[ci][ri] = raw; break;
+                        case T_FLOAT64:   colVals[ci][ri] = Double.longBitsToDouble(raw); break;
+                    }
+                }
+            }
         }
         for (int ri = 0; ri < nrows; ri++) {
             Object[] row = new Object[ncols];
-            for (int ci = 0; ci < ncols; ci++) {
-                long raw = ByteBuffer.wrap(cols[ci], ri * 8, 8)
-                        .order(ByteOrder.LITTLE_ENDIAN).getLong();
-                switch (qr.colTypes[ci]) {
-                    case T_TIMESTAMP: row[ci] = raw; break;
-                    case T_INT64:     row[ci] = raw; break;
-                    case T_FLOAT64:   row[ci] = Double.longBitsToDouble(raw); break;
-                    case T_SYMBOL:    row[ci] = (int) raw; break;
-                }
-            }
+            for (int ci = 0; ci < ncols; ci++) row[ci] = colVals[ci][ri];
             qr.rows.add(row);
         }
     }

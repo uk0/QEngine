@@ -42,6 +42,7 @@ public class ReconnectTest {
     private static final byte MSG_WRITE_ACK    = 34;
     private static final byte MSG_QUERY        = 40;
     private static final byte MSG_QUERY_HDR    = 41;
+    private static final byte MSG_QUERY_ROWS   = 42;
     private static final short FLAG_FIN        = 0x0001;
 
     private static final class SrvFrame {
@@ -331,6 +332,83 @@ public class ReconnectTest {
         System.out.println("ok  testDropTable");
     }
 
+    /**
+     * SYMBOL decode on the binary query path: the server emits SYMBOL result
+     * columns as a length-prefixed string block ({@code [u32 blocklen]} +
+     * nrows × {@code [u16 len][bytes]}, see emit_query_chunk) — not dict IDs.
+     * The client must therefore yield {@link String} cells, matching the Go
+     * SDK and the HTTP driver, and keep the following fixed-width columns
+     * correctly aligned.
+     */
+    private static void testQuerySymbolDecode() throws Exception {
+        ServerSocket ln = new ServerSocket();
+        ln.bind(new InetSocketAddress("127.0.0.1", 0));
+
+        // HDR payload: [ncols u16] then per column [name_len u8][name][type u8].
+        byte[] tsName  = "ts".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] tagName = "tag".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] vName   = "v".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ByteBuffer hb = ByteBuffer.allocate(2 + 3 * 2 + tsName.length + tagName.length + vName.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        hb.putShort((short) 3);
+        hb.put((byte) tsName.length).put(tsName).put(TsdbClient.T_TIMESTAMP);
+        hb.put((byte) tagName.length).put(tagName).put(TsdbClient.T_SYMBOL);
+        hb.put((byte) vName.length).put(vName).put(TsdbClient.T_INT64);
+        byte[] hdrPayload = hb.array();
+
+        // ROWS payload: [nrows u32][ncols u16], ts col (2×8), SYMBOL block
+        // ([u32 blocklen][u16 len][bytes]…), then v col (2×8) AFTER the
+        // variable-length block — mis-decoding the symbol block as 8-byte
+        // cells would shear v off its values.
+        byte[] aa  = "aa".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] bbb = "bbb".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int blockLen = 2 + aa.length + 2 + bbb.length;
+        ByteBuffer rb = ByteBuffer.allocate(6 + 16 + 4 + blockLen + 16)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        rb.putInt(2).putShort((short) 3);
+        rb.putLong(111L).putLong(222L);            // ts
+        rb.putInt(blockLen);                       // tag (SYMBOL strings)
+        rb.putShort((short) aa.length).put(aa);
+        rb.putShort((short) bbb.length).put(bbb);
+        rb.putLong(7L).putLong(8L);                // v
+        byte[] rowsPayload = rb.array();
+
+        Thread server = new Thread(() -> {
+            try {
+                Socket c1 = ln.accept();
+                DataInputStream in1 = din(c1);
+                DataOutputStream out1 = dout(c1);
+                srvRead(in1);                                  // HELLO
+                srvWrite(out1, MSG_HELLO_OK, (short) 0, 0, null);
+                SrvFrame q = srvRead(in1);
+                check(q.type == MSG_QUERY, "expected QUERY");
+                srvWrite(out1, MSG_QUERY_HDR, (short) 0, q.reqId, hdrPayload);
+                srvWrite(out1, MSG_QUERY_ROWS, FLAG_FIN, q.reqId, rowsPayload);
+                c1.close();
+            } catch (IOException e) { /* ignore */ }
+        });
+        server.setDaemon(true);
+        server.start();
+
+        int port = ln.getLocalPort();
+        try (TsdbClient cl = new TsdbClient("127.0.0.1", port, 1000)) {
+            TsdbClient.QueryResult r = cl.query("SELECT ts, tag, v FROM t");
+            check(r.rows.size() == 2, "want 2 rows, got " + r.rows.size());
+            Object s0 = r.rows.get(0)[1];
+            Object s1 = r.rows.get(1)[1];
+            check(s0 instanceof String, "SYMBOL cell is " +
+                    (s0 == null ? "null" : s0.getClass().getSimpleName()) + ", want String");
+            check("aa".equals(s0),  "row0 tag = " + s0 + ", want aa");
+            check("bbb".equals(s1), "row1 tag = " + s1 + ", want bbb");
+            check(Long.valueOf(111L).equals(r.rows.get(0)[0]), "row0 ts mangled: " + r.rows.get(0)[0]);
+            check(Long.valueOf(7L).equals(r.rows.get(0)[2]), "row0 v misaligned: " + r.rows.get(0)[2]);
+            check(Long.valueOf(8L).equals(r.rows.get(1)[2]), "row1 v misaligned: " + r.rows.get(1)[2]);
+        }
+        server.join(2000);
+        ln.close();
+        System.out.println("ok  testQuerySymbolDecode");
+    }
+
     /** Table-driven classifier test: transport-worthy vs server/other errors. */
     private static void testTransportClassifier() {
         Object[][] cases = {
@@ -362,6 +440,7 @@ public class ReconnectTest {
         testReconnectDisabled();
         testWriteBatchNoRetryAfterSend();
         testDropTable();
+        testQuerySymbolDecode();
         System.out.println("ALL RECONNECT TESTS PASSED");
     }
 }
