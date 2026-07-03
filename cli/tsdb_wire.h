@@ -145,7 +145,10 @@ typedef enum {
  * WRITE_STREAM_END payload: empty (nrows=0 signal)
  *
  * WRITE_ACK payload:
- *   [rows_accepted u64 LE] [last_seq u64 LE]
+ *   [rows_accepted u32 LE]
+ *   Canonical server shape (src/server/server.c send_write_ack); the Go and
+ *   Java SDKs parse this u32 form.  An early draft spec'd
+ *   [u64 rows][u64 last_seq] — nothing ever emitted it.
  *
  * SUBSCRIBE payload:
  *   [table_len u8] [table utf8] [filter_len u16 LE] [filter utf8] (0 = no filter)

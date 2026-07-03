@@ -1066,20 +1066,18 @@ static int do_write_stream(tsdb_conn_t *c, const char *table, FILE *fp) {
             /* Wait for WRITE_ACK */
             int rc2 = frame_recv(c, &resp);
             if (rc2 == 0 && resp.hdr.type == MSG_WRITE_ACK) {
-                uint64_t rows_acc = 0, last_seq = 0;
-                if (resp.hdr.payload_len >= 16) {
-                    rows_acc = get_u64(resp.payload);
-                    last_seq = get_u64(resp.payload + 8);
-                }
+                /* Canonical WRITE_ACK: [rows_accepted u32 LE]. */
+                uint32_t rows_acc = 0;
+                if (resp.hdr.payload_len >= 4)
+                    rows_acc = get_u32(resp.payload);
                 gettimeofday(&t1, NULL);
                 double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
                                  (double)(t1.tv_usec - t0.tv_usec) / 1e6;
                 double rate = elapsed > 0 ? (double)total_rows / elapsed / 1e6 : 0;
                 printf("wrote %lld rows in %.2fs (%.2f M rows/sec), "
-                       "server accepted %llu (last_seq=%llu)\n",
+                       "server accepted %u\n",
                        (long long)total_rows, elapsed, rate,
-                       (unsigned long long)rows_acc,
-                       (unsigned long long)last_seq);
+                       (unsigned)rows_acc);
                 msg_free(&resp);
             } else if (rc2 == 0) {
                 gettimeofday(&t1, NULL);

@@ -138,11 +138,10 @@ static void handle_write_batch(tsdb_conn_t *c, const tsdb_msg_t *req) {
             nrows = get_u32(p);
         }
     }
-    /* WRITE_ACK: [rows_accepted u64][last_seq u64] */
-    uint8_t ack[16];
-    put_u64(ack,     (uint64_t)nrows);
-    put_u64(ack + 8, 1ULL);
-    mock_send(c, MSG_WRITE_ACK, 0, req->hdr.req_id, ack, 16);
+    /* WRITE_ACK: [rows_accepted u32] (canonical server shape) */
+    uint8_t ack[4];
+    put_u32(ack, nrows);
+    mock_send(c, MSG_WRITE_ACK, 0, req->hdr.req_id, ack, 4);
 }
 
 static void handle_list_groups(tsdb_conn_t *c, const tsdb_msg_t *req) {
@@ -178,10 +177,9 @@ static void handle_write_stream_data(tsdb_conn_t *c, const tsdb_msg_t *req) {
 }
 
 static void handle_write_stream_end(tsdb_conn_t *c, const tsdb_msg_t *req) {
-    uint8_t ack[16];
-    put_u64(ack,     42ULL);  /* rows_accepted */
-    put_u64(ack + 8, 99ULL);  /* last_seq */
-    mock_send(c, MSG_WRITE_ACK, 0, req->hdr.req_id, ack, 16);
+    uint8_t ack[4];
+    put_u32(ack, 42);  /* rows_accepted */
+    mock_send(c, MSG_WRITE_ACK, 0, req->hdr.req_id, ack, 4);
 }
 
 /* ─── Mock server connection handler ───────────────────────────────────────── */
@@ -484,8 +482,8 @@ static void test_write_batch(void) {
     int rc = send_recv(&g_conn, MSG_WRITE_BATCH, 0, buf, (uint32_t)(p - buf),
                         MSG_WRITE_ACK, &resp);
     ASSERT(rc == 0, "WRITE_BATCH→WRITE_ACK success");
-    if (rc == 0 && resp.hdr.payload_len >= 8) {
-        uint64_t rows_acc = get_u64(resp.payload);
+    if (rc == 0 && resp.hdr.payload_len >= 4) {
+        uint32_t rows_acc = get_u32(resp.payload);
         ASSERT(rows_acc == 2, "server accepted 2 rows");
     }
     msg_free(&resp);
@@ -551,8 +549,8 @@ static void test_write_stream(void) {
     rc = frame_recv(&g_conn, &resp);
     ASSERT(rc == 0, "WRITE_ACK received");
     ASSERT(resp.hdr.type == MSG_WRITE_ACK, "type is WRITE_ACK");
-    if (rc == 0 && resp.hdr.payload_len >= 8) {
-        uint64_t rows_acc = get_u64(resp.payload);
+    if (rc == 0 && resp.hdr.payload_len >= 4) {
+        uint32_t rows_acc = get_u32(resp.payload);
         ASSERT(rows_acc == 42, "mock server acked 42 rows");
     }
     msg_free(&resp);
