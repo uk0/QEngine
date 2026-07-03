@@ -350,6 +350,17 @@ public class TsdbClient implements AutoCloseable {
         if (f.type == MSG_ERROR) throw decodeError(f.payload);
     }
 
+    /**
+     * Runs DROP_TABLE.  The payload is the raw table name; the server replies
+     * with a generic OK, or MSG_ERROR (e.g. when the table does not exist),
+     * decoded like {@link #createTable}'s.
+     */
+    public void dropTable(String table) throws IOException {
+        send(MSG_DROP_TABLE, (short) 0, table.getBytes("UTF-8"));
+        Frame f = recv();
+        if (f.type == MSG_ERROR) throw decodeError(f.payload);
+    }
+
     /* ----- Columnar WRITE_BATCH ----- */
 
     /**

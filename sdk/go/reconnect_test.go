@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -352,6 +353,74 @@ func TestWriteBatchNoRetryAfterSend(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if atomic.LoadInt32(&sawWriteOnConn2) != 0 {
 		t.Fatal("WriteBatch was auto-resent after a post-send drop — risks duplicate rows")
+	}
+}
+
+// srvErrPayload builds a MSG_ERROR payload in the spec shape
+// [i32 rc][u16 msg_len][msg].
+func srvErrPayload(rc int32, msg string) []byte {
+	p := make([]byte, 6+len(msg))
+	binary.LittleEndian.PutUint32(p[0:4], uint32(rc))
+	binary.LittleEndian.PutUint16(p[4:6], uint16(len(msg)))
+	copy(p[6:], msg)
+	return p
+}
+
+// TestDropTable drives the DROP_TABLE round-trip against the mock listener:
+// the server must see MSG_DROP_TABLE carrying the raw table name as payload,
+// a generic-OK reply means success, and an MSG_ERROR reply surfaces as a
+// decoded error.
+func TestDropTable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c1, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c1.Close()
+		_, _, _, _, _ = srvReadFrame(c1) // HELLO
+		_ = srvWriteFrame(c1, MsgHelloOK, 0, 0, nil)
+
+		// Drop #1: succeed.  The payload must be the bare table name.
+		typ, _, reqID, payload, err := srvReadFrame(c1)
+		if err != nil || typ != MsgDropTable {
+			t.Errorf("want DROP_TABLE got typ=%d err=%v", typ, err)
+			return
+		}
+		if string(payload) != "trades" {
+			t.Errorf("DROP_TABLE payload = %q, want raw name %q", payload, "trades")
+		}
+		_ = srvWriteFrame(c1, MsgHelloOK, FlagFin, reqID, nil) // generic OK
+
+		// Drop #2: fail with a server error frame.
+		typ, _, reqID, _, err = srvReadFrame(c1)
+		if err != nil || typ != MsgDropTable {
+			t.Errorf("want 2nd DROP_TABLE got typ=%d err=%v", typ, err)
+			return
+		}
+		_ = srvWriteFrame(c1, MsgError, FlagFin, reqID, srvErrPayload(-3, "no such table"))
+	}()
+
+	cl, err := Open(ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cl.Close()
+
+	if err := cl.DropTable("trades"); err != nil {
+		t.Fatalf("DropTable: %v", err)
+	}
+	err = cl.DropTable("missing")
+	if err == nil {
+		t.Fatal("DropTable on MSG_ERROR reply must return an error")
+	}
+	if !strings.Contains(err.Error(), "no such table") {
+		t.Fatalf("error should carry the server message, got: %v", err)
 	}
 }
 

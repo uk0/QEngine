@@ -158,6 +158,23 @@ func (c *Client) CreateTable(table, tsCol string, cols []Column) error {
 	return nil
 }
 
+// DropTable runs TSDB_MT_DROP_TABLE.  The payload is the raw table name;
+// the server replies with a generic OK, or MSG_ERROR (e.g. when the table
+// does not exist), decoded like CreateTable's.
+func (c *Client) DropTable(name string) error {
+	if _, err := c.Conn.Send(MsgDropTable, 0, 0, []byte(name)); err != nil {
+		return err
+	}
+	f, err := c.Conn.Recv()
+	if err != nil {
+		return err
+	}
+	if f.Type == MsgError {
+		return decodeError(f.Payload)
+	}
+	return nil
+}
+
 // Row is a single row to insert.  Col indexes correspond to the order in
 // CreateTable (ts is always col 0 if you used the default shape).
 type Row struct {

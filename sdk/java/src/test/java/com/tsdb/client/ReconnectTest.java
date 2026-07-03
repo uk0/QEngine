@@ -36,6 +36,8 @@ public class ReconnectTest {
     private static final int  HDR  = 24;
     private static final byte MSG_HELLO        = 1;
     private static final byte MSG_HELLO_OK     = 2;
+    private static final byte MSG_ERROR        = 3;
+    private static final byte MSG_DROP_TABLE   = 21;
     private static final byte MSG_WRITE_BATCH  = 30;
     private static final byte MSG_WRITE_ACK    = 34;
     private static final byte MSG_QUERY        = 40;
@@ -95,6 +97,16 @@ public class ReconnectTest {
 
     private static byte[] writeAck(int n) {
         return ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(n).array();
+    }
+
+    /** MSG_ERROR payload in the spec shape [i32 rc][u16 msg_len][msg]. */
+    private static byte[] errPayload(int rc, String msg) {
+        byte[] m = msg.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ByteBuffer b = ByteBuffer.allocate(6 + m.length).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt(rc);
+        b.putShort((short) m.length);
+        b.put(m);
+        return b.array();
     }
 
     private static DataInputStream din(Socket s) throws IOException {
@@ -266,6 +278,59 @@ public class ReconnectTest {
         System.out.println("ok  testWriteBatchNoRetryAfterSend");
     }
 
+    /**
+     * DROP_TABLE round-trip against the mock listener (reusing the reconnect
+     * scaffolding): the server must see MSG_DROP_TABLE carrying the raw table
+     * name as payload; a generic-OK reply means success and an MSG_ERROR
+     * reply is decoded and thrown.
+     */
+    private static void testDropTable() throws Exception {
+        ServerSocket ln = new ServerSocket();
+        ln.bind(new InetSocketAddress("127.0.0.1", 0));
+        final String[] gotName = { null };
+
+        Thread server = new Thread(() -> {
+            try {
+                Socket c1 = ln.accept();
+                DataInputStream in1 = din(c1);
+                DataOutputStream out1 = dout(c1);
+                srvRead(in1);                                  // HELLO
+                srvWrite(out1, MSG_HELLO_OK, (short) 0, 0, null);
+
+                // Drop #1: succeed.  Payload must be the bare table name.
+                SrvFrame d1 = srvRead(in1);
+                check(d1.type == MSG_DROP_TABLE, "expected DROP_TABLE");
+                gotName[0] = new String(d1.payload, java.nio.charset.StandardCharsets.UTF_8);
+                srvWrite(out1, MSG_HELLO_OK, FLAG_FIN, d1.reqId, null); // generic OK
+
+                // Drop #2: fail with a server error frame.
+                SrvFrame d2 = srvRead(in1);
+                check(d2.type == MSG_DROP_TABLE, "expected 2nd DROP_TABLE");
+                srvWrite(out1, MSG_ERROR, FLAG_FIN, d2.reqId, errPayload(-3, "no such table"));
+                c1.close();
+            } catch (IOException e) { /* ignore */ }
+        });
+        server.setDaemon(true);
+        server.start();
+
+        int port = ln.getLocalPort();
+        boolean threw = false;
+        String errMsg = "";
+        try (TsdbClient cl = new TsdbClient("127.0.0.1", port, 1000)) {
+            cl.dropTable("trades");
+            try { cl.dropTable("missing"); }
+            catch (IOException e) { threw = true; errMsg = e.getMessage(); }
+        }
+        server.join(2000);
+        ln.close();
+        check("trades".equals(gotName[0]),
+                "DROP_TABLE payload = " + gotName[0] + ", want raw name trades");
+        check(threw, "dropTable on MSG_ERROR reply must throw");
+        check(errMsg != null && errMsg.contains("no such table"),
+                "error should carry the server message, got: " + errMsg);
+        System.out.println("ok  testDropTable");
+    }
+
     /** Table-driven classifier test: transport-worthy vs server/other errors. */
     private static void testTransportClassifier() {
         Object[][] cases = {
@@ -296,6 +361,7 @@ public class ReconnectTest {
         testReconnectOnDrop();
         testReconnectDisabled();
         testWriteBatchNoRetryAfterSend();
+        testDropTable();
         System.out.println("ALL RECONNECT TESTS PASSED");
     }
 }
