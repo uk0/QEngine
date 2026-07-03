@@ -18,6 +18,7 @@
 package tsdb
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -95,6 +96,23 @@ func Dial(addr string, timeout time.Duration) (*Conn, error) {
 		timeout = 10 * time.Second
 	}
 	c, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return &Conn{c: c, nextReq: 1}, nil
+}
+
+// DialTLS opens a TLS connection.  A server started with --tls-cert/--tls-key
+// speaks standard TLS on its regular port (every accepted connection is
+// wrapped before the first frame), so this is Dial plus a TLS handshake — no
+// STARTTLS step.  cfg may be nil for defaults; when cfg.ServerName is empty
+// it is derived from addr.  timeout bounds the TCP connect and the TLS
+// handshake together and may be zero to use the default of 10 s.
+func DialTLS(addr string, timeout time.Duration, cfg *tls.Config) (*Conn, error) {
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	c, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, cfg)
 	if err != nil {
 		return nil, err
 	}

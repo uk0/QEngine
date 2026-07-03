@@ -2,6 +2,7 @@ package tsdb
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ type Client struct {
 	// Retained reconnect state.
 	addr     string        // server address passed to Open
 	timeout  time.Duration // dial timeout passed to Open
+	tlsCfg   *tls.Config   // non-nil → dial and re-dial over TLS (set by OpenTLS)
 	user     string        // login username (set by Login)
 	pass     string        // login password (set by Login)
 	loggedIn bool          // true once Login succeeded; re-Login on reconnect
@@ -41,11 +43,26 @@ type Client struct {
 
 // Open dials + sends HELLO.
 func Open(addr string, timeout time.Duration) (*Client, error) {
-	conn, err := Dial(addr, timeout)
+	return open(addr, timeout, nil)
+}
+
+// OpenTLS is Open over TLS: DialTLS + HELLO.  The tls.Config is retained so
+// automatic reconnects re-dial through the same TLS path (see reconnect.go).
+// cfg may be nil for defaults (ServerName derived from addr).
+func OpenTLS(addr string, timeout time.Duration, cfg *tls.Config) (*Client, error) {
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
+	return open(addr, timeout, cfg)
+}
+
+func open(addr string, timeout time.Duration, tlsCfg *tls.Config) (*Client, error) {
+	cl := &Client{addr: addr, timeout: timeout, tlsCfg: tlsCfg}
+	conn, err := cl.dial()
 	if err != nil {
 		return nil, err
 	}
-	cl := &Client{Conn: conn, addr: addr, timeout: timeout}
+	cl.Conn = conn
 	if _, err := conn.Send(MsgHello, 0, 0, nil); err != nil {
 		conn.Close()
 		return nil, err
@@ -60,6 +77,16 @@ func Open(addr string, timeout time.Duration) (*Client, error) {
 		return nil, fmt.Errorf("unexpected HELLO response type=%d", f.Type)
 	}
 	return cl, nil
+}
+
+// dial opens a transport connection to the retained address — over TLS when
+// the client was created via OpenTLS, so reconnects never fall back to
+// plaintext.
+func (c *Client) dial() (*Conn, error) {
+	if c.tlsCfg != nil {
+		return DialTLS(c.addr, c.timeout, c.tlsCfg)
+	}
+	return Dial(c.addr, c.timeout)
 }
 
 // Close tears down the connection.

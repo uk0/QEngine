@@ -64,5 +64,7 @@ TSDB_TEST_ADDR=127.0.0.1:28190 go test -v ./...
 - [x] WRITE_BATCH (INT64/FLOAT64/TIMESTAMP — SYMBOL TODO)
 - [x] QUERY with HDR + ROWS streaming
 - [ ] SUBSCRIBE (next)
-- [ ] TLS (next)
+- [x] TLS — `DialTLS(addr, timeout, *tls.Config)` / `OpenTLS(addr, timeout, *tls.Config)`;
+      the server speaks standard TLS on its regular port when started with
+      `--tls-cert/--tls-key`, and reconnects re-dial over TLS automatically
 - [ ] Retry / connection pooling (v2)

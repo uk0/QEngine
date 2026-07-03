@@ -45,7 +45,8 @@ func isConnError(err error) bool {
 }
 
 // reconnect tears down the dead connection and re-establishes a fresh session
-// on the retained address: re-dial (Dial → net.DialTimeout), re-send HELLO
+// on the retained address: re-dial (Dial, or DialTLS with the retained
+// tls.Config when the client was opened via OpenTLS), re-send HELLO
 // exactly as Open did, and — if the original session authenticated — re-Login
 // with the retained credentials so the new socket carries a valid server-side
 // token.
@@ -83,7 +84,7 @@ func (c *Client) reconnect() error {
 // dialAndHandshake performs one full open: Dial + HELLO + (optional) re-Login.
 // On any failure it closes the partial connection and returns the error.
 func (c *Client) dialAndHandshake() error {
-	conn, err := Dial(c.addr, c.timeout)
+	conn, err := c.dial()
 	if err != nil {
 		return err
 	}
