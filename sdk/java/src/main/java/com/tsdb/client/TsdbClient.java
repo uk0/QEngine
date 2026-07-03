@@ -96,6 +96,12 @@ public class TsdbClient implements AutoCloseable {
      * few hundred ms. */
     private static final int[] RECONNECT_BACKOFF_MS = { 100, 300 };
 
+    /* Non-null while a WritePipeline is open on this connection.  The pipeline
+     * owns the socket's FIFO ack stream, so query/writeBatch/login refuse to
+     * interleave (IllegalStateException) until WritePipeline.close() clears
+     * this. */
+    WritePipeline activePipeline;
+
     public TsdbClient(String host, int port) throws IOException {
         this(host, port, 10_000);
     }
@@ -307,6 +313,7 @@ public class TsdbClient implements AutoCloseable {
     }
 
     public void login(String user, String pass) throws IOException {
+        ensureNoPipeline();
         // Retain credentials so a reconnect can re-authenticate the fresh
         // socket: the server attaches the token to the connection, so the old
         // token dies with the old socket and a new login() is mandatory.
@@ -402,8 +409,31 @@ public class TsdbClient implements AutoCloseable {
      * @return number of rows the server confirmed it persisted.
      */
     public int writeBatch(String table, List<Column> cols, List<Row> rows) throws IOException {
+        ensureNoPipeline();
         if (rows.isEmpty()) return 0;
+        byte[] payload = encodeBatch(table, cols, rows);
+        try {
+            return writeBatchOnce(payload);
+        } catch (PostSendException e) {
+            // Frame was fully sent before the drop: the server may have applied
+            // it.  Reconnect for future calls but do NOT auto-resend (would risk
+            // duplicate rows); rethrow the underlying transport error.
+            if (maxReconnect > 0) reconnectQuietly();
+            throw e.cause;
+        } catch (IOException e) {
+            // Send/connect-phase failure (nothing landed) — safe to retry once.
+            if (!isTransportError(e) || maxReconnect <= 0) throw e;
+            reconnect(e);
+            return writeBatchOnce(payload);
+        }
+    }
 
+    /**
+     * Builds the columnar WRITE_BATCH payload (see {@link #writeBatch} for the
+     * wire format).  Shared by the synchronous {@link #writeBatch} path and
+     * {@link WritePipeline#write}.
+     */
+    static byte[] encodeBatch(String table, List<Column> cols, List<Row> rows) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DataOutputStream dout = new DataOutputStream(out);
 
@@ -460,21 +490,33 @@ public class TsdbClient implements AutoCloseable {
             }
         }
 
-        byte[] payload = out.toByteArray();
-        try {
-            return writeBatchOnce(payload);
-        } catch (PostSendException e) {
-            // Frame was fully sent before the drop: the server may have applied
-            // it.  Reconnect for future calls but do NOT auto-resend (would risk
-            // duplicate rows); rethrow the underlying transport error.
-            if (maxReconnect > 0) reconnectQuietly();
-            throw e.cause;
-        } catch (IOException e) {
-            // Send/connect-phase failure (nothing landed) — safe to retry once.
-            if (!isTransportError(e) || maxReconnect <= 0) throw e;
-            reconnect(e);
-            return writeBatchOnce(payload);
-        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Opens a pipelined writer that keeps up to {@code depth} WRITE_BATCH
+     * frames in flight on this connection (see {@link WritePipeline} for the
+     * FIFO-ack contract and error semantics).  {@code depth} must be &gt;= 1
+     * and is clamped to {@link WritePipeline#MAX_DEPTH}.  Only one pipeline
+     * may be open per client at a time; while it is open, query/writeBatch/
+     * login on this client throw {@link IllegalStateException} until
+     * {@link WritePipeline#close()} releases the connection.
+     */
+    public WritePipeline newWritePipeline(int depth) {
+        if (depth < 1)
+            throw new IllegalArgumentException("write pipeline depth must be >= 1, got " + depth);
+        if (depth > WritePipeline.MAX_DEPTH) depth = WritePipeline.MAX_DEPTH;
+        ensureNoPipeline();
+        WritePipeline p = new WritePipeline(this, depth);
+        activePipeline = p;
+        return p;
+    }
+
+    /** Rejects parent-client I/O while a {@link WritePipeline} owns the
+     *  connection: interleaving would corrupt the FIFO ack accounting. */
+    private void ensureNoPipeline() {
+        if (activePipeline != null)
+            throw new IllegalStateException("write pipeline in progress on this connection");
     }
 
     /**
@@ -540,6 +582,7 @@ public class TsdbClient implements AutoCloseable {
      * transport failure and is rethrown without reconnecting.
      */
     public QueryResult query(String qtl) throws IOException {
+        ensureNoPipeline();
         try {
             return queryOnce(qtl);
         } catch (IOException e) {
@@ -638,7 +681,9 @@ public class TsdbClient implements AutoCloseable {
         buf.put((byte) b.length).put(b);
     }
 
-    private static IOException decodeError(byte[] payload) {
+    /** Decodes a MSG_ERROR payload into an IOException.  Package-private so
+     *  {@link WritePipeline} reuses the same decoding. */
+    static IOException decodeError(byte[] payload) {
         if (payload.length < 4) return new IOException("server error");
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
         int rc = b.getInt();
