@@ -1753,6 +1753,40 @@ static void *agg_scratch_alloc(size_t rows) {
     return aligned_alloc(32, sz);
 }
 
+/* Load column c of a disk-backed scan source block (zero-copy when the
+ * part layer allows it).
+ *
+ * On success *out_buf is readable for src->row_count values.  When the
+ * block was served zero-copy, *out_owned is NULL and *out_buf points into
+ * the partition's mmap — valid until scan_plan_free() closes the part,
+ * and every caller consumes bufs[] strictly before that (parallel workers
+ * are pool_wait()ed before their plan is freed).  Otherwise *out_owned ==
+ * *out_buf is a malloc the caller frees after consumption.  All converted
+ * callers treat bufs[] as read-only (filters write only the bitmap;
+ * agg_update only reads), which is what makes the aliasing safe.  Paths
+ * that must own or mutate a contiguous multi-block buffer (ASOF right-side
+ * materialisation, row-emit scans) keep tsdb_part_read_block. */
+static int scan_load_col_block(scan_src_t *src, int c,
+                               void **out_buf, void **out_owned)
+{
+    tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+    int rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+    if (rc != TSDB_OK) return rc;
+    tsdb_block_meta_t *hit = NULL;
+    for (size_t b = 0; b < nb; b++)
+        if (metas[b].ts_min == src->meta.ts_min &&
+            metas[b].count  == src->meta.count) {
+            hit = &metas[b]; break;
+        }
+    if (!hit) { free(metas); return TSDB_ERR_CORRUPT; }
+    const void *data = NULL;
+    rc = tsdb_part_read_block_ref(src->part, c, hit, &data, out_owned);
+    free(metas);
+    if (rc != TSDB_OK) return rc;
+    *out_buf = (void *)data;
+    return TSDB_OK;
+}
+
 void tsdb_par_scan_task(void *arg) {
     par_task_t *t = (par_task_t *)arg;
     t->rc = TSDB_OK;
@@ -1820,36 +1854,26 @@ void tsdb_par_scan_task(void *arg) {
         if (!bufs) { t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
         tsdb_symtab_t **syms = calloc((size_t)t->schema->ncols, sizeof(tsdb_symtab_t *));
         if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
+        /* owned[c]: malloc to free after use; NULL for memtable buffers and
+         * zero-copy mmap pointers (see scan_load_col_block). */
+        void **owned = calloc((size_t)t->schema->ncols, sizeof(void *));
+        if (!owned) { free(bufs); free(syms); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
 
         int load_rc = TSDB_OK;
         for (int c = 0; c < t->schema->ncols; c++) {
             if (!t->need_col[c]) continue;
             syms[c] = t->schema->cols[c].symtab;
-            size_t w = tsdb_type_width(t->schema->cols[c].type);
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                bufs[c] = malloc(w * n);
-                if (!bufs[c]) { load_rc = TSDB_ERR_NOMEM; break; }
-                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-                load_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
-                if (load_rc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++) {
-                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                }
-                if (!hit) { free(metas); load_rc = TSDB_ERR_CORRUPT; break; }
-                load_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
-                free(metas);
+                load_rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
                 if (load_rc != TSDB_OK) break;
             }
         }
         if (load_rc != TSDB_OK) {
             for (int c = 0; c < t->schema->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms);
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned);
             t->rc = load_rc;
             free(agg_scratch);
             return;
@@ -1860,8 +1884,8 @@ void tsdb_par_scan_task(void *arg) {
         uint64_t *bm = malloc(nw * sizeof(uint64_t));
         if (!bm) {
             for (int c = 0; c < t->schema->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms);
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned);
             t->rc = TSDB_ERR_NOMEM;
             free(agg_scratch);
             return;
@@ -1881,8 +1905,8 @@ void tsdb_par_scan_task(void *arg) {
                 if (ctx.err[0]) snprintf(t->err, sizeof(t->err), "%s", ctx.err);
                 free(bm);
                 for (int c = 0; c < t->schema->ncols; c++)
-                    if (!src->mem && bufs[c]) free(bufs[c]);
-                free(bufs); free(syms);
+                    if (owned[c]) free(owned[c]);
+                free(bufs); free(syms); free(owned);
                 t->rc = frc;
                 free(agg_scratch);
                 return;
@@ -1897,8 +1921,8 @@ void tsdb_par_scan_task(void *arg) {
 
         free(bm);
         for (int c = 0; c < t->schema->ncols; c++)
-            if (!src->mem && bufs[c]) free(bufs[c]);
-        free(bufs); free(syms);
+            if (owned[c]) free(owned[c]);
+        free(bufs); free(syms); free(owned);
     }
     free(agg_scratch);
 }
@@ -2827,37 +2851,29 @@ static void tsdb_gbpar_scan_task(void *arg) {
         /* Decode needed columns. */
         void **bufs = calloc((size_t)s->ncols, sizeof(void *));
         tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
-        if (!bufs || !syms) { free(bufs); free(syms); t->rc = TSDB_ERR_NOMEM; break; }
+        /* owned[c]: malloc to free after use; NULL for memtable buffers and
+         * zero-copy mmap pointers (see scan_load_col_block). */
+        void **owned = calloc((size_t)s->ncols, sizeof(void *));
+        if (!bufs || !syms || !owned) {
+            free(bufs); free(syms); free(owned);
+            t->rc = TSDB_ERR_NOMEM; break;
+        }
 
         int local_rc = TSDB_OK;
         for (int c = 0; c < s->ncols; c++) {
             if (!t->need_col[c]) continue;
             syms[c] = s->cols[c].symtab;
-            size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                bufs[c] = malloc(w * n);
-                if (!bufs[c]) { local_rc = TSDB_ERR_NOMEM; break; }
-                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-                local_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
-                if (local_rc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++)
-                    if (metas[b].ts_min == src->meta.ts_min &&
-                        metas[b].count  == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                if (!hit) { free(metas); local_rc = TSDB_ERR_CORRUPT; break; }
-                local_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
-                free(metas);
+                local_rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
                 if (local_rc != TSDB_OK) break;
             }
         }
         if (local_rc != TSDB_OK) {
             for (int c = 0; c < s->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms);
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned);
             t->rc = local_rc;
             break;
         }
@@ -2867,8 +2883,8 @@ static void tsdb_gbpar_scan_task(void *arg) {
         uint64_t *bm = malloc(nw * sizeof(uint64_t));
         if (!bm) {
             for (int c = 0; c < s->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms);
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned);
             t->rc = TSDB_ERR_NOMEM;
             break;
         }
@@ -2883,8 +2899,8 @@ static void tsdb_gbpar_scan_task(void *arg) {
             if (local_rc != TSDB_OK) {
                 free(bm);
                 for (int c = 0; c < s->ncols; c++)
-                    if (!src->mem && bufs[c]) free(bufs[c]);
-                free(bufs); free(syms);
+                    if (owned[c]) free(owned[c]);
+                free(bufs); free(syms); free(owned);
                 t->rc = local_rc;
                 break;
             }
@@ -2998,8 +3014,8 @@ static void tsdb_gbpar_scan_task(void *arg) {
 
         free(bm);
         for (int c = 0; c < s->ncols; c++)
-            if (!src->mem && bufs[c]) free(bufs[c]);
-        free(bufs); free(syms);
+            if (owned[c]) free(owned[c]);
+        free(bufs); free(syms); free(owned);
         if (t->rc != TSDB_OK) break;
     }
     free(agg_scratch);
@@ -3255,36 +3271,28 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
 
         void **bufs = calloc((size_t)s->ncols, sizeof(void *));
         tsdb_symtab_t **syms = calloc((size_t)s->ncols, sizeof(tsdb_symtab_t *));
-        if (!bufs || !syms) { free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto out; }
+        /* owned[c]: malloc to free after use; NULL for memtable buffers and
+         * zero-copy mmap pointers (see scan_load_col_block). */
+        void **owned = calloc((size_t)s->ncols, sizeof(void *));
+        if (!bufs || !syms || !owned) {
+            free(bufs); free(syms); free(owned);
+            rc = TSDB_ERR_NOMEM; goto out;
+        }
 
         for (int c = 0; c < s->ncols; c++) {
             if (!need_col[c]) continue;
             syms[c] = s->cols[c].symtab;
-            size_t w = tsdb_type_width(s->cols[c].type);
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                bufs[c] = malloc(w * n);
-                if (!bufs[c]) { rc = TSDB_ERR_NOMEM; break; }
-                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-                rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
-                if (rc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++)
-                    if (metas[b].ts_min == src->meta.ts_min
-                        && metas[b].count == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                if (!hit) { free(metas); rc = TSDB_ERR_CORRUPT; break; }
-                rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
-                free(metas);
+                rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
                 if (rc != TSDB_OK) break;
             }
         }
         if (rc != TSDB_OK) {
             for (int c = 0; c < s->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms); goto out;
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned); goto out;
         }
 
         /* Apply WHERE → bitmap. */
@@ -3292,8 +3300,8 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         uint64_t *bm = malloc(nw * sizeof(uint64_t));
         if (!bm) {
             for (int c = 0; c < s->ncols; c++)
-                if (!src->mem && bufs[c]) free(bufs[c]);
-            free(bufs); free(syms); rc = TSDB_ERR_NOMEM; goto out;
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned); rc = TSDB_ERR_NOMEM; goto out;
         }
         for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
         size_t tail = nw * 64 - n;
@@ -3306,8 +3314,8 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             if (frc != TSDB_OK) {
                 free(bm);
                 for (int c = 0; c < s->ncols; c++)
-                    if (!src->mem && bufs[c]) free(bufs[c]);
-                free(bufs); free(syms); rc = frc; goto out;
+                    if (owned[c]) free(owned[c]);
+                free(bufs); free(syms); free(owned); rc = frc; goto out;
             }
         }
 
@@ -3425,8 +3433,8 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         }
         free(bm);
         for (int c = 0; c < s->ncols; c++)
-            if (!src->mem && bufs[c]) free(bufs[c]);
-        free(bufs); free(syms);
+            if (owned[c]) free(owned[c]);
+        free(bufs); free(syms); free(owned);
         if (rc != TSDB_OK) goto out;
     }
 
