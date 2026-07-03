@@ -6077,6 +6077,173 @@ static int result_status(tsdb_result_t *r, const char *msg) {
     return TSDB_OK;
 }
 
+/* ---- INSERT INTO ... VALUES -------------------------------------------- */
+/*
+ * Executes a parsed QAST_STMT_INSERT.  Writes through the same internal
+ * batch API the wire WRITE_BATCH handler uses (tsdb_table_lock_write +
+ * tsdb_batch_begin / row setters / commit), so replication hooks, WAL and
+ * flush semantics are identical to a wire write.
+ *
+ * Validation is all-up-front: every cell is type-checked against the
+ * schema BEFORE the first row is written, so a type error never leaves
+ * a partial batch in the memtable.
+ */
+static int exec_insert(tsdb_db_t *db, const qast_insert_t *ins,
+                       tsdb_result_t *r, char *err, size_t errcap)
+{
+    tsdb_table_t *h = NULL;
+    if (tsdb_open_table(db, ins->table, &h) != TSDB_OK || !h) {
+        eset(err, errcap, "table '%s' not found", ins->table);
+        return TSDB_ERR_NOTFOUND;
+    }
+    tsdb_table_internal_t *ti = tsdb_db_find_table(db, ins->table);
+    if (!ti) {
+        eset(err, errcap, "table '%s' not found", ins->table);
+        return TSDB_ERR_NOTFOUND;
+    }
+    tsdb_schema_t *s = tsdb_tbl_schema(ti);
+
+    /* Map tuple position → schema column.  The memtable row API requires
+     * every column set per row, so an explicit column list must name every
+     * table column exactly once (reordering only). */
+    int map[TSDB_MAX_COLS];
+    if (ins->ncols > 0) {
+        if (ins->ncols != s->ncols) {
+            eset(err, errcap,
+                 "INSERT column list names %d columns, table '%s' has %d "
+                 "(all columns are required)",
+                 ins->ncols, ins->table, s->ncols);
+            return TSDB_ERR_SCHEMA;
+        }
+        int used[TSDB_MAX_COLS] = {0};
+        for (int i = 0; i < ins->ncols; i++) {
+            int c = resolve_col(s, ins->col_names[i]);
+            if (c < 0) {
+                eset(err, errcap, "unknown column '%s' in INSERT column list",
+                     ins->col_names[i]);
+                return TSDB_ERR_SCHEMA;
+            }
+            if (used[c]) {
+                eset(err, errcap, "duplicate column '%s' in INSERT column list",
+                     ins->col_names[i]);
+                return TSDB_ERR_SCHEMA;
+            }
+            used[c] = 1;
+            map[i] = c;
+        }
+    } else {
+        for (int i = 0; i < s->ncols; i++) map[i] = i;
+    }
+    if (ins->width != s->ncols) {
+        eset(err, errcap, "INSERT row has %d values, table '%s' has %d columns",
+             ins->width, ins->table, s->ncols);
+        return TSDB_ERR_SCHEMA;
+    }
+
+    /* Tuple position of the designated ts column — must be written first:
+     * tsdb_batch_row_ts opens the row (row_begin). */
+    int ts_pos = -1;
+    for (int i = 0; i < ins->width; i++) {
+        if (map[i] == s->ts_col_idx) { ts_pos = i; break; }
+    }
+    if (ts_pos < 0) {
+        eset(err, errcap, "INSERT must provide the timestamp column '%s'",
+             s->cols[s->ts_col_idx].name);
+        return TSDB_ERR_SCHEMA;
+    }
+
+    /* Type-check every cell before writing anything. */
+    for (int row = 0; row < ins->nrows; row++) {
+        for (int i = 0; i < ins->width; i++) {
+            const qast_insert_val_t *v = &ins->vals[(size_t)row * ins->width + i];
+            int c = map[i];
+            tsdb_type_t ct = s->cols[c].type;
+            int ok = 0;
+            switch (ct) {
+            case TSDB_TYPE_TIMESTAMP:
+                /* Only the designated ts column is writable (the per-row
+                 * memtable API has no setter for secondary TIMESTAMP cols). */
+                ok = (c == s->ts_col_idx && v->kind == QAST_INS_INT);
+                break;
+            case TSDB_TYPE_INT64:
+                ok = (v->kind == QAST_INS_INT);
+                break;
+            case TSDB_TYPE_FLOAT64:
+            case TSDB_TYPE_FLOAT32:
+                ok = (v->kind == QAST_INS_INT || v->kind == QAST_INS_FLOAT);
+                break;
+            case TSDB_TYPE_SYMBOL:
+                ok = (v->kind == QAST_INS_STR);
+                break;
+            default:
+                break;
+            }
+            if (!ok) {
+                eset(err, errcap,
+                     "INSERT row %d: value for column '%s' does not match type %s",
+                     row + 1, s->cols[c].name, tsdb_type_name(ct));
+                return TSDB_ERR_SCHEMA;
+            }
+        }
+    }
+
+    /* Write.  Same lock the wire WRITE_BATCH path takes: joins the table's
+     * batch_mu domain so a SQL INSERT can't interleave with a concurrent
+     * flush from the influx / cluster-RPC / anti-entropy writers. */
+    tsdb_table_lock_write(h);
+    tsdb_batch_t *b = NULL;
+    int rc = tsdb_batch_begin(h, &b);
+    if (rc != TSDB_OK) {
+        tsdb_table_unlock_write(h);
+        eset(err, errcap, "batch begin failed");
+        return rc;
+    }
+
+    for (int row = 0; row < ins->nrows && rc == TSDB_OK; row++) {
+        const qast_insert_val_t *rv = &ins->vals[(size_t)row * ins->width];
+        rc = tsdb_batch_row_ts(b, (tsdb_ts_t)rv[ts_pos].i);
+        for (int i = 0; i < ins->width && rc == TSDB_OK; i++) {
+            if (i == ts_pos) continue;
+            const qast_insert_val_t *v = &rv[i];
+            int c = map[i];
+            switch (s->cols[c].type) {
+            case TSDB_TYPE_INT64:
+                rc = tsdb_batch_row_i64(b, c, v->i);
+                break;
+            case TSDB_TYPE_FLOAT64:
+            case TSDB_TYPE_FLOAT32:
+                rc = tsdb_batch_row_f64(
+                    b, c, v->kind == QAST_INS_INT ? (double)v->i : v->f);
+                break;
+            case TSDB_TYPE_SYMBOL:
+                rc = tsdb_batch_row_sym(b, c, v->s);
+                break;
+            default:
+                rc = TSDB_ERR_SCHEMA;
+                break;
+            }
+        }
+        if (rc == TSDB_OK) rc = tsdb_batch_row_end(b);
+    }
+
+    if (rc != TSDB_OK) {
+        tsdb_batch_discard(b);
+        tsdb_table_unlock_write(h);
+        eset(err, errcap, "INSERT write failed: %s", tsdb_errstr(rc));
+        return rc;
+    }
+    rc = tsdb_batch_commit(b);
+    tsdb_table_unlock_write(h);
+    if (rc != TSDB_OK) {
+        eset(err, errcap, "INSERT commit failed: %s", tsdb_errstr(rc));
+        return rc;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "OK: inserted %d row(s)", ins->nrows);
+    return result_status(r, msg);
+}
+
 /* ---- Public API implementations --------------------------------------- */
 
 /* Defined in storage/db_cluster.c.  Peer-side RPC and apply paths
@@ -6184,6 +6351,18 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
             rc = result_apply_order_by(r, &stmt.u.query, err, sizeof(err));
         if (qtbl2) tsdb_db_scan_release(db, qtbl2);
         if (qtbl) tsdb_db_scan_release(db, qtbl);
+        tsdb_arena_free(&a);
+        if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
+        *out = r;
+        return TSDB_OK;
+    }
+
+    /* ---- INSERT — data write, executed before the arena is freed --------
+     * (the tuple values live in the parse arena).  Not catalog DDL: no raft
+     * routing, no catalog broadcast — replication rides the batch-commit
+     * hooks exactly as a wire WRITE_BATCH does. */
+    if (stmt.kind == QAST_STMT_INSERT) {
+        rc = exec_insert(db, &stmt.u.insert_, r, err, sizeof(err));
         tsdb_arena_free(&a);
         if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
         *out = r;
@@ -7458,6 +7637,12 @@ static void stmt_required_authz(const qast_stmt_t *stmt,
         *out_resource = stmt->u.query.from ? stmt->u.query.from : "*";
         break;
 
+    /* Data write — same gate the wire WRITE_BATCH handler applies. */
+    case QAST_STMT_INSERT:
+        *out_priv     = TSDB_PRIV_INSERT;
+        *out_resource = stmt->u.insert_.table;
+        break;
+
     /* Catalog reads — SELECT privilege on "*" */
     case QAST_STMT_LIST_DATABASES:
     case QAST_STMT_LIST_GROUPS:
@@ -7578,6 +7763,7 @@ static void stmt_audit_kind(const qast_stmt_t *stmt,
     const char *ev = "QUERY", *act = "SELECT";
     switch (stmt->kind) {
     case QAST_STMT_SELECT:                  ev = "QUERY"; act = "SELECT"; break;
+    case QAST_STMT_INSERT:                  ev = "DATA"; act = "INSERT"; break;
     case QAST_STMT_DESCRIBE:                ev = "QUERY"; act = "DESCRIBE"; break;
     case QAST_STMT_CREATE_DATABASE:         ev = "DDL"; act = "CREATE DATABASE"; break;
     case QAST_STMT_DROP_DATABASE:           ev = "DDL"; act = "DROP DATABASE"; break;

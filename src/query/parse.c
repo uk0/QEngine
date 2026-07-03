@@ -664,6 +664,123 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return qparse(src, a, &out->u.query, err, errcap);
     }
 
+    /* ---- INSERT INTO <table> [(col,...)] VALUES (v,...)[,(...)] --------- */
+    if (accept(&p, QTOK_INSERT)) {
+        if (!accept(&p, QTOK_INTO)) {
+            perr(&p, "expected INTO after INSERT"); return TSDB_ERR_PARSE;
+        }
+        out->kind = QAST_STMT_INSERT;
+        qast_insert_t *ins = &out->u.insert_;
+        memset(ins, 0, sizeof(*ins));
+        if (p.tok.kind != QTOK_IDENT) {
+            perr(&p, "expected table name after INSERT INTO"); return TSDB_ERR_PARSE;
+        }
+        tok_copy(&p.tok, ins->table, sizeof(ins->table));
+        advance(&p);
+
+        /* Optional explicit column list. */
+        if (accept(&p, QTOK_LPAREN)) {
+            for (;;) {
+                if (ins->ncols >= TSDB_STABLE_MAX_COLS) {
+                    perr(&p, "too many columns in INSERT column list");
+                    return TSDB_ERR_PARSE;
+                }
+                if (!tok_is_name_like(&p.tok)) {
+                    perr(&p, "expected column name in INSERT column list");
+                    return TSDB_ERR_PARSE;
+                }
+                tok_copy(&p.tok, ins->col_names[ins->ncols],
+                         sizeof(ins->col_names[ins->ncols]));
+                ins->ncols++;
+                advance(&p);
+                if (!accept(&p, QTOK_COMMA)) break;
+            }
+            if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+        }
+
+        if (!accept(&p, QTOK_VALUES)) {
+            perr(&p, "expected VALUES"); return TSDB_ERR_PARSE;
+        }
+
+        /* Row tuples — arena-chained, flattened after the loop. */
+        typedef struct ins_row {
+            qast_insert_val_t *v;
+            struct ins_row    *next;
+        } ins_row_t;
+        ins_row_t *head = NULL, *tail = NULL;
+        int nrows = 0, width = 0;
+        do {
+            if (expect(&p, QTOK_LPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            qast_insert_val_t tmp[TSDB_STABLE_MAX_COLS];
+            int nv = 0;
+            for (;;) {
+                if (nv >= TSDB_STABLE_MAX_COLS) {
+                    perr(&p, "too many values in INSERT tuple");
+                    return TSDB_ERR_PARSE;
+                }
+                qast_insert_val_t *v = &tmp[nv];
+                memset(v, 0, sizeof(*v));
+                int neg = 0;
+                if (p.tok.kind == QTOK_MINUS) { neg = 1; advance(&p); }
+                if (p.tok.kind == QTOK_NUMBER) {
+                    v->kind = QAST_INS_INT;
+                    v->i = neg ? -p.tok.i : p.tok.i;
+                    advance(&p);
+                } else if (p.tok.kind == QTOK_FLOAT) {
+                    v->kind = QAST_INS_FLOAT;
+                    v->f = neg ? -p.tok.f : p.tok.f;
+                    advance(&p);
+                } else if (!neg && p.tok.kind == QTOK_STRING) {
+                    v->kind = QAST_INS_STR;
+                    v->s = str_literal(&p, &p.tok);
+                    if (!v->s) return TSDB_ERR_NOMEM;
+                    advance(&p);
+                } else {
+                    perr(&p, "expected literal value in INSERT tuple");
+                    return TSDB_ERR_PARSE;
+                }
+                nv++;
+                if (!accept(&p, QTOK_COMMA)) break;
+            }
+            if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+            if (width == 0) width = nv;
+            else if (nv != width) {
+                perr(&p, "INSERT tuples must all have %d values", width);
+                return TSDB_ERR_PARSE;
+            }
+            ins_row_t *node = tsdb_arena_alloc(p.arena, sizeof(*node));
+            qast_insert_val_t *rowv = tsdb_arena_alloc(
+                p.arena, sizeof(qast_insert_val_t) * (size_t)nv);
+            if (!node || !rowv) return TSDB_ERR_NOMEM;
+            memcpy(rowv, tmp, sizeof(qast_insert_val_t) * (size_t)nv);
+            node->v = rowv;
+            node->next = NULL;
+            if (tail) tail->next = node; else head = node;
+            tail = node;
+            nrows++;
+        } while (accept(&p, QTOK_COMMA));
+
+        if (ins->ncols > 0 && width != ins->ncols) {
+            perr(&p, "INSERT tuple has %d values but column list names %d",
+                 width, ins->ncols);
+            return TSDB_ERR_PARSE;
+        }
+
+        ins->vals = tsdb_arena_alloc(
+            p.arena, sizeof(qast_insert_val_t) * (size_t)nrows * (size_t)width);
+        if (!ins->vals) return TSDB_ERR_NOMEM;
+        int ri = 0;
+        for (ins_row_t *n2 = head; n2; n2 = n2->next, ri++) {
+            memcpy(&ins->vals[(size_t)ri * (size_t)width], n2->v,
+                   sizeof(qast_insert_val_t) * (size_t)width);
+        }
+        ins->nrows = nrows;
+        ins->width = width;
+
+        accept(&p, QTOK_SEMI);
+        return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+    }
+
     /* ---- ADD MASTER / REMOVE MASTER -----------------------------------
      *
      * ADD is an existing keyword (QTOK_ADD, used by ALTER TABLE ADD
@@ -1912,9 +2029,8 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         int priv = 0;
         if (accept(&p, QTOK_SELECT)) {
             priv = TSDB_PRIV_SELECT;
-        } else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "insert")) {
+        } else if (accept(&p, QTOK_INSERT)) {
             priv = TSDB_PRIV_INSERT;
-            advance(&p);
         } else if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "ddl")) {
             priv = TSDB_PRIV_DDL;
             advance(&p);
@@ -1970,7 +2086,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
     }
 
-    perr(&p, "expected SELECT, CREATE, DROP, LIST, JOIN, LEAVE, COMMIT, GRANT, REVOKE, or EXPORT");
+    perr(&p, "expected SELECT, INSERT, CREATE, DROP, LIST, JOIN, LEAVE, COMMIT, GRANT, REVOKE, or EXPORT");
     return TSDB_ERR_PARSE;
 }
 

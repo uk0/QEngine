@@ -83,6 +83,11 @@ typedef enum {
     QTOK_REVOKE,
     QTOK_PASSWORD,        /* ALTER USER ... SET PASSWORD '<pw>'       */
 
+    /* DML: INSERT INTO <t> [(cols)] VALUES (v,...)[,(...)] */
+    QTOK_INSERT,
+    QTOK_INTO,
+    QTOK_VALUES,
+
     QTOK_ERR
 } qtok_kind_t;
 

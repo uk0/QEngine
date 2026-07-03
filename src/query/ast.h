@@ -168,6 +168,8 @@ qast_expr_t *qast_mk_call(tsdb_arena_t *a, const char *name, qast_expr_t **args,
 
 typedef enum {
     QAST_STMT_SELECT,          /* existing query */
+    /* DML: INSERT INTO <t> [(col,...)] VALUES (v,...)[,(...)] */
+    QAST_STMT_INSERT,
     /* Database DDL — top of the 3-level hierarchy (DB → Group → Table). */
     QAST_STMT_CREATE_DATABASE,
     QAST_STMT_DROP_DATABASE,
@@ -231,10 +233,34 @@ typedef enum {
     QAST_STMT_REMOVE_MASTER,          /* REMOVE MASTER '<node_id_or_addr>'                     */
 } qast_stmt_kind_t;
 
+/* One literal cell of an INSERT tuple. */
+typedef enum { QAST_INS_INT, QAST_INS_FLOAT, QAST_INS_STR } qast_insert_valkind_t;
+
+typedef struct {
+    qast_insert_valkind_t kind;
+    int64_t i;      /* QAST_INS_INT   */
+    double  f;      /* QAST_INS_FLOAT */
+    char   *s;      /* QAST_INS_STR — arena-allocated */
+} qast_insert_val_t;
+
+/* INSERT INTO <table> [(col,...)] VALUES (v,...)[,(...)].
+ * vals is arena-allocated (nrows * width, row-major), so the statement
+ * must be executed BEFORE the parse arena is freed — same lifetime rule
+ * as QAST_STMT_SELECT's qast_query_t. */
+typedef struct {
+    char  table[64];
+    int   ncols;                                  /* 0 = no explicit list */
+    char  col_names[TSDB_STABLE_MAX_COLS][64];
+    qast_insert_val_t *vals;
+    int   nrows;
+    int   width;                                  /* values per tuple */
+} qast_insert_t;
+
 typedef struct {
     qast_stmt_kind_t kind;
     union {
         qast_query_t query;                              /* QAST_STMT_SELECT */
+        qast_insert_t insert_;                           /* QAST_STMT_INSERT */
         /* Database DDL */
         struct { char name[64]; char description[192]; int64_t retention_ns; }
                create_database;                          /* QAST_STMT_CREATE_DATABASE */

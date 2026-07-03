@@ -63,6 +63,10 @@ static struct { const char *kw; qtok_kind_t k; } KEYWORDS[] = {
     {"grant",        QTOK_GRANT},
     {"revoke",       QTOK_REVOKE},
     {"password",     QTOK_PASSWORD},
+    /* DML */
+    {"insert",       QTOK_INSERT},
+    {"into",         QTOK_INTO},
+    {"values",       QTOK_VALUES},
 };
 
 static qtok_kind_t keyword_lookup(const char *s, size_t n) {
@@ -133,6 +137,9 @@ const char *qtok_name(qtok_kind_t k) {
     case QTOK_GRANT:        return "GRANT";
     case QTOK_REVOKE:       return "REVOKE";
     case QTOK_PASSWORD:     return "PASSWORD";
+    case QTOK_INSERT:       return "INSERT";
+    case QTOK_INTO:         return "INTO";
+    case QTOK_VALUES:       return "VALUES";
     case QTOK_ERR: return "<error>";
     }
     return "?";
