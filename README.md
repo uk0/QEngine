@@ -611,22 +611,28 @@ docs/                   # design notes, research, test plan (gitignored)
 
 ## Limits and roadmap
 
+**Shipped since the list below was written** — ASOF JOIN executor;
+TLS (wire server, CLI `--tls`, Go SDK `OpenTLS`/`DialTLS`, inter-node
+mTLS); percentile/stddev via T-digest; retention GC (`/retention/sweep`
++ background sweeper); size-tiered background compaction; SQL
+`INSERT INTO … VALUES`, `HAVING`, `SELECT DISTINCT`; UDFs
+(`CREATE FUNCTION` → dlopen ABI v1, raft-replicated DDL, SDK
+`RegisterUDF`/`DropUDF`); client auto-reconnect (CLI/Go/Java) and
+pipelined writes (Go `WritePipeline`, Java `WritePipeline`,
+~4x per-conn throughput); zero-copy mmap block reads; SWIM failure
+detection with ~10s DEAD convergence; wire `LOGIN` + per-conn auth;
+i64 sum/avg overflow detection.
+
 **Known gaps** (shipping order tentative):
 
-- **ASOF JOIN executor** — syntax is parsed; the two-pointer merge is not
-  yet wired in
-- **Multi-key GROUP BY** — current executor handles single-dim; TSBS
-  `double-groupby-all` falls back to `SAMPLE BY`
-- **TLS on the wire** — v1 assumes a trusted network; v1.1 adds
-  pre-shared token, v2 adds TLS
-- **Percentile aggregates** — `p50 / p99 / stddev` rely on T-digest;
-  planned
 - **Cross-cluster rebalance** — within a cluster is automatic; across
   clusters requires manual re-routing rules today
-- **Retention enforcement** — `retention='30d'` is stored but not yet
-  enforced by a background GC
-- **Background compaction** — size-tiered merge of small parts to
-  control fd count at high cardinality
+- **Stable scatter-gather reads** — `SELECT … FROM <stable>` aggregates
+  only local children; cluster-wide aggregation from any node is
+  in progress
+- **Row-level replica reconciliation** — anti-entropy converges on
+  count/max(ts); divergent middle-gap replicas are preserved (never
+  destructively truncated) but not yet backfilled row-by-row
 
 **Non-goals for 1.0**:
 
