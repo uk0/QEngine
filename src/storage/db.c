@@ -2230,6 +2230,13 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
         if (rc != TSDB_OK) return rc;
         consumed += chunk;
     }
+    /* Record content provenance for the idle-flush on whatever tail remains in
+     * the memtable (the columnar bulk path — used by influx /write — bypasses
+     * the per-row tsdb_batch_row_ts where this is otherwise set). */
+    if (tsdb_memtable_rows(b->tbl->memtable) > 0) {
+        if (b->local_only) b->tbl->mem_has_received = 1;
+        else               b->tbl->mem_has_local    = 1;
+    }
     return TSDB_OK;
 }
 
