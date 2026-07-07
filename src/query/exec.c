@@ -4281,6 +4281,7 @@ enum {
     STAB_AGG_MIN,
     STAB_AGG_MAX,
     STAB_AGG_AVG,
+    STAB_AGG_SPREAD,   /* spread(x) == max(x) - min(x); merges via min+max */
     STAB_AGG_OTHER
 };
 
@@ -4313,7 +4314,8 @@ static int stable_classify_scalar_agg(qast_query_t *q, const tsdb_stable_t *st,
         if (strcasecmp(fn, "count") == 0) {
             k = STAB_AGG_CNT;
         } else if (strcasecmp(fn, "sum") == 0 || strcasecmp(fn, "min") == 0 ||
-                   strcasecmp(fn, "max") == 0 || strcasecmp(fn, "avg") == 0) {
+                   strcasecmp(fn, "max") == 0 || strcasecmp(fn, "avg") == 0 ||
+                   strcasecmp(fn, "spread") == 0) {
             if (e->nargs == 1 && e->args[0] && e->args[0]->kind == QAST_IDENT) {
                 int sym = 0;
                 for (int c = 0; c < st->ncols; c++) {
@@ -4323,10 +4325,11 @@ static int stable_classify_scalar_agg(qast_query_t *q, const tsdb_stable_t *st,
                     }
                 }
                 if (!sym) {
-                    if      (strcasecmp(fn, "sum") == 0) k = STAB_AGG_SUM;
-                    else if (strcasecmp(fn, "min") == 0) k = STAB_AGG_MIN;
-                    else if (strcasecmp(fn, "max") == 0) k = STAB_AGG_MAX;
-                    else                                  k = STAB_AGG_AVG;
+                    if      (strcasecmp(fn, "sum") == 0)    k = STAB_AGG_SUM;
+                    else if (strcasecmp(fn, "min") == 0)    k = STAB_AGG_MIN;
+                    else if (strcasecmp(fn, "max") == 0)    k = STAB_AGG_MAX;
+                    else if (strcasecmp(fn, "spread") == 0) k = STAB_AGG_SPREAD;
+                    else                                     k = STAB_AGG_AVG;
                 }
             }
         }
@@ -4355,13 +4358,16 @@ static int stab_partial_sel_build(qast_query_t *q, const int *kinds,
 {
     int n = 0;
     for (int i = 0; i < q->nsel; i++) {
-        if (kinds[i] == STAB_AGG_AVG) {
+        if (kinds[i] == STAB_AGG_AVG || kinds[i] == STAB_AGG_SPREAD) {
             qast_expr_t *orig = q->sel[i].expr;
+            /* avg → sum,count ; spread → min,max */
+            const char *fn0 = (kinds[i] == STAB_AGG_AVG) ? "sum" : "min";
+            const char *fn1 = (kinds[i] == STAB_AGG_AVG) ? "count" : "max";
             for (int half = 0; half < 2; half++) {
                 qast_expr_t *call = &ps->nodes[n];
                 memset(call, 0, sizeof(*call));
                 call->kind  = QAST_CALL;
-                call->v.s   = (char *)(half == 0 ? "sum" : "count");
+                call->v.s   = (char *)(half == 0 ? fn0 : fn1);
                 ps->argv[n] = orig->args[0];
                 call->args  = &ps->argv[n];
                 call->nargs = 1;
@@ -4401,6 +4407,9 @@ static void stab_pacc_init(stab_pacc_t *acc, const int *sel_kinds, int nsel) {
         if (sel_kinds[i] == STAB_AGG_AVG) {
             acc->kinds[n++] = STAB_AGG_SUM;
             acc->kinds[n++] = STAB_AGG_CNT;
+        } else if (sel_kinds[i] == STAB_AGG_SPREAD) {
+            acc->kinds[n++] = STAB_AGG_MIN;
+            acc->kinds[n++] = STAB_AGG_MAX;
         } else {
             acc->kinds[n++] = sel_kinds[i];
         }
@@ -4471,19 +4480,26 @@ static int stab_pacc_finalize(const stab_pacc_t *acc, qast_query_t *q,
 
     int p = 0;
     for (int i = 0; i < q->nsel; i++) {
-        if (sel_kinds[i] == STAB_AGG_AVG) {
+        if (sel_kinds[i] == STAB_AGG_AVG || sel_kinds[i] == STAB_AGG_SPREAD) {
+            /* avg → FLOAT64 sum/count; spread → max-min in the column's type.
+             * Both split into a two-slot partial (p, p+1); rebuild the display
+             * name and skip both slots. */
+            int is_avg = (sel_kinds[i] == STAB_AGG_AVG);
+            const char *fn   = is_avg ? "avg" : "spread";
+            const char *half = is_avg ? "sum(" : "min(";
             char name[144];
             if (q->sel[i].alias) {
                 snprintf(name, sizeof(name), "%s", q->sel[i].alias);
-            } else if (strncasecmp(acc->names[p], "sum(", 4) == 0) {
-                snprintf(name, sizeof(name), "avg(%s", acc->names[p] + 4);
+            } else if (strncasecmp(acc->names[p], half, 4) == 0) {
+                snprintf(name, sizeof(name), "%s(%s", fn, acc->names[p] + 4);
             } else {
-                snprintf(name, sizeof(name), "avg(%s)",
+                snprintf(name, sizeof(name), "%s(%s)", fn,
                          (q->sel[i].expr->nargs > 0 &&
                           q->sel[i].expr->args[0]->kind == QAST_IDENT)
                              ? q->sel[i].expr->args[0]->v.s : "?");
             }
-            rc = result_set_col(r, i, name, TSDB_TYPE_FLOAT64, NULL);
+            tsdb_type_t ty = is_avg ? TSDB_TYPE_FLOAT64 : acc->types[p];
+            rc = result_set_col(r, i, name, ty, NULL);
             p += 2;
         } else {
             rc = result_set_col(r, i, acc->names[p], acc->types[p], NULL);
@@ -4504,6 +4520,19 @@ static int stab_pacc_finalize(const stab_pacc_t *acc, qast_query_t *q,
                               ? (int64_t)acc->fv[p + 1] : acc->iv[p + 1];
             double avg = (cnt == 0) ? 0.0 / 0.0 : sum / (double)cnt;
             memcpy(&bits, &avg, 8);
+            p += 2;
+        } else if (sel_kinds[i] == STAB_AGG_SPREAD) {
+            /* min slot = p, max slot = p+1; spread = max - min in the col type
+             * (unsigned subtract for the int path so the all-empty identity
+             * case INT64_MIN-INT64_MAX wraps defined instead of overflowing). */
+            if (acc->types[p] == TSDB_TYPE_FLOAT64) {
+                double spr = acc->fv[p + 1] - acc->fv[p];
+                memcpy(&bits, &spr, 8);
+            } else {
+                int64_t spr = (int64_t)((uint64_t)acc->iv[p + 1] -
+                                        (uint64_t)acc->iv[p]);
+                memcpy(&bits, &spr, 8);
+            }
             p += 2;
         } else if (acc->types[p] == TSDB_TYPE_FLOAT64) {
             memcpy(&bits, &acc->fv[p], 8);
@@ -4753,14 +4782,20 @@ static int stable_render_partial_list(qast_query_t *q, const tsdb_stable_t *st,
             n = snprintf(buf + off, cap - off, "%ssum(%s), count(%s)",
                          i ? ", " : "", arg, arg);
             break;
+        case STAB_AGG_SPREAD:
+            if (!arg) return -1;
+            n = snprintf(buf + off, cap - off, "%smin(%s), max(%s)",
+                         i ? ", " : "", arg, arg);
+            break;
         default:
             return -1;
         }
         if (n < 0 || (size_t)n >= cap - off) return -1;
         off += (size_t)n;
-        /* Alias rides only on non-avg items (avg splits into two partials
-         * whose final name the finalizer rebuilds). */
-        if (kinds[i] != STAB_AGG_AVG && q->sel[i].alias) {
+        /* Alias rides only on single-partial items (avg/spread each split into
+         * two partials whose final name the finalizer rebuilds). */
+        if (kinds[i] != STAB_AGG_AVG && kinds[i] != STAB_AGG_SPREAD &&
+            q->sel[i].alias) {
             n = snprintf(buf + off, cap - off, " AS %s", q->sel[i].alias);
             if (n < 0 || (size_t)n >= cap - off) return -1;
             off += (size_t)n;

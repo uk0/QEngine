@@ -126,6 +126,16 @@ static void check_totals(tsdb_db_t *db, const char *label) {
     ASSERT(tsdb_result_i64(r, 2) == 100);
     ASSERT_F64_EQ(tsdb_result_f64(r, 3), 22.5);
     tsdb_result_free(r);
+
+    /* spread(x) == max(x) - min(x), merged via min+max across children;
+     * float spread stays float, int spread stays int. */
+    r = one_row(db, "SELECT spread(v), spread(w) FROM m");
+    ASSERT(tsdb_result_ncols(r) == 2);
+    ASSERT_F64_EQ(tsdb_result_f64(r, 0), 11.0);   /* 10 - (-1) */
+    ASSERT(tsdb_result_i64(r, 1) == 105);          /* 100 - (-5) */
+    ASSERT(tsdb_result_col_index_by_name(r, "spread(v)") == 0);
+    ASSERT(tsdb_result_col_index_by_name(r, "spread(w)") == 1);
+    tsdb_result_free(r);
     printf("  PASS: totals correct (%s)\n", label);
 }
 
