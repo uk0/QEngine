@@ -4663,6 +4663,27 @@ static int stable_self_storage_exists(tsdb_db_t *db, const char *name) {
     return 0;
 }
 
+/* Does the LOCAL node hold ANY data for a same-named table — on-disk partitions
+ * OR unflushed memtable rows?  The cluster-agg coordinator gates on THIS, not the
+ * disk-only stable_self_storage_exists: a data-bearing super-table whose rows are
+ * still in the memtable (a fresh influx write not yet flushed) has no partition
+ * dir yet, so the disk-only probe reports "no self storage" and the coordinator
+ * scatters — but the scatter's per-child owner-dedup assumes hash-sharded child
+ * tables and drops that memtable data (the ingesting node is usually not the
+ * name's hash-owner, and no peer holds the un-replicated rows), returning 0.
+ * Counting the memtable keeps the read local — correct and complete — whenever
+ * this node actually holds the rows; a node that holds NOTHING (empty mirror,
+ * e.g. a catalog-only replica) still scatters to find the data on a peer. */
+static int stable_has_local_data(tsdb_db_t *db, const char *name) {
+    if (stable_self_storage_exists(db, name)) return 1;
+    tsdb_table_internal_t *ti = tsdb_db_find_table(db, name);
+    if (ti) {
+        tsdb_memtable_t *mt = tsdb_tbl_memtable(ti);
+        if (mt && tsdb_memtable_rows_relaxed(mt) > 0) return 1;
+    }
+    return 0;
+}
+
 /* ---- Task #175: cluster-wide stable aggregation coordinator ------------ */
 
 /* Find the top-level FROM keyword in a SELECT statement: case-insensitive,
@@ -4895,18 +4916,20 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
      *   - not already inside a scatter (anti-recursion),
      *   - the query is pure count/sum/min/max/avg (no GROUP BY / SAMPLE BY /
      *     windows / PARTITION BY tbname — those keep the old local paths),
-     *   - the stable is genuine: it has local children OR has no same-named
-     *     self storage.  A data-bearing MIRROR of a plain table (self storage
-     *     present, zero children) stays strictly local — anti-entropy and peer
-     *     stats compare its PER-NODE count and must never see a cluster-wide
-     *     number.  But a genuine super-table with ZERO LOCAL children is the
-     *     case the old `nchildren > 0` gate got wrong: a catalog-sync gap left
-     *     this node without the child records, so the query silently
-     *     under-counted to 0 instead of scattering to the peers that hold them,
+     *   - the stable has local children, OR this node holds NO local data for
+     *     it (neither on-disk partitions NOR memtable rows).  A node that holds
+     *     the data locally reads it directly: a data-bearing mirror's rows are
+     *     its own same-named storage (a full replica, or a fresh influx write
+     *     still in the memtable), so the local read is already complete AND
+     *     anti-entropy's per-node count stays intact.  Only a node holding
+     *     nothing (an empty/catalog-only mirror) scatters — to find the data on
+     *     a peer.  Gating on disk-only self-storage (the earlier bug) made a
+     *     node with the rows only in its memtable scatter and, via the child
+     *     owner-dedup, drop its own un-flushed data to 0,
      *   - at least one peer is alive (standalone/solo → local path is
      *     already the whole truth). */
     int coord_eligible = (nchildren > 0) ||
-                         !stable_self_storage_exists(db, st->name);
+                         !stable_has_local_data(db, st->name);
     if (is_scalar_agg && !any_other_agg && !tsdb_g_scatter_local_mode &&
         coord_eligible && tsdb_cluster_alive_count(db) >= 2) {
         int fired = 0;
