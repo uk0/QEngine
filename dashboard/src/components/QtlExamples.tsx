@@ -17,6 +17,16 @@ export interface ExampleGroup {
   items: Example[];
 }
 
+/* Always-visible quick picks rendered as chips under the editor. */
+export const QUICK_EXAMPLES: Example[] = [
+  { title: 'List databases', sql: 'LIST DATABASES;' },
+  { title: 'List VTables', sql: 'LIST VTABLES;' },
+  { title: 'Top 1000 rows', sql: 'SELECT * FROM metrics ORDER BY ts DESC LIMIT 1000;' },
+  { title: '5m time buckets', sql: "SELECT time_bucket('5m', ts) AS ts5,\n       host,\n       avg(cpu) AS cpu\nFROM metrics\nGROUP BY ts5, host\nORDER BY ts5;" },
+  { title: 'List users', sql: 'LIST USERS;' },
+  { title: 'List masters', sql: 'LIST MASTERS;' },
+];
+
 export const EXAMPLES: ExampleGroup[] = [
   {
     label: 'Catalog — list',

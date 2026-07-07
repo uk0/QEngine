@@ -1,10 +1,123 @@
-/* api.ts — thin HTTP client for the tsdb metrics_server endpoints.
+/* api.ts — hardened HTTP client for the tsdb metrics_server endpoints.
  *
- * Every call is a POST/GET with cookie-based auth; the browser manages
- * the session cookie automatically, so we never need to pass a token
- * explicitly.  Errors surface as thrown Error objects carrying both the
- * HTTP status and the parsed body so callers can show actionable text.
+ * Every call goes through request(): AbortController timeout, consistent
+ * ApiError typing (network / timeout / auth / http), 401 routed to a
+ * registered handler (the App flips back to the login screen — never a
+ * crash or a raw redirect loop), non-2xx surfaced as readable messages.
+ * Cookie-based auth: the browser carries the session cookie itself.
  */
+
+export type ApiErrorKind = 'network' | 'timeout' | 'auth' | 'http';
+
+export class ApiError extends Error {
+  readonly status: number; // 0 when no HTTP response (network / timeout)
+  readonly kind: ApiErrorKind;
+  constructor(message: string, kind: ApiErrorKind, status = 0) {
+    super(message);
+    this.name = 'ApiError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/** Registered by App: called once per 401 so the SPA can return to its
+ *  login screen instead of dying mid-render. */
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  onUnauthorized = fn;
+}
+
+export function errMsg(e: unknown, fallback = 'request failed'): string {
+  if (e instanceof Error && e.message) return e.message;
+  return fallback;
+}
+
+interface ReqOpts {
+  body?: BodyInit;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  /** Return the raw response text instead of parsed JSON (/metrics). */
+  raw?: boolean;
+  /** Don't fire the global 401 handler (login-flow probes). */
+  skipAuthHook?: boolean;
+}
+
+const DEFAULT_TIMEOUT_MS = 12_000;
+
+async function request<T = unknown>(
+  method: string,
+  path: string,
+  opts: ReqOpts = {},
+): Promise<T> {
+  const ctl = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = window.setTimeout(() => ctl.abort(), timeoutMs);
+
+  let resp: Response;
+  try {
+    resp = await fetch(path, {
+      method,
+      credentials: 'include',
+      signal: ctl.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(opts.body && !(opts.body instanceof FormData)
+          ? { 'Content-Type': 'application/json' }
+          : {}),
+        ...opts.headers,
+      },
+      body: opts.body,
+    });
+  } catch (e) {
+    if (ctl.signal.aborted) {
+      throw new ApiError(
+        `${path} timed out after ${Math.round(timeoutMs / 1000)}s`,
+        'timeout',
+      );
+    }
+    throw new ApiError(
+      `server unreachable (${e instanceof Error ? e.message : 'network error'})`,
+      'network',
+    );
+  } finally {
+    window.clearTimeout(timer);
+  }
+
+  if (resp.status === 401) {
+    if (!opts.skipAuthHook && onUnauthorized) onUnauthorized();
+    throw new ApiError('login required', 'auth', 401);
+  }
+
+  let text = '';
+  try {
+    text = await resp.text();
+  } catch {
+    /* body read failed — fall through with empty text */
+  }
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = text; // non-JSON payload (/metrics, HTML error pages)
+    }
+  }
+
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ''}`;
+    if (parsed && typeof parsed === 'object') {
+      const rec = parsed as Record<string, unknown>;
+      if (typeof rec.error === 'string' && rec.error) msg = rec.error;
+      else if (resp.status === 503) msg = 'service unavailable — provider not registered on this node';
+    }
+    if (resp.status === 405) msg = `${msg} (method not allowed)`;
+    throw new ApiError(msg, 'http', resp.status);
+  }
+
+  return (opts.raw ? (text as unknown) : parsed) as T;
+}
+
+/* ── Result / payload types ───────────────────────────────────────── */
 
 export interface SqlResult {
   cols: string[];
@@ -15,8 +128,6 @@ export interface SqlResult {
   ms: number;
 }
 
-/* ── Cluster + Raft types ─────────────────────────────────────────── */
-
 export interface ClusterNode {
   id: string;
   addr: string;
@@ -26,8 +137,7 @@ export interface ClusterNode {
   hb_age_ms: number;
   known_for_s: number;
   suspect_count: number;
-  /** Data-directory size in bytes, propagated via the DISK_SYNC gossip
-   *  message.  0 until the owning node's first sample reaches us. */
+  /** Data-directory size in bytes via DISK_SYNC gossip; 0 until sampled. */
   disk_bytes?: number;
 }
 
@@ -58,12 +168,8 @@ export interface LocalDisk {
 }
 
 export interface ShardingInfo {
-  /** TSDB_SHARD_REPLICA_N — owner count per table.  0 = full broadcast. */
   replica_n: number;
-  /** Cluster size at the moment /cluster_stats was sampled. */
   alive_nodes: number;
-  /** True iff replica_n > 0 AND replica_n < alive_nodes (i.e. sharding
-   *  actually narrows the fan-out). */
   active: number;
 }
 
@@ -101,32 +207,11 @@ export interface AuditRecord {
   detail: string;
 }
 
-export interface TreeDatabase {
-  name: string;
-  description?: string;
-  protected?: boolean;
-}
-export interface TreeGroup {
-  name: string;
-  database?: string;
-}
-export interface TreeVTable {
-  name: string;
-  database?: string;
-  group?: string;
-  ncols: number;
-}
-export interface TreePTable {
-  name: string;
-  vtable?: string;
-  database?: string;
-  group?: string;
-}
-export interface TreeTable {
-  name: string;
-  ncols: number;
-  is_stable?: boolean;
-}
+export interface TreeDatabase { name: string; description?: string; protected?: boolean; }
+export interface TreeGroup { name: string; database?: string; }
+export interface TreeVTable { name: string; database?: string; group?: string; ncols: number; }
+export interface TreePTable { name: string; vtable?: string; database?: string; group?: string; }
+export interface TreeTable { name: string; ncols: number; is_stable?: boolean; }
 export interface TreeDbInfo {
   name?: string;
   path?: string;
@@ -143,150 +228,172 @@ export interface Tree {
   tables?: TreeTable[];
 }
 
-async function req<T = unknown>(
-  method: string,
-  path: string,
-  body?: BodyInit,
-  extraHeaders: Record<string, string> = {},
-): Promise<T> {
-  const resp = await fetch(path, {
-    method,
-    credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-      ...(body && !(body instanceof FormData)
-        ? { 'Content-Type': 'application/json' }
-        : {}),
-      ...extraHeaders,
-    },
-    body,
-  });
-  if (resp.status === 401) {
-    // Force login — full reload so the server's /login redirect takes.
-    window.location.href = '/login';
-    throw new Error('login required');
-  }
-  const text = await resp.text();
-  let parsed: unknown = text;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    /* fall through — raw text */
-  }
-  if (!resp.ok) {
-    let msg = `HTTP ${resp.status}`;
-    if (parsed && typeof parsed === 'object' && 'error' in (parsed as Record<string, unknown>)) {
-      msg = String((parsed as Record<string, unknown>).error);
-    }
-    throw new Error(msg);
-  }
-  return parsed as T;
+export interface HealthInfo { status: string; uptime_s: number; pid: number; }
+
+export interface CatalogOrphan {
+  name: string;
+  missing_db?: string;
+  missing_group?: string;
+  missing_stable?: string;
+  path?: string;
+}
+export interface CatalogReport {
+  error?: string;
+  orphan_groups?: CatalogOrphan[];
+  orphan_stables?: CatalogOrphan[];
+  orphan_children?: CatalogOrphan[];
+  orphan_dirs?: CatalogOrphan[];
+  summary?: {
+    databases?: number;
+    groups?: number;
+    stables?: number;
+    children?: number;
+  };
 }
 
+/* ── Endpoint surface ─────────────────────────────────────────────── */
+
 export const api = {
-  /** Execute a SQL/QTL statement.  Errors come back as {error: ...} with
-   *  HTTP 200 — unwrap them so callers can catch them normally. */
+  /** Execute a SQL/QTL statement.  The server can answer {error:...}
+   *  with HTTP 200 — unwrap so callers catch one error shape. */
   async sql(q: string): Promise<SqlResult> {
-    const r = await req<SqlResult & { error?: string }>(
+    const r = await request<Partial<SqlResult> & { error?: string }>(
       'POST',
       '/sql',
-      JSON.stringify({ q }),
+      { body: JSON.stringify({ q }), timeoutMs: 30_000 },
     );
-    if (r && typeof r === 'object' && 'error' in r && r.error) {
-      throw new Error(String(r.error));
+    if (r && typeof r === 'object' && r.error) {
+      throw new ApiError(String(r.error), 'http', 200);
     }
-    return r as SqlResult;
+    // Defensive defaults — a partial payload must never crash the grid.
+    return {
+      cols: r?.cols ?? [],
+      types: r?.types ?? [],
+      rows: r?.rows ?? [],
+      nrows: r?.nrows ?? (r?.rows?.length ?? 0),
+      truncated: r?.truncated ?? false,
+      ms: r?.ms ?? 0,
+    };
   },
 
   tree(): Promise<Tree> {
-    return req<Tree>('GET', '/tree');
+    return request<Tree>('GET', '/tree');
   },
 
   cluster(): Promise<ClusterInfo> {
-    return req<ClusterInfo>('GET', '/cluster');
+    return request<ClusterInfo>('GET', '/cluster');
   },
 
   raft(): Promise<RaftInfo> {
-    return req<RaftInfo>('GET', '/raft');
+    return request<RaftInfo>('GET', '/raft');
   },
 
-  /** Prometheus-text /metrics — parse key counters the dashboard uses
-   *  to estimate replication health and memtable pressure. */
+  /** Prometheus-text /metrics → {series → value}.  Labelled series keep
+   *  their label block in the key (`x_bucket{le="5"}`). */
   async metrics(): Promise<Record<string, number>> {
-    const resp = await fetch('/metrics', { credentials: 'include' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const txt = await resp.text();
+    const txt = await request<string>('GET', '/metrics', {
+      raw: true,
+      headers: { Accept: 'text/plain' },
+    });
     const out: Record<string, number> = {};
-    for (const line of txt.split('\n')) {
+    for (const line of String(txt ?? '').split('\n')) {
       if (!line || line.startsWith('#')) continue;
       const sp = line.indexOf(' ');
       if (sp < 0) continue;
       const k = line.slice(0, sp).trim();
       const v = Number(line.slice(sp + 1).trim());
-      if (!Number.isNaN(v)) out[k] = v;
+      if (k && Number.isFinite(v)) out[k] = v;
     }
     return out;
   },
 
-  health(): Promise<{ status: string; uptime_s: number; pid: number }> {
-    return req<{ status: string; uptime_s: number; pid: number }>(
-      'GET',
-      '/health',
-    );
+  health(): Promise<HealthInfo> {
+    return request<HealthInfo>('GET', '/health');
   },
 
   audit(n = 200): Promise<{ rows: AuditRecord[]; nrows: number }> {
-    return req<{ rows: AuditRecord[]; nrows: number }>(
+    return request<{ rows: AuditRecord[]; nrows: number }>(
       'GET',
-      `/audit?n=${n}`,
+      `/audit?n=${encodeURIComponent(n)}`,
     );
   },
 
+  /** MUTATING — POST only (GET answers 405 server-side). */
   retentionSweep(): Promise<{ ok: boolean; partitions_deleted: number }> {
-    return req<{ ok: boolean; partitions_deleted: number }>(
+    return request<{ ok: boolean; partitions_deleted: number }>(
       'POST',
       '/retention/sweep',
+      { timeoutMs: 60_000 },
     );
   },
 
+  /** MUTATING — trims every partition starting after target_ns. */
   pitr(
     targetNs: number | string,
   ): Promise<{ ok: boolean; target_ns: number; partitions_removed: number }> {
-    return req<{
-      ok: boolean;
-      target_ns: number;
-      partitions_removed: number;
-    }>('POST', `/pitr?ts=${targetNs}`);
+    return request<{ ok: boolean; target_ns: number; partitions_removed: number }>(
+      'POST',
+      `/pitr?ts=${encodeURIComponent(String(targetNs))}`,
+      { timeoutMs: 60_000 },
+    );
   },
 
-  /** POST the HTML-form login — same endpoint the embedded HTML uses.
-   *  Returns after the server has set the cookie. */
+  catalogCheck(): Promise<CatalogReport> {
+    return request<CatalogReport>('GET', '/catalog/check', { timeoutMs: 30_000 });
+  },
+
+  /** POST the HTML-form login.  Success = 302 (opaqueredirect / status 0
+   *  under redirect:"manual"); bad credentials = 401 JSON. */
   async login(user: string, password: string): Promise<void> {
     const form = new URLSearchParams();
     form.append('user', user);
     form.append('pass', password);
-    const resp = await fetch('/login', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form.toString(),
-      redirect: 'manual',
-    });
-    // Server answers 302 on success; fetch surfaces that as type:'opaqueredirect'.
-    if (resp.status !== 0 && resp.status >= 400) {
-      throw new Error(`login failed (${resp.status})`);
+
+    const ctl = new AbortController();
+    const timer = window.setTimeout(() => ctl.abort(), DEFAULT_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch('/login', {
+        method: 'POST',
+        credentials: 'include',
+        signal: ctl.signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString(),
+        redirect: 'manual',
+      });
+    } catch (e) {
+      if (ctl.signal.aborted) throw new ApiError('login timed out', 'timeout');
+      throw new ApiError(
+        `server unreachable (${e instanceof Error ? e.message : 'network error'})`,
+        'network',
+      );
+    } finally {
+      window.clearTimeout(timer);
     }
+
+    if (resp.status === 401) {
+      let msg = 'invalid credentials';
+      try {
+        const j = (await resp.json()) as { error?: string };
+        if (j?.error) msg = j.error;
+      } catch { /* keep default */ }
+      throw new ApiError(msg, 'auth', 401);
+    }
+    if (resp.status >= 400) {
+      throw new ApiError(`login failed (HTTP ${resp.status})`, 'http', resp.status);
+    }
+    // status 0 (opaqueredirect) or 2xx/3xx ⇒ cookie set.
   },
 
+  /** Best-effort — never throws. */
   async logout(): Promise<void> {
-    await fetch('/logout', { credentials: 'include' });
+    try {
+      await fetch('/logout', { credentials: 'include', redirect: 'manual' });
+    } catch { /* cookie clear is best-effort */ }
   },
 };
 
-// ──────────────────────────────────────────────────────────────────────
-// Delete helpers — centralised so the component tree doesn't care about
-// the underlying SQL shape.  If the grammar changes we flip one place.
-// ──────────────────────────────────────────────────────────────────────
+/* ── DDL helpers — one place owns the SQL shape ───────────────────── */
 
 export const ddl = {
   dropDatabase: (name: string) => api.sql(`DROP DATABASE ${ident(name)}`),
@@ -304,8 +411,7 @@ export const ddl = {
     ),
 };
 
-// Very small identifier / literal quoting — tsdb accepts [A-Za-z0-9_.]
-// identifiers.  Anything else we quote as a string for safety.
+// tsdb accepts [A-Za-z0-9_.] identifiers; anything else gets quoted.
 function ident(s: string): string {
   if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(s)) return s;
   return `"${s.replace(/"/g, '""')}"`;

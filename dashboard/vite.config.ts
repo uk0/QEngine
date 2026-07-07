@@ -23,6 +23,7 @@ export default defineConfig({
       '/backup':          { target: API, changeOrigin: true },
       '/retention':       { target: API, changeOrigin: true },
       '/pitr':            { target: API, changeOrigin: true },
+      '/catalog':         { target: API, changeOrigin: true },
     },
   },
   build: {

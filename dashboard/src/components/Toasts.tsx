@@ -29,7 +29,7 @@ export function useToastCtx() {
 
 export function Toasts({ items }: { items: ToastItem[] }) {
   return (
-    <div className="toast-stack">
+    <div className="toast-stack" role="status" aria-live="polite">
       {items.map(t => (
         <div key={t.id} className={`toast ${t.kind}`}>
           {t.text}
