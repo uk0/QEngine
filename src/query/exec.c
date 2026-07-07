@@ -4889,20 +4889,26 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     if (rc != TSDB_OK) { eset(err, errcap, "failed to list children of stable '%s'", st->name); return rc; }
 
     /* Task #175 — cluster-wide aggregation coordinator.  A pure mergeable
-     * scalar-agg SELECT over a stable WITH children returns the aggregate
-     * over EVERY node's shard, not just the local catalog view of the data.
+     * scalar-agg SELECT over a stable returns the aggregate over EVERY node's
+     * shard, not just the local catalog view of the data.
      * Fires only when:
      *   - not already inside a scatter (anti-recursion),
      *   - the query is pure count/sum/min/max/avg (no GROUP BY / SAMPLE BY /
      *     windows / PARTITION BY tbname — those keep the old local paths),
-     *   - the stable has at least one catalog child.  Childless mirrors of
-     *     plain tables stay strictly local: anti-entropy and peer stats
-     *     compare PER-NODE counts of those and must never see a
-     *     cluster-wide number,
+     *   - the stable is genuine: it has local children OR has no same-named
+     *     self storage.  A data-bearing MIRROR of a plain table (self storage
+     *     present, zero children) stays strictly local — anti-entropy and peer
+     *     stats compare its PER-NODE count and must never see a cluster-wide
+     *     number.  But a genuine super-table with ZERO LOCAL children is the
+     *     case the old `nchildren > 0` gate got wrong: a catalog-sync gap left
+     *     this node without the child records, so the query silently
+     *     under-counted to 0 instead of scattering to the peers that hold them,
      *   - at least one peer is alive (standalone/solo → local path is
      *     already the whole truth). */
+    int coord_eligible = (nchildren > 0) ||
+                         !stable_self_storage_exists(db, st->name);
     if (is_scalar_agg && !any_other_agg && !tsdb_g_scatter_local_mode &&
-        nchildren > 0 && tsdb_cluster_alive_count(db) >= 2) {
+        coord_eligible && tsdb_cluster_alive_count(db) >= 2) {
         int fired = 0;
         int src = stable_scatter_coordinate(db, q, st, sel_agg_kinds, r,
                                             err, errcap, &fired);
