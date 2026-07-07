@@ -87,13 +87,6 @@ typedef struct tsdb_table_internal {
      *               nrows) into the next redo record. */
     uint64_t             commit_seq;
     size_t               mem_logged;
-    /* idle_prev_rows : memtable row count seen by the idle-flush thread at the
-     *               previous tick.  When unchanged AND non-zero the table has
-     *               gone quiet, so its unflushed tail is drained (flush fires
-     *               on_replicate → the last <block_points rows reach the shard
-     *               owners and become cluster-visible + durable).  Touched only
-     *               by tsdb_idle_flush_thread, under db->lock. */
-    size_t               idle_prev_rows;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -1917,63 +1910,6 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     int rc = flush_and_clear_locked(t, skip_replicate);
     pthread_mutex_unlock(&t->compact_mtx);
     return rc;
-}
-
-/* Idle-flush maintenance thread.  The size path only flushes a memtable when it
- * fills a block (block_points rows), so the last <block_points rows of a table
- * that stops being written sit unflushed in the ingesting node's memtable —
- * WAL-durable locally but NOT replicated (on_replicate fires on flush) and NOT
- * visible from other nodes (a non-owner ingester keeps nothing on disk).  This
- * thread drains that tail: every tick it flushes any table whose memtable row
- * count is non-zero AND UNCHANGED since the previous tick (i.e. writes paused).
- * A table still being written keeps growing, so it is never touched here and
- * still flushes via the size path — hot tables are never fragmented, so there
- * is no steady-state write-throughput cost.  The flush runs under the table
- * write lock (batch_mu) exactly like the size path, and scan_acquire pins the
- * table so a concurrent DROP can't free it mid-flush.
- * Env: TSDB_IDLE_FLUSH=0 disables it; TSDB_IDLE_FLUSH_MS overrides the 2s tick. */
-void *tsdb_idle_flush_thread(void *ud) {
-    tsdb_db_t *db = (tsdb_db_t *)ud;
-    if (!db) return NULL;
-    const char *off = getenv("TSDB_IDLE_FLUSH");
-    if (off && atoi(off) == 0) return NULL;
-    int interval_ms = 2000;
-    const char *ev = getenv("TSDB_IDLE_FLUSH_MS");
-    if (ev && atoi(ev) > 0) interval_ms = atoi(ev);
-
-    /* Names to flush this tick — heap-allocated once to avoid a 1 MB stack. */
-    char (*names)[64] = malloc((size_t)TSDB_DB_MAX_TABLES * 64);
-    if (!names) return NULL;
-
-    for (;;) {
-        struct timespec ts = { interval_ms / 1000,
-                               (long)(interval_ms % 1000) * 1000000 };
-        nanosleep(&ts, NULL);
-
-        int nflush = 0;
-        pthread_mutex_lock(&db->lock);
-        for (int i = 0; i < db->ntables; i++) {
-            tsdb_table_internal_t *t = db->tables[i];
-            if (!t || !t->memtable) continue;
-            size_t r = tsdb_memtable_rows_relaxed(t->memtable);
-            if (r > 0 && r == t->idle_prev_rows && nflush < TSDB_DB_MAX_TABLES)
-                snprintf(names[nflush++], 64, "%s", t->name);
-            t->idle_prev_rows = r;
-        }
-        pthread_mutex_unlock(&db->lock);
-
-        for (int i = 0; i < nflush; i++) {
-            tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, names[i]);
-            if (!t) continue;                       /* dropped since snapshot */
-            tsdb_table_lock_write((tsdb_table_t *)t);
-            if (t->memtable && tsdb_memtable_rows(t->memtable) > 0)
-                (void)flush_and_clear_ex(t, 0);     /* skip_replicate=0 → replicate */
-            tsdb_table_unlock_write((tsdb_table_t *)t);
-            tsdb_db_scan_release(db, t);
-        }
-    }
-    free(names);   /* not reached — loop is infinite */
-    return NULL;
 }
 
 /*
