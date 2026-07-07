@@ -87,6 +87,26 @@ typedef struct tsdb_table_internal {
      *               nrows) into the next redo record. */
     uint64_t             commit_seq;
     size_t               mem_logged;
+    /* idle-flush (tsdb_idle_flush_thread) state — touched only by that thread
+     * under db->lock, except mem_has_local which the write path also sets.
+     *  idle_prev_rows : memtable row count at the previous idle tick; a table
+     *               whose count is unchanged (and non-zero) has gone quiet.
+     *  mem_has_local : the memtable holds locally-INGESTED rows (a client write
+     *               with local_only=0) that have NOT yet been flushed/replicated
+     *               to the shard owners.  Set on a local append, cleared on
+     *               every flush.  The idle-flush replicates ONLY such tables —
+     *               a memtable holding purely RECEIVED (replicated, local_only=1)
+     *               rows must never be re-flushed-with-replicate, or two replica
+     *               owners bounce the same rows back and forth forever. */
+    size_t               idle_prev_rows;
+    int                  mem_has_local;
+    /* mem_has_received : the memtable has absorbed REPLICATED (local_only=1)
+     * rows since its last flush.  The idle-flush refuses to flush-with-replicate
+     * such a memtable even when it also holds local rows (a node that both
+     * ingests and owns a table): re-sending the received portion to the other
+     * replica would duplicate it (the memtable has no ts-dedup).  The local tail
+     * stays visible + WAL-durable locally and drains via the size path. */
+    int                  mem_has_received;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -1851,6 +1871,8 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         tsdb_memtable_clear(t->memtable);
         if (t->wal) tsdb_wal_truncate(t->wal);
         t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
+        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
+        t->mem_has_received = 0;
         tsdb_metric_inc("qengine_shard_local_skipped_total");
         return TSDB_OK;
     }
@@ -1875,6 +1897,8 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
         tsdb_memtable_clear(t->memtable);
         t->mem_logged = 0;        /* memtable drained: nothing logged yet */
+        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
+        t->mem_has_received = 0;
         /* Truncate WAL after the partition (with its checkpoint) is durably
          * published.  Correctness does NOT depend on this — the seq>checkpoint
          * skip dedups even if truncate is skipped — it only bounds WAL size. */
@@ -1912,6 +1936,74 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     return rc;
 }
 
+/* Idle-flush maintenance thread.  The size path only flushes a memtable when it
+ * fills a block (block_points rows), so the last <block_points rows of a table
+ * that stops being written sit unflushed in the INGESTING node's memtable —
+ * WAL-durable locally but NOT replicated (on_replicate fires on flush) and NOT
+ * visible from other nodes (a non-owner ingester keeps nothing on disk).  This
+ * thread drains that tail so it reaches the shard owners and becomes
+ * cluster-visible + durable.
+ *
+ * It flushes a table only when ALL of:
+ *   - the memtable is non-empty and its row count is UNCHANGED since the last
+ *     tick (writes have paused — a still-growing hot table flushes via the size
+ *     path and is left alone, so steady-state write throughput is unchanged), and
+ *   - mem_has_local is set: the memtable holds locally-ingested, not-yet-
+ *     replicated rows.  A memtable of purely RECEIVED (replicated) rows is NEVER
+ *     flushed-with-replicate here — otherwise two replica owners would bounce
+ *     the same rows back and forth every tick (the bug the first attempt hit).
+ * The flush runs under the table write lock (batch_mu) exactly like the size
+ * path and scan_acquire pins the table so a concurrent DROP can't free it.
+ * Env: TSDB_IDLE_FLUSH=0 disables it; TSDB_IDLE_FLUSH_MS overrides the 2s tick. */
+void *tsdb_idle_flush_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return NULL;
+    const char *off = getenv("TSDB_IDLE_FLUSH");
+    if (off && atoi(off) == 0) return NULL;
+    int interval_ms = 2000;
+    const char *ev = getenv("TSDB_IDLE_FLUSH_MS");
+    if (ev && atoi(ev) > 0) interval_ms = atoi(ev);
+
+    /* Names to flush this tick — heap-allocated once to avoid a 1 MB stack. */
+    char (*names)[64] = malloc((size_t)TSDB_DB_MAX_TABLES * 64);
+    if (!names) return NULL;
+
+    for (;;) {
+        struct timespec ts = { interval_ms / 1000,
+                               (long)(interval_ms % 1000) * 1000000 };
+        nanosleep(&ts, NULL);
+
+        int nflush = 0;
+        pthread_mutex_lock(&db->lock);
+        for (int i = 0; i < db->ntables; i++) {
+            tsdb_table_internal_t *t = db->tables[i];
+            if (!t || !t->memtable) continue;
+            size_t r = tsdb_memtable_rows_relaxed(t->memtable);
+            if (r > 0 && r == t->idle_prev_rows && t->mem_has_local &&
+                !t->mem_has_received && nflush < TSDB_DB_MAX_TABLES)
+                snprintf(names[nflush++], 64, "%s", t->name);
+            t->idle_prev_rows = r;
+        }
+        pthread_mutex_unlock(&db->lock);
+
+        for (int i = 0; i < nflush; i++) {
+            tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, names[i]);
+            if (!t) continue;                       /* dropped since snapshot */
+            tsdb_table_lock_write((tsdb_table_t *)t);
+            /* Re-check under the write lock: mem_has_local may have cleared (a
+             * size-flush drained it) or fresh rows arrived — only replicate a
+             * still-local, still-non-empty tail. */
+            if (t->memtable && t->mem_has_local && !t->mem_has_received &&
+                tsdb_memtable_rows(t->memtable) > 0)
+                (void)flush_and_clear_ex(t, 0);     /* skip_replicate=0 → replicate */
+            tsdb_table_unlock_write((tsdb_table_t *)t);
+            tsdb_db_scan_release(db, t);
+        }
+    }
+    free(names);   /* not reached — loop is infinite */
+    return NULL;
+}
+
 /*
  * Auto-flush if memtable is full. Called before row_begin.
  * skip_replicate mirrors the batch's local_only flag.
@@ -1945,6 +2037,11 @@ int tsdb_batch_row_ts(tsdb_batch_t *b, tsdb_ts_t ts) {
         rc = tsdb_memtable_row_begin(t->memtable);
         if (rc != TSDB_OK) return rc;
         b->in_row = 1;
+        /* Record memtable-content provenance for the idle-flush: locally
+         * ingested (replicate the tail) vs received (never re-replicate).  Set
+         * AFTER maybe_flush_b, which clears both on a size-flush. */
+        if (b->local_only) t->mem_has_received = 1;
+        else               t->mem_has_local    = 1;
     }
     return tsdb_memtable_row_ts(t->memtable, ts);
 }
