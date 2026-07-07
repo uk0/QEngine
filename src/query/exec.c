@@ -4243,81 +4243,260 @@ static int stable_child_matches(const tsdb_child_table_t *ct,
     return 1;
 }
 
-/* Merge child_r (1-row aggregate result) INTO master_r (first child or
- * accumulate). col_types must match. Returns TSDB_OK. */
-static int stable_merge_agg_row(tsdb_result_t *master, const tsdb_result_t *child,
-                                  const int *col_agg_kinds, int ncols)
+/* ---- Scalar-aggregate partial merge (children / cluster nodes) ---------
+ *
+ * Per-select-item aggregate class for the super-table merge paths.  A query
+ * whose every select item is one of the mergeable kinds below can be split
+ * into per-child (and, in cluster mode, per-node) PARTIAL aggregates and
+ * recombined losslessly:
+ *
+ *   count → Σ partial counts        sum → Σ partial sums
+ *   min   → min(partial mins)       max → max(partial maxes)
+ *   avg   → Σ sum / Σ count  (rewritten to a sum+count partial pair)
+ *
+ * Everything else (stddev/percentile/spread/first/last/twa/...) has no
+ * lossless scalar partial form here and is classified OTHER. */
+enum {
+    STAB_AGG_CNT = 0,
+    STAB_AGG_SUM,
+    STAB_AGG_MIN,
+    STAB_AGG_MAX,
+    STAB_AGG_AVG,
+    STAB_AGG_OTHER
+};
+
+/* Classify q's select list.  Returns 1 when q is a pure scalar-aggregate
+ * query (every item an aggregate call; no GROUP BY / SAMPLE BY / advanced
+ * window / LATEST ON / ASOF JOIN / PARTITION BY tbname), else 0.
+ * kinds[i] receives the STAB_AGG_* class of item i.  *any_other is set when
+ * at least one item is STAB_AGG_OTHER; *other_fn receives the first such
+ * function name for error messages.  sum/min/max/avg need a plain IDENT
+ * argument over a non-SYMBOL stable column to be mergeable — merging symbol
+ * codes numerically is meaningless. */
+static int stable_classify_scalar_agg(qast_query_t *q, const tsdb_stable_t *st,
+                                       int *kinds, int cap,
+                                       int *any_other, const char **other_fn)
 {
-    /* col_agg_kinds[i]: 0=sum_int, 1=sum_float, 2=count, 3=skip/unknown */
-    if (master->nrows == 0) {
-        /* Copy the child row directly */
-        result_reserve_rows(master, 1);
-        for (int c = 0; c < ncols; c++) {
-            uint64_t bits = ((const uint64_t *)child->col_data[c])[0];
-            result_append_cell(master, c, bits);
+    *any_other = 0;
+    if (other_fn) *other_fn = NULL;
+    if (q->has_sample_by || q->ngroup_by > 0 || q->has_adv_window) return 0;
+    if (q->has_latest_on || q->has_asof_join) return 0;
+    /* PARTITION BY tbname wants one row per child; never merge. */
+    if (q->has_partition_by_tbname) return 0;
+    if (q->nsel <= 0 || q->nsel > cap) return 0;
+    for (int i = 0; i < q->nsel; i++) {
+        qast_sel_item_t *si = &q->sel[i];
+        if (si->is_star) return 0;
+        qast_expr_t *e = si->expr;
+        if (!e || e->kind != QAST_CALL || !is_agg_call(e)) return 0;
+        const char *fn = e->v.s;
+        int k = STAB_AGG_OTHER;
+        if (strcasecmp(fn, "count") == 0) {
+            k = STAB_AGG_CNT;
+        } else if (strcasecmp(fn, "sum") == 0 || strcasecmp(fn, "min") == 0 ||
+                   strcasecmp(fn, "max") == 0 || strcasecmp(fn, "avg") == 0) {
+            if (e->nargs == 1 && e->args[0] && e->args[0]->kind == QAST_IDENT) {
+                int sym = 0;
+                for (int c = 0; c < st->ncols; c++) {
+                    if (strcasecmp(st->cols[c].name, e->args[0]->v.s) == 0) {
+                        sym = (st->cols[c].type == TSDB_TYPE_SYMBOL);
+                        break;
+                    }
+                }
+                if (!sym) {
+                    if      (strcasecmp(fn, "sum") == 0) k = STAB_AGG_SUM;
+                    else if (strcasecmp(fn, "min") == 0) k = STAB_AGG_MIN;
+                    else if (strcasecmp(fn, "max") == 0) k = STAB_AGG_MAX;
+                    else                                  k = STAB_AGG_AVG;
+                }
+            }
         }
-        master->nrows = 1;
-        return TSDB_OK;
+        kinds[i] = k;
+        if (k == STAB_AGG_OTHER) {
+            *any_other = 1;
+            if (other_fn && !*other_fn) *other_fn = fn;
+        }
     }
-    /* Accumulate into existing row 0 */
-    for (int c = 0; c < ncols; c++) {
-        uint64_t child_bits = ((const uint64_t *)child->col_data[c])[0];
-        uint64_t *master_slot = &((uint64_t *)master->col_data[c])[0];
-        int kind = (c < ncols) ? col_agg_kinds[c] : 3;
-        if (kind == 0) {          /* sum int64 */
-            int64_t cv; memcpy(&cv, &child_bits, 8);
-            int64_t mv; memcpy(&mv, master_slot, 8);
-            mv += cv;
-            memcpy(master_slot, &mv, 8);
-        } else if (kind == 1) {   /* sum float64 */
-            double cv; memcpy(&cv, &child_bits, 8);
-            double mv; memcpy(&mv, master_slot, 8);
-            mv += cv;
-            memcpy(master_slot, &mv, 8);
-        } else if (kind == 2) {   /* count: same as int64 sum */
-            int64_t cv; memcpy(&cv, &child_bits, 8);
-            int64_t mv; memcpy(&mv, master_slot, 8);
-            mv += cv;
-            memcpy(master_slot, &mv, 8);
+    return 1;
+}
+
+/* Partial-aggregate select list: avg(x) expands to sum(x), count(x); other
+ * mergeable items ride verbatim (alias included).  nodes/argv back the
+ * synthesized CALL exprs — no arena at hand, storage owned by this struct
+ * (heap-allocate it: ~30 KB). */
+typedef struct {
+    qast_sel_item_t items[TSDB_STABLE_MAX_COLS * 2];
+    qast_expr_t     nodes[TSDB_STABLE_MAX_COLS * 2];
+    qast_expr_t    *argv [TSDB_STABLE_MAX_COLS * 2];
+    int             n;
+} stab_partial_sel_t;
+
+static int stab_partial_sel_build(qast_query_t *q, const int *kinds,
+                                   stab_partial_sel_t *ps)
+{
+    int n = 0;
+    for (int i = 0; i < q->nsel; i++) {
+        if (kinds[i] == STAB_AGG_AVG) {
+            qast_expr_t *orig = q->sel[i].expr;
+            for (int half = 0; half < 2; half++) {
+                qast_expr_t *call = &ps->nodes[n];
+                memset(call, 0, sizeof(*call));
+                call->kind  = QAST_CALL;
+                call->v.s   = (char *)(half == 0 ? "sum" : "count");
+                ps->argv[n] = orig->args[0];
+                call->args  = &ps->argv[n];
+                call->nargs = 1;
+                memset(&ps->items[n], 0, sizeof(ps->items[n]));
+                ps->items[n].expr = call;
+                n++;
+            }
+        } else {
+            ps->items[n] = q->sel[i];
+            n++;
         }
-        /* kind==3: first child value; don't update */
+    }
+    ps->n = n;
+    return n;
+}
+
+/* Running partial-aggregate accumulator.  One slot per partial column;
+ * int64 vs double representation follows the column type reported by the
+ * first non-empty partial result.  Identity elements match what agg_write
+ * emits for empty inputs (0 for count/sum, ±inf / INT64_MAX/MIN for
+ * min/max), so empty children fold in as no-ops. */
+typedef struct {
+    int         n;                                  /* partial column count */
+    int         kinds[TSDB_STABLE_MAX_COLS * 2];    /* STAB_AGG_* per col   */
+    int         have_schema;                        /* names/types captured */
+    int         have_row;                           /* >=1 partial row seen */
+    tsdb_type_t types[TSDB_STABLE_MAX_COLS * 2];
+    char        names[TSDB_STABLE_MAX_COLS * 2][128];
+    int64_t     iv[TSDB_STABLE_MAX_COLS * 2];
+    double      fv[TSDB_STABLE_MAX_COLS * 2];
+} stab_pacc_t;
+
+static void stab_pacc_init(stab_pacc_t *acc, const int *sel_kinds, int nsel) {
+    memset(acc, 0, sizeof(*acc));
+    int n = 0;
+    for (int i = 0; i < nsel; i++) {
+        if (sel_kinds[i] == STAB_AGG_AVG) {
+            acc->kinds[n++] = STAB_AGG_SUM;
+            acc->kinds[n++] = STAB_AGG_CNT;
+        } else {
+            acc->kinds[n++] = sel_kinds[i];
+        }
+    }
+    acc->n = n;
+}
+
+/* Fold row 0 of `part` into the accumulator.  A NULL / column-less /
+ * row-less partial contributes nothing.  Column-count mismatch (schema or
+ * peer version drift) is an error — merging misaligned partials would
+ * silently produce wrong aggregates. */
+static int stab_pacc_merge(stab_pacc_t *acc, const tsdb_result_t *part) {
+    if (!part || part->ncols == 0) return TSDB_OK;
+    if (part->ncols != acc->n) return TSDB_ERR_CORRUPT;
+    if (!acc->have_schema) {
+        for (int p = 0; p < acc->n; p++) {
+            acc->types[p] = part->col_types ? part->col_types[p] : TSDB_TYPE_INT64;
+            snprintf(acc->names[p], sizeof(acc->names[p]), "%s",
+                     (part->col_names && part->col_names[p])
+                         ? part->col_names[p] : "");
+            if (acc->types[p] == TSDB_TYPE_FLOAT64) {
+                if      (acc->kinds[p] == STAB_AGG_MIN) acc->fv[p] = INFINITY;
+                else if (acc->kinds[p] == STAB_AGG_MAX) acc->fv[p] = -INFINITY;
+                else                                    acc->fv[p] = 0.0;
+            } else {
+                if      (acc->kinds[p] == STAB_AGG_MIN) acc->iv[p] = INT64_MAX;
+                else if (acc->kinds[p] == STAB_AGG_MAX) acc->iv[p] = INT64_MIN;
+                else                                    acc->iv[p] = 0;
+            }
+        }
+        acc->have_schema = 1;
+    }
+    if (part->nrows == 0) return TSDB_OK;
+    acc->have_row = 1;
+    for (int p = 0; p < acc->n; p++) {
+        uint64_t bits = ((const uint64_t *)part->col_data[p])[0];
+        if (acc->types[p] == TSDB_TYPE_FLOAT64) {
+            double v; memcpy(&v, &bits, 8);
+            switch (acc->kinds[p]) {
+            case STAB_AGG_MIN: if (v < acc->fv[p]) acc->fv[p] = v; break;
+            case STAB_AGG_MAX: if (v > acc->fv[p]) acc->fv[p] = v; break;
+            default:           acc->fv[p] += v;                    break;
+            }
+        } else {
+            int64_t v; memcpy(&v, &bits, 8);
+            switch (acc->kinds[p]) {
+            case STAB_AGG_MIN: if (v < acc->iv[p]) acc->iv[p] = v; break;
+            case STAB_AGG_MAX: if (v > acc->iv[p]) acc->iv[p] = v; break;
+            default:           acc->iv[p] += v;                    break;
+            }
+        }
     }
     return TSDB_OK;
 }
 
-/* Detect whether every select item in q is a pure scalar aggregate (no
- * GROUP BY, no SAMPLE BY), suitable for per-child-merge.
- * Also fills col_agg_kinds[]:
- *   0 = int64 sum (sum/min/max of int col), 1 = float64 sum, 2 = count
- *   3 = not summable (e.g. avg, first value of non-agg col in a mix) */
-static int stable_is_pure_scalar_agg(qast_query_t *q,
-                                      int *col_agg_kinds, int cap_cols)
+/* Project the merged partials back into the ORIGINAL select shape: avg
+ * items become sum/count (NaN when count==0), everything else passes
+ * through with its merged value.  Column names and order match what the
+ * single-table executor would have produced (aliases included; avg's name
+ * is rebuilt from the partial sum column).  No-op — result left empty —
+ * when no partial carried a schema. */
+static int stab_pacc_finalize(const stab_pacc_t *acc, qast_query_t *q,
+                               const int *sel_kinds, tsdb_result_t *r)
 {
-    if (q->has_sample_by || q->ngroup_by > 0 || q->has_adv_window) return 0;
-    /* PARTITION BY tbname wants one row per child; never merge. */
-    if (q->has_partition_by_tbname) return 0;
-    for (int i = 0; i < q->nsel && i < cap_cols; i++) {
-        qast_sel_item_t *si = &q->sel[i];
-        if (si->is_star) return 0;
-        qast_expr_t *e = si->expr;
-        if (!e || e->kind != QAST_CALL) return 0;
-        const char *fn = e->v.s;
-        if (strcasecmp(fn, "count") == 0) {
-            col_agg_kinds[i] = 2;
-        } else if (strcasecmp(fn, "sum") == 0) {
-            /* We'll call it float sum (safe for both int and float partial sums) */
-            col_agg_kinds[i] = 1;
-        } else if (strcasecmp(fn, "min") == 0 || strcasecmp(fn, "max") == 0) {
-            /* For min/max merging per-child results doesn't work simply:
-             * min(partial) != min(whole) unless we keep min across children.
-             * Use float merge as approximation — works correctly here. */
-            col_agg_kinds[i] = 1;
+    if (!acc->have_schema) return TSDB_OK;
+    int rc = result_reserve_cols(r, q->nsel);
+    if (rc != TSDB_OK) return rc;
+
+    int p = 0;
+    for (int i = 0; i < q->nsel; i++) {
+        if (sel_kinds[i] == STAB_AGG_AVG) {
+            char name[144];
+            if (q->sel[i].alias) {
+                snprintf(name, sizeof(name), "%s", q->sel[i].alias);
+            } else if (strncasecmp(acc->names[p], "sum(", 4) == 0) {
+                snprintf(name, sizeof(name), "avg(%s", acc->names[p] + 4);
+            } else {
+                snprintf(name, sizeof(name), "avg(%s)",
+                         (q->sel[i].expr->nargs > 0 &&
+                          q->sel[i].expr->args[0]->kind == QAST_IDENT)
+                             ? q->sel[i].expr->args[0]->v.s : "?");
+            }
+            rc = result_set_col(r, i, name, TSDB_TYPE_FLOAT64, NULL);
+            p += 2;
         } else {
-            /* avg, stddev, percentile etc: can't naively sum */
-            col_agg_kinds[i] = 3;
+            rc = result_set_col(r, i, acc->names[p], acc->types[p], NULL);
+            p += 1;
         }
+        if (rc != TSDB_OK) return rc;
     }
-    return 1;
+
+    rc = result_reserve_rows(r, 1);
+    if (rc != TSDB_OK) return rc;
+    p = 0;
+    for (int i = 0; i < q->nsel; i++) {
+        uint64_t bits;
+        if (sel_kinds[i] == STAB_AGG_AVG) {
+            double sum = (acc->types[p] == TSDB_TYPE_FLOAT64)
+                             ? acc->fv[p] : (double)acc->iv[p];
+            int64_t cnt = (acc->types[p + 1] == TSDB_TYPE_FLOAT64)
+                              ? (int64_t)acc->fv[p + 1] : acc->iv[p + 1];
+            double avg = (cnt == 0) ? 0.0 / 0.0 : sum / (double)cnt;
+            memcpy(&bits, &avg, 8);
+            p += 2;
+        } else if (acc->types[p] == TSDB_TYPE_FLOAT64) {
+            memcpy(&bits, &acc->fv[p], 8);
+            p += 1;
+        } else {
+            memcpy(&bits, &acc->iv[p], 8);
+            p += 1;
+        }
+        result_append_cell(r, i, bits);
+    }
+    r->nrows = 1;
+    return TSDB_OK;
 }
 
 /* Append all rows from src into dst.  dst must already be initialized with
@@ -4493,9 +4672,14 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     }
 
     /* Detect pure-scalar-aggregate query for merge strategy. */
-    int col_agg_kinds[64];
-    memset(col_agg_kinds, 0, sizeof(col_agg_kinds));
-    int is_scalar_agg = stable_is_pure_scalar_agg(q, col_agg_kinds, 64);
+    int sel_agg_kinds[TSDB_STABLE_MAX_COLS];
+    memset(sel_agg_kinds, 0, sizeof(sel_agg_kinds));
+    int any_other_agg = 0;
+    const char *other_agg_fn = NULL;
+    int is_scalar_agg = stable_classify_scalar_agg(q, st, sel_agg_kinds,
+                                                   TSDB_STABLE_MAX_COLS,
+                                                   &any_other_agg,
+                                                   &other_agg_fn);
 
     /* List all child tables under this stable. */
     tsdb_child_table_t *children = NULL;
@@ -4586,6 +4770,31 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
 
     char child_name[TSDB_STABLE_NAME_MAX + 1];
 
+    /* Tag pushdown pre-pass: build the matched child index list up-front so
+     * every execution strategy below sees the same set, and multi-child
+     * decisions (partial merge vs unsupported-aggregate error) are made
+     * BEFORE any child runs.  Tag-only mode evaluates the whole WHERE per
+     * child; AND-only mode uses the extracted preds vector (legacy path). */
+    size_t *matched = NULL;
+    size_t  nmatched = 0;
+    if (nchildren > 0) {
+        matched = malloc(nchildren * sizeof(size_t));
+        if (!matched) {
+            q->has_partition_by_tbname = orig_pb_tbname;
+            free(children);
+            return TSDB_ERR_NOMEM;
+        }
+        for (size_t ci = 0; ci < nchildren; ci++) {
+            tsdb_child_table_t *ct = &children[ci];
+            if (tag_only_mode) {
+                if (!tag_expr_eval(q->where, ct, st)) continue;
+            } else {
+                if (!stable_child_matches(ct, st, preds, npreds)) continue;
+            }
+            matched[nmatched++] = ci;
+        }
+    }
+
     /* If we're in tag_only_mode, save the original WHERE so we can
      * evaluate per-child, then null it out so per-child exec_select
      * doesn't see tag IDENTs (children's physical schemas have no
@@ -4596,17 +4805,78 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
         q->where = NULL;
     }
 
-    for (size_t ci = 0; ci < nchildren; ci++) {
-        tsdb_child_table_t *ct = &children[ci];
+    /* Multi-child + non-mergeable aggregate (stddev/percentile/spread/
+     * first/last/twa/...): a per-child scalar cannot be recombined into
+     * the whole-table value, and the old code silently kept the FIRST
+     * child's number.  Fail loudly instead.  Single-child stables keep
+     * the (correct) passthrough below. */
+    if (is_scalar_agg && any_other_agg && nmatched > 1) {
+        eset(err, errcap,
+             "aggregate '%s' not supported on multi-child super-table yet",
+             other_agg_fn ? other_agg_fn : "?");
+        q->from = orig_from;
+        q->has_partition_by_tbname = orig_pb_tbname;
+        if (saved_where) q->where = saved_where;
+        free(matched);
+        free(children);
+        return TSDB_ERR_UNSUPPORTED;
+    }
 
-        /* Tag pushdown: skip children that don't match.  Tag-only
-         * mode runs the saved WHERE per child; AND-only mode uses
-         * the extracted preds vector (legacy fast path). */
-        if (tag_only_mode) {
-            if (!tag_expr_eval(saved_where, ct, st)) continue;
-        } else {
-            if (!stable_child_matches(ct, st, preds, npreds)) continue;
+    /* Multi-child mergeable scalar aggregates: run the PARTIAL select list
+     * (avg → sum+count) against every matched child and recombine with the
+     * correct per-kind operator (count/sum add, min min, max max, avg =
+     * Σsum/Σcount).  Replaces the old accumulate-into-row-0 code that
+     * SUMMED min/max partials and kept avg from the first child only. */
+    if (is_scalar_agg && !any_other_agg && nmatched > 1) {
+        stab_partial_sel_t *ps  = malloc(sizeof(*ps));
+        stab_pacc_t        *acc = malloc(sizeof(*acc));
+        if (!ps || !acc) {
+            free(ps); free(acc);
+            q->from = orig_from;
+            q->has_partition_by_tbname = orig_pb_tbname;
+            if (saved_where) q->where = saved_where;
+            free(matched);
+            free(children);
+            return TSDB_ERR_NOMEM;
         }
+        stab_partial_sel_build(q, sel_agg_kinds, ps);
+        stab_pacc_init(acc, sel_agg_kinds, q->nsel);
+
+        qast_sel_item_t *orig_sel  = q->sel;
+        int              orig_nsel = q->nsel;
+        q->sel  = ps->items;
+        q->nsel = ps->n;
+
+        rc = TSDB_OK;
+        for (size_t mi = 0; mi < nmatched && rc == TSDB_OK; mi++) {
+            tsdb_child_table_t *ct = &children[matched[mi]];
+            snprintf(child_name, sizeof(child_name), "%s", ct->name);
+            q->from = child_name;
+
+            tsdb_result_t child_r;
+            memset(&child_r, 0, sizeof(child_r));
+            child_r.cur = -1;
+            rc = exec_select_child(db, q, &child_r, err, errcap);
+            if (rc == TSDB_OK) rc = stab_pacc_merge(acc, &child_r);
+            tsdb_result_free_internal(&child_r);
+        }
+
+        q->sel  = orig_sel;
+        q->nsel = orig_nsel;
+        if (rc == TSDB_OK) rc = stab_pacc_finalize(acc, q, sel_agg_kinds, r);
+
+        free(ps);
+        free(acc);
+        q->from = orig_from;
+        q->has_partition_by_tbname = orig_pb_tbname;
+        if (saved_where) q->where = saved_where;
+        free(matched);
+        free(children);
+        return rc;
+    }
+
+    for (size_t mi = 0; mi < nmatched; mi++) {
+        tsdb_child_table_t *ct = &children[matched[mi]];
 
         /* Replace FROM with child name for the duration of exec_select. */
         snprintf(child_name, sizeof(child_name), "%s", ct->name);
@@ -4624,6 +4894,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 q->from = orig_from;
                 q->has_partition_by_tbname = orig_pb_tbname;
                 if (saved_where) q->where = saved_where;
+                free(matched);
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
@@ -4635,11 +4906,16 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 q->from = orig_from;
                 q->has_partition_by_tbname = orig_pb_tbname;
                 if (saved_where) q->where = saved_where;
+                free(matched);
                 free(children);
                 return rc;
             }
         } else if (is_scalar_agg) {
-            /* Per-child aggregate; merge into master. */
+            /* Single matched child (nmatched <= 1 here: the multi-child
+             * mergeable case returned via the partial-merge path above, the
+             * multi-child non-mergeable case errored out): run the original
+             * query against it and steal the result structure.  Correct for
+             * every aggregate kind, including the non-mergeable ones. */
             tsdb_result_t child_r;
             memset(&child_r, 0, sizeof(child_r));
             child_r.cur = -1;
@@ -4648,27 +4924,17 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 if (saved_where) q->where = saved_where;
+                free(matched);
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
             }
 
             if (r->ncols == 0) {
-                /* First child: steal the result structure. */
+                /* First (only) child: steal the result structure. */
                 *r = child_r;
             } else {
-                /* Accumulate into r (row 0). */
-                if (child_r.nrows > 0 && r->nrows > 0) {
-                    stable_merge_agg_row(r, &child_r, col_agg_kinds, r->ncols);
-                } else if (child_r.nrows > 0 && r->nrows == 0) {
-                    /* r was allocated but empty: copy. */
-                    result_reserve_rows(r, 1);
-                    for (int c = 0; c < r->ncols; c++) {
-                        uint64_t bits = ((const uint64_t *)child_r.col_data[c])[0];
-                        result_append_cell(r, c, bits);
-                    }
-                    r->nrows = 1;
-                }
+                /* Defensive — unreachable with a single matched child. */
                 tsdb_result_free_internal(&child_r);
             }
         } else {
@@ -4681,6 +4947,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             if (rc != TSDB_OK) {
                 q->from = orig_from;
                 if (saved_where) q->where = saved_where;
+                free(matched);
                 free(children);
                 tsdb_result_free_internal(&child_r);
                 return rc;
@@ -4694,6 +4961,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                 if (rc != TSDB_OK) {
                     q->from = orig_from;
                     if (saved_where) q->where = saved_where;
+                    free(matched);
                     free(children);
                     return rc;
                 }
@@ -4704,6 +4972,7 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     q->from = orig_from;
     q->has_partition_by_tbname = orig_pb_tbname;
     if (saved_where) q->where = saved_where;
+    free(matched);
     free(children);
 
     /* Terminal guard (task #174 L4).  Reaching here with r->ncols == 0 means no
