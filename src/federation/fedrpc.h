@@ -51,6 +51,18 @@ int fedrpc_query(tsdb_rpc_conn_t *conn,
                  tsdb_result_t **out);
 
 /*
+ * FED_QUERY_LOCAL variant: the peer executes the QTL in scatter-local
+ * mode (no re-scatter; super-table reads cover only the children whose
+ * primary alive owner is the peer).  Unlike fedrpc_query, timeout_ms is
+ * enforced as a hard per-call socket deadline — the coordinator must
+ * never park behind a wedged peer.
+ */
+int fedrpc_query_local(tsdb_rpc_conn_t *conn,
+                       const char *qtl,
+                       int timeout_ms,
+                       tsdb_result_t **out);
+
+/*
  * Encode a federation query result into buf.
  * Returns bytes written or -1 if buffer too small.
  */

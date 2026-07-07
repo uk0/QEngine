@@ -92,7 +92,17 @@ typedef enum {
                                          /sql proxy, which could not pass the
                                          dashboard auth gate (session cookies
                                          are node-local).  Payload format is
-                                         the same as APPLY_CATALOG_QTL. */
+                                         the same as APPLY_CATALOG_QTL. */,
+    TSDB_RPC_FED_QUERY_LOCAL    = 22  /* FED_QUERY variant executed in
+                                         scatter-local mode: the handler sets
+                                         tsdb_g_scatter_local_mode around
+                                         tsdb_query so a super-table read (a)
+                                         never re-scatters and (b) covers only
+                                         the children whose primary alive
+                                         hashring owner is the receiving node.
+                                         Used by the cluster-wide stable
+                                         aggregation coordinator; wire format
+                                         identical to FED_QUERY. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */

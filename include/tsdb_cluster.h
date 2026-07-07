@@ -177,6 +177,40 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
                                        const char *qtl,
                                        tsdb_result_t **out);
 
+/* ---- Cluster-wide super-table aggregation (task #175) -----------------
+ *
+ * Scatter-local mode flag.  Defined in query/exec.c; set by the
+ * FED_QUERY_LOCAL RPC handler (and around the coordinator's own local
+ * partial leg).  While non-zero:
+ *   - exec_stable_select never starts a new scatter (anti-recursion),
+ *   - the per-child expansion covers only children whose primary ALIVE
+ *     hashring owner is this node (all children when standalone),
+ *   - tsdb_cluster_maybe_forward_select is inert (a scattered partial
+ *     must read local data, never bounce to another node). */
+extern __thread int tsdb_g_scatter_local_mode;
+
+/* Scatter-read child assignment: 1 when `child_name`'s primary alive
+ * hashring owner is this node — walks tsdb_cluster_route() preference
+ * order (TSDB_SHARD_REPLICA_N entries when sharding, every node
+ * otherwise), skips non-ALIVE peers, compares the first alive owner
+ * against self.  1 in standalone mode or when routing fails (fall back
+ * to reading locally rather than dropping a child everywhere). */
+int tsdb_cluster_child_assigned_to_self(tsdb_db_t *db, const char *child_name);
+
+/* Coordinator fan-out: send `qtl` via FED_QUERY_LOCAL to every ALIVE peer
+ * sequentially (timeout_ms per peer), collecting one decoded partial
+ * result per peer into results[0..*out_n).  Returns TSDB_OK when every
+ * alive peer answered.  On any peer failure returns TSDB_ERR_IO with
+ * *out_failed_peer set and every already-collected result freed — a
+ * missing partial would silently under-count the aggregate, so the
+ * caller must surface the failure instead of merging what remains. */
+int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
+                                     const char *qtl,
+                                     int timeout_ms,
+                                     tsdb_result_t **results, int cap,
+                                     int *out_n,
+                                     uint64_t *out_failed_peer);
+
 /* Bridges into the cluster layer for modules that live above it
  * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each
  * returns NULL / 0 if the db is in standalone mode. */

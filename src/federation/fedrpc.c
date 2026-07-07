@@ -130,8 +130,14 @@ int fedrpc_decode_result(const uint8_t *buf, uint32_t len, tsdb_result_t **out) 
 
 /* ---- Send query, receive encoded result ---------------------------------- */
 
-int fedrpc_query(tsdb_rpc_conn_t *conn, const char *qtl,
-                 int timeout_ms, tsdb_result_t **out)
+/* Shared core for FED_QUERY / FED_QUERY_LOCAL: identical payload and
+ * result wire format, only the RPC type (and timeout enforcement)
+ * differs.  hard_timeout != 0 arms a per-call socket deadline via
+ * tsdb_rpc_call_recv_to; 0 keeps the historical blocking behaviour of
+ * fedrpc_query (its timeout_ms was never wired to the socket). */
+static int fedrpc_query_type(tsdb_rpc_conn_t *conn, int rpc_type,
+                             const char *qtl, int timeout_ms,
+                             int hard_timeout, tsdb_result_t **out)
 {
     if (!conn || !qtl || !out) return TSDB_ERR_INVAL;
     if (timeout_ms <= 0) timeout_ms = FED_DEFAULT_TIMEOUT_MS;
@@ -153,11 +159,15 @@ int fedrpc_query(tsdb_rpc_conn_t *conn, const char *qtl,
     if (!resp) { free(payload); return TSDB_ERR_NOMEM; }
 
     uint32_t resp_len = 0;
-    int rc = tsdb_rpc_call_recv(conn,
-                                TSDB_RPC_FED_QUERY,
+    int rc = hard_timeout
+        ? tsdb_rpc_call_recv_to(conn, (tsdb_rpc_type_t)rpc_type,
                                 payload, (uint32_t)payload_len,
                                 resp, (uint32_t)FED_MAX_RESULT_BUF,
-                                &resp_len);
+                                &resp_len, timeout_ms)
+        : tsdb_rpc_call_recv(conn, (tsdb_rpc_type_t)rpc_type,
+                             payload, (uint32_t)payload_len,
+                             resp, (uint32_t)FED_MAX_RESULT_BUF,
+                             &resp_len);
     free(payload);
 
     if (rc != TSDB_OK) {
@@ -169,4 +179,18 @@ int fedrpc_query(tsdb_rpc_conn_t *conn, const char *qtl,
     rc = fedrpc_decode_result(resp, resp_len, out);
     free(resp);
     return rc;
+}
+
+int fedrpc_query(tsdb_rpc_conn_t *conn, const char *qtl,
+                 int timeout_ms, tsdb_result_t **out)
+{
+    return fedrpc_query_type(conn, TSDB_RPC_FED_QUERY, qtl, timeout_ms,
+                             0 /* keep historical blocking semantics */, out);
+}
+
+int fedrpc_query_local(tsdb_rpc_conn_t *conn, const char *qtl,
+                       int timeout_ms, tsdb_result_t **out)
+{
+    return fedrpc_query_type(conn, TSDB_RPC_FED_QUERY_LOCAL, qtl, timeout_ms,
+                             1 /* scatter leg: bounded wait */, out);
 }

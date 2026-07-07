@@ -1259,6 +1259,11 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
     /* Re-entry guard: a forwarded query landing here would loop. */
     if (tsdb_g_inside_shard_forward) return TSDB_OK;
 
+    /* Scatter-local partials must read LOCAL data only — the stable-agg
+     * coordinator already fanned the query out to every node, so a
+     * second hop here would double-count (or loop). */
+    if (tsdb_g_scatter_local_mode) return TSDB_OK;
+
     int n = shard_replica_n_cached();
     if (n <= 0) return TSDB_OK;  /* shard mode off → run local */
 
@@ -1289,5 +1294,95 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
         if (*out) { tsdb_result_free(*out); *out = NULL; }
         return rc;
     }
+    return TSDB_OK;
+}
+
+/* ---- Cluster-wide super-table aggregation (task #175) ------------------ */
+
+/* Scatter-read child assignment.  Deterministic single-assignee rule so a
+ * scattered stable aggregate counts every child's data exactly once
+ * cluster-wide: the child belongs to the FIRST ALIVE node in its hashring
+ * preference order.  With TSDB_SHARD_REPLICA_N set, the preference list is
+ * the owner set (the only nodes holding the child's data — if all owners
+ * are down the data is unreachable and every node skips the child); with
+ * sharding off, data is fully replicated, so the walk covers every node
+ * and always lands on some alive assignee.  Standalone / routing failure
+ * → 1 (read locally rather than dropping the child everywhere). */
+int tsdb_cluster_child_assigned_to_self(tsdb_db_t *db, const char *child_name) {
+    if (!db || !child_name) return 1;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return 1;                       /* cluster inactive → all local */
+
+    int npref = shard_replica_n_cached();
+    if (npref <= 0) npref = TSDB_CLUSTER_MAX_NODES;
+
+    tsdb_node_id_t pref[TSDB_CLUSTER_MAX_NODES];
+    int got = tsdb_cluster_route(c, child_name, "", npref, pref);
+    if (got <= 0) return 1;                 /* routing failed → run local */
+
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = mgr ? tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES) : 0;
+
+    for (int i = 0; i < got; i++) {
+        if (pref[i] == self) return 1;      /* self is first alive owner */
+        int alive = 0;
+        for (int j = 0; j < n; j++) {
+            if (snap[j].id == pref[i]) {
+                alive = (snap[j].state == TSDB_NODE_ALIVE);
+                break;
+            }
+        }
+        if (alive) return 0;                /* an earlier owner is alive */
+    }
+    return 0;                               /* no owner alive (and self not
+                                             * an owner) — data unreachable */
+}
+
+/* Coordinator fan-out for the stable-aggregation scatter.  Sequential
+ * FED_QUERY_LOCAL to every ALIVE peer (MVP; typical cluster is 3 nodes),
+ * hard per-peer timeout.  All-or-nothing: one missing partial would
+ * silently under-count the aggregate, so any peer failure aborts. */
+int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
+                                     const char *qtl,
+                                     int timeout_ms,
+                                     tsdb_result_t **results, int cap,
+                                     int *out_n,
+                                     uint64_t *out_failed_peer)
+{
+    if (out_n) *out_n = 0;
+    if (out_failed_peer) *out_failed_peer = 0;
+    if (!db || !qtl || !results || cap <= 0 || !out_n) return TSDB_ERR_INVAL;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return TSDB_OK;                 /* standalone — nothing to ask */
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    if (npeers == 0) return TSDB_OK;
+    if (npeers > cap) npeers = cap;
+
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+
+    int n = 0;
+    for (int i = 0; i < npeers; i++) {
+        tsdb_rpc_conn_t *conn =
+            rmgr ? tsdb_replica_mgr_get_conn(rmgr, peers[i]) : NULL;
+        tsdb_result_t *res = NULL;
+        int rc = conn ? fedrpc_query_local(conn, qtl, timeout_ms, &res)
+                      : TSDB_ERR_IO;
+        if (rc != TSDB_OK || !res) {
+            if (res) tsdb_result_free(res);
+            for (int k = 0; k < n; k++) tsdb_result_free(results[k]);
+            *out_n = 0;
+            if (out_failed_peer) *out_failed_peer = (uint64_t)peers[i];
+            return TSDB_ERR_IO;
+        }
+        results[n++] = res;
+    }
+    *out_n = n;
     return TSDB_OK;
 }

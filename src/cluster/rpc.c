@@ -10,6 +10,7 @@
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
 #include "../federation/fedrpc.h"
+#include "../../include/tsdb_cluster.h"  /* tsdb_g_scatter_local_mode */
 #include "../server/metrics.h"
 #include "../server/tls.h"
 #include "../compress/lzlite.h"
@@ -467,6 +468,69 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
     return write_ok;
 }
 
+/* Shared body of the FED_QUERY / FED_QUERY_LOCAL receive paths: decode the
+ * QTL payload, run it through tsdb_query, encode the result, reply.
+ * local_mode != 0 arms tsdb_g_scatter_local_mode (defined in query/exec.c)
+ * for the duration of the query — scatter-local semantics for the
+ * cluster-wide stable aggregation, and the anti-recursion guard that keeps
+ * a scattered partial from scattering again. */
+static void handle_fed_query(tsdb_db_t *db, int fd, tsdb_tls_conn_t *tls,
+                             const tsdb_rpc_msg_t *msg, int local_mode)
+{
+    if (!db || msg->payload_len < 2) {
+        send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+        return;
+    }
+    uint16_t qlen;
+    memcpy(&qlen, msg->payload, 2);
+    if ((uint32_t)qlen + 2 > msg->payload_len || qlen >= 4096) {
+        send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+        return;
+    }
+    char qtl[4096];
+    memcpy(qtl, msg->payload + 2, qlen);
+    qtl[qlen] = '\0';
+
+    tsdb_result_t *qr = NULL;
+    int prev_mode = tsdb_g_scatter_local_mode;
+    if (local_mode) tsdb_g_scatter_local_mode = 1;
+    int qrc = tsdb_query(db, qtl, &qr);
+    tsdb_g_scatter_local_mode = prev_mode;
+
+    if (qrc != TSDB_OK || !qr) {
+        send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+        return;
+    }
+
+    /* Encode result into a response buffer. */
+    uint32_t rbufcap = 64 * 1024 * 1024; /* 64 MB */
+    uint8_t *rbuf = malloc(rbufcap);
+    if (rbuf) {
+        int encoded = fedrpc_encode_result(rbuf, rbufcap, qr);
+        if (encoded > 0) {
+            /* Send ACK with payload = encoded result. */
+            uint8_t *frame = malloc((size_t)encoded + TSDB_RPC_HDR_SIZE);
+            if (frame) {
+                int fn = tsdb_rpc_encode(frame,
+                                         (size_t)encoded + TSDB_RPC_HDR_SIZE,
+                                         TSDB_RPC_ACK,
+                                         msg->req_id,
+                                         rbuf, (uint32_t)encoded);
+                if (fn > 0) write_full(fd, tls, frame, (size_t)fn);
+                free(frame);
+            } else {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+            }
+        } else {
+            send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+        }
+        free(rbuf);
+    } else {
+        send_reply(fd, tls, TSDB_RPC_ERR, msg->req_id, NULL, 0);
+    }
+    tsdb_result_free(qr);
+}
+
 static void *connection_handler(void *arg) {
     handler_args_t *ha = (handler_args_t *)arg;
     int fd = ha->fd;
@@ -671,52 +735,16 @@ static void *connection_handler(void *arg) {
 
         case TSDB_RPC_FED_QUERY:
             /* Federation query: run QTL on local DB, encode result, send back. */
-            if (db && msg.payload_len >= 2) {
-                uint16_t qlen;
-                memcpy(&qlen, msg.payload, 2);
-                if ((uint32_t)qlen + 2 <= msg.payload_len && qlen < 4096) {
-                    char qtl[4096];
-                    memcpy(qtl, msg.payload + 2, qlen);
-                    qtl[qlen] = '\0';
+            handle_fed_query(db, fd, tls, &msg, 0 /* full local semantics */);
+            break;
 
-                    tsdb_result_t *qr = NULL;
-                    int qrc = tsdb_query(db, qtl, &qr);
-
-                    if (qrc == TSDB_OK && qr) {
-                        /* Encode result into a response buffer. */
-                        uint32_t rbufcap = 64 * 1024 * 1024; /* 64 MB */
-                        uint8_t *rbuf = malloc(rbufcap);
-                        if (rbuf) {
-                            int encoded = fedrpc_encode_result(rbuf, rbufcap, qr);
-                            if (encoded > 0) {
-                                /* Send ACK with payload = encoded result. */
-                                uint8_t *frame = malloc((size_t)encoded + TSDB_RPC_HDR_SIZE);
-                                if (frame) {
-                                    int fn = tsdb_rpc_encode(frame,
-                                                             (size_t)encoded + TSDB_RPC_HDR_SIZE,
-                                                             TSDB_RPC_ACK,
-                                                             msg.req_id,
-                                                             rbuf, (uint32_t)encoded);
-                                    if (fn > 0) write_full(fd, tls, frame, (size_t)fn);
-                                    free(frame);
-                                }
-                            } else {
-                                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
-                            }
-                            free(rbuf);
-                        } else {
-                            send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
-                        }
-                        tsdb_result_free(qr);
-                    } else {
-                        send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
-                    }
-                } else {
-                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
-                }
-            } else {
-                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
-            }
+        case TSDB_RPC_FED_QUERY_LOCAL:
+            /* Scatter-local query: same wire contract as FED_QUERY, but the
+             * QTL executes with tsdb_g_scatter_local_mode set, so a stable
+             * read never re-scatters and covers only the children this node
+             * is the primary alive owner for.  Sent by the cluster-wide
+             * stable-aggregation coordinator. */
+            handle_fed_query(db, fd, tls, &msg, 1 /* scatter-local */);
             break;
 
         case TSDB_RPC_RAW_BLOCK_PUSH:

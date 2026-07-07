@@ -98,6 +98,25 @@ static inline tsdb_type_t qcoltype(tsdb_type_t t) {
  * inner call treat the name as a plain table (read its storage) instead. */
 static __thread int g_inside_stable_child = 0;
 
+/* Scatter-local mode (task #175 cluster-wide stable aggregation).  Declared
+ * in include/tsdb_cluster.h; set by the FED_QUERY_LOCAL RPC handler in
+ * cluster/rpc.c and by the coordinator around its own local partial leg.
+ * While non-zero, exec_stable_select never starts a new scatter and its
+ * per-child expansion covers only the children assigned to this node
+ * (tsdb_cluster_child_assigned_to_self); the shard read-forward path is
+ * inert.  Lives here (not db_cluster.c) because exec.c is linked into
+ * every binary that runs queries. */
+__thread int tsdb_g_scatter_local_mode = 0;
+
+/* Raw text of the QTL currently executing in tsdb_query (thread-local,
+ * save/restore across nested queries).  The stable-aggregation coordinator
+ * needs it to build the rewritten partial query it ships to peers — the
+ * AST has no renderer, but the original text's FROM/WHERE/... tail can be
+ * reused verbatim.  NULL when the executor was entered without text
+ * (tsdb_query_exec direct callers); the coordinator then falls back to
+ * local-only execution. */
+static __thread const char *g_cur_select_qtl = NULL;
+
 /* ---- Bloom filter block-skip statistics --------------------------------- */
 
 /* Counts blocks skipped by Bloom filter in the most recent query.
