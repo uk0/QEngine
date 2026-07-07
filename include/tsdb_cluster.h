@@ -160,6 +160,32 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
                                          uint64_t best_count,
                                          int64_t  best_max_ts);
 
+/* Partition-level backfill primitive (exposed for unit testing).
+ *
+ * Materialises `res` — every row of ONE partition, as pulled from a fuller
+ * peer via `SELECT * FROM t WHERE ts >= pstart AND ts <= pend` — into a
+ * temp partition under <table>/.aebf_tmp/ (normal col-writer flush path,
+ * SYMBOL codes interned through the live table's dictionaries), then swaps
+ * the .col/.idx pairs over the live partition atomically under the table's
+ * compaction mutex.
+ *
+ * `part_name` is the partition dir name ("YYYYMMDD" for DAY tables,
+ * "YYYYMMDDHH" for HOUR); every row in `res` must fall inside its range.
+ * `expected_local_rows` is the caller's snapshot of the live partition's
+ * ts.idx total_rows; if the live value moved by swap time (a concurrent
+ * flush/delete touched the partition) the swap aborts with TSDB_ERR_BUSY
+ * and the table is left untouched.  Refuses (TSDB_ERR_INVAL) unless the
+ * pulled copy is STRICTLY fuller than expected_local_rows — backfill never
+ * reduces durable rows.  On success *out_rows_written is the new partition
+ * row count.  Local-unique rows in the swapped partition are replaced by
+ * the peer copy (MVP limitation; logged loudly by the resync caller). */
+int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
+                                                const char *table_name,
+                                                const char *part_name,
+                                                tsdb_result_t *res,
+                                                uint64_t expected_local_rows,
+                                                uint64_t *out_rows_written);
+
 /* Phase γ — read-side shard forwarding.
  *
  * If TSDB_SHARD_REPLICA_N > 0 and this node is NOT in the owner set

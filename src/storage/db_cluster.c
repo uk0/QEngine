@@ -13,6 +13,11 @@
 #ifndef _DEFAULT_SOURCE
 #  define _DEFAULT_SOURCE 1
 #endif
+/* timegm() is a BSD extension; the strict _POSIX_C_SOURCE above would hide
+ * it on Darwin without this (glibc/musl unhide it via _DEFAULT_SOURCE). */
+#ifndef _DARWIN_C_SOURCE
+#  define _DARWIN_C_SOURCE 1
+#endif
 
 #include "db.h"
 #include "../catalog/stable.h"
@@ -34,6 +39,8 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* ---- Cluster registry ---------------------------------------------------- */
 
@@ -902,6 +909,486 @@ static int pull_table_delta(tsdb_db_t *db,
     return pulled;
 }
 
+/* ---- Partition-level backfill (middle-gap convergence, env-gated) --------
+ *
+ * A "middle gap" (equal max_ts, higher peer count) is never resolved by the
+ * table-level truncate+re-pull (that was the data-loss bug).  Instead, when
+ * TSDB_AE_PARTITION_BACKFILL=1, we converge ONE cold divergent partition per
+ * resync tick: pull the peer's full copy of that partition, build a temp
+ * partition through the normal col-writer flush path, and atomically swap it
+ * in under the table's compact mutex — the same phase-1/phase-2 pattern
+ * compaction uses, including the staleness guard. */
+
+/* Duplicate of db.c's static part_dir_to_range: parse "YYYYMMDD" /
+ * "YYYYMMDDHH" into an inclusive [start_ns, end_ns] UTC range. */
+static int aebf_part_dir_to_range(const char *dname, tsdb_partition_unit_t unit,
+                                  int64_t *out_start, int64_t *out_end)
+{
+    int y, mo, dy, hh = 0;
+    size_t n = strlen(dname);
+    if (unit == TSDB_PARTITION_HOUR) {
+        if (n != 10) return -1;
+        if (sscanf(dname, "%4d%2d%2d%2d", &y, &mo, &dy, &hh) != 4) return -1;
+    } else {
+        if (n != 8) return -1;
+        if (sscanf(dname, "%4d%2d%2d", &y, &mo, &dy) != 3) return -1;
+    }
+    struct tm tm = {0};
+    tm.tm_year = y - 1900;
+    tm.tm_mon  = mo - 1;
+    tm.tm_mday = dy;
+    tm.tm_hour = hh;
+    time_t secs = timegm(&tm);
+    if (secs == (time_t)-1) return -1;
+    int64_t start = (int64_t)secs * 1000000000LL;
+    int64_t span  = (unit == TSDB_PARTITION_HOUR) ? 3600000000000LL
+                                                  : 86400000000000LL;
+    *out_start = start;
+    *out_end   = start + span - 1;
+    return 0;
+}
+
+/* Best-effort removal of the scratch partition build area.  Only the files
+ * this module creates (one .col/.idx pair per schema column, plus the idx
+ * writer's transient .tmp) are unlinked; rmdir then fails harmlessly if
+ * anything unexpected is present.  The scratch dir is dot-prefixed, so
+ * scans, resync and the compactor never see it. */
+static void aebf_scratch_remove(const tsdb_schema_t *s,
+                                const char *scratch_part, const char *scratch)
+{
+    for (int ci = 0; ci < s->ncols; ci++) {
+        char p[4200];
+        snprintf(p, sizeof(p), "%s/%s.col", scratch_part, s->cols[ci].name);
+        remove(p);
+        snprintf(p, sizeof(p), "%s/%s.idx", scratch_part, s->cols[ci].name);
+        remove(p);
+        snprintf(p, sizeof(p), "%s/%s.idx.tmp", scratch_part, s->cols[ci].name);
+        remove(p);
+    }
+    remove(scratch_part);
+    remove(scratch);
+}
+
+extern int tsdb_mkdir_p(const char *path);
+
+/* Core backfill primitive (exposed for unit testing): materialise `res`
+ * (every row of one partition, pulled from a fuller peer) as a fresh
+ * partition and atomically swap it over the live one.
+ *
+ * Phase 1 (no lock): replay the rows through a standalone memtable bound to
+ * a schema clone whose dir points at <table>/.aebf_tmp — SYMBOL columns
+ * intern through the LIVE table's shared symtabs, so the emitted codes stay
+ * valid — and flush through the normal col-writer path (CRC, stats, zone
+ * maps).  The live partition's durable max_seq checkpoint is carried
+ * forward so WAL redo never regresses.
+ *
+ * Phase 2 (under compact_mtx): re-probe the live ts idx; if its total_rows
+ * moved off `expected_local_rows` (a concurrent flush/truncate/delete
+ * touched the partition) abort with TSDB_ERR_BUSY and leave the table
+ * untouched.  Otherwise rename every .col/.idx pair into place, ts column
+ * last (flush's visibility order).  scan_refs are held throughout, so
+ * ALTER/DROP wait for us like they do for any scan.
+ *
+ * Hard invariant: refuses to swap unless the pulled row count STRICTLY
+ * exceeds expected_local_rows — anti-entropy never shrinks durable data. */
+int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
+                                                const char *table_name,
+                                                const char *part_name,
+                                                tsdb_result_t *res,
+                                                uint64_t expected_local_rows,
+                                                uint64_t *out_rows_written)
+{
+    if (out_rows_written) *out_rows_written = 0;
+    if (!db || !table_name || !part_name || !res) return TSDB_ERR_INVAL;
+
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, table_name);
+    if (!t) return TSDB_ERR_NOTFOUND;
+    tsdb_schema_t *s   = tsdb_tbl_schema(t);
+    const char    *dir = tsdb_tbl_dir(t);
+    if (!s || !dir) { tsdb_db_scan_release(db, t); return TSDB_ERR_INTERNAL; }
+
+    int rc = TSDB_OK;
+    tsdb_memtable_t *mt = NULL;
+
+    int64_t pstart = 0, pend = 0;
+    if (aebf_part_dir_to_range(part_name, s->partition_unit,
+                               &pstart, &pend) != 0) {
+        tsdb_db_scan_release(db, t);
+        return TSDB_ERR_INVAL;
+    }
+
+    /* Map result columns to schema columns by EXACT name (the substring
+     * matcher would confuse "v" with "val") and validate the types. */
+    int ncols = s->ncols;
+    int rmap[TSDB_MAX_COLS];
+    if (ncols > TSDB_MAX_COLS || tsdb_result_ncols(res) != ncols) {
+        tsdb_db_scan_release(db, t);
+        return TSDB_ERR_SCHEMA;
+    }
+    for (int ci = 0; ci < ncols; ci++) {
+        rmap[ci] = -1;
+        for (int i = 0; i < ncols; i++) {
+            const char *nm = tsdb_result_col_name(res, i);
+            if (nm && strcmp(nm, s->cols[ci].name) == 0) { rmap[ci] = i; break; }
+        }
+        if (rmap[ci] < 0) { tsdb_db_scan_release(db, t); return TSDB_ERR_SCHEMA; }
+        tsdb_type_t st = s->cols[ci].type;
+        tsdb_type_t rt = tsdb_result_col_type(res, rmap[ci]);
+        int type_ok = (st == rt) ||
+                      /* FLOAT32 is normalised to FLOAT64 on result wires. */
+                      (st == TSDB_TYPE_FLOAT32 && rt == TSDB_TYPE_FLOAT64);
+        if (!type_ok || (ci != s->ts_col_idx && st == TSDB_TYPE_TIMESTAMP)) {
+            tsdb_db_scan_release(db, t);
+            return type_ok ? TSDB_ERR_UNSUPPORTED : TSDB_ERR_SCHEMA;
+        }
+    }
+
+    char live_part[4096], scratch[4096], scratch_part[4096], ts_idx_live[4200];
+    snprintf(live_part,    sizeof(live_part),    "%s/%s", dir, part_name);
+    snprintf(scratch,      sizeof(scratch),      "%s/.aebf_tmp", dir);
+    snprintf(scratch_part, sizeof(scratch_part), "%s/%s", scratch, part_name);
+    snprintf(ts_idx_live,  sizeof(ts_idx_live),  "%s/%s.idx",
+             live_part, s->cols[s->ts_col_idx].name);
+
+    /* Clear any crash residue; if the scratch partition still exists after
+     * that, something unexpected lives there — refuse to build on top. */
+    aebf_scratch_remove(s, scratch_part, scratch);
+    struct stat sst;
+    if (stat(scratch_part, &sst) == 0) {
+        tsdb_db_scan_release(db, t);
+        return TSDB_ERR_IO;
+    }
+
+    /* Carry the live partition's durable WAL checkpoint into the rebuilt
+     * idx headers so redo recovery never replays already-durable rows. */
+    uint64_t keep_seq = tsdb_part_max_seq(s, live_part);
+
+    /* Schema clone: identical layout + SHARED symtabs, dir → scratch. */
+    tsdb_schema_t tmp_s = *s;
+    tmp_s.dir = scratch;
+
+    if (tsdb_memtable_new(&tmp_s, &mt) != TSDB_OK) {
+        tsdb_db_scan_release(db, t);
+        return TSDB_ERR_NOMEM;
+    }
+
+    size_t chunk_cap = (s->block_points > 0 &&
+                        s->block_points <= TSDB_BLOCK_POINTS)
+                         ? (size_t)s->block_points : (size_t)TSDB_BLOCK_POINTS;
+    uint64_t rows = 0;
+    size_t inmem = 0;
+    while (tsdb_result_next(res)) {
+        int64_t ts = tsdb_result_ts(res, rmap[s->ts_col_idx]);
+        if (ts < pstart || ts > pend) { rc = TSDB_ERR_INVAL; goto fail; }
+        if (tsdb_memtable_row_begin(mt) != TSDB_OK ||
+            tsdb_memtable_row_ts(mt, ts) != TSDB_OK) {
+            rc = TSDB_ERR_INTERNAL; goto fail;
+        }
+        for (int ci = 0; ci < ncols; ci++) {
+            if (ci == s->ts_col_idx) continue;
+            int rci = rmap[ci];
+            switch (s->cols[ci].type) {
+            case TSDB_TYPE_INT64:
+                tsdb_memtable_row_i64(mt, ci, tsdb_result_i64(res, rci));
+                break;
+            case TSDB_TYPE_FLOAT64:
+            case TSDB_TYPE_FLOAT32:
+                tsdb_memtable_row_f64(mt, ci, tsdb_result_f64(res, rci));
+                break;
+            case TSDB_TYPE_SYMBOL: {
+                const char *sym = tsdb_result_sym(res, rci);
+                tsdb_memtable_row_sym(mt, ci, sym ? sym : "");
+                break;
+            }
+            default:
+                rc = TSDB_ERR_UNSUPPORTED; goto fail;
+            }
+        }
+        if (tsdb_memtable_row_end(mt) != TSDB_OK) { rc = TSDB_ERR_SCHEMA; goto fail; }
+        rows++;
+        if (++inmem >= chunk_cap) {
+            rc = tsdb_part_flush_ex2(&tmp_s, mt, NULL, NULL, keep_seq);
+            if (rc != TSDB_OK) goto fail;
+            tsdb_memtable_clear(mt);
+            inmem = 0;
+        }
+    }
+    if (inmem > 0) {
+        rc = tsdb_part_flush_ex2(&tmp_s, mt, NULL, NULL, keep_seq);
+        if (rc != TSDB_OK) goto fail;
+    }
+
+    /* Never shrink durable data: the peer copy must be strictly fuller. */
+    if (rows == 0 || rows <= expected_local_rows) { rc = TSDB_ERR_INVAL; goto fail; }
+
+    /* Newly interned symbols exist only in memory until close; persist the
+     * dictionaries now so the swapped codes survive an unclean shutdown. */
+    for (int ci = 0; ci < ncols; ci++) {
+        if (s->cols[ci].type == TSDB_TYPE_SYMBOL && s->cols[ci].symtab) {
+            char sym_path[4200];
+            snprintf(sym_path, sizeof(sym_path), "%s/%s.sym",
+                     dir, s->cols[ci].name);
+            tsdb_symtab_save(s->cols[ci].symtab, sym_path);
+        }
+    }
+
+    /* Phase 2 — swap under the compaction lock with the staleness guard. */
+    {
+        pthread_mutex_t *cmtx = tsdb_tbl_compact_mtx(t);
+        pthread_mutex_lock(cmtx);
+
+        uint64_t cur = 0;
+        int prc = tsdb_part_idx_probe(ts_idx_live, NULL, NULL, NULL,
+                                      &cur, NULL, NULL, NULL);
+        if (prc < 0 || cur != expected_local_rows) {
+            pthread_mutex_unlock(cmtx);
+            rc = TSDB_ERR_BUSY;
+            goto fail;
+        }
+
+        (void)tsdb_mkdir_p(live_part);   /* no-op when already present */
+
+        /* Rename every column pair, ts LAST — same visibility order as the
+         * flush path (readers enumerate blocks via ts.idx).  Failures are
+         * logged and skipped like compaction's renames; the torn-column
+         * prefix clamp keeps a partially-swapped partition readable. */
+        for (int pass = 0; pass < 2; pass++) {
+            for (int ci = 0; ci < ncols; ci++) {
+                int is_ts = (ci == s->ts_col_idx);
+                if ((pass == 0 && is_ts) || (pass == 1 && !is_ts)) continue;
+                char from[4200], to[4200];
+                snprintf(from, sizeof(from), "%s/%s.col", scratch_part, s->cols[ci].name);
+                snprintf(to,   sizeof(to),   "%s/%s.col", live_part,    s->cols[ci].name);
+                if (rename(from, to) != 0)
+                    fprintf(stderr, "[anti-entropy] %s: backfill rename %s failed\n",
+                            table_name, from);
+                snprintf(from, sizeof(from), "%s/%s.idx", scratch_part, s->cols[ci].name);
+                snprintf(to,   sizeof(to),   "%s/%s.idx", live_part,    s->cols[ci].name);
+                if (rename(from, to) != 0)
+                    fprintf(stderr, "[anti-entropy] %s: backfill rename %s failed\n",
+                            table_name, from);
+            }
+        }
+        pthread_mutex_unlock(cmtx);
+    }
+
+    aebf_scratch_remove(s, scratch_part, scratch);
+    tsdb_memtable_free(mt);
+    tsdb_db_scan_release(db, t);
+    if (out_rows_written) *out_rows_written = rows;
+    return TSDB_OK;
+
+fail:
+    if (mt) {
+        tsdb_memtable_row_abort(mt);
+        tsdb_memtable_free(mt);
+    }
+    aebf_scratch_remove(s, scratch_part, scratch);
+    tsdb_db_scan_release(db, t);
+    return rc;
+}
+
+/* One resync-tick partition backfill attempt against peer `best`.
+ * Returns the number of rows swapped in (> 0) on success, 0 otherwise
+ * (no qualifying partition / transport failure / staleness abort). */
+#define AEBF_MAX_PARTS   1024
+#define AEBF_MAX_BUCKETS 4096
+
+static int ae_partition_backfill(tsdb_db_t *db, tsdb_cluster_t *c,
+                                 tsdb_node_id_t best, const char *table_name,
+                                 int64_t delwm)
+{
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return 0;
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, best);
+    if (!conn) return 0;
+
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, table_name);
+    if (!t) return 0;
+    tsdb_schema_t *s   = tsdb_tbl_schema(t);
+    const char    *dir = tsdb_tbl_dir(t);
+    if (!s || !dir) { tsdb_db_scan_release(db, t); return 0; }
+
+    tsdb_partition_unit_t unit = s->partition_unit;
+    int64_t span = (unit == TSDB_PARTITION_HOUR) ? 3600000000000LL
+                                                 : 86400000000000LL;
+    size_t name_len = (unit == TSDB_PARTITION_HOUR) ? 10 : 8;
+    const char *ts_col_name = s->cols[s->ts_col_idx].name;
+
+    /* Local per-partition map: dir name → [pstart,pend], ts.idx total_rows
+     * (header probe only — no blocks opened), dir mtime. */
+    typedef struct {
+        char     name[12];
+        int64_t  pstart, pend;
+        uint64_t rows;
+        time_t   mtime;
+    } aebf_part_t;
+    aebf_part_t *parts    = malloc(sizeof(*parts) * AEBF_MAX_PARTS);
+    int64_t     *pb_start = malloc(sizeof(*pb_start) * AEBF_MAX_BUCKETS);
+    uint64_t    *pb_count = malloc(sizeof(*pb_count) * AEBF_MAX_BUCKETS);
+    if (!parts || !pb_start || !pb_count) {
+        free(parts); free(pb_start); free(pb_count);
+        tsdb_db_scan_release(db, t);
+        return 0;
+    }
+    int nparts = 0;
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        free(parts); free(pb_start); free(pb_count);
+        tsdb_db_scan_release(db, t);
+        return 0;
+    }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && nparts < AEBF_MAX_PARTS) {
+        size_t nl = strlen(de->d_name);
+        if (nl != name_len) continue;
+        int all_digit = 1;
+        for (size_t i = 0; i < nl; i++) {
+            if (de->d_name[i] < '0' || de->d_name[i] > '9') { all_digit = 0; break; }
+        }
+        if (!all_digit) continue;
+
+        aebf_part_t p;
+        snprintf(p.name, sizeof(p.name), "%s", de->d_name);
+        if (aebf_part_dir_to_range(p.name, unit, &p.pstart, &p.pend) != 0)
+            continue;
+
+        char path[4200];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s", dir, p.name);
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        p.mtime = st.st_mtime;
+
+        p.rows = 0;
+        snprintf(path, sizeof(path), "%s/%s/%s.idx", dir, p.name, ts_col_name);
+        if (tsdb_part_idx_probe(path, NULL, NULL, NULL,
+                                &p.rows, NULL, NULL, NULL) < 0)
+            continue;   /* corrupt idx — leave it to the torn-read clamp */
+
+        parts[nparts++] = p;
+    }
+    closedir(d);
+    int ret = 0;
+    if (nparts == 0) goto out;
+
+    /* Oldest-first, deterministic. */
+    for (int i = 1; i < nparts; i++) {
+        aebf_part_t x = parts[i];
+        int j = i;
+        while (j > 0 && parts[j - 1].pstart > x.pstart) { parts[j] = parts[j - 1]; j--; }
+        parts[j] = x;
+    }
+
+    /* Peer per-partition map in ONE query.  time_bucket(ts, span) starts
+     * are epoch-aligned, exactly like the UTC partition boundaries. */
+    int nbuckets = 0;
+    {
+        char qtl[512];
+        snprintf(qtl, sizeof(qtl),
+                 "SELECT time_bucket(ts, %lld), count(*) FROM %s SAMPLE BY %s",
+                 (long long)span, table_name,
+                 unit == TSDB_PARTITION_HOUR ? "1h" : "1d");
+        tsdb_result_t *pres = NULL;
+        if (fedrpc_query(conn, qtl, 10000, &pres) != TSDB_OK || !pres) {
+            if (pres) tsdb_result_free(pres);
+            goto out;
+        }
+        int ci_b = tsdb_result_col_index_by_name(pres, "time_bucket");
+        int ci_c = tsdb_result_col_index_by_name(pres, "count");
+        if (ci_b < 0 || ci_c < 0) {
+            tsdb_result_free(pres);
+            goto out;
+        }
+        while (tsdb_result_next(pres) && nbuckets < AEBF_MAX_BUCKETS) {
+            pb_start[nbuckets] = tsdb_result_ts(pres, ci_b);
+            pb_count[nbuckets] = (uint64_t)tsdb_result_i64(pres, ci_c);
+            nbuckets++;
+        }
+        tsdb_result_free(pres);
+    }
+    if (nbuckets == 0) goto out;
+
+    /* Pick THE first qualifying partition (one per resync tick, bounding
+     * the fedrpc frame and the temp-build memory):
+     *   - at or above the delete watermark,
+     *   - COLD: not the current bucket AND dir mtime older than 60s,
+     *   - peer strictly fuller, with a plausible (non-timestamp-scale) count. */
+    const uint64_t IMPLAUSIBLE_COUNT = 100000000000ULL; /* 1e11, as decide() */
+    int64_t now_ns   = tsdb_now_ns();
+    int64_t cur_bkt  = now_ns - (now_ns % span);
+    time_t  now_s    = time(NULL);
+    int pick = -1;
+    uint64_t pick_peer_rows = 0;
+    for (int i = 0; i < nparts; i++) {
+        if (delwm > 0 && parts[i].pstart < delwm) continue;
+        if (parts[i].pstart == cur_bkt) continue;
+        if (now_s - parts[i].mtime <= 60) continue;
+        uint64_t pc = 0;
+        for (int b = 0; b < nbuckets; b++) {
+            if (pb_start[b] >= parts[i].pstart && pb_start[b] <= parts[i].pend)
+                pc += pb_count[b];
+        }
+        if (pc <= parts[i].rows || pc >= IMPLAUSIBLE_COUNT) continue;
+        pick = i;
+        pick_peer_rows = pc;
+        break;
+    }
+    if (pick < 0) goto out;
+
+    /* Pull the peer's full copy of exactly this partition. */
+    {
+        tsdb_result_t *rows_res = NULL;
+        char qtl[512];
+        snprintf(qtl, sizeof(qtl),
+                 "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
+                 table_name,
+                 (long long)parts[pick].pstart, (long long)parts[pick].pend);
+        if (fedrpc_query(conn, qtl, 60000, &rows_res) != TSDB_OK || !rows_res) {
+            if (rows_res) tsdb_result_free(rows_res);
+            goto out;
+        }
+
+        uint64_t written = 0;
+        int rc = tsdb_cluster_backfill_partition_from_result(db, table_name,
+                                                             parts[pick].name,
+                                                             rows_res,
+                                                             parts[pick].rows,
+                                                             &written);
+        tsdb_result_free(rows_res);
+
+        if (rc != TSDB_OK) {
+            fprintf(stderr,
+                    "[anti-entropy] %s: partition %s backfill %s "
+                    "(local=%llu peer_map=%llu rc=%d)\n",
+                    table_name, parts[pick].name,
+                    rc == TSDB_ERR_BUSY ? "aborted by staleness guard "
+                                          "(concurrent write; retry next tick)"
+                                        : "failed",
+                    (unsigned long long)parts[pick].rows,
+                    (unsigned long long)pick_peer_rows, rc);
+            goto out;
+        }
+
+        fprintf(stderr,
+                "[anti-entropy] %s: backfilled partition %s local=%llu -> "
+                "peer=%llu rows (local-unique rows in this partition, if any, "
+                "are replaced by the peer copy - MVP limitation)\n",
+                table_name, parts[pick].name,
+                (unsigned long long)parts[pick].rows,
+                (unsigned long long)written);
+        tsdb_metric_inc("qengine_antientropy_partition_backfills_total");
+        ret = (int)written;
+    }
+
+out:
+    free(parts);
+    free(pb_start);
+    free(pb_count);
+    tsdb_db_scan_release(db, t);
+    return ret;
+}
+
 /* Pure anti-entropy reconcile decision (exposed for unit testing).
  *
  * INVARIANT enforced here: anti-entropy must NEVER reduce a node's durable row
@@ -1041,7 +1528,16 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         pulled = pull_table_delta(db, c, best, table_name, 0);
         break;
 
-    case TSDB_AE_SKIP_UNSAFE:
+    case TSDB_AE_SKIP_UNSAFE: {
+        /* Opt-in convergence: swap ONE cold divergent partition from the
+         * fuller peer (temp build + atomic rename under compact_mtx with a
+         * staleness guard).  Never reduces durable rows — the swap helper
+         * refuses unless the pulled copy is strictly fuller.  Default OFF. */
+        const char *bfe = getenv("TSDB_AE_PARTITION_BACKFILL");
+        if (bfe && strcmp(bfe, "1") == 0 && best_count < 100000000000ULL) {
+            int bf = ae_partition_backfill(db, c, best, table_name, wm);
+            if (bf > 0) { pulled = bf; break; }
+        }
         /* Would shrink durable data on a peer-count comparison — refuse. */
         fprintf(stderr,
                 "[anti-entropy] %s: middle-gap (local=%llu/peer=%llu, "
@@ -1054,6 +1550,7 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                 best_count >= 100000000000ULL ? " (timestamp-scale count)" : "");
         if (out_rows_pulled) *out_rows_pulled = 0;
         return TSDB_OK;
+    }
 
     case TSDB_AE_UP_TO_DATE:
     default:
