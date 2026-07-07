@@ -1711,6 +1711,23 @@ void *tsdb_delwm_reassert_thread(void *ud) {
         struct timespec ts = { 30, 0 };
         nanosleep(&ts, NULL);
         tsdb_delwm_reassert_all(db);
+
+        /* Periodic catalog anti-entropy.  The catalog-broadcast fan-out
+         * (raft-apply → tsdb_cluster_broadcast_catalog_qtl_to_data) is
+         * best-effort with a single retry; a data node that misses both
+         * attempts for a table/stable created AFTER its one-shot startup
+         * reconcile stays diverged until its next restart.  A missed stable
+         * record is worse than missing rows: SELECT count/sum/... FROM that
+         * stable resolves via the plain-table path and silently under-answers
+         * instead of scattering (observed live: a node with the table's
+         * schema.bin but no stables.log record returns 0 for cluster data).
+         * Pulling missing catalog records from peers here on the same 30s tick
+         * closes that residual gap — the "catalog-level anti-entropy" the
+         * broadcast path explicitly defers to.  Safe to repeat: the apply is
+         * filtered + resurrection-safe (respects tombstones, adds only missing
+         * records) and a no-op that logs nothing when the node is already in
+         * sync.  Cost is one CATALOG_DUMP RPC per alive peer per tick. */
+        (void)tsdb_catalog_reconcile_from_peers(db);
     }
     return NULL;
 }
