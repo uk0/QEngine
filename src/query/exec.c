@@ -4663,6 +4663,188 @@ static int stable_self_storage_exists(tsdb_db_t *db, const char *name) {
     return 0;
 }
 
+/* ---- Task #175: cluster-wide stable aggregation coordinator ------------ */
+
+/* Find the top-level FROM keyword in a SELECT statement: case-insensitive,
+ * outside parentheses and quoted strings, on word boundaries.  Returns the
+ * byte offset of the keyword or -1. */
+static int qtl_top_level_from(const char *s) {
+    int depth = 0;
+    for (const char *p = s; *p; p++) {
+        char ch = *p;
+        if (ch == '(') { depth++; continue; }
+        if (ch == ')') { if (depth > 0) depth--; continue; }
+        if (ch == '\'' || ch == '"') {
+            char qch = ch;
+            p++;
+            while (*p && *p != qch) p++;
+            if (!*p) return -1;              /* unterminated literal */
+            continue;
+        }
+        if (depth != 0) continue;
+        if ((ch == 'f' || ch == 'F') && strncasecmp(p, "from", 4) == 0) {
+            int lb = (p == s) ||
+                     (!isalnum((unsigned char)p[-1]) && p[-1] != '_');
+            char after = p[4];
+            int rb = (after == '\0') ||
+                     (!isalnum((unsigned char)after) && after != '_');
+            if (lb && rb) return (int)(p - s);
+        }
+    }
+    return -1;
+}
+
+/* Render the partial-aggregate select list as QTL text: count/sum/min/max
+ * items with canonical function name + IDENT argument (alias kept),
+ * avg(x) as "sum(x), count(x)", count(*)/count() as count(<ts col>).
+ * Returns 0 on success, -1 when an item is not renderable or the buffer
+ * is too small (caller falls back to local-only execution). */
+static int stable_render_partial_list(qast_query_t *q, const tsdb_stable_t *st,
+                                       const int *kinds, char *buf, size_t cap)
+{
+    static const char *fn_of[] = { "count", "sum", "min", "max" };
+    size_t off = 0;
+    for (int i = 0; i < q->nsel; i++) {
+        qast_expr_t *e = q->sel[i].expr;
+        const char *arg = NULL;
+        if (e->nargs >= 1 && e->args[0] && e->args[0]->kind == QAST_IDENT)
+            arg = e->args[0]->v.s;
+        int n;
+        switch (kinds[i]) {
+        case STAB_AGG_CNT:
+            if (!arg) {
+                if (st->ts_col_idx < 0 || st->ts_col_idx >= st->ncols)
+                    return -1;
+                arg = st->cols[st->ts_col_idx].name; /* count(*) → count(ts) */
+            }
+            n = snprintf(buf + off, cap - off, "%scount(%s)",
+                         i ? ", " : "", arg);
+            break;
+        case STAB_AGG_SUM:
+        case STAB_AGG_MIN:
+        case STAB_AGG_MAX:
+            if (!arg) return -1;
+            n = snprintf(buf + off, cap - off, "%s%s(%s)",
+                         i ? ", " : "", fn_of[kinds[i]], arg);
+            break;
+        case STAB_AGG_AVG:
+            if (!arg) return -1;
+            n = snprintf(buf + off, cap - off, "%ssum(%s), count(%s)",
+                         i ? ", " : "", arg, arg);
+            break;
+        default:
+            return -1;
+        }
+        if (n < 0 || (size_t)n >= cap - off) return -1;
+        off += (size_t)n;
+        /* Alias rides only on non-avg items (avg splits into two partials
+         * whose final name the finalizer rebuilds). */
+        if (kinds[i] != STAB_AGG_AVG && q->sel[i].alias) {
+            n = snprintf(buf + off, cap - off, " AS %s", q->sel[i].alias);
+            if (n < 0 || (size_t)n >= cap - off) return -1;
+            off += (size_t)n;
+        }
+    }
+    return off > 0 ? 0 : -1;
+}
+
+/* Peer fan-out cap.  Mirrors TSDB_CLUSTER_MAX_NODES (cluster/node.h, not
+ * visible from the query layer). */
+enum { STAB_SCATTER_MAX_PEERS = 64 };
+
+/* Coordinator: rewrite the pure-scalar-agg stable query into its partial
+ * form (avg → sum+count, count(*) → count(ts)) reusing the original text's
+ * FROM/WHERE/... tail verbatim, execute it locally in scatter-local mode
+ * AND on every alive peer via FED_QUERY_LOCAL, then merge the partials
+ * with the correct per-kind operator and project the ORIGINAL column
+ * names/order into r.
+ *
+ * *fired = 0 → coordinator declined (no query text / unrenderable list /
+ * no FROM in text): caller falls back to the plain local path, result
+ * untouched.  *fired = 1 → r/rc are final; any peer failure is a hard
+ * error (a missing partial would silently under-count). */
+static int stable_scatter_coordinate(tsdb_db_t *db, qast_query_t *q,
+                                      const tsdb_stable_t *st,
+                                      const int *sel_kinds,
+                                      tsdb_result_t *r,
+                                      char *err, size_t errcap,
+                                      int *fired)
+{
+    *fired = 0;
+    const char *orig_qtl = g_cur_select_qtl;
+    if (!orig_qtl) return TSDB_OK;              /* no text → local path */
+
+    char plist[4096];
+    if (stable_render_partial_list(q, st, sel_kinds, plist,
+                                   sizeof(plist)) != 0)
+        return TSDB_OK;                         /* unrenderable → local */
+
+    int from_off = qtl_top_level_from(orig_qtl);
+    if (from_off < 0) return TSDB_OK;           /* no FROM → local */
+
+    size_t cap = 7 /* "SELECT " */ + strlen(plist) + 1 +
+                 strlen(orig_qtl + from_off) + 1;
+    char *qtl = malloc(cap);
+    if (!qtl) { *fired = 1; return TSDB_ERR_NOMEM; }
+    snprintf(qtl, cap, "SELECT %s %s", plist, orig_qtl + from_off);
+
+    /* Local partial leg: recursive tsdb_query on the rewritten text with
+     * scatter-local mode armed — the exact path a peer runs, so both legs
+     * share one implementation. */
+    tsdb_result_t *local_res = NULL;
+    int prev_mode = tsdb_g_scatter_local_mode;
+    tsdb_g_scatter_local_mode = 1;
+    int rc = tsdb_query(db, qtl, &local_res);
+    tsdb_g_scatter_local_mode = prev_mode;
+    if (rc != TSDB_OK) {
+        free(qtl);
+        *fired = 1;
+        eset(err, errcap, "stable scatter: local partial failed: %s",
+             tsdb_errstr(rc));
+        return rc;
+    }
+
+    /* Peer partial legs: sequential, hard 5s per peer, all-or-nothing. */
+    tsdb_result_t *peer_res[STAB_SCATTER_MAX_PEERS];
+    int npeer = 0;
+    uint64_t failed_peer = 0;
+    rc = tsdb_cluster_scatter_stable_agg(db, qtl, 5000,
+                                         peer_res, STAB_SCATTER_MAX_PEERS,
+                                         &npeer, &failed_peer);
+    free(qtl);
+    if (rc != TSDB_OK) {
+        tsdb_result_free(local_res);
+        *fired = 1;
+        eset(err, errcap,
+             "stable scatter: peer node %llu failed or timed out — "
+             "cluster-wide aggregate unavailable",
+             (unsigned long long)failed_peer);
+        return rc;
+    }
+
+    stab_pacc_t *acc = malloc(sizeof(*acc));
+    if (!acc) {
+        tsdb_result_free(local_res);
+        for (int i = 0; i < npeer; i++) tsdb_result_free(peer_res[i]);
+        *fired = 1;
+        return TSDB_ERR_NOMEM;
+    }
+    stab_pacc_init(acc, sel_kinds, q->nsel);
+    rc = stab_pacc_merge(acc, local_res);
+    for (int i = 0; i < npeer && rc == TSDB_OK; i++)
+        rc = stab_pacc_merge(acc, peer_res[i]);
+    if (rc == TSDB_OK)
+        rc = stab_pacc_finalize(acc, q, sel_kinds, r);
+    else if (rc == TSDB_ERR_CORRUPT)
+        eset(err, errcap, "stable scatter: partial result shape mismatch");
+
+    tsdb_result_free(local_res);
+    for (int i = 0; i < npeer; i++) tsdb_result_free(peer_res[i]);
+    free(acc);
+    *fired = 1;
+    return rc;
+}
+
 /* exec_select is forward-declared at line ~130; exec_stable_select follows: */
 static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
                                const tsdb_stable_t *st,
@@ -4705,6 +4887,32 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
     size_t nchildren = 0;
     int rc = tsdb_child_table_list(cat, st->name, &children, &nchildren);
     if (rc != TSDB_OK) { eset(err, errcap, "failed to list children of stable '%s'", st->name); return rc; }
+
+    /* Task #175 — cluster-wide aggregation coordinator.  A pure mergeable
+     * scalar-agg SELECT over a stable WITH children returns the aggregate
+     * over EVERY node's shard, not just the local catalog view of the data.
+     * Fires only when:
+     *   - not already inside a scatter (anti-recursion),
+     *   - the query is pure count/sum/min/max/avg (no GROUP BY / SAMPLE BY /
+     *     windows / PARTITION BY tbname — those keep the old local paths),
+     *   - the stable has at least one catalog child.  Childless mirrors of
+     *     plain tables stay strictly local: anti-entropy and peer stats
+     *     compare PER-NODE counts of those and must never see a
+     *     cluster-wide number,
+     *   - at least one peer is alive (standalone/solo → local path is
+     *     already the whole truth). */
+    if (is_scalar_agg && !any_other_agg && !tsdb_g_scatter_local_mode &&
+        nchildren > 0 && tsdb_cluster_alive_count(db) >= 2) {
+        int fired = 0;
+        int src = stable_scatter_coordinate(db, q, st, sel_agg_kinds, r,
+                                            err, errcap, &fired);
+        if (fired) {
+            free(children);
+            return src;
+        }
+        /* Coordinator declined (no query text / unrenderable) → fall
+         * through to the local-only path unchanged. */
+    }
 
     /* Data-bearing super-table: a plain table mirrored into the hierarchy has no
      * child rows — its data is its own same-named storage.  When the stable has
@@ -4810,6 +5018,13 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             } else {
                 if (!stable_child_matches(ct, st, preds, npreds)) continue;
             }
+            /* Scatter-local mode (task #175): cover only the children whose
+             * primary alive owner is this node, so the coordinator's merge
+             * counts each child exactly once cluster-wide.  All children
+             * qualify when the cluster is inactive. */
+            if (tsdb_g_scatter_local_mode &&
+                !tsdb_cluster_child_assigned_to_self(db, ct->name))
+                continue;
             matched[nmatched++] = ci;
         }
     }
@@ -5005,7 +5220,10 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
      * handle the merge then dropped) — surface a real error instead so the read
      * fails loudly rather than silently empty.  PARTITION BY tbname is exempt:
      * it legitimately emits zero rows when no child matches. */
-    if (r->ncols == 0 && !orig_pb_tbname &&
+    /* Scatter-local partials are exempt: an empty result here just means no
+     * child was ASSIGNED to this node — other nodes cover them, and the
+     * coordinator owns global completeness. */
+    if (r->ncols == 0 && !orig_pb_tbname && !tsdb_g_scatter_local_mode &&
         stable_self_storage_exists(db, st->name)) {
         eset(err, errcap,
              "table '%s' has on-disk data but produced no result rows "
@@ -6975,7 +7193,14 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         tsdb_table_internal_t *qtbl2 = (stmt.u.query.has_asof_join &&
                                         stmt.u.query.asof_table)
             ? tsdb_db_scan_acquire(db, stmt.u.query.asof_table) : NULL;
+        /* Expose the raw QTL text to the stable-aggregation coordinator
+         * (it reuses the FROM/WHERE tail verbatim when building the
+         * partial query it scatters).  Save/restore: the coordinator's
+         * local partial leg recurses through tsdb_query. */
+        const char *prev_qtl = g_cur_select_qtl;
+        g_cur_select_qtl = qtl;
         rc = exec_select(db, &stmt.u.query, r, err, sizeof(err));
+        g_cur_select_qtl = prev_qtl;
         /* Apply ORDER BY post-execution so plain SELECT, GROUP BY,
          * SAMPLE BY, LATEST ON, and the stable-select union all share
          * the same sort path.  Must run before arena_free because
