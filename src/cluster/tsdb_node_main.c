@@ -1309,6 +1309,23 @@ int main(int argc, char **argv) {
         pthread_attr_destroy(&attr);
     }
 
+    /* Idle-flush: drain the unflushed memtable tail of quiesced tables so the
+     * last <block_points rows reach the shard owners (replicate on flush) and
+     * become cluster-visible + durable instead of lingering only in the
+     * ingesting node's memtable.  Hot tables keep flushing via the size path
+     * and are untouched here. */
+    {
+        pthread_t idle_thr;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        extern void *tsdb_idle_flush_thread(void *ud);
+        if (pthread_create(&idle_thr, &attr, tsdb_idle_flush_thread, db) == 0) {
+            printf("[node] idle-flush armed\n");
+        }
+        pthread_attr_destroy(&attr);
+    }
+
     /* Catalog self-heal for data nodes: pull master's catalog log
      * files via TSDB_RPC_CATALOG_DUMP and replay locally.  Closes the
      * recurring 'cnode-3 missing 50 catalog rows' divergence — caused
