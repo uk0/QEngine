@@ -7201,6 +7201,19 @@ static int is_catalog_ddl(qast_stmt_kind_t k) {
      * node before the function's first use there. */
     case QAST_STMT_CREATE_FUNCTION:
     case QAST_STMT_DROP_FUNCTION:
+    /* User + grant DDL is cluster catalog state too: without replication a
+     * user exists only on the node that ran the CREATE, so dashboard logins
+     * and RBAC checks diverge per node (observed live: LIST USERS on a peer
+     * showed only the seeded root).  Raft apply re-runs the verbatim QTL —
+     * for CREATE USER that text carries the plaintext password into the
+     * raft log; that log lives in the same trust domain as the WAL and the
+     * wire (which already carry it), so replicated-but-internal is strictly
+     * better than per-node divergence.  LIST USERS stays read-only/local. */
+    case QAST_STMT_CREATE_USER:
+    case QAST_STMT_DROP_USER:
+    case QAST_STMT_GRANT:
+    case QAST_STMT_REVOKE:
+    case QAST_STMT_ALTER_USER_PASSWORD:
         return 1;
     default:
         return 0;

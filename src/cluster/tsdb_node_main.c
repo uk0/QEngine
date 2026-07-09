@@ -1039,7 +1039,17 @@ int tsdb_node_auth_login_trampoline(void *ud, const char *user,
 }
 
 int tsdb_node_auth_check_trampoline(void *ud, const char *token) {
-    return tsdb_auth_check((tsdb_db_t *)ud, token, TSDB_PRIV_SELECT, "*");
+    /* Session-validity check for the dashboard gate: AUTHENTICATION only.
+     * The old check demanded PRIV_SELECT on "*", which locked out valid
+     * users with narrower (or zero) grants before they could reach any
+     * page and surfaced as a misleading "login required".  A token that
+     * resolves to a role is a live session; per-statement AUTHORIZATION
+     * is enforced downstream by the SQL layer (admin_only + grant checks),
+     * which is the boundary that actually matters. */
+    tsdb_auth_t *a = tsdb_db_auth((tsdb_db_t *)ud);
+    if (!a || !token || !token[0]) return TSDB_ERR_PERMISSION;
+    tsdb_user_role_t role;
+    return tsdb_auth_token_role(a, token, &role);
 }
 
 /* GET /whoami: resolve the dashboard session cookie to (user, role) via the
