@@ -17,7 +17,9 @@ interface FormField {
   value?: string;
   placeholder?: string;
   readonly?: boolean;
-  type?: 'text' | 'password';
+  type?: 'text' | 'password' | 'select';
+  /** Choices for type:"select" — first entry is the default value. */
+  options?: string[];
   /** Row below the label, e.g. "Parent database: prod". */
   help?: string;
 }
@@ -162,7 +164,10 @@ function ConfirmBody({ state }: { state: ConfirmArgs }) {
 
 function FormBody({ state }: { state: FormArgs }) {
   const [values, setValues] = useState<Record<string, string>>(() =>
-    Object.fromEntries(state.fields.map(f => [f.name, f.value ?? ''])),
+    Object.fromEntries(state.fields.map(f => [
+      f.name,
+      f.value ?? (f.type === 'select' ? (f.options?.[0] ?? '') : ''),
+    ])),
   );
   const first = useRef<HTMLInputElement | null>(null);
   useEffect(() => { first.current?.focus(); first.current?.select(); }, []);
@@ -178,14 +183,23 @@ function FormBody({ state }: { state: FormArgs }) {
         {state.fields.map((f, i) => (
           <div className="modal-field" key={f.name}>
             <label>{f.label}</label>
-            <input
-              ref={i === 0 ? first : undefined}
-              type={f.type ?? 'text'}
-              value={values[f.name] ?? ''}
-              placeholder={f.placeholder}
-              readOnly={f.readonly}
-              onChange={e => setValues(v => ({ ...v, [f.name]: e.target.value }))}
-            />
+            {f.type === 'select' ? (
+              <select
+                value={values[f.name] ?? ''}
+                onChange={e => setValues(v => ({ ...v, [f.name]: e.target.value }))}
+              >
+                {(f.options ?? []).map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            ) : (
+              <input
+                ref={i === 0 ? first : undefined}
+                type={f.type ?? 'text'}
+                value={values[f.name] ?? ''}
+                placeholder={f.placeholder}
+                readOnly={f.readonly}
+                onChange={e => setValues(v => ({ ...v, [f.name]: e.target.value }))}
+              />
+            )}
             {f.help && <div className="modal-field-help">{f.help}</div>}
           </div>
         ))}

@@ -1,24 +1,27 @@
 import { ClusterInfo } from '../api';
-import { IconPulse, IconTerminal, IconList, IconWrench } from './icons';
+import { IconPulse, IconTerminal, IconList, IconUsers, IconWrench } from './icons';
 
-export type Page = 'overview' | 'sql' | 'audit' | 'maintenance';
+export type Page = 'overview' | 'sql' | 'users' | 'audit' | 'maintenance';
 
 interface Props {
   page: Page;
   onPage: (p: Page) => void;
   cluster: ClusterInfo | null;
+  role: 'admin' | 'normal';
 }
 
-const NAV: { id: Page; label: string; icon: (p: { size?: number }) => JSX.Element }[] = [
+const NAV: { id: Page; label: string; icon: (p: { size?: number }) => JSX.Element; adminOnly?: boolean }[] = [
   { id: 'overview', label: 'Overview', icon: IconPulse },
   { id: 'sql', label: 'SQL console', icon: IconTerminal },
+  { id: 'users', label: 'Users', icon: IconUsers, adminOnly: true },
   { id: 'audit', label: 'Audit log', icon: IconList },
   { id: 'maintenance', label: 'Maintenance', icon: IconWrench },
 ];
 
-export function Sidebar({ page, onPage, cluster }: Props) {
+export function Sidebar({ page, onPage, cluster, role }: Props) {
   const host = cluster?.local?.host ?? '';
   const nodes = cluster?.nodes ?? [];
+  const items = NAV.filter(i => !i.adminOnly || role === 'admin');
 
   return (
     <nav className="side-nav" aria-label="Primary">
@@ -31,7 +34,7 @@ export function Sidebar({ page, onPage, cluster }: Props) {
       </div>
       <div className="nav-list">
         <div className="nav-label">Operate</div>
-        {NAV.map(item => (
+        {items.map(item => (
           <button
             key={item.id}
             className={`nav-item ${page === item.id ? 'active' : ''}`}

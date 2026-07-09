@@ -211,7 +211,14 @@ export interface TreeDatabase { name: string; description?: string; protected?: 
 export interface TreeGroup { name: string; database?: string; }
 export interface TreeVTable { name: string; database?: string; group?: string; ncols: number; }
 export interface TreePTable { name: string; vtable?: string; database?: string; group?: string; }
-export interface TreeTable { name: string; ncols: number; is_stable?: boolean; }
+export interface TreeTable {
+  name: string;
+  ncols: number;
+  is_stable?: boolean;
+  /** Cluster nodes report on-disk footprint per table dir. */
+  kind?: string;
+  bytes?: number;
+}
 export interface TreeDbInfo {
   name?: string;
   path?: string;
@@ -229,6 +236,15 @@ export interface Tree {
 }
 
 export interface HealthInfo { status: string; uptime_s: number; pid: number; }
+
+/** GET /whoami — session identity for RBAC-aware UI.
+ *  {auth:true,user,role} on gated servers; {auth:false} when the auth
+ *  gate is disabled; 404 on servers that predate the endpoint. */
+export interface WhoAmI {
+  auth: boolean;
+  user?: string | null;
+  role?: 'admin' | 'normal' | string | null;
+}
 
 export interface CatalogOrphan {
   name: string;
@@ -309,6 +325,12 @@ export const api = {
 
   health(): Promise<HealthInfo> {
     return request<HealthInfo>('GET', '/health');
+  },
+
+  /** Callers must treat any failure (404 on old servers, network) as
+   *  "admin" — UI-only gating; the server enforces per-statement RBAC. */
+  whoami(): Promise<WhoAmI> {
+    return request<WhoAmI>('GET', '/whoami');
   },
 
   audit(n = 200): Promise<{ rows: AuditRecord[]; nrows: number }> {

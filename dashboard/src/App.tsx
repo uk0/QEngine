@@ -6,6 +6,7 @@ import { SchemaTree } from './components/SchemaTree';
 import { AuditPanel } from './components/AuditPanel';
 import { ClusterPanel } from './components/ClusterPanel';
 import { MaintenancePanel } from './components/MaintenancePanel';
+import { UsersPanel } from './components/UsersPanel';
 import { Login } from './components/Login';
 import { Toasts, ToastCtx, useToasts } from './components/Toasts';
 import { ModalProvider } from './components/ModalCtx';
@@ -22,6 +23,7 @@ import { usePoll, useTheme, useLocalFlag } from './hooks';
 const PAGE_TITLES: Record<Page, string> = {
   overview: 'Cluster overview',
   sql: 'SQL console',
+  users: 'Users & access',
   audit: 'Audit log',
   maintenance: 'Maintenance',
 };
@@ -35,6 +37,10 @@ export function App() {
   const [user, setUser] = useState<string>(() => {
     try { return localStorage.getItem('tsdb.user') ?? ''; } catch { return ''; }
   });
+  /* Session role from /whoami.  Default "admin": old servers without the
+   * endpoint (404) keep the full UI — gating here is convenience only,
+   * the server enforces RBAC on every statement. */
+  const [role, setRole] = useState<'admin' | 'normal'>('admin');
   const [navMin, toggleNav] = useLocalFlag('tsdb.navmin', false);
   const { theme, toggle: toggleTheme } = useTheme();
   const toasts = useToasts();
@@ -63,6 +69,29 @@ export function App() {
     })();
     return () => { alive = false; };
   }, []);
+
+  /* ── Session identity (/whoami) ─────────────────────────────────── */
+  useEffect(() => {
+    if (authed !== true) return;
+    let alive = true;
+    (async () => {
+      try {
+        const w = await api.whoami();
+        if (!alive) return;
+        setRole(w?.auth && w.role === 'normal' ? 'normal' : 'admin');
+        if (w?.auth && typeof w.user === 'string' && w.user) setUser(w.user);
+      } catch {
+        // 404 (old server) / transient error → keep the admin default.
+        if (alive) setRole('admin');
+      }
+    })();
+    return () => { alive = false; };
+  }, [authed]);
+
+  /* Users page is admin-only — bounce if the role downgrades. */
+  useEffect(() => {
+    if (role !== 'admin' && page === 'users') setPage('overview');
+  }, [role, page]);
 
   /* ── Shared cluster/raft poll (Topbar pill + Overview panel) ────── */
   const [cluster, setCluster] = useState<ClusterInfo | null>(null);
@@ -100,6 +129,7 @@ export function App() {
     await api.logout();
     setCluster(null);
     setRaft(null);
+    setRole('admin');
     setAuthed(false);
   }, []);
 
@@ -124,7 +154,7 @@ export function App() {
     <ToastCtx.Provider value={toasts}>
       <ModalProvider>
         <div className={`shell ${navMin ? 'nav-min' : ''}`}>
-          <Sidebar page={page} onPage={setPage} cluster={cluster} />
+          <Sidebar page={page} onPage={setPage} cluster={cluster} role={role} />
           <Topbar
             title={PAGE_TITLES[page]}
             cluster={cluster}
@@ -134,6 +164,7 @@ export function App() {
             onTheme={toggleTheme}
             onNav={toggleNav}
             user={user}
+            role={role}
             onLogout={onLogout}
             onHealthClick={() => setPage('overview')}
           />
@@ -160,8 +191,9 @@ export function App() {
                   </div>
                 </div>
               )}
+              {page === 'users' && <UsersPanel selfUser={user} />}
               {page === 'audit' && <AuditPanel />}
-              {page === 'maintenance' && <MaintenancePanel />}
+              {page === 'maintenance' && <MaintenancePanel role={role} />}
             </div>
           </main>
         </div>

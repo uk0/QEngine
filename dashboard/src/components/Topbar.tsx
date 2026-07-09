@@ -10,13 +10,14 @@ interface Props {
   onTheme: () => void;
   onNav: () => void;
   user: string;
+  role: 'admin' | 'normal';
   onLogout: () => void;
   onHealthClick: () => void;
 }
 
 export function Topbar({
   title, cluster, raft, clusterErr, theme, onTheme, onNav,
-  user, onLogout, onHealthClick,
+  user, role, onLogout, onHealthClick,
 }: Props) {
   return (
     <header className="topbar">
@@ -37,6 +38,14 @@ export function Topbar({
       <span className="user-chip">
         <span className="avatar">{(user || '?').slice(0, 2)}</span>
         {user && <span className="user-name">{user}</span>}
+        <span
+          className={`role-chip ${role === 'admin' ? 'lead' : ''}`}
+          title={role === 'admin'
+            ? 'admin — full control (DDL, users, maintenance)'
+            : 'normal — admin-only actions are locked; the server enforces RBAC per statement'}
+        >
+          {role}
+        </span>
       </span>
       <button className="icon-btn" onClick={onLogout} title="Sign out" aria-label="Sign out">
         <IconLogout />

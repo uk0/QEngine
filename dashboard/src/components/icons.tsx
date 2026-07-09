@@ -70,3 +70,28 @@ export const IconDownload = (p: P) => (
     <path d="M7 10l5 5 5-5M12 15V3" />
   </svg>
 );
+
+export const IconUsers = (p: P) => (
+  <svg {...S(p)}>
+    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+  </svg>
+);
+
+export const IconCrown = (p: P) => (
+  <svg {...S(p)}>
+    <path d="M4 18h16M4 17l-1.5-9L8 12l4-7 4 7 5.5-4L20 17z" />
+  </svg>
+);
+
+export const IconLock = (p: P) => (
+  <svg {...S(p)}>
+    <rect x="4" y="11" width="16" height="10" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+  </svg>
+);
+
+export const IconX = (p: P) => (
+  <svg {...S(p)}><path d="M18 6L6 18M6 6l12 12" /></svg>
+);

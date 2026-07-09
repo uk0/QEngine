@@ -2,12 +2,16 @@ import { useState } from 'react';
 import { api, CatalogOrphan, CatalogReport, errMsg } from '../api';
 import { useToastCtx } from './Toasts';
 import { useModalCtx } from './ModalCtx';
-import { IconDownload } from './icons';
+import { IconDownload, IconLock } from './icons';
 
 /* Maintenance page: catalog consistency scan (read-only), retention
  * sweep + PITR (both MUTATING — POST only, guarded by confirm modals),
- * and the /backup tarball download. */
-export function MaintenancePanel() {
+ * and the /backup tarball download.
+ *
+ * role="normal" locks the mutating actions client-side (lock hint +
+ * disabled buttons); the server enforces RBAC regardless. */
+export function MaintenancePanel({ role }: { role: 'admin' | 'normal' }) {
+  const locked = role !== 'admin';
   return (
     <>
       <div className="page-head">
@@ -16,8 +20,8 @@ export function MaintenancePanel() {
       </div>
       <CatalogCheckCard />
       <div className="maint-grid">
-        <RetentionCard />
-        <PitrCard />
+        <RetentionCard locked={locked} />
+        <PitrCard locked={locked} />
         <BackupCard />
       </div>
     </>
@@ -151,7 +155,7 @@ function MiniStat({ label, val }: { label: string; val?: number }) {
 
 /* ── Retention sweep (MUTATING) ───────────────────────────────────── */
 
-function RetentionCard() {
+function RetentionCard({ locked }: { locked: boolean }) {
   const toast = useToastCtx();
   const modal = useModalCtx();
   const [busy, setBusy] = useState(false);
@@ -190,6 +194,11 @@ function RetentionCard() {
       <h3 className="card-title">
         Retention sweep
         <span className="grow" />
+        {locked && (
+          <span className="lock-hint" title="requires admin">
+            <IconLock size={11} /> admin only
+          </span>
+        )}
         <span className="badge warn">Mutating</span>
       </h3>
       <p className="maint-desc">
@@ -197,7 +206,8 @@ function RetentionCard() {
         cycle. <code>POST /retention/sweep</code> — expired partitions are
         removed from disk.
       </p>
-      <button className="danger" onClick={sweep} disabled={busy}>
+      <button className="danger" onClick={sweep} disabled={busy || locked}
+              title={locked ? 'requires admin' : undefined}>
         {busy ? <><span className="spinner" /> Sweeping…</> : 'Run sweep…'}
       </button>
       {last && <div className="stat-sub" style={{ marginTop: 8 }}>Last run: {last}</div>}
@@ -226,7 +236,7 @@ function parseTarget(input: string): { ns: string; human: string } | null {
   return { ns: `${ms}000000`, human: new Date(ms).toISOString() };
 }
 
-function PitrCard() {
+function PitrCard({ locked }: { locked: boolean }) {
   const toast = useToastCtx();
   const modal = useModalCtx();
   const [busy, setBusy] = useState(false);
@@ -287,13 +297,19 @@ function PitrCard() {
       <h3 className="card-title">
         Point-in-time recovery
         <span className="grow" />
+        {locked && (
+          <span className="lock-hint" title="requires admin">
+            <IconLock size={11} /> admin only
+          </span>
+        )}
         <span className="badge bad">Destructive</span>
       </h3>
       <p className="maint-desc">
         <code>POST /pitr?ts=&lt;ns&gt;</code> — drops partitions newer than the
         target instant. Use only right after restoring from a backup tarball.
       </p>
-      <button className="danger" onClick={trim} disabled={busy}>
+      <button className="danger" onClick={trim} disabled={busy || locked}
+              title={locked ? 'requires admin' : undefined}>
         {busy ? <><span className="spinner" /> Trimming…</> : 'Roll to instant…'}
       </button>
       {last && <div className="stat-sub" style={{ marginTop: 8 }}>Last run: {last}</div>}

@@ -1,6 +1,10 @@
-import { useCallback, useRef, useState } from 'react';
-import { api, ClusterInfo, ClusterNode, HealthInfo, RaftInfo } from '../api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  api, AutobalanceNode, ClusterInfo, ClusterNode, errMsg, HealthInfo,
+  RaftInfo, Tree,
+} from '../api';
 import { usePoll } from '../hooks';
+import { IconCrown, IconX } from './icons';
 
 interface Props {
   cluster: ClusterInfo | null;
@@ -8,6 +12,9 @@ interface Props {
   err: string;
   lastAt: number;
 }
+
+/** Poll-history samples kept per node for the write-load sparkline. */
+const SPARK_SAMPLES = 30;
 
 /* Overview page: KPI tiles from /metrics + /health, then the cluster
  * cards.  /cluster + /raft arrive via the App-level shared 4s poll. */
@@ -18,6 +25,32 @@ export function ClusterPanel({ cluster, raft, err, lastAt }: Props) {
   // Previous snapshot → per-second deltas without server-side rates.
   const prev = useRef<{ at: number; m: Record<string, number> } | null>(null);
   const [rate, setRate] = useState<Record<string, number>>({});
+
+  /* Per-node write-load history from the autobalance load table.
+   * Accumulated during render, deduped by poll stamp so StrictMode's
+   * double render can't double-push. */
+  const spark = useRef<{ stamp: number; per: Record<string, number[]> }>({
+    stamp: 0,
+    per: {},
+  });
+  if (cluster && lastAt && lastAt !== spark.current.stamp) {
+    spark.current.stamp = lastAt;
+    for (const n of cluster.autobalance?.nodes ?? []) {
+      if (!n?.id) continue;
+      const arr = (spark.current.per[n.id] ??= []);
+      arr.push(Math.max(0, n.writes_sec ?? 0));
+      if (arr.length > SPARK_SAMPLES) arr.shift();
+    }
+  }
+
+  /* Node detail drawer — stores an id, resolves against the live poll. */
+  const [drawerId, setDrawerId] = useState<string | null>(null);
+  const drawerNode = drawerId
+    ? (cluster?.nodes ?? []).find(n => n?.id === drawerId) ?? null
+    : null;
+  useEffect(() => {
+    if (drawerId && cluster && !drawerNode) setDrawerId(null);
+  }, [drawerId, cluster, drawerNode]);
 
   const pollMetrics = useCallback(async () => {
     const [m, h] = await Promise.allSettled([api.metrics(), api.health()]);
@@ -80,13 +113,29 @@ export function ClusterPanel({ cluster, raft, err, lastAt }: Props) {
 
       <KpiRow metrics={metrics} rate={rate} health={health} cluster={cluster} />
 
+      <SummaryStrip cluster={cluster} raft={raft} />
+      <NodeCards
+        cluster={cluster}
+        raft={raft}
+        sparkPer={spark.current.per}
+        onOpen={setDrawerId}
+      />
       <LocalNodeCard cluster={cluster} raft={raft} />
       <RaftCard raft={raft} cluster={cluster} />
-      <NodesTable cluster={cluster} raft={raft} />
       <ShardingCard cluster={cluster} />
       <ReplicationCard metrics={metrics} rate={rate} />
       <CompactionCard metrics={metrics} rate={rate} />
       <AutobalanceCard cluster={cluster} />
+
+      {drawerNode && (
+        <NodeDrawer
+          n={drawerNode}
+          cluster={cluster}
+          raft={raft}
+          spark={spark.current.per[drawerNode.id] ?? []}
+          onClose={() => setDrawerId(null)}
+        />
+      )}
     </>
   );
 }
@@ -229,8 +278,83 @@ function LocalNodeCard({ cluster, raft }: { cluster: ClusterInfo | null; raft: R
   );
 }
 
-/* ── Node list: all gossiped peers with HB + state colour ────────── */
-function NodesTable({ cluster, raft }: { cluster: ClusterInfo | null; raft: RaftInfo | null }) {
+/* ── Cluster summary strip: headline topology numbers in one line ── */
+function SummaryStrip({ cluster, raft }: {
+  cluster: ClusterInfo | null;
+  raft: RaftInfo | null;
+}) {
+  if (!cluster) return null;
+  const nodes = cluster.nodes ?? [];
+  const alive = nodes.filter(n => n?.state === 'ALIVE').length;
+  const dead = nodes.filter(n => n?.state === 'DEAD').length;
+  const totalDisk = nodes.reduce((s, n) => s + (n?.disk_bytes ?? 0), 0);
+  const s = cluster.sharding;
+  const leaderId = raft?.leader_id && raft.leader_id !== '0' ? raft.leader_id : '';
+  const leader = nodes.find(n => n?.id === leaderId);
+  const ema = cluster.autobalance?.ema_writes_sec;
+
+  return (
+    <div className="summary-strip">
+      <SummaryItem
+        label="Nodes alive"
+        val={nodes.length ? `${alive}/${nodes.length}` : 'standalone'}
+        tone={dead > 0 ? 'bad' : alive < nodes.length ? 'warn' : 'ok'}
+      />
+      <SummaryItem
+        label="Leader"
+        val={leaderId ? (leader?.addr ?? shortId(leaderId)) : raft?.role ? 'none' : '—'}
+        tone={raft?.role && !leaderId ? 'bad' : undefined}
+        title={leaderId || undefined}
+      />
+      <SummaryItem
+        label="Raft term · commit"
+        val={raft?.role
+          ? `${raft.current_term ?? '—'} · ${fmtNum(raft.commit_index ?? 0)}`
+          : 'fanout mode'}
+      />
+      <SummaryItem
+        label="Replicas"
+        val={s ? (s.replica_n > 0 ? `N=${s.replica_n}` : 'broadcast') : '—'}
+      />
+      <SummaryItem
+        label="Sharding"
+        val={s ? (s.active === 1 ? 'active' : s.replica_n > 0 ? 'idle' : 'off') : '—'}
+        tone={s?.active === 1 ? 'ok' : undefined}
+      />
+      <SummaryItem
+        label="Cluster disk"
+        val={totalDisk > 0 ? fmtBytes(totalDisk) : '—'}
+        title={totalDisk > 0 ? `${fmtNum(totalDisk)} bytes across ${nodes.length} node${nodes.length === 1 ? '' : 's'}` : undefined}
+      />
+      <SummaryItem label="Local uptime" val={fmtSec(cluster.local?.uptime_s)} />
+      {ema != null && (
+        <SummaryItem label="Writes EMA" val={`${ema.toFixed(1)}/s`} />
+      )}
+    </div>
+  );
+}
+
+function SummaryItem({ label, val, tone, title }: {
+  label: string;
+  val: string;
+  tone?: 'ok' | 'warn' | 'bad';
+  title?: string;
+}) {
+  return (
+    <div className="ss-item" title={title}>
+      <div className="ss-label">{label}</div>
+      <div className={`ss-val ${tone ? `tone-${tone}` : ''}`}>{val}</div>
+    </div>
+  );
+}
+
+/* ── Node cards: one card per gossiped peer ───────────────────────── */
+function NodeCards({ cluster, raft, sparkPer, onOpen }: {
+  cluster: ClusterInfo | null;
+  raft: RaftInfo | null;
+  sparkPer: Record<string, number[]>;
+  onOpen: (id: string) => void;
+}) {
   if (!cluster) return null;
   const sorted = [...(cluster.nodes ?? [])].sort((a, b) =>
     (a?.addr ?? '').localeCompare(b?.addr ?? ''));
@@ -247,64 +371,331 @@ function NodesTable({ cluster, raft }: { cluster: ClusterInfo | null; raft: Raft
       </div>
     );
   }
+  const maxDisk = Math.max(...sorted.map(n => n?.disk_bytes ?? 0), 1);
+  const abById: Record<string, AutobalanceNode> = {};
+  for (const a of cluster.autobalance?.nodes ?? []) {
+    if (a?.id) abById[a.id] = a;
+  }
   return (
-    <div className="card">
-      <h3 className="card-title">
+    <section>
+      <h3 className="card-title" style={{ margin: '2px 2px 8px' }}>
         <span className="live-dot" />
-        Nodes <span className="mu">{sorted.length} gossiped · refresh 4s</span>
+        Nodes <span className="mu">{sorted.length} gossiped · click a card for detail</span>
         <span className="grow" />
         <span className={`badge ${degraded > 0 ? 'warn' : 'ok'}`}>
           {alive}/{sorted.length} alive
         </span>
       </h3>
-      <div className="result">
-        <table className="rows">
-          <thead>
-            <tr>
-              <th>Node</th>
-              <th>Addr</th>
-              <th>Role</th>
-              <th>State</th>
-              <th>Storage</th>
-              <th>HB age</th>
-              <th>Susp.</th>
-              <th>Known for</th>
-              <th>Ver</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map(n => (
-              <NodeRow key={n.id} n={n}
-                       local={n.id === cluster.local_id}
-                       isLeader={!!leaderId && n.id === leaderId} />
-            ))}
-          </tbody>
-        </table>
+      <div className="node-grid">
+        {sorted.map(n => (
+          <NodeCard
+            key={n.id}
+            n={n}
+            self={n.id === cluster.local_id}
+            isLeader={!!leaderId && n.id === leaderId}
+            ab={abById[n.id]}
+            spark={sparkPer[n.id] ?? []}
+            maxDisk={maxDisk}
+            onOpen={() => onOpen(n.id)}
+          />
+        ))}
       </div>
-    </div>
+    </section>
   );
 }
 
-function NodeRow({ n, local, isLeader }: { n: ClusterNode; local: boolean; isLeader: boolean }) {
-  const hb = n.hb_age_ms ?? 0;
-  const hbClass = hb < 500 ? 'ok' : hb < 2000 ? 'warn' : 'bad';
+function stateCls(state?: string): 'ok' | 'warn' | 'bad' {
+  return state === 'ALIVE' ? 'ok' : state === 'SUSPECT' ? 'warn' : 'bad';
+}
+
+function hbTone(ms: number): 'ok' | 'warn' | 'bad' {
+  return ms < 2_000 ? 'ok' : ms < 10_000 ? 'warn' : 'bad';
+}
+
+function NodeCard({ n, self, isLeader, ab, spark, maxDisk, onOpen }: {
+  n: ClusterNode;
+  self: boolean;
+  isLeader: boolean;
+  ab?: AutobalanceNode;
+  spark: number[];
+  maxDisk: number;
+  onOpen: () => void;
+}) {
   const st = n.state ?? '?';
-  const stClass = st === 'ALIVE' ? 'ok' : st === 'SUSPECT' ? 'warn' : 'bad';
+  const sc = stateCls(st);
+  const hb = n.hb_age_ms ?? 0;
+  const hbc = self ? 'ok' : hbTone(hb);
+  const disk = n.disk_bytes ?? 0;
+
   return (
-    <tr>
-      <td>
-        {local && <b title="this node">★ </b>}
-        <span title={n.id} className="mono">{shortId(n.id ?? '')}</span>
-      </td>
-      <td className="mono">{n.addr ?? '—'}</td>
-      <td><RoleChip role={isLeader ? 'leader' : (n.role ?? '—')} /></td>
-      <td><span className={`pill ${stClass}`}>{st}</span></td>
-      <td className="mono">{n.disk_bytes ? fmtBytes(n.disk_bytes) : '–'}</td>
-      <td className={`mono hb-${hbClass}`}>{fmtNum(hb)} ms</td>
-      <td>{n.suspect_count || '-'}</td>
-      <td>{fmtSec(n.known_for_s)}</td>
-      <td>{n.ver ?? '—'}</td>
-    </tr>
+    <button
+      type="button"
+      className={`node-card ${st === 'SUSPECT' ? 'suspect' : ''} ${st === 'DEAD' ? 'dead' : ''}`}
+      onClick={onOpen}
+      title={`${n.addr ?? n.id} — open node detail`}
+    >
+      <div className="nc-head">
+        <span className={`node-dot ${st === 'ALIVE' ? 'alive' : st === 'SUSPECT' ? 'suspect' : 'dead'}`} />
+        <span className="nc-addr">{n.addr ?? '—'}</span>
+        {isLeader && (
+          <span className="crown" title="raft leader"><IconCrown size={13} /></span>
+        )}
+        {self && <span className="self-chip">self</span>}
+        <span className="grow" />
+        <span className={`pill ${sc}`}>{st}</span>
+      </div>
+
+      <div className="nc-sub">
+        <span className="mono mu" title={n.id}>{shortId(n.id ?? '')}</span>
+        <RoleChip role={isLeader ? 'leader' : (n.role ?? '—')} />
+        {(n.suspect_count ?? 0) > 0 && (
+          <span className="pill warn" title="failure-detector suspicions accumulated against this node">
+            {n.suspect_count} susp
+          </span>
+        )}
+        <span className="mu num">v{n.ver ?? 0}</span>
+      </div>
+
+      <div className="nc-rows">
+        <div className="nc-row">
+          <span className="k">Disk</span>
+          <span className="v">{disk > 0 ? fmtBytes(disk) : '–'}</span>
+          <span className="nc-bar" title={disk > 0 ? `${((disk / maxDisk) * 100).toFixed(0)}% of the largest node` : 'not sampled yet'}>
+            <span style={{ width: `${Math.min(100, (disk / maxDisk) * 100)}%` }} />
+          </span>
+        </div>
+        <div className="nc-row">
+          <span className="k">Heartbeat</span>
+          <span className={`v tone-${hbc}`}>{self ? 'local' : `${fmtNum(hb)} ms`}</span>
+          <span className="note">{self ? 'this node' : hbc === 'ok' ? 'fresh' : hbc === 'warn' ? 'lagging' : 'stale'}</span>
+        </div>
+        <div className="nc-row">
+          <span className="k">Member</span>
+          <span className="v">{fmtSec(n.known_for_s)}</span>
+          <span className="note">in gossip view</span>
+        </div>
+      </div>
+
+      <div className="nc-spark">
+        {spark.length >= 2 ? (
+          <>
+            <Spark data={spark} />
+            <span className="cur">{fmtNum(Math.round(spark[spark.length - 1] ?? 0))} w/s</span>
+          </>
+        ) : ab ? (
+          <span className="note">writes {fmtNum(ab.writes_sec ?? 0)}/s · cpu {(ab.cpu_pct ?? 0).toFixed(0)}% · {ab.vn ?? 0} vn</span>
+        ) : (
+          <span className="note">no per-node write telemetry</span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+/* Inline write-load sparkline — area + line over the last N polls. */
+function Spark({ data }: { data: number[] }) {
+  const W = 120;
+  const H = 26;
+  const n = data.length;
+  const max = Math.max(...data, 1e-9);
+  const pts = data.map((v, i) => {
+    const x = (i / (n - 1)) * W;
+    const y = H - 2 - (Math.max(0, v) / max) * (H - 6);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" aria-hidden="true">
+      <path className="spark-fill" d={`M0,${H} L${pts.join(' L')} L${W},${H} Z`} />
+      <polyline className="spark-line" points={pts.join(' ')} />
+    </svg>
+  );
+}
+
+/* ── Node detail drawer: every raw field, labelled ────────────────── */
+function NodeDrawer({ n, cluster, raft, spark, onClose }: {
+  n: ClusterNode;
+  cluster: ClusterInfo | null;
+  raft: RaftInfo | null;
+  spark: number[];
+  onClose: () => void;
+}) {
+  const self = n.id === cluster?.local_id;
+  const leaderId = raft?.leader_id && raft.leader_id !== '0' ? raft.leader_id : '';
+  const isLeader = !!leaderId && n.id === leaderId;
+  const ab = (cluster?.autobalance?.nodes ?? []).find(a => a?.id === n.id);
+  const st = n.state ?? '?';
+
+  /* Self node: pull /tree for db identity + per-table on-disk bytes. */
+  const [tree, setTree] = useState<Tree | null>(null);
+  const [treeErr, setTreeErr] = useState('');
+  useEffect(() => {
+    if (!self) return;
+    let alive = true;
+    (async () => {
+      try {
+        const t = await api.tree();
+        if (alive) { setTree(t ?? {}); setTreeErr(''); }
+      } catch (e) {
+        if (alive) setTreeErr(errMsg(e, 'tree unavailable'));
+      }
+    })();
+    return () => { alive = false; };
+  }, [self]);
+
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const L = cluster?.local;
+  const db = tree?.db;
+  const tables = [...(tree?.tables ?? [])]
+    .sort((a, b) => (b?.bytes ?? 0) - (a?.bytes ?? 0));
+  const maxTblBytes = Math.max(...tables.map(t => t?.bytes ?? 0), 1);
+
+  return (
+    <>
+      <div className="drawer-backdrop" onMouseDown={onClose} />
+      <aside className="drawer" role="dialog" aria-modal="true" aria-label={`Node ${n.addr ?? n.id}`}>
+        <div className="drawer-head">
+          <span className={`node-dot ${st === 'ALIVE' ? 'alive' : st === 'SUSPECT' ? 'suspect' : 'dead'}`} />
+          <span className="drawer-title">{n.addr ?? shortId(n.id ?? '')}</span>
+          {isLeader && <span className="crown" title="raft leader"><IconCrown size={13} /></span>}
+          {self && <span className="self-chip">self</span>}
+          <span className="grow" />
+          <span className={`pill ${stateCls(st)}`}>{st}</span>
+          <button className="icon-btn" onClick={onClose} title="Close" aria-label="Close node detail">
+            <IconX />
+          </button>
+        </div>
+        <div className="drawer-body">
+          <section>
+            <div className="section-label">Identity</div>
+            <dl className="kv-grid">
+              <dt>Node id</dt><dd>{n.id ?? '—'}</dd>
+              <dt>Address</dt><dd>{n.addr ?? '—'}</dd>
+              <dt>Role</dt><dd><RoleChip role={isLeader ? 'leader' : (n.role ?? '—')} /></dd>
+              <dt>Gossip version</dt><dd>{fmtNum(n.ver ?? 0)}</dd>
+            </dl>
+          </section>
+
+          <section>
+            <div className="section-label">Health</div>
+            <dl className="kv-grid">
+              <dt>State</dt><dd className={`tone-${stateCls(st)}`}>{st}</dd>
+              <dt>Heartbeat age</dt>
+              <dd className={self ? '' : `tone-${hbTone(n.hb_age_ms ?? 0)}`}>
+                {self ? 'local node' : `${fmtNum(n.hb_age_ms ?? 0)} ms`}
+              </dd>
+              <dt>Known for</dt><dd>{fmtSec(n.known_for_s)} ({fmtNum(n.known_for_s ?? 0)}s)</dd>
+              <dt>Suspect count</dt>
+              <dd className={(n.suspect_count ?? 0) > 0 ? 'tone-warn' : ''}>
+                {fmtNum(n.suspect_count ?? 0)}
+              </dd>
+            </dl>
+          </section>
+
+          <section>
+            <div className="section-label">Storage</div>
+            <dl className="kv-grid">
+              <dt>Data dir size</dt>
+              <dd>{(n.disk_bytes ?? 0) > 0
+                ? `${fmtBytes(n.disk_bytes ?? 0)} (${fmtNum(n.disk_bytes ?? 0)} B)`
+                : 'not sampled yet'}</dd>
+            </dl>
+          </section>
+
+          {(ab || spark.length >= 2) && (
+            <section>
+              <div className="section-label">Write load</div>
+              {spark.length >= 2 && (
+                <div className="drawer-spark">
+                  <Spark data={spark} />
+                  <span className="cur mono mu">
+                    last {spark.length} polls · now {fmtNum(Math.round(spark[spark.length - 1] ?? 0))}/s
+                  </span>
+                </div>
+              )}
+              {ab && (
+                <dl className="kv-grid">
+                  <dt>Writes/s</dt><dd>{fmtNum(ab.writes_sec ?? 0)}</dd>
+                  <dt>Storage</dt><dd>{(ab.storage_mb ?? 0) < 1024
+                    ? `${(ab.storage_mb ?? 0).toFixed(1)} MB`
+                    : fmtBytes((ab.storage_mb ?? 0) * 1024 * 1024)}</dd>
+                  <dt>CPU</dt><dd>{(ab.cpu_pct ?? 0).toFixed(1)}%</dd>
+                  <dt>Virtual nodes</dt><dd>{fmtNum(ab.vn ?? 0)}</dd>
+                </dl>
+              )}
+            </section>
+          )}
+
+          {raft?.role && (isLeader || (raft.self_id && n.id === raft.self_id)) && (
+            <section>
+              <div className="section-label">Raft</div>
+              <dl className="kv-grid">
+                {isLeader && (<><dt>Position</dt><dd className="tone-ok">cluster leader</dd></>)}
+                {raft.self_id && n.id === raft.self_id && (
+                  <>
+                    <dt>Raft role</dt><dd>{raft.role}</dd>
+                    <dt>Term</dt><dd>{fmtNum(raft.current_term ?? 0)}</dd>
+                    <dt>Commit index</dt><dd>{fmtNum(raft.commit_index ?? 0)}</dd>
+                    <dt>Applied</dt><dd>{fmtNum(raft.last_applied ?? 0)}</dd>
+                  </>
+                )}
+              </dl>
+            </section>
+          )}
+
+          {self && (
+            <>
+              <section>
+                <div className="section-label">Local database</div>
+                <dl className="kv-grid">
+                  <dt>Name</dt><dd>{db?.name ?? '—'}</dd>
+                  <dt>Host</dt><dd>{db?.host ?? L?.host ?? '—'}</dd>
+                  <dt>Path</dt><dd>{db?.path ?? L?.disk?.data_dir ?? '—'}</dd>
+                  <dt>Uptime</dt><dd>{fmtSec(db?.uptime_s ?? L?.uptime_s)}</dd>
+                  {L?.pid != null && (<><dt>PID</dt><dd>{L.pid}</dd></>)}
+                  {L?.disk && (
+                    <>
+                      <dt>Volume free</dt>
+                      <dd>{fmtBytes(L.disk.free_bytes ?? 0)} of {fmtBytes(L.disk.total_bytes ?? 0)}</dd>
+                    </>
+                  )}
+                </dl>
+                {treeErr && <div className="empty tight">{treeErr}</div>}
+              </section>
+
+              <section>
+                <div className="section-label">
+                  Tables on this node {tables.length > 0 && `(${tables.length}${tables.length >= 32 ? '+, capped' : ''})`}
+                </div>
+                {!tree && !treeErr && (
+                  <div className="empty tight"><span className="spinner" /> loading table list…</div>
+                )}
+                {tree && tables.length === 0 && (
+                  <div className="empty tight">no on-disk tables reported</div>
+                )}
+                <div className="tbl-list">
+                  {tables.map(t => (
+                    <div key={t.name} className="tbl-item" title={t.name}>
+                      <span className="nm">{t.name}</span>
+                      {t.bytes != null && (
+                        <span className="tbl-bar">
+                          <span style={{ width: `${Math.min(100, ((t.bytes ?? 0) / maxTblBytes) * 100)}%` }} />
+                        </span>
+                      )}
+                      <span className="sz">{t.bytes != null ? fmtBytes(t.bytes) : `${t.ncols ?? '—'} cols`}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </>
+          )}
+        </div>
+      </aside>
+    </>
   );
 }
 
