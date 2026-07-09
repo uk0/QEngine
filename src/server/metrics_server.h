@@ -148,6 +148,17 @@ void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
                                              tsdb_auth_check_fn check,
                                              void *userdata);
 
+/* GET /whoami — resolve the session cookie to its user + role so the
+ * dashboard can show who is logged in and gate admin-only UI (server-side
+ * RBAC stays authoritative regardless).  Fills out_user (NUL-terminated)
+ * and *out_is_admin; returns TSDB_OK, or an error when the token is
+ * unknown/expired. */
+typedef int (*tsdb_whoami_fn)(void *userdata, const char *token,
+                               char *out_user, size_t user_cap,
+                               int *out_is_admin);
+void tsdb_metrics_server_set_whoami_provider(tsdb_whoami_fn fn,
+                                              void *userdata);
+
 /* ---- /raft provider hook ------------------------------------------------- *
  * Returns a JSON snapshot of the local Raft state machine for the
  * acceptance harness and the topology dashboard.  Expected shape:

@@ -16,6 +16,7 @@
 #include "../server/influx_line.h"
 #include "../storage/retention.h"
 #include "../catalog/audit.h"
+#include "../catalog/user.h"
 #include "../storage/db.h"
 #include "../storage/compaction.h"
 #include "../raft/raft.h"
@@ -1041,6 +1042,22 @@ int tsdb_node_auth_check_trampoline(void *ud, const char *token) {
     return tsdb_auth_check((tsdb_db_t *)ud, token, TSDB_PRIV_SELECT, "*");
 }
 
+/* GET /whoami: resolve the dashboard session cookie to (user, role) via the
+ * catalog auth module's token table. */
+int tsdb_node_whoami_trampoline(void *ud, const char *token,
+                                 char *out_user, size_t user_cap,
+                                 int *out_is_admin) {
+    tsdb_auth_t *a = tsdb_db_auth((tsdb_db_t *)ud);
+    if (!a || !token || !token[0]) return TSDB_ERR_PERMISSION;
+    if (tsdb_auth_token_user(a, token, out_user, user_cap) != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
+    tsdb_user_role_t role = TSDB_USER_ROLE_NORMAL;
+    if (tsdb_auth_token_role(a, token, &role) != TSDB_OK)
+        return TSDB_ERR_PERMISSION;
+    *out_is_admin = (role == TSDB_USER_ROLE_ADMIN);
+    return TSDB_OK;
+}
+
 int main(int argc, char **argv) {
     const char *data_dir     = NULL;
     const char *rpc_addr     = NULL;
@@ -1444,6 +1461,7 @@ int main(int argc, char **argv) {
         tsdb_node_auth_login_trampoline,
         tsdb_node_auth_check_trampoline,
         db);
+    tsdb_metrics_server_set_whoami_provider(tsdb_node_whoami_trampoline, db);
     fflush(stdout);
 
     /* Background compaction: merge size-tiered flush blocks into larger cold

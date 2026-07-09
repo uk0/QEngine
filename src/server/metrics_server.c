@@ -62,6 +62,8 @@ static void                  *g_backup_manifest_ud = NULL;
 static tsdb_auth_login_fn   g_auth_login_fn = NULL;
 static tsdb_auth_check_fn   g_auth_check_fn = NULL;
 static void                *g_auth_ud       = NULL;
+static tsdb_whoami_fn       g_whoami_fn     = NULL;
+static void                *g_whoami_ud     = NULL;
 static tsdb_raft_json_fn    g_raft_fn     = NULL;
 static void                *g_raft_ud     = NULL;
 static char                 g_data_dir[4096] = {0};
@@ -126,6 +128,13 @@ void tsdb_metrics_server_set_auth_provider(tsdb_auth_login_fn login,
     g_auth_login_fn = login;
     g_auth_check_fn = check;
     g_auth_ud       = userdata;
+}
+
+void tsdb_metrics_server_set_whoami_provider(tsdb_whoami_fn fn,
+                                              void *userdata)
+{
+    g_whoami_fn = fn;
+    g_whoami_ud = userdata;
 }
 
 void tsdb_metrics_server_set_raft_provider(tsdb_raft_json_fn fn,
@@ -412,6 +421,7 @@ static void *handle_connection(void *arg) {
     int route_audit   = 0;
     int route_pitr    = 0;
     int route_cat_check = 0;
+    int route_whoami  = 0;
     if (strncmp(req, "GET /metrics", 12) == 0)           route_metrics = 1;
     else if (strncmp(req, "GET /login", 10) == 0)        route_login = 1;
     else if (strncmp(req, "POST /login", 11) == 0)       route_login = 2; /* 2 = POST */
@@ -420,6 +430,7 @@ static void *handle_connection(void *arg) {
     else if (strncmp(req, "GET /cluster", 12) == 0)      route_cluster = 1;
     else if (strncmp(req, "GET /tree", 9) == 0)          route_tree    = 1;
     else if (strncmp(req, "GET /raft", 9) == 0)          route_raft    = 1;
+    else if (strncmp(req, "GET /whoami", 11) == 0)       route_whoami  = 1;
     else if (strncmp(req, "GET /backup", 11) == 0)       route_backup  = 1;
     else if (strncmp(req, "GET /audit", 10) == 0)        route_audit   = 1;
     /* /pitr accepts POST (canonical) and GET (so the auth gate still
@@ -480,7 +491,7 @@ static void *handle_connection(void *arg) {
         (route_dash || route_cluster || route_tree ||
          route_backup || route_ret_sweep || route_sql ||
          route_audit || route_pitr || route_cat_check ||
-         route_static);
+         route_whoami || route_static);
 
     /* Extract tsdb_auth token from Cookie header (first match wins).
      * HTTP headers are case-insensitive per RFC 7230; most clients use
@@ -659,6 +670,49 @@ static void *handle_connection(void *arg) {
             "Location: /login\r\nContent-Length: 0\r\n"
             "Connection: close\r\n\r\n";
         write_all(fd, r, strlen(r));
+        goto done;
+    }
+
+    if (route_whoami) {
+        /* Session identity for the dashboard: which user does this cookie
+         * belong to, and is it an admin?  With the auth gate disabled there
+         * is no session — report auth:false so the UI skips login/RBAC
+         * gating (server-side enforcement stays authoritative regardless).
+         * Reaching here with auth enabled means the gate above already
+         * validated the cookie, so the provider lookup normally succeeds. */
+        char body[256];
+        if (!g_auth_enabled) {
+            snprintf(body, sizeof(body), "{\"auth\":false}\n");
+        } else {
+            char user[64] = {0};
+            int is_admin = 0;
+            if (g_whoami_fn &&
+                g_whoami_fn(g_whoami_ud, cookie_tok, user, sizeof(user),
+                            &is_admin) == TSDB_OK) {
+                /* Usernames are parser identifiers, but stay JSON-safe:
+                 * drop quote/backslash/control bytes on the way out. */
+                char safe[64]; size_t w2 = 0;
+                for (size_t i = 0; user[i] && w2 < sizeof(safe) - 1; i++) {
+                    unsigned char ch2 = (unsigned char)user[i];
+                    if (ch2 >= 0x20 && ch2 != '"' && ch2 != '\\')
+                        safe[w2++] = (char)ch2;
+                }
+                safe[w2] = '\0';
+                snprintf(body, sizeof(body),
+                         "{\"auth\":true,\"user\":\"%s\",\"role\":\"%s\"}\n",
+                         safe, is_admin ? "admin" : "normal");
+            } else {
+                snprintf(body, sizeof(body),
+                         "{\"auth\":true,\"user\":null,\"role\":null}\n");
+            }
+        }
+        char hdr[160];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+            strlen(body));
+        write_all(fd, hdr, (size_t)hlen);
+        write_all(fd, body, strlen(body));
         goto done;
     }
 
