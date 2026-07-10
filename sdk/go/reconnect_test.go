@@ -422,6 +422,15 @@ func TestDropTable(t *testing.T) {
 	if !strings.Contains(err.Error(), "no such table") {
 		t.Fatalf("error should carry the server message, got: %v", err)
 	}
+	// A decoded MSG_ERROR is a typed *ServerError carrying the code + message.
+	var se *ServerError
+	if !errors.As(err, &se) {
+		t.Fatalf("DropTable error is %T, want *ServerError via errors.As", err)
+	}
+	if se.Code != -3 || se.Msg != "no such table" {
+		t.Fatalf("ServerError = {Code:%d Msg:%q}, want {Code:-3 Msg:\"no such table\"}",
+			se.Code, se.Msg)
+	}
 }
 
 // TestIsConnError table-tests the classifier that decides reconnect-worthy

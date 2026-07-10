@@ -70,9 +70,9 @@ func main() {
 	defer c.Close()
 
 	cols := []tsdb.Column{
-		{"ts", tsdb.TypeTimestamp},
-		{"price", tsdb.TypeFloat64},
-		{"qty", tsdb.TypeInt64},
+		{Name: "ts", Type: tsdb.TypeTimestamp},
+		{Name: "price", Type: tsdb.TypeFloat64},
+		{Name: "qty", Type: tsdb.TypeInt64},
 	}
 
 	if *reset {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -173,6 +174,86 @@ func (c *Client) DropTable(name string) error {
 		return decodeError(f.Payload)
 	}
 	return nil
+}
+
+// Ping sends MSG_PING with a small payload and verifies the server echoes it
+// back (the server replies with the same type and payload, PONG flag set).
+// A transport failure or a mismatched echo returns an error; nil means the
+// round-trip completed.
+func (c *Client) Ping() error {
+	if c.pipeline != nil {
+		return errPipelineActive
+	}
+	payload := []byte("ping")
+	if _, err := c.Conn.Send(MsgPing, 0, 0, payload); err != nil {
+		return err
+	}
+	f, err := c.Conn.Recv()
+	if err != nil {
+		return err
+	}
+	if f.Type == MsgError {
+		return decodeError(f.Payload)
+	}
+	if f.Type != MsgPing {
+		return fmt.Errorf("unexpected PING response type=%d", f.Type)
+	}
+	if !bytes.Equal(f.Payload, payload) {
+		return fmt.Errorf("PING echo mismatch: sent %q got %q", payload, f.Payload)
+	}
+	return nil
+}
+
+// ClusterStats requests the server's live counters (MSG_CLUSTER_STATS).  The
+// server replies with TSDB_MT_HELLO_OK carrying a kv payload —
+// [kv_count u16 LE] then per pair [klen u8][key][vlen u8][val], values being
+// decimal strings (server.c handle_cluster_stats) — rendered here as one
+// "key=value" line per pair, in server order.
+func (c *Client) ClusterStats() (string, error) {
+	if c.pipeline != nil {
+		return "", errPipelineActive
+	}
+	if _, err := c.Conn.Send(MsgClusterStats, 0, 0, nil); err != nil {
+		return "", err
+	}
+	f, err := c.Conn.Recv()
+	if err != nil {
+		return "", err
+	}
+	if f.Type == MsgError {
+		return "", decodeError(f.Payload)
+	}
+	if f.Type != MsgHelloOK {
+		return "", fmt.Errorf("unexpected CLUSTER_STATS response type=%d", f.Type)
+	}
+	p := f.Payload
+	if len(p) < 2 {
+		return "", errors.New("short CLUSTER_STATS payload")
+	}
+	n := int(binary.LittleEndian.Uint16(p[0:2]))
+	p = p[2:]
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		if len(p) < 1 || len(p) < 1+int(p[0]) {
+			return "", errors.New("truncated CLUSTER_STATS key")
+		}
+		kl := int(p[0])
+		key := string(p[1 : 1+kl])
+		p = p[1+kl:]
+		if len(p) < 1 || len(p) < 1+int(p[0]) {
+			return "", errors.New("truncated CLUSTER_STATS value")
+		}
+		vl := int(p[0])
+		val := string(p[1 : 1+vl])
+		p = p[1+vl:]
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(key)
+		sb.WriteByte('=')
+		sb.WriteString(val)
+	}
+	return sb.String(), nil
 }
 
 // Row is a single row to insert.  Col indexes correspond to the order in
@@ -619,6 +700,24 @@ func parseRowsChunk(qr *QueryResult, p []byte) error {
 	return nil
 }
 
+// ServerError is a decoded server MSG_ERROR frame: the server-side status
+// code plus its message.  decodeError returns it for every well-formed error
+// payload, so callers can branch on the code with errors.As:
+//
+//	var se *tsdb.ServerError
+//	if errors.As(err, &se) && se.Code == -3 { ... }
+//
+// Its Error() text is identical to the pre-typed formatting
+// ("server error rc=%d: %s"), so existing string matching keeps working.
+type ServerError struct {
+	Code int32
+	Msg  string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("server error rc=%d: %s", e.Code, e.Msg)
+}
+
 func decodeError(p []byte) error {
 	if len(p) < 4 {
 		return errors.New("server error")
@@ -636,5 +735,5 @@ func decodeError(p []byte) error {
 	} else if len(p) > 4 {
 		msg = string(p[4:])
 	}
-	return fmt.Errorf("server error rc=%d: %s", rc, msg)
+	return &ServerError{Code: rc, Msg: msg}
 }

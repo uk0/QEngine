@@ -59,9 +59,9 @@ func main() {
 	_, _ = c.Query("DROP TABLE " + table)
 	if err := c.CreateTable(table, "ts",
 		[]tsdb.Column{
-			{"ts",  tsdb.TypeTimestamp},
-			{"val", tsdb.TypeFloat64},
-			{"vol", tsdb.TypeInt64},
+			{Name: "ts", Type: tsdb.TypeTimestamp},
+			{Name: "val", Type: tsdb.TypeFloat64},
+			{Name: "vol", Type: tsdb.TypeInt64},
 		}); err != nil {
 		log.Fatalf("create table: %v", err)
 	}
@@ -69,9 +69,9 @@ func main() {
 	base := int64(1_700_000_000) * int64(1e9)
 	rows := make([]tsdb.Row, 0, 2048)
 	cols := []tsdb.Column{
-		{"ts",  tsdb.TypeTimestamp},
-		{"val", tsdb.TypeFloat64},
-		{"vol", tsdb.TypeInt64},
+		{Name: "ts", Type: tsdb.TypeTimestamp},
+		{Name: "val", Type: tsdb.TypeFloat64},
+		{Name: "vol", Type: tsdb.TypeInt64},
 	}
 	for i := 0; i < N; i++ {
 		rows = append(rows, tsdb.Row{

@@ -53,6 +53,7 @@ const (
 	MsgSubscribe     byte = 50
 	MsgSubEvent      byte = 51
 	MsgUnsubscribe   byte = 52
+	MsgClusterStats  byte = 60
 )
 
 const (
