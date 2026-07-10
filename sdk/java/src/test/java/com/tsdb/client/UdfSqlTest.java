@@ -12,12 +12,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Self-contained test for {@link TsdbClient#registerUdf} /
- * {@link TsdbClient#dropUdf}.  Like {@code ReconnectTest} this is a runnable
- * {@code main} self-test (the SDK ships no JUnit): a mock listener speaks
- * just enough of the wire protocol (HELLO + query replies) to capture the
- * SQL each helper sends, and the test asserts the exact strings against the
- * server's CREATE FUNCTION grammar.  Exits non-zero on the first failure.
+ * Self-contained test for the SQL-building helpers: {@link
+ * TsdbClient#registerUdf} / {@link TsdbClient#dropUdf} plus the admin
+ * wrappers ({@code createUser} / {@code dropUser} / {@code grant} /
+ * {@code revoke} / {@code createDatabase}).  Like {@code ReconnectTest} this
+ * is a runnable {@code main} self-test (the SDK ships no JUnit): a mock
+ * listener speaks just enough of the wire protocol (HELLO + query replies)
+ * to capture the SQL each helper sends, and the test asserts the exact
+ * strings against the server grammar.  Exits non-zero on the first failure.
  */
 public class UdfSqlTest {
 
@@ -89,7 +91,7 @@ public class UdfSqlTest {
         ServerSocket ln = new ServerSocket();
         ln.bind(new InetSocketAddress("127.0.0.1", 0));
 
-        final int nQueries = 3;
+        final int nQueries = 9;
         final List<String> got = new ArrayList<>();
 
         Thread server = new Thread(() -> {
@@ -120,6 +122,15 @@ public class UdfSqlTest {
             cl.registerUdf("nofn", new byte[0], (byte) 2, "/opt/udf/y.so", null);
             cl.dropUdf("my_double");
 
+            // Admin helpers: password with an embedded single quote must be
+            // doubled on the wire ('' escape, see server lex.c).
+            cl.createUser("alice", "s3cr'et", true);
+            cl.createUser("bob", "pw", false);
+            cl.grant("SELECT", "trades", "bob");
+            cl.revoke("ALL", "*", "bob");
+            cl.dropUser("bob");
+            cl.createDatabase("metrics");
+
             // Unsupported type byte fails client-side, nothing hits the wire.
             boolean threw = false;
             try {
@@ -144,6 +155,19 @@ public class UdfSqlTest {
                 "registerUdf(no symbol) SQL mismatch: " + got.get(1));
             check(got.get(2).equals("DROP FUNCTION my_double"),
                 "dropUdf SQL mismatch: " + got.get(2));
+            check(got.get(3).equals(
+                "CREATE USER alice IDENTIFIED BY 's3cr''et' ROLE ADMIN"),
+                "createUser(admin) SQL mismatch: " + got.get(3));
+            check(got.get(4).equals("CREATE USER bob IDENTIFIED BY 'pw'"),
+                "createUser SQL mismatch: " + got.get(4));
+            check(got.get(5).equals("GRANT SELECT ON trades TO bob"),
+                "grant SQL mismatch: " + got.get(5));
+            check(got.get(6).equals("REVOKE ALL ON * FROM bob"),
+                "revoke SQL mismatch: " + got.get(6));
+            check(got.get(7).equals("DROP USER bob"),
+                "dropUser SQL mismatch: " + got.get(7));
+            check(got.get(8).equals("CREATE DATABASE metrics"),
+                "createDatabase SQL mismatch: " + got.get(8));
         }
 
         System.out.println("ok  UdfSqlTest (" + nQueries + " SQL strings verified)");

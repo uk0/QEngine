@@ -55,6 +55,7 @@ public class TsdbClient implements AutoCloseable {
     public static final byte MSG_QUERY          = 40;
     public static final byte MSG_QUERY_HDR      = 41;
     public static final byte MSG_QUERY_ROWS     = 42;
+    public static final byte MSG_CLUSTER_STATS  = 60;
 
     public static final short FLAG_FIN  = 0x0001;
 
@@ -63,6 +64,10 @@ public class TsdbClient implements AutoCloseable {
     public static final byte T_INT64     = 2;
     public static final byte T_FLOAT64   = 3;
     public static final byte T_SYMBOL    = 4;
+    /** FLOAT32 stores 4 bytes on disk (half of FLOAT64) but travels as a
+     *  64-bit double on the wire (the server widens it) — write its values
+     *  via {@link Row#f64}; query results decode to {@link Double}. */
+    public static final byte T_FLOAT32   = 5;
 
     /* Live socket + streams.  Non-final: {@link #reconnect()} swaps them for a
      * fresh connection after a mid-session drop. */
@@ -333,6 +338,60 @@ public class TsdbClient implements AutoCloseable {
         loggedIn = true;
     }
 
+    /* ----- Ping / stats ----- */
+
+    /**
+     * Sends MSG_PING with a small payload and verifies the server echoes it
+     * back (the server replies with the same type and payload, PONG flag
+     * set).  A transport failure or a mismatched echo throws; a normal
+     * return means the round-trip completed.
+     */
+    public void ping() throws IOException {
+        ensureNoPipeline();
+        byte[] payload = "ping".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        send(MSG_PING, (short) 0, payload);
+        Frame f = recv();
+        if (f.type == MSG_ERROR) throw decodeError(f.payload);
+        if (f.type != MSG_PING) throw new IOException("unexpected PING response type=" + f.type);
+        if (!java.util.Arrays.equals(f.payload, payload))
+            throw new IOException("PING echo mismatch");
+    }
+
+    /**
+     * Requests the server's live counters (MSG_CLUSTER_STATS).  The server
+     * replies with MSG_HELLO_OK carrying a kv payload — {@code [kv_count u16
+     * LE]} then per pair {@code [klen u8][key][vlen u8][val]}, values being
+     * decimal strings (server.c handle_cluster_stats) — rendered here as one
+     * {@code key=value} line per pair, in server order.
+     */
+    public String clusterStats() throws IOException {
+        ensureNoPipeline();
+        send(MSG_CLUSTER_STATS, (short) 0, null);
+        Frame f = recv();
+        if (f.type == MSG_ERROR) throw decodeError(f.payload);
+        if (f.type != MSG_HELLO_OK)
+            throw new IOException("unexpected CLUSTER_STATS response type=" + f.type);
+        ByteBuffer b = ByteBuffer.wrap(f.payload).order(ByteOrder.LITTLE_ENDIAN);
+        if (b.remaining() < 2) throw new IOException("short CLUSTER_STATS payload");
+        int n = b.getShort() & 0xFFFF;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append('\n');
+            sb.append(readU8Str(b, "key")).append('=').append(readU8Str(b, "value"));
+        }
+        return sb.toString();
+    }
+
+    /** Reads one [len u8][bytes] string out of a CLUSTER_STATS kv payload. */
+    private static String readU8Str(ByteBuffer b, String what) throws IOException {
+        if (b.remaining() < 1) throw new IOException("truncated CLUSTER_STATS " + what);
+        int len = b.get() & 0xFF;
+        if (b.remaining() < len) throw new IOException("truncated CLUSTER_STATS " + what);
+        byte[] s = new byte[len];
+        b.get(s);
+        return new String(s, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
     /* ----- DDL ----- */
 
     public static final class Column {
@@ -411,6 +470,52 @@ public class TsdbClient implements AutoCloseable {
     /** Unregisters a scalar UDF: {@code DROP FUNCTION name}. */
     public void dropUdf(String name) throws IOException {
         query("DROP FUNCTION " + name);
+    }
+
+    /* ----- Admin / user management (thin SQL wrappers) ----- */
+
+    /** Escapes s for a single-quoted SQL string literal: every single quote
+     *  is doubled, matching the server lexer's {@code ''} escape. */
+    private static String sqlQuoteStr(String s) {
+        return s.replace("'", "''");
+    }
+
+    /**
+     * Issues {@code CREATE USER name IDENTIFIED BY 'pass' [ROLE ADMIN]} over
+     * the standard query channel.  The server defaults the role to NORMAL
+     * when the ROLE clause is omitted.  Requires an ADMIN session when auth
+     * is enabled.
+     */
+    public void createUser(String name, String pass, boolean admin) throws IOException {
+        StringBuilder sb = new StringBuilder("CREATE USER ").append(name)
+            .append(" IDENTIFIED BY '").append(sqlQuoteStr(pass)).append('\'');
+        if (admin) sb.append(" ROLE ADMIN");
+        query(sb.toString());
+    }
+
+    /** Issues {@code DROP USER name}. */
+    public void dropUser(String name) throws IOException {
+        query("DROP USER " + name);
+    }
+
+    /**
+     * Issues {@code GRANT priv ON table TO user}.  {@code priv} is one of
+     * SELECT, INSERT, DDL, or ALL (server parse.c); {@code table} may be
+     * {@code "*"} for all tables.
+     */
+    public void grant(String priv, String table, String user) throws IOException {
+        query("GRANT " + priv + " ON " + table + " TO " + user);
+    }
+
+    /** Issues {@code REVOKE priv ON table FROM user}.  Same priv/table
+     *  grammar as {@link #grant}. */
+    public void revoke(String priv, String table, String user) throws IOException {
+        query("REVOKE " + priv + " ON " + table + " FROM " + user);
+    }
+
+    /** Issues {@code CREATE DATABASE name}. */
+    public void createDatabase(String name) throws IOException {
+        query("CREATE DATABASE " + name);
     }
 
     /* ----- Columnar WRITE_BATCH ----- */
@@ -527,7 +632,12 @@ public class TsdbClient implements AutoCloseable {
                     switch (c.type) {
                         case T_TIMESTAMP: bits = r.ts; break;
                         case T_INT64:     bits = r.i64.getOrDefault(ci, 0L); break;
-                        case T_FLOAT64:   bits = Double.doubleToRawLongBits(r.f64.getOrDefault(ci, 0.0)); break;
+                        // FLOAT32 travels as a double too — the server stores it
+                        // 8-byte in memory and the codec narrows to 4 bytes only
+                        // on disk — so its values also come from Row.f64 (a Float
+                        // value is widened by the caller storing it as Double).
+                        case T_FLOAT64:
+                        case T_FLOAT32:   bits = Double.doubleToRawLongBits(r.f64.getOrDefault(ci, 0.0)); break;
                         default: throw new IOException("unsupported column type " + c.type);
                     }
                     writeU64LE(dout, bits);
@@ -707,7 +817,12 @@ public class TsdbClient implements AutoCloseable {
                     switch (qr.colTypes[ci]) {
                         case T_TIMESTAMP: colVals[ci][ri] = raw; break;
                         case T_INT64:     colVals[ci][ri] = raw; break;
-                        case T_FLOAT64:   colVals[ci][ri] = Double.longBitsToDouble(raw); break;
+                        // FLOAT32 travels as an 8-byte double on the wire (the
+                        // server widens it); decode it to Double exactly like
+                        // FLOAT64 — matching the Go SDK — so FLOAT32 cells (and
+                        // aggregates over them) don't come back null.
+                        case T_FLOAT64:
+                        case T_FLOAT32:   colVals[ci][ri] = Double.longBitsToDouble(raw); break;
                     }
                 }
             }
@@ -726,7 +841,8 @@ public class TsdbClient implements AutoCloseable {
         buf.put((byte) b.length).put(b);
     }
 
-    /** Decodes a MSG_ERROR payload into an IOException.  Package-private so
+    /** Decodes a MSG_ERROR payload into a {@link TsdbServerException} (an
+     *  IOException carrying the server status code).  Package-private so
      *  {@link WritePipeline} reuses the same decoding. */
     static IOException decodeError(byte[] payload) {
         if (payload.length < 4) return new IOException("server error");
@@ -744,6 +860,6 @@ public class TsdbClient implements AutoCloseable {
             msg = new String(payload, 4, payload.length - 4,
                     java.nio.charset.StandardCharsets.UTF_8);
         }
-        return new IOException("server rc=" + rc + ": " + msg);
+        return new TsdbServerException(rc, msg);
     }
 }

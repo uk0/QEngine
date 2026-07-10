@@ -317,9 +317,13 @@ public class ReconnectTest {
         int port = ln.getLocalPort();
         boolean threw = false;
         String errMsg = "";
+        int errCode = 0;
         try (TsdbClient cl = new TsdbClient("127.0.0.1", port, 1000)) {
             cl.dropTable("trades");
+            // A decoded MSG_ERROR must surface as the typed TsdbServerException
+            // carrying the server code, not a plain IOException.
             try { cl.dropTable("missing"); }
+            catch (TsdbServerException e) { threw = true; errMsg = e.getMessage(); errCode = e.code; }
             catch (IOException e) { threw = true; errMsg = e.getMessage(); }
         }
         server.join(2000);
@@ -327,6 +331,8 @@ public class ReconnectTest {
         check("trades".equals(gotName[0]),
                 "DROP_TABLE payload = " + gotName[0] + ", want raw name trades");
         check(threw, "dropTable on MSG_ERROR reply must throw");
+        check(errCode == -3, "TsdbServerException.code = " + errCode
+                + ", want -3 (plain IOException thrown instead?)");
         check(errMsg != null && errMsg.contains("no such table"),
                 "error should carry the server message, got: " + errMsg);
         System.out.println("ok  testDropTable");

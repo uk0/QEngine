@@ -98,6 +98,10 @@ public class TsdbResultSet implements ResultSet {
                     case TsdbClient.T_INT64:     return Types.BIGINT;
                     case TsdbClient.T_FLOAT64:   return Types.DOUBLE;
                     case TsdbClient.T_SYMBOL:    return Types.VARCHAR;
+                    // 4-byte float on disk; cells decode as Double (the wire
+                    // carries doubles), so getObject yields Double and
+                    // getFloat narrows.
+                    case TsdbClient.T_FLOAT32:   return Types.REAL;
                 }
                 return Types.OTHER;
             }
@@ -107,6 +111,7 @@ public class TsdbResultSet implements ResultSet {
                     case TsdbClient.T_INT64:     return "INT64";
                     case TsdbClient.T_FLOAT64:   return "FLOAT64";
                     case TsdbClient.T_SYMBOL:    return "SYMBOL";
+                    case TsdbClient.T_FLOAT32:   return "FLOAT32";
                 }
                 return "OTHER";
             }
