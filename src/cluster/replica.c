@@ -291,6 +291,17 @@ static void evict_one_conn(tsdb_replica_mgr_t *rmgr,
     /* DO NOT tsdb_rpc_conn_close(bad). */
 }
 
+/* Public wrapper: callers outside the replication fan-out (e.g. the stable
+ * scatter coordinator) hit the same stale-cached-conn failure mode after a
+ * peer restart, and without eviction every retry gets the same poisoned
+ * socket back — the failure becomes permanent instead of a one-shot blip. */
+void tsdb_replica_mgr_evict_conn(tsdb_replica_mgr_t *rmgr,
+                                  tsdb_node_id_t node_id,
+                                  tsdb_rpc_conn_t *bad)
+{
+    evict_one_conn(rmgr, node_id, bad);
+}
+
 /* ---- Replication --------------------------------------------------------- */
 
 /*

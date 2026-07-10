@@ -125,6 +125,15 @@ int tsdb_replica_broadcast_catalog_qtl(tsdb_replica_mgr_t *rmgr,
 tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
                                             tsdb_node_id_t node_id);
 
+/*
+ * Evict a failing conn from its pool slot so the next get_conn redials.
+ * The conn object is intentionally NOT closed (in-flight callers may hold
+ * its lock); the bounded leak is documented at evict_one_conn.
+ */
+void tsdb_replica_mgr_evict_conn(tsdb_replica_mgr_t *rmgr,
+                                  tsdb_node_id_t node_id,
+                                  tsdb_rpc_conn_t *bad);
+
 #ifdef __cplusplus
 }
 #endif
