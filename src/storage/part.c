@@ -1353,8 +1353,47 @@ void tsdb_part_zerocopy_stats(uint64_t *out_hits, uint64_t *out_fallbacks) {
         *out_fallbacks = __atomic_load_n(&g_zerocopy_fallbacks, __ATOMIC_RELAXED);
 }
 
+/* Complete a compaction column-swap that a crash interrupted.  The compactor
+ * persists <part>/.compact_swap (one column name per line, fsynced before the
+ * first rename) and unlinks it only after every produced column's .tmp pair
+ * has been renamed in and the directory fsynced.  So when the marker exists
+ * here, the staged .tmp files that remain are the not-yet-renamed remainder
+ * of a fully-staged swap: renaming them in rolls the partition FORWARD to
+ * the complete post-compaction state.  Without this, a restart mid-swap
+ * (this engine's shutdown is deliberately a fast-exit "controlled crash")
+ * left e.g. ts/h compacted but v on the old block layout — a column-desynced
+ * partition surfacing as "data corrupt" with a collapsed row count (observed
+ * live on the test cluster).  Idempotent and safe under concurrent callers:
+ * each rename is atomic, a second rename of the same pair is a harmless
+ * ENOENT, and every opener runs this to completion before reading. */
+static void part_compact_swap_recover(const char *part_dir) {
+    char marker[4096];
+    snprintf(marker, sizeof(marker), "%s/.compact_swap", part_dir);
+    FILE *f = fopen(marker, "r");
+    if (!f) return;                          /* common case: no crashed swap */
+    char col[256];
+    while (fgets(col, sizeof(col), f)) {
+        size_t L = strlen(col);
+        while (L > 0 && (col[L-1] == '\n' || col[L-1] == '\r')) col[--L] = '\0';
+        if (!L) continue;
+        char tmp[4096], live[4096];
+        snprintf(tmp,  sizeof(tmp),  "%s/%s.col.tmp", part_dir, col);
+        snprintf(live, sizeof(live), "%s/%s.col",     part_dir, col);
+        rename(tmp, live);                   /* ENOENT = already renamed */
+        snprintf(tmp,  sizeof(tmp),  "%s/%s.idx.tmp", part_dir, col);
+        snprintf(live, sizeof(live), "%s/%s.idx",     part_dir, col);
+        rename(tmp, live);
+    }
+    fclose(f);
+    unlink(marker);
+    int dfd = open(part_dir, O_RDONLY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+}
+
 int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out) {
     if (!s || !partition_dir || !out) return TSDB_ERR_INVAL;
+
+    part_compact_swap_recover(partition_dir);
 
     tsdb_part_t *p = calloc(1, sizeof(*p));
     if (!p) return TSDB_ERR_NOMEM;

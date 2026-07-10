@@ -717,6 +717,34 @@ static int compact_partition(tsdb_schema_t   *schema,
                 stale = 1;
         }
 
+        /* Crash-atomicity journal.  The per-column renames below are atomic
+         * individually but NOT as a set: a crash (or this engine's fast-exit
+         * shutdown) between them leaves some columns compacted and others on
+         * the old block layout — a desynced partition that reads as corrupt.
+         * Persist the produced-column list BEFORE the first rename (file
+         * fsync + directory fsync, so no rename can become durable without
+         * the marker also being durable); tsdb_part_open's recovery then
+         * rolls any interrupted swap forward by renaming the remaining .tmp
+         * pairs.  The marker is unlinked only after the renames are fsynced. */
+        char swap_marker[4096];
+        snprintf(swap_marker, sizeof(swap_marker), "%s/.compact_swap", part_dir);
+        if (!stale) {
+            FILE *mf = fopen(swap_marker, "w");
+            if (mf) {
+                for (int ci = 0; ci < schema->ncols; ci++)
+                    if (produced[ci]) fprintf(mf, "%s\n", schema->cols[ci].name);
+                fflush(mf);
+                fsync(fileno(mf));
+                fclose(mf);
+                int dfd = open(part_dir, O_RDONLY);
+                if (dfd >= 0) { fsync(dfd); close(dfd); }
+            } else {
+                /* Cannot journal — do not risk a torn swap; leave the .tmp
+                 * files for a later pass and keep the old (consistent) set. */
+                stale = 1;
+            }
+        }
+
         for (int ci = 0; ci < schema->ncols; ci++) {
             if (!produced[ci]) continue;
             char col_path[4096], idx_path[4096], col_tmp[4096], idx_tmp[4096];
@@ -739,6 +767,15 @@ static int compact_partition(tsdb_schema_t   *schema,
             }
             rename(col_tmp, col_path);
             rename(idx_tmp, idx_path);
+        }
+        if (!stale) {
+            /* Make the renames durable, then retire the journal.  Order
+             * matters: if the marker outlives a crash the recovery is a
+             * no-op (no .tmp files remain); if renames were lost with it,
+             * recovery replays them from the still-present .tmp files. */
+            int dfd = open(part_dir, O_RDONLY);
+            if (dfd >= 0) { fsync(dfd); close(dfd); }
+            unlink(swap_marker);
         }
         if (unlock_fn) unlock_fn(lock_ud);
     }
