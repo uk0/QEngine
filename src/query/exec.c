@@ -182,9 +182,25 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
 /* ---- small helpers ----------------------------------------------------- */
 
+/* Thread-local copy of the most recent eset() detail.  The public
+ * tsdb_query/tsdb_query_auth entry points return only an int rc, so the
+ * human-readable diagnostic ("stable scatter: peer node N failed", "table X
+ * has on-disk data but could not be opened: ...") was built and then thrown
+ * away — every transport surfaced an opaque "query failed".  Callers that
+ * want the detail read tsdb_last_error() right after a failing call, on the
+ * SAME thread.  Best-effort: cleared at each tsdb_query entry. */
+static __thread char g_last_err[256];
+
+const char *tsdb_last_error(void) { return g_last_err; }
+
+void tsdb_last_error_clear(void) { g_last_err[0] = '\0'; }
+
 static void eset(char *err, size_t cap, const char *fmt, ...) {
-    if (!err || !cap) return;
     va_list ap; va_start(ap, fmt);
+    vsnprintf(g_last_err, sizeof(g_last_err), fmt, ap);
+    va_end(ap);
+    if (!err || !cap) return;
+    va_start(ap, fmt);
     vsnprintf(err, cap, fmt, ap);
     va_end(ap);
 }
@@ -7225,6 +7241,7 @@ static int is_catalog_ddl(qast_stmt_kind_t k) {
 
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     if (!db || !qtl || !out) return TSDB_ERR_INVAL;
+    tsdb_last_error_clear();
 
     tsdb_arena_t a; tsdb_arena_init(&a, 16 * 1024);
     qast_stmt_t stmt;

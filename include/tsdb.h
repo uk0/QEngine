@@ -199,6 +199,13 @@ void tsdb_batch_discard(tsdb_batch_t *b);
 /* Query: QTL text → result iterator. */
 int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out);
 
+/* Human-readable detail of the most recent query failure on THIS thread
+ * (the executor's internal eset() diagnostic, e.g. "stable scatter: peer
+ * node N failed or timed out").  Empty string when the last query succeeded
+ * or recorded no detail.  Valid until the next tsdb_query on this thread. */
+const char *tsdb_last_error(void);
+void        tsdb_last_error_clear(void);
+
 /* Authenticated query: parses <qtl>, authorizes it against <token>'s
  * grants/role, then executes.  Differs from tsdb_query in that it ALWAYS
  * enforces RBAC regardless of db->auth_enforce — callers that want bypass

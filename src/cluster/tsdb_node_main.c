@@ -938,7 +938,18 @@ static int sql_exec_cb(void *ud, const char *q, size_t qlen,
     if (rc != 0 || !res) {
         const char *e = tsdb_errstr(rc);
         char esc[512]; j_escape_str(esc, sizeof(esc), e ? e : "unknown error");
-        int w = snprintf(buf, cap,
+        /* Surface the executor's eset() diagnostic (same thread): "I/O
+         * error" alone is undebuggable; "stable scatter: peer node N
+         * failed" names the culprit. */
+        const char *d = tsdb_last_error();
+        char desc[512]; j_escape_str(desc, sizeof(desc), (d && d[0]) ? d : "");
+        int w;
+        if (desc[0])
+            w = snprintf(buf, cap,
+                         "{\"error\":\"%s\",\"detail\":\"%s\",\"ms\":%" PRId64 "}",
+                         esc, desc, now_ms() - t0);
+        else
+            w = snprintf(buf, cap,
                          "{\"error\":\"%s\",\"ms\":%" PRId64 "}",
                          esc, now_ms() - t0);
         free(stmt);

@@ -1888,15 +1888,17 @@ int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
         tsdb_result_t *res = NULL;
         int rc = conn ? fedrpc_query_local(conn, qtl, timeout_ms, &res)
                       : TSDB_ERR_IO;
-        if ((rc != TSDB_OK || !res) && rmgr && conn) {
+        if ((rc != TSDB_OK || !res) && rmgr) {
             /* The pooled conn may be stale (peer restarted since it was
              * dialed; half-open socket).  Without eviction every future
              * scatter gets the same poisoned conn back and the failure is
              * PERMANENT (observed live as a node answering "I/O error"
              * forever while its peers were healthy).  Evict so the pool
-             * redials, and retry this leg once on the fresh conn. */
+             * redials, and retry this leg once — also when the first
+             * get_conn returned NULL (a transient dial/membership blip),
+             * which the fresh attempt may succeed on. */
             if (res) { tsdb_result_free(res); res = NULL; }
-            tsdb_replica_mgr_evict_conn(rmgr, peers[i], conn);
+            if (conn) tsdb_replica_mgr_evict_conn(rmgr, peers[i], conn);
             conn = tsdb_replica_mgr_get_conn(rmgr, peers[i]);
             rc = conn ? fedrpc_query_local(conn, qtl, timeout_ms, &res)
                       : TSDB_ERR_IO;
