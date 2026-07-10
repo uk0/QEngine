@@ -109,7 +109,7 @@ SERVER_CLI_BIN  := build/tsdb-server
 CLUSTER_NODE_SRC := src/cluster/tsdb_node_main.c
 CLUSTER_NODE_BIN := build/cluster/tsdb_node
 
-.PHONY: all clean test test-client test-cluster test-federation bench cli tcp_cli server_cli cluster_node debug
+.PHONY: all clean test test-client test-cluster test-federation bench cli tcp_cli server_cli cluster_node debug sdk-go sdk-java
 .DEFAULT_GOAL := all
 
 all: lib cli tcp_cli server_cli test $(CLUSTER_TEST_BINS) $(FED_TEST_BINS)
@@ -281,6 +281,18 @@ check-levels: build/test/test_simd_dispatch
 	@TSDB_CPU_LEVEL=AVX2   build/test/test_simd_dispatch 2>/dev/null || true
 	@echo "--- AVX512 ---"
 	@TSDB_CPU_LEVEL=AVX512 build/test/test_simd_dispatch 2>/dev/null || true
+
+# ── SDK builds (not part of the default target) ────────────────────────────
+# sdk-go: build + test the pure-Go client (mock-listener tests need no server).
+sdk-go:
+	cd sdk/go && go build ./... && go test ./...
+
+# sdk-java: plain-javac compile of the Java client + JDBC driver (main + test
+# sources; JDK-only, no Maven needed), --release 11 matching the pom.
+sdk-java:
+	@mkdir -p build/java
+	@find sdk/java/src -name '*.java' | xargs javac --release 11 -d build/java
+	@echo "JAVAC sdk/java -> build/java"
 
 print-%:
 	@echo $* = $($*)
