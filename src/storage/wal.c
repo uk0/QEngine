@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -239,27 +240,21 @@ int tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n) {
     }
     c ^= 0xFFFFFFFFu;
 
-    /* Write header then payload as two writev-style writes.
-     * Using a small stack buffer to combine crc+len. */
     uint8_t hdr[8];
     put_u32le_buf(hdr + 0, c);
     put_u32le_buf(hdr + 4, (uint32_t)n);
 
-    /* Write atomically with writev to avoid partial records. */
-    struct iovec {
-        void  *iov_base;
-        size_t iov_len;
-    } iov[2];
-    (void)iov; /* not using iov directly to keep portability */
-
-    /* Simple sequential writes — acceptable for WAL correctness. */
-    ssize_t wr = write(w->fd, hdr, 8);
-    if (wr != 8) return TSDB_ERR_IO;
-
-    if (n > 0) {
-        wr = write(w->fd, rec, n);
-        if ((size_t)wr != n) return TSDB_ERR_IO;
-    }
+    /* One writev instead of two write()s: halves the syscalls per record and
+     * closes the header-written/payload-not window a crash between the two
+     * writes used to leave (replay already tolerates a torn tail, but a
+     * single vectored append makes the common case atomic on O_APPEND). */
+    struct iovec iov[2] = {
+        { .iov_base = hdr,          .iov_len = 8 },
+        { .iov_base = (void *)rec,  .iov_len = n },
+    };
+    ssize_t want = (ssize_t)(8 + n);
+    ssize_t wr = writev(w->fd, iov, n > 0 ? 2 : 1);
+    if (wr != want) return TSDB_ERR_IO;
     return TSDB_OK;
 }
 

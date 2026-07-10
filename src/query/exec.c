@@ -358,6 +358,10 @@ static int scan_plan_push_part(scan_plan_t *p, tsdb_part_t *part) {
 /* Collect every partition directory under a table dir, sorted ascending.
  * Accepts both YYYYMMDD (8 chars, DAY partitions) and YYYYMMDDHH (10 chars,
  * HOUR partitions) names. Non-numeric entries are skipped. */
+static int part_name_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
 static int list_partitions(const char *table_dir, char ***out, size_t *n_out) {
     DIR *d = opendir(table_dir);
     if (!d) { *out = NULL; *n_out = 0; return TSDB_OK; }
@@ -385,12 +389,11 @@ static int list_partitions(const char *table_dir, char ***out, size_t *n_out) {
         names[n++] = strdup(full);
     }
     closedir(d);
-    /* sort */
-    for (size_t i = 1; i < n; i++) {
-        char *x = names[i]; size_t j = i;
-        while (j > 0 && strcmp(names[j - 1], x) > 0) { names[j] = names[j - 1]; j--; }
-        names[j] = x;
-    }
+    /* Sort lexicographically (partition dir names are fixed-width digit
+     * strings, so this is also chronological).  qsort keeps this O(n log n);
+     * the previous insertion sort went quadratic on tables with hundreds of
+     * hourly/daily partitions and ran once per query. */
+    if (n > 1) qsort(names, n, sizeof(char *), part_name_cmp);
     *out = names; *n_out = n;
     return TSDB_OK;
 }

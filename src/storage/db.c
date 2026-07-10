@@ -2164,6 +2164,16 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
               b->tbl->schema->block_points <= TSDB_BLOCK_POINTS)
                 ? b->tbl->schema->block_points : TSDB_BLOCK_POINTS;
 
+    /* Running per-SYMBOL-column read cursors.  Chunk k used to re-walk the
+     * variable-length wire format from the start to skip chunks 0..k-1 —
+     * O(chunks²) symbol scanning on large multi-block batches (the
+     * WRITE_BATCH millions-rows path).  Each cursor starts past the [u32
+     * total] header and is advanced once per chunk instead. */
+    const uint8_t *sym_cursor[TSDB_MAX_COLS];
+    for (int d = 0; d < ncols_data; d++)
+        sym_cursor[d] = (col_types[d] == TSDB_TYPE_SYMBOL)
+                            ? (const uint8_t *)col_arrs[d] + 4 : NULL;
+
     size_t consumed = 0;
     while (consumed < n) {
         size_t cur_rows = tsdb_memtable_rows(b->tbl->memtable);
@@ -2179,19 +2189,12 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
 
         /* Per-column source pointers slid forward by `consumed` rows.
          * 8-byte fixed cols just advance by 8 × consumed; SYMBOL cols
-         * are variable-length so we walk the wire format to skip the
-         * already-consumed prefix.  One-time cost per chunk. */
+         * resume from their carried cursor. */
         const void *col_arrs_off[TSDB_MAX_COLS];
         for (int d = 0; d < ncols_data; d++) {
             const uint8_t *p = (const uint8_t *)col_arrs[d];
             if (col_types[d] == TSDB_TYPE_SYMBOL) {
-                /* Skip [u32 total] header, then walk consumed [u16 len][bytes]. */
-                const uint8_t *cur = p + 4;
-                for (size_t k = 0; k < consumed; k++) {
-                    uint16_t l16;
-                    memcpy(&l16, cur, 2);
-                    cur += 2 + l16;
-                }
+                const uint8_t *cur = sym_cursor[d];
                 /* Build a temp [u32 total][rest] view for the chunk.
                  * Compute new total = sum of [2 + len] for chunk rows. */
                 const uint8_t *chunk_start = cur;
@@ -2202,6 +2205,7 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
                     cur += 2 + l16;
                     chunk_payload += 2 + l16;
                 }
+                sym_cursor[d] = cur;   /* resume point for the next chunk */
                 /* memtable_append_bulk expects a [u32 total][...] header.
                  * Allocate a small wrapper buffer for this chunk. */
                 uint8_t *tmp = malloc(4 + chunk_payload);

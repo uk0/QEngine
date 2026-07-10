@@ -43,27 +43,23 @@
  * Advances *pos past the token (but NOT past the stop character).
  * Returns number of bytes written to dst (not counting NUL).
  */
-static inline void build_stop_mask(const char *stop_chars, uint8_t mask[256]) {
-    for (int i = 0; i < 256; i++) mask[i] = 0;
-    /* Mark backslash with bit 1 (escape marker) and stop chars with
-     * bit 0.  One indexed load decides both per-byte branches in the
-     * scan loop, replacing the prior strchr-style inner loop. */
-    mask[(unsigned char)'\\'] = 2;
-    for (const char *s = stop_chars; *s; s++) {
-        mask[(unsigned char)*s] |= 1;
-    }
-}
+/* Stop-char bitmaps: bit 0 = stop char, bit 1 = backslash escape marker.
+ * One indexed load decides both per-byte branches in the scan loop.  Only
+ * three distinct stop sets exist in the line protocol, so the masks are
+ * compile-time constants — the previous code re-zeroed and re-populated a
+ * 256-byte table on EVERY scan_token call (~7 calls per line), which showed
+ * up as a top cost of the HTTP ingest path. */
+static const uint8_t MASK_COMMA_SPACE[256]    = { [','] = 1, [' '] = 1,
+                                                  ['\\'] = 2 };
+static const uint8_t MASK_COMMA_SPACE_NL[256] = { [','] = 1, [' '] = 1,
+                                                  ['\n'] = 1, ['\r'] = 1,
+                                                  ['\\'] = 2 };
+static const uint8_t MASK_EQ_COMMA[256]       = { ['='] = 1, [','] = 1,
+                                                  ['\\'] = 2 };
 
 static size_t scan_token(const char *src, size_t srclen, size_t *pos,
-                          const char *stop_chars,
+                          const uint8_t mask[256],
                           char *dst, size_t dsz) {
-    /* O(N×K) → O(N): build a 256-byte stop-char bitmap once, then
-     * scan with a single indexed load per byte.  Gain on Influx
-     * line-protocol ingest is multiplicative because every tag /
-     * field / value goes through this. */
-    uint8_t mask[256];
-    build_stop_mask(stop_chars, mask);
-
     size_t dpos = 0;
     size_t i = *pos;
     const size_t cap = dsz - 1;
@@ -140,7 +136,7 @@ static int parse_field_value(const char *src, size_t srclen, size_t *pos,
         /* Collect the boolean token. */
         char tmp[16];
         size_t tpos = *pos;
-        scan_token(src, srclen, &tpos, ", \n\r", tmp, sizeof(tmp));
+        scan_token(src, srclen, &tpos, MASK_COMMA_SPACE_NL, tmp, sizeof(tmp));
         if (!strcasecmp(tmp, "t") || !strcasecmp(tmp, "true")) {
             *ftype   = TSDB_INFLUX_BOOL;
             val->i64 = 1;
@@ -161,7 +157,7 @@ static int parse_field_value(const char *src, size_t srclen, size_t *pos,
     /* Numeric: collect until comma, space, or end. */
     char numbuf[64];
     size_t npos = *pos;
-    scan_token(src, srclen, &npos, ", \n\r", numbuf, sizeof(numbuf));
+    scan_token(src, srclen, &npos, MASK_COMMA_SPACE_NL, numbuf, sizeof(numbuf));
     if (numbuf[0] == '\0') return TSDB_ERR_PARSE;
 
     size_t nlen = strlen(numbuf);
@@ -228,7 +224,7 @@ int tsdb_influx_line_parse(const char *line, size_t len,
     /* ---- Measurement name ---- */
     char *meas;
     SCRATCH_ALLOC(meas, len); /* upper bound */
-    size_t mlen = scan_token(line, len, &pos, ", ", meas, scap - spos + len + 1);
+    size_t mlen = scan_token(line, len, &pos, MASK_COMMA_SPACE, meas, scap - spos + len + 1);
     /* Adjust spos to actual length used. */
     spos = (size_t)(meas - scratch) + mlen + 1;
     if (mlen == 0) return TSDB_ERR_PARSE;
@@ -243,7 +239,7 @@ int tsdb_influx_line_parse(const char *line, size_t len,
 
         char *tk;
         SCRATCH_ALLOC(tk, len);
-        size_t tklen = scan_token(line, len, &pos, "=,", tk, scap - spos + len + 1);
+        size_t tklen = scan_token(line, len, &pos, MASK_EQ_COMMA, tk, scap - spos + len + 1);
         spos = (size_t)(tk - scratch) + tklen + 1;
         if (tklen == 0) return TSDB_ERR_PARSE;
 
@@ -252,7 +248,7 @@ int tsdb_influx_line_parse(const char *line, size_t len,
 
         char *tv;
         SCRATCH_ALLOC(tv, len);
-        size_t tvlen = scan_token(line, len, &pos, ", ", tv, scap - spos + len + 1);
+        size_t tvlen = scan_token(line, len, &pos, MASK_COMMA_SPACE, tv, scap - spos + len + 1);
         spos = (size_t)(tv - scratch) + tvlen + 1;
         if (tvlen == 0) return TSDB_ERR_PARSE;
 
@@ -276,7 +272,7 @@ int tsdb_influx_line_parse(const char *line, size_t len,
         /* Field key. */
         char *fk;
         SCRATCH_ALLOC(fk, len);
-        size_t fklen = scan_token(line, len, &pos, "=,", fk, scap - spos + len + 1);
+        size_t fklen = scan_token(line, len, &pos, MASK_EQ_COMMA, fk, scap - spos + len + 1);
         spos = (size_t)(fk - scratch) + fklen + 1;
         if (fklen == 0) break;
 

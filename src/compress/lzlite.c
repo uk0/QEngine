@@ -119,11 +119,18 @@ int tsdb_lzlite_encode(const uint8_t *in, size_t in_n,
      * literal copy path — we still check on token/overflow writes. */
     if (out_cap < tsdb_lzlite_max_output(in_n)) return TSDB_ERR_OVERFLOW;
 
-    /* Allocate hash table. */
-    lz_ht_t *ht = (lz_ht_t *)malloc(sizeof(lz_ht_t));
-    if (!ht) return TSDB_ERR_NOMEM;
+    /* Hash table: one lazily-allocated 256 KB scratch per thread, reused
+     * across calls.  This encoder runs once per column block on the flush
+     * path, and the former per-call malloc+free of 256 KB dominated the cost
+     * of hashing a ~16-32 KB domain buffer.  The head[] reset below is what
+     * guarantees byte-identical output vs the fresh-alloc version; prev[] is
+     * only ever read at indices linked in the current call. */
+    static __thread lz_ht_t *ht = NULL;
+    if (!ht) {
+        ht = (lz_ht_t *)malloc(sizeof(lz_ht_t));
+        if (!ht) return TSDB_ERR_NOMEM;
+    }
     memset(ht->head, 0xFF, sizeof(ht->head)); /* NIL = 0xFFFF */
-    /* prev doesn't need initialisation — unlinked cells are never followed. */
 
     size_t ip   = 0;  /* input position (read cursor)      */
     size_t op   = 0;  /* output position (write cursor)    */
@@ -218,30 +225,30 @@ int tsdb_lzlite_encode(const uint8_t *in, size_t in_n,
         /* We already checked out_cap >= max_output, so simple writes are safe,
          * but we double-check op stays in bounds for the overflow varint paths
          * (which can be lengthy on huge data). */
-        if (op >= out_cap) { free(ht); return TSDB_ERR_OVERFLOW; }
+        if (op >= out_cap) { return TSDB_ERR_OVERFLOW; }
         out[op++] = token;
 
         /* Literal overflow varint. */
         if (lit_nib == NIBBLE_MAX) {
             int rc = write_overflow(out, out_cap, &op, lit_len - NIBBLE_MAX);
-            if (rc) { free(ht); return rc; }
+            if (rc) { return rc; }
         }
 
         /* Match length overflow varint. */
         if (match_nib == NIBBLE_MAX) {
             size_t match_extra = match_len - MIN_MATCH - NIBBLE_MAX;
             int rc = write_overflow(out, out_cap, &op, match_extra);
-            if (rc) { free(ht); return rc; }
+            if (rc) { return rc; }
         }
 
         /* Offset: 2 bytes little-endian. */
-        if (op + 2 > out_cap) { free(ht); return TSDB_ERR_OVERFLOW; }
+        if (op + 2 > out_cap) { return TSDB_ERR_OVERFLOW; }
         uint16_t off16 = (uint16_t)best_off;
         out[op++] = (uint8_t)(off16 & 0xFF);
         out[op++] = (uint8_t)(off16 >> 8);
 
         /* Literal bytes. */
-        if (op + lit_len > out_cap) { free(ht); return TSDB_ERR_OVERFLOW; }
+        if (op + lit_len > out_cap) { return TSDB_ERR_OVERFLOW; }
         memcpy(out + op, in + lit_start, lit_len);
         op += lit_len;
 
@@ -268,20 +275,18 @@ int tsdb_lzlite_encode(const uint8_t *in, size_t in_n,
         /* match_nibble == 0 for the last sequence (no match). */
         uint8_t token = (uint8_t)(lit_nib << 4);
 
-        if (op >= out_cap) { free(ht); return TSDB_ERR_OVERFLOW; }
+        if (op >= out_cap) { return TSDB_ERR_OVERFLOW; }
         out[op++] = token;
 
         if (lit_nib == NIBBLE_MAX) {
             int rc = write_overflow(out, out_cap, &op, lit_len - NIBBLE_MAX);
-            if (rc) { free(ht); return rc; }
+            if (rc) { return rc; }
         }
 
-        if (op + lit_len > out_cap) { free(ht); return TSDB_ERR_OVERFLOW; }
+        if (op + lit_len > out_cap) { return TSDB_ERR_OVERFLOW; }
         memcpy(out + op, in + lit_start, lit_len);
         op += lit_len;
     }
-
-    free(ht);
     *out_bytes = op;
     return (int)op;
 }
