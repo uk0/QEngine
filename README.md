@@ -700,7 +700,8 @@ predicates; owner-ACK-gated `SKIP_LOCAL` (a non-owner keeps its durable
 copy until a remote owner ACKs, closing a crash-loss window under
 async `REPLICATION_QUORUM=0`); partition-mtime compaction memo (a
 steadily-appended table is no longer skip-compacted until its partition
-rolls); live `qengine_cluster_nodes_alive` gauge.
+rolls); live `qengine_cluster_nodes_alive` gauge; ANSI-style
+`GROUP BY time_bucket(ts, interval)` (routes to the SAMPLE BY executor).
 
 **Known gaps** (shipping order tentative):
 
@@ -726,6 +727,11 @@ rolls); live `qengine_cluster_nodes_alive` gauge.
   wire `WRITE … FROM FILE` CSV path mis-infers `INT64` columns
   (`TSDB_ERR_SCHEMA`) — use the SDK/`WRITE_BATCH` or a `FLOAT64` column
   meanwhile. Both scoped as follow-ups
+- **Time-bucketed aggregation over a super-table** — `SAMPLE BY` /
+  `GROUP BY time_bucket(...)` work on a single table but return 0 buckets
+  over a scatter-gather `<stable>` (bucketing isn't wired into the
+  cross-child merge); query the child tables, or aggregate the stable with
+  non-bucketed aggregates (count/sum/min/max/avg), meanwhile
 - **Row-level replica reconciliation** — anti-entropy converges on
   count/max(ts); divergent middle-gap replicas are preserved (never
   destructively truncated) but not yet backfilled row-by-row. Related:
