@@ -17,6 +17,7 @@
 #include "metrics.h"
 #include "../cluster/disk_weight.h"
 #include "../../include/tsdb.h"   /* for TSDB_OK, TSDB_ERR_PERMISSION */
+#include "../../include/tsdb_cluster.h"  /* tsdb_cluster_alive_count for the alive gauge */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -718,6 +719,15 @@ static void *handle_connection(void *arg) {
 
     if (route_metrics) {
         size_t body_len = 0;
+        /* Refresh the cluster-alive gauge from live membership just before the
+         * scrape (the gauge is otherwise never set → always 0).  Guarded so the
+         * standalone server (no cluster provider) and the test stub (NULL ud)
+         * skip it; g_cluster_ud is the node's tsdb_db_t*, same as cluster_json_cb. */
+        if (g_cluster_fn && g_cluster_ud) {
+            int alive = tsdb_cluster_alive_count((tsdb_db_t *)g_cluster_ud);
+            if (alive > 0)
+                tsdb_metric_gauge_set("qengine_cluster_nodes_alive", (double)alive);
+        }
         char *body = tsdb_metrics_render(&body_len);
         if (!body) {
             const char *err =

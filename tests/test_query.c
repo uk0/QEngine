@@ -142,6 +142,45 @@ int main(void) {
     assert(cnt == 1000);
     tsdb_result_free(r);
 
+    /* --- Test 5b: IN / BETWEEN predicates (desugared to OR/AND in the parser) --- */
+    printf("\n[5b] IN / BETWEEN predicates\n");
+    /* 3 symbols x 2000 rows each = 6000 */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE symbol IN ('AAPL','MSFT','GOOG')", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  symbol IN (AAPL,MSFT,GOOG) = %lld (expect 6000)\n", (long long)cnt);
+    assert(cnt == 6000); tsdb_result_free(r);
+    /* volume 1000→1 (day0 only), 3000→2 (both days), 6000→1 (day1 only) = 4 */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE volume IN (1000, 3000, 6000)", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  volume IN (1000,3000,6000) = %lld (expect 4)\n", (long long)cnt);
+    assert(cnt == 4); tsdb_result_free(r);
+    /* NOT IN: 10000 - (vol 1000: 1 row) - (vol 6000: 1 row) = 9998 */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE volume NOT IN (1000, 6000)", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  volume NOT IN (1000,6000) = %lld (expect 9998)\n", (long long)cnt);
+    assert(cnt == 9998); tsdb_result_free(r);
+    /* BETWEEN inclusive: day0 vol in [2000,5999] i=1000..4999 (4000) + day1 i=0..3999 (4000) = 8000 */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE volume BETWEEN 2000 AND 5999", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  volume BETWEEN 2000 AND 5999 = %lld (expect 8000)\n", (long long)cnt);
+    assert(cnt == 8000); tsdb_result_free(r);
+    /* NOT BETWEEN: 10000 - 8000 = 2000 (vol<2000: 1000 rows, vol>5999: 1000 rows) */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE volume NOT BETWEEN 2000 AND 5999", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  volume NOT BETWEEN 2000 AND 5999 = %lld (expect 2000)\n", (long long)cnt);
+    assert(cnt == 2000); tsdb_result_free(r);
+    /* BETWEEN's AND must NOT be swallowed as boolean AND: this is
+     * (volume>=2000 AND volume<=5999) AND symbol='AAPL' = 8000 AAPL-fraction = 1600 */
+    OK(tsdb_query(db, "SELECT count(*) FROM trades WHERE volume BETWEEN 2000 AND 5999 AND symbol = 'AAPL'", &r));
+    assert(tsdb_result_next(r)); cnt = tsdb_result_i64(r, 0);
+    printf("  volume BETWEEN 2000 AND 5999 AND symbol=AAPL = %lld (expect 1600)\n", (long long)cnt);
+    assert(cnt == 1600); tsdb_result_free(r);
+    /* empty IN () is a graceful parse error, not a crash */
+    { tsdb_result_t *er = NULL;
+      int rc = tsdb_query(db, "SELECT count(*) FROM trades WHERE volume IN ()", &er);
+      printf("  volume IN () rc=%d (expect <0)\n", rc);
+      assert(rc < 0); if (er) tsdb_result_free(er); }
+
     /* --- Test 6: SAMPLE BY aggregation --- */
     printf("\n[6] SELECT time_bucket(ts, 1m), avg(price) FROM trades WHERE symbol='AAPL' SAMPLE BY 1m LIMIT 5\n");
     OK(tsdb_query(db,

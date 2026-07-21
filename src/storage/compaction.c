@@ -817,13 +817,16 @@ struct tsdb_compactor {
     int64_t         last_check_ns;
     uint64_t        last_flush_seq;
 
-    /* Per-table mtime memo (kdb+ style "immutable HDB" inspired): a table
-     * whose dir mtime hasn't moved since we last processed it has had no
-     * new flush → no compaction possible.  Skipping it saves the inner
-     * partition-walk syscalls (open+getdents+stat per partition) which
-     * dominate compactor CPU at 2000 tables.  Compactor's own writes DO
-     * update the dir mtime, so the next cycle still re-checks any table
-     * we just touched. The memo is reset (size set to 0) on disable via
+    /* Per-table mtime memo (kdb+ style "immutable HDB" inspired): a table none
+     * of whose PARTITION dirs has moved since we last processed it has had no
+     * new flush → no compaction possible.  Keyed on max(partition-dir mtime),
+     * not the table-dir mtime: an append into an existing partition bumps that
+     * partition dir (via the <col>.idx temp+rename) but never the table dir, so
+     * a table-dir key would wrongly skip a steadily-written table.  Skipping an
+     * idle table saves the inner partition-walk syscalls (open+getdents+stat per
+     * partition) which dominate compactor CPU at 2000 tables.  Compactor's own
+     * writes DO bump partition mtimes, so the next cycle still re-checks any
+     * table we just touched. The memo is reset (size set to 0) on disable via
      * TSDB_COMPACTION_MEMO=0 — useful for safety drills. */
     int                       memo_enabled;
     pthread_mutex_t           memo_mtx;
@@ -911,6 +914,28 @@ static int compactor_should_pause(tsdb_compactor_t *c) {
     return pause;
 }
 
+/* Newest mtime across a table's partition subdirs.  Keying the compaction memo
+ * on this (not the table-dir mtime) is what makes an append into an EXISTING
+ * partition bust the memo: flush publishes <col>.idx via temp+rename, which
+ * bumps the owning partition dir's mtime — but never the table dir's.  Returns 0
+ * if the dir is unreadable or has no partitions (caller then never memo-skips).
+ * Stats partition dirs only, not the per-column files — cheap. */
+static time_t table_max_part_mtime(const char *tbl_dir) {
+    DIR *td = opendir(tbl_dir);
+    if (!td) return 0;
+    time_t maxm = 0;
+    struct dirent *pe;
+    while ((pe = readdir(td)) != NULL) {
+        if (!is_partition_dir(pe->d_name)) continue;
+        char part_dir[4096];
+        snprintf(part_dir, sizeof(part_dir), "%s/%s", tbl_dir, pe->d_name);
+        struct stat ps;
+        if (stat(part_dir, &ps) == 0 && ps.st_mtime > maxm) maxm = ps.st_mtime;
+    }
+    closedir(td);
+    return maxm;
+}
+
 /* One compaction pass over the table subdirs of a single data dir.  Split
  * out of compactor_run_once_impl() so every striped data dir gets the same
  * pass; the per-table logic is unchanged. */
@@ -932,16 +957,22 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
         struct stat tst;
         if (stat(tbl_dir, &tst) < 0 || !S_ISDIR(tst.st_mode)) continue;
 
-        /* mtime memo: skip the entire per-partition scan if this table's
-         * dir hasn't been touched since we last processed it.  No new
-         * flush → no new candidate blocks → no work to do.  Compaction
-         * itself rewrites files in the dir and bumps the mtime, so the
-         * NEXT cycle still re-checks any table we just touched.  Big win
-         * on wide-cardinality workloads where most tables are idle in any
-         * given 10 s window. */
+        /* mtime memo: skip the entire per-partition scan if none of this
+         * table's PARTITION dirs has moved since we last processed it.  Keyed on
+         * max(partition-dir mtime), NOT the table-dir mtime — a flush that
+         * appends into an existing partition bumps that partition dir (via the
+         * <col>.idx temp+rename) but never the table dir, so a table-dir key
+         * would wrongly skip a steadily-written table forever.  Compaction
+         * itself rewrites partition files and bumps their mtime, so the NEXT
+         * cycle still re-checks any table we just touched.  Big win on
+         * wide-cardinality workloads where most tables are idle in any given
+         * 10 s window.  part_mtime is recorded pre-walk (below) so an append
+         * during this cycle is re-checked next cycle. */
+        time_t part_mtime = 0;
         if (c->memo_enabled) {
+            part_mtime = table_max_part_mtime(tbl_dir);
             time_t cached = compactor_memo_get(c, de->d_name);
-            if (cached != 0 && cached == tst.st_mtime) {
+            if (part_mtime != 0 && cached == part_mtime) {
                 tsdb_metric_inc("qengine_compaction_memo_skipped_total");
                 continue;
             }
@@ -1003,10 +1034,10 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
         closedir(td);
         tsdb_db_compact_release(db, tbl);
 
-        /* Memo: record the mtime we just observed so the next cycle can
-         * fast-skip this table if no flush has touched it.  Recorded even
-         * when no compaction happened — equally valid signal. */
-        if (c->memo_enabled) compactor_memo_set(c, de->d_name, tst.st_mtime);
+        /* Memo: record the max partition mtime we observed pre-walk so the next
+         * cycle can fast-skip this table if no flush has touched any partition.
+         * Recorded even when no compaction happened — equally valid signal. */
+        if (c->memo_enabled) compactor_memo_set(c, de->d_name, part_mtime);
 
         if (c->quit) break;
     }
@@ -1121,9 +1152,10 @@ int tsdb_compactor_start(tsdb_db_t *db,
     }
 
     /* Per-table mtime memo — kdb+ inspired "stable data stays stable": if
-     * a table dir's mtime hasn't changed, there's no new flush so no work
-     * to do, skip the inner enumeration entirely.  Default ON; env
-     * TSDB_COMPACTION_MEMO=0 disables (useful when chasing a bug to force
+     * none of a table's partition dirs' mtimes has changed (max-partition-mtime
+     * key, which a flush into an existing partition DOES bump), there's no new
+     * flush so no work to do, skip the inner enumeration entirely.  Default ON;
+     * env TSDB_COMPACTION_MEMO=0 disables (useful when chasing a bug to force
      * a full re-scan every cycle). */
     {
         const char *e = getenv("TSDB_COMPACTION_MEMO");

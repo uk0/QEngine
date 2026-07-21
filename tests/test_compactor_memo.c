@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <glob.h>        /* enumerate partition dirs without <dirent.h> (its DIR
+                            type name collides with this file's DIR constant) */
+#include <sys/stat.h>
+#include <fcntl.h>       /* AT_FDCWD */
+#include <time.h>
 
 #define ASSERT(cond) do { if (!(cond)) { \
     fprintf(stderr, "ASSERT FAILED: %s  [%s:%d]\n", #cond, __FILE__, __LINE__); abort(); } } while (0)
@@ -120,10 +125,79 @@ static void run_memo_disabled(void) {
     printf("  [PASS] no memo skips when TSDB_COMPACTION_MEMO=0\n");
 }
 
+/* Push every partition subdir's mtime 100 s into the future WITHOUT touching the
+ * table dir — mirrors a flush that appends into an EXISTING partition (bumps the
+ * partition dir via the <col>.idx temp+rename, never the table dir).  Uses glob
+ * to avoid <dirent.h>'s DIR type clashing with this file's DIR constant. */
+static void bump_partition_mtimes(const char *tbl_dir) {
+    char pat[512]; snprintf(pat, sizeof(pat), "%s/*", tbl_dir);
+    glob_t g; memset(&g, 0, sizeof(g));
+    if (glob(pat, 0, NULL, &g) == 0) {
+        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+        struct timespec future[2];
+        future[0].tv_sec = now.tv_sec + 100; future[0].tv_nsec = 0;
+        future[1].tv_sec = now.tv_sec + 100; future[1].tv_nsec = 0;
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            struct stat st;
+            if (stat(g.gl_pathv[i], &st) == 0 && S_ISDIR(st.st_mode))
+                utimensat(AT_FDCWD, g.gl_pathv[i], future, 0);
+        }
+    }
+    globfree(&g);
+}
+
+/* Regression for the table-dir-mtime bug: a steadily-appended table must NOT be
+ * memo-skipped.  Keying on max(partition mtime) re-checks tA after its partition
+ * grows, while the untouched idle tB is still skipped. */
+static void run_memo_detects_partition_append(void) {
+    printf("--- memo re-checks a table whose partition grew (partition-mtime key) ---\n");
+    rm_tree(DIR);
+    unsetenv("TSDB_COMPACTION_MEMO");
+    tsdb_metrics_init();
+
+    tsdb_db_t *db = NULL; OK(tsdb_open(DIR, &db));
+    make_and_flush(db, "tA");
+    make_and_flush(db, "tB");
+    OK(tsdb_db_flush_all(db));
+
+    tsdb_compactor_opts_t opts = { .worker_threads = -1 };  /* manual mode */
+    tsdb_compactor_t *cpt = NULL;
+    OK(tsdb_compactor_start(db, &opts, &cpt));
+
+    uint64_t before = metric_counter("qengine_compaction_memo_skipped_total");
+    OK(tsdb_compactor_run_once(cpt));   /* cycle 1: record memo, no skips */
+    uint64_t after1 = metric_counter("qengine_compaction_memo_skipped_total");
+    ASSERT(after1 == before);
+
+    /* Append into tA's existing partition (bump its partition mtime, not the
+     * table dir).  Assert the table-dir mtime is unchanged — that is exactly the
+     * condition under which the OLD table-dir memo would wrongly skip tA. */
+    char ta_dir[512]; snprintf(ta_dir, sizeof(ta_dir), "%s/tA", DIR);
+    struct stat tbl_before; ASSERT(stat(ta_dir, &tbl_before) == 0);
+    bump_partition_mtimes(ta_dir);
+    struct stat tbl_after;  ASSERT(stat(ta_dir, &tbl_after) == 0);
+    ASSERT(tbl_after.st_mtime == tbl_before.st_mtime);   /* table dir untouched */
+
+    /* Cycle 2: tB idle → memo-skipped; tA's partition moved → re-checked, NOT
+     * skipped.  Counter advances by exactly 1 (with the old table-dir key it
+     * would be +2, wrongly skipping tA). */
+    OK(tsdb_compactor_run_once(cpt));
+    uint64_t after2 = metric_counter("qengine_compaction_memo_skipped_total");
+    printf("  cycle2 skipped=%llu (expect +1: tB idle skipped, tA re-checked)\n",
+           (unsigned long long)(after2 - before));
+    ASSERT(after2 == before + 1);
+
+    tsdb_compactor_stop(cpt);
+    tsdb_close(db);
+    rm_tree(DIR);
+    printf("  [PASS] partition-append busts the memo; idle table still skipped\n");
+}
+
 int main(void) {
     printf("=== test_compactor_memo ===\n");
     run_memo_enabled();
     run_memo_disabled();
+    run_memo_detects_partition_append();
     printf("[PASS] all\n");
     return 0;
 }

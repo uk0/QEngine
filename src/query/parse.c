@@ -180,9 +180,58 @@ static qast_expr_t *parse_add(parser_t *p) {
     return l;
 }
 
+/* Desugar `lhs [NOT] IN (v1, v2, ...)` into an OR-chain of equalities (or an
+ * AND-chain of inequalities for NOT IN), reusing the comparison + boolean nodes
+ * the executor already handles so no new eval path is needed.  QTOK_IN already
+ * consumed by the caller.  The lhs node is shared across the desugared
+ * comparisons — safe because the AST is read-only during evaluation and the
+ * arena frees nodes wholesale. */
+static qast_expr_t *parse_in_tail(parser_t *p, qast_expr_t *lhs, int negate) {
+    if (expect(p, QTOK_LPAREN) != TSDB_OK) return NULL;
+    if (p->tok.kind == QTOK_RPAREN) { perr(p, "empty IN () list"); return NULL; }
+    qast_kind_t cmp  = negate ? QAST_NE  : QAST_EQ;
+    qast_kind_t comb = negate ? QAST_AND : QAST_OR;
+    qast_expr_t *acc = NULL;
+    do {
+        qast_expr_t *v = parse_add(p);
+        if (!v) return NULL;
+        qast_expr_t *cur = qast_mk_binop(p->arena, cmp, lhs, v);
+        acc = acc ? qast_mk_binop(p->arena, comb, acc, cur) : cur;
+    } while (accept(p, QTOK_COMMA));
+    if (expect(p, QTOK_RPAREN) != TSDB_OK) return NULL;
+    return acc;
+}
+
+/* Desugar `lhs [NOT] BETWEEN lo AND hi` into `(lhs>=lo) AND (lhs<=hi)` (or
+ * `(lhs<lo) OR (lhs>hi)` for NOT BETWEEN).  QTOK_BETWEEN already consumed.  lo/hi
+ * parse at add-expr precedence, so BETWEEN's mandatory AND is not swallowed as a
+ * boolean AND — we consume exactly one here; a trailing boolean AND (e.g.
+ * `ts BETWEEN a AND b AND sym='X'`) is left for parse_and. */
+static qast_expr_t *parse_between_tail(parser_t *p, qast_expr_t *lhs, int negate) {
+    qast_expr_t *lo = parse_add(p);
+    if (!lo) return NULL;
+    if (expect(p, QTOK_AND) != TSDB_OK) return NULL;
+    qast_expr_t *hi = parse_add(p);
+    if (!hi) return NULL;
+    qast_expr_t *a = qast_mk_binop(p->arena, negate ? QAST_LT : QAST_GE, lhs, lo);
+    qast_expr_t *b = qast_mk_binop(p->arena, negate ? QAST_GT : QAST_LE, lhs, hi);
+    return qast_mk_binop(p->arena, negate ? QAST_OR : QAST_AND, a, b);
+}
+
 static qast_expr_t *parse_cmp(parser_t *p) {
     qast_expr_t *l = parse_add(p);
     if (!l || p->errored) return l;
+    /* Postfix set/range predicates: `col [NOT] IN (...)`, `col [NOT] BETWEEN a AND b`.
+     * Prefix NOT is handled earlier by parse_unary; this is the postfix form. */
+    if (p->tok.kind == QTOK_NOT) {
+        advance(p);
+        if (accept(p, QTOK_IN))      return parse_in_tail(p, l, 1);
+        if (accept(p, QTOK_BETWEEN)) return parse_between_tail(p, l, 1);
+        perr(p, "expected IN or BETWEEN after NOT");
+        return NULL;
+    }
+    if (accept(p, QTOK_IN))      return parse_in_tail(p, l, 0);
+    if (accept(p, QTOK_BETWEEN)) return parse_between_tail(p, l, 0);
     qast_kind_t k;
     switch (p->tok.kind) {
     case QTOK_EQ: k = QAST_EQ; break;
