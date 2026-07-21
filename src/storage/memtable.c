@@ -499,12 +499,22 @@ int tsdb_memtable_snapshot(tsdb_memtable_t *m,
     return TSDB_OK;
 }
 
-int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
-                               const void *ts_arr,
-                               const void * const *col_arrs,
-                               const int *col_types,
-                               int ncols_data,
-                               size_t n)
+/* Internal raw variant of tsdb_memtable_append_bulk.  When sym_lens is
+ * non-NULL, each SYMBOL entry in col_arrs points straight at the packed
+ * [u16 len][bytes]... rows (no [u32 total] header) and sym_lens[d] is
+ * that payload's byte length — db.c's bulk chunker uses this to hand in
+ * a sub-range of a larger symbol payload without re-packing it into a
+ * malloc'd temp wrapper.  sym_lens == NULL means the legacy wire
+ * format: SYMBOL entries carry a leading [u32 total] header.
+ * Not in memtable.h on purpose; the prototype is mirrored in db.c —
+ * keep the two in sync. */
+int tsdb_memtable_append_bulk_raw(tsdb_memtable_t *m,
+                                   const void *ts_arr,
+                                   const void * const *col_arrs,
+                                   const size_t *sym_lens,
+                                   const int *col_types,
+                                   int ncols_data,
+                                   size_t n)
 {
     if (!m || !ts_arr || !col_arrs || !col_types) return TSDB_ERR_INVAL;
     if (n == 0) return TSDB_OK;
@@ -539,20 +549,30 @@ int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
             sym_resolved[data_idx] = resolved;
             tsdb_symtab_t *st = m->schema->cols[c].symtab;
             const uint8_t *p = (const uint8_t *)col_arrs[data_idx];
-            uint32_t total = 0;
-            if (p) memcpy(&total, p, 4);
-            const uint8_t *cur = p ? p + 4 : NULL;
-            const uint8_t *end = p ? p + 4 + total : NULL;
+            const uint8_t *cur, *end;
+            if (sym_lens) {
+                cur = p;
+                end = p ? p + sym_lens[data_idx] : NULL;
+            } else {
+                uint32_t total = 0;
+                if (p) memcpy(&total, p, 4);
+                cur = p ? p + 4 : NULL;
+                end = p ? p + 4 + total : NULL;
+            }
             for (size_t r = 0; r < n; r++) {
                 if (!cur || cur >= end) { resolved[r] = 0; continue; }
                 uint16_t l16; memcpy(&l16, cur, 2); cur += 2;
                 if (cur + l16 > end) goto err_corrupt;
-                char sbuf[260];
-                int len = l16 < 256 ? l16 : 255;
-                memcpy(sbuf, cur, len); sbuf[len] = '\0';
-                cur += l16;
-                uint32_t code = st ? tsdb_symtab_intern(st, sbuf)
+                /* Intern straight out of the wire buffer — no stack
+                 * copy.  Semantics match the old copy+NUL-terminate
+                 * path exactly: cap at 255 bytes, stop at an embedded
+                 * NUL (strlen on the copy did both). */
+                size_t slen = l16 < 256 ? (size_t)l16 : 255;
+                const void *nul = memchr(cur, 0, slen);
+                if (nul) slen = (size_t)((const uint8_t *)nul - cur);
+                uint32_t code = st ? tsdb_symtab_intern_n(st, (const char *)cur, slen)
                                    : TSDB_SYMBOL_INVALID;
+                cur += l16;
                 if (code == TSDB_SYMBOL_INVALID) goto err_nomem;
                 resolved[r] = code;
             }
@@ -624,6 +644,17 @@ err_corrupt:  for (int i = 0; i < ncols_data; i++) free(sym_resolved[i]); return
 err_nomem:    for (int i = 0; i < ncols_data; i++) free(sym_resolved[i]); return TSDB_ERR_NOMEM;
 err_inval_unlocked: for (int i = 0; i < ncols_data; i++) free(sym_resolved[i]); return TSDB_ERR_INVAL;
 err_full_unlocked:  for (int i = 0; i < ncols_data; i++) free(sym_resolved[i]); return TSDB_ERR_FULL;
+}
+
+int tsdb_memtable_append_bulk(tsdb_memtable_t *m,
+                               const void *ts_arr,
+                               const void * const *col_arrs,
+                               const int *col_types,
+                               int ncols_data,
+                               size_t n)
+{
+    return tsdb_memtable_append_bulk_raw(m, ts_arr, col_arrs, NULL,
+                                         col_types, ncols_data, n);
 }
 
 int tsdb_memtable_sorted_indices(tsdb_memtable_t *m, size_t *out_idx) {

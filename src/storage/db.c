@@ -2138,6 +2138,20 @@ void tsdb_batch_set_local_only(tsdb_batch_t *b) {
     if (b) b->local_only = 1;
 }
 
+/* Internal memtable entry point (defined in memtable.c, deliberately
+ * not in memtable.h): like tsdb_memtable_append_bulk, but SYMBOL
+ * columns are passed as a raw payload pointer + byte length
+ * (sym_lens[d]) with no [u32 total] header, so a chunk of a larger
+ * batch can be appended without re-packing it into a temp buffer.
+ * Mirror of the definition — keep the two in sync. */
+int tsdb_memtable_append_bulk_raw(tsdb_memtable_t *m,
+                                  const void *ts_arr,
+                                  const void * const *col_arrs,
+                                  const size_t *sym_lens,
+                                  const int *col_types,
+                                  int ncols_data,
+                                  size_t n);
+
 int tsdb_batch_append_bulk(tsdb_batch_t *b,
                             const void *ts_arr,
                             const void * const *col_arrs,
@@ -2191,12 +2205,14 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
          * 8-byte fixed cols just advance by 8 × consumed; SYMBOL cols
          * resume from their carried cursor. */
         const void *col_arrs_off[TSDB_MAX_COLS];
+        size_t      sym_lens_off[TSDB_MAX_COLS];
         for (int d = 0; d < ncols_data; d++) {
             const uint8_t *p = (const uint8_t *)col_arrs[d];
             if (col_types[d] == TSDB_TYPE_SYMBOL) {
                 const uint8_t *cur = sym_cursor[d];
-                /* Build a temp [u32 total][rest] view for the chunk.
-                 * Compute new total = sum of [2 + len] for chunk rows. */
+                /* Walk the chunk's rows once to find its byte extent,
+                 * then hand the payload slice straight to the memtable
+                 * (ptr + len, no [u32 total] wrapper copy). */
                 const uint8_t *chunk_start = cur;
                 size_t chunk_payload = 0;
                 for (size_t k = 0; k < chunk; k++) {
@@ -2206,31 +2222,18 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
                     chunk_payload += 2 + l16;
                 }
                 sym_cursor[d] = cur;   /* resume point for the next chunk */
-                /* memtable_append_bulk expects a [u32 total][...] header.
-                 * Allocate a small wrapper buffer for this chunk. */
-                uint8_t *tmp = malloc(4 + chunk_payload);
-                if (!tmp) return TSDB_ERR_NOMEM;
-                uint32_t t32 = (uint32_t)chunk_payload;
-                memcpy(tmp, &t32, 4);
-                memcpy(tmp + 4, chunk_start, chunk_payload);
-                col_arrs_off[d] = tmp;
+                col_arrs_off[d] = chunk_start;
+                sym_lens_off[d] = chunk_payload;
             } else {
                 col_arrs_off[d] = p + consumed * 8;
+                sym_lens_off[d] = 0;
             }
         }
 
-        int rc = tsdb_memtable_append_bulk(b->tbl->memtable,
-                                            ts_bytes + consumed * sizeof(int64_t),
-                                            col_arrs_off, col_types,
-                                            ncols_data, chunk);
-
-        /* Free the SYMBOL chunk wrappers we malloc'd above. */
-        for (int d = 0; d < ncols_data; d++) {
-            if (col_types[d] == TSDB_TYPE_SYMBOL) {
-                free((void *)col_arrs_off[d]);
-            }
-        }
-
+        int rc = tsdb_memtable_append_bulk_raw(b->tbl->memtable,
+                                                ts_bytes + consumed * sizeof(int64_t),
+                                                col_arrs_off, sym_lens_off,
+                                                col_types, ncols_data, chunk);
         if (rc != TSDB_OK) return rc;
         consumed += chunk;
     }

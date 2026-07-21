@@ -500,10 +500,16 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
     int ts_ci   = schema->ts_col_idx;
     int n_data  = schema->ncols - 1;
 
-    /* Count matching rows up front so we can size buffers exactly. */
+    /* Count matching rows up front so we can size buffers exactly.
+     * Remember the first match: it is the reference row for the hoisted
+     * name->column resolution below. */
     size_t n = 0;
+    const influx_row_t *ref = NULL;
     for (size_t j = 0; j < nrows_total; j++) {
-        if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0) n++;
+        if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0) {
+            if (!ref) ref = &rows[j];
+            n++;
+        }
     }
     if (n == 0) return TSDB_OK;
 
@@ -555,7 +561,46 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
         data_idx++;
     }
 
-    /* Walk rows once.  For each col we scan the row's tag_keys[] then
+    /* Hoisted name->column resolution: resolve each data column ONCE
+     * against `ref` instead of strcmp-scanning every row's keys for
+     * every column.  A row reuses the resolved slot only when its key
+     * layout (tag keys, field keys, field types) is identical to ref's;
+     * any other row falls back to the original full scan, so the packed
+     * output is bit-identical either way — including duplicate keys and
+     * tag-shadows-field lines. */
+    typedef struct { int kind; int idx; } col_res_t;
+    enum { RES_NONE = 0, RES_TAG = 1, RES_FIELD = 2 };
+    col_res_t res[TSDB_MAX_COLS];
+    for (int d = 0; d < n_data; d++) {
+        const char *col_name = schema->cols[cs[d].schema_idx].name;
+        res[d].kind = RES_NONE;
+        res[d].idx  = -1;
+        if (cs[d].col_type == TSDB_TYPE_SYMBOL) {
+            for (int t = 0; t < ref->ntags; t++) {
+                if (strcmp(ref->tag_keys[t], col_name) == 0) {
+                    res[d].kind = RES_TAG; res[d].idx = t; break;
+                }
+            }
+            if (res[d].kind == RES_NONE) {
+                for (int f = 0; f < ref->nfields; f++) {
+                    if (strcmp(ref->field_keys[f], col_name) == 0 &&
+                        ref->field_types[f] == TSDB_INFLUX_STRING)
+                    {
+                        res[d].kind = RES_FIELD; res[d].idx = f; break;
+                    }
+                }
+            }
+        } else {
+            for (int f = 0; f < ref->nfields; f++) {
+                if (strcmp(ref->field_keys[f], col_name) == 0) {
+                    res[d].kind = RES_FIELD; res[d].idx = f; break;
+                }
+            }
+        }
+    }
+
+    /* Walk rows once.  Layout-matching rows use the hoisted res[] slots
+     * directly; mismatching rows scan the row's tag_keys[] then
      * field_keys[] for the matching name (same lookup write_row_to_batch
      * did per-cell, just inlined).  Unset cols get default values: 0 for
      * numeric, empty string for SYMBOL — matches the row-end "all cols
@@ -568,21 +613,45 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
         const influx_row_t *row = &rows[j];
         ts_arr[r] = (int64_t)row->ts;
 
+        /* One layout check per row replaces one strcmp scan per cell:
+         * reuse res[] only when this row's keys/types match ref's. */
+        int same_layout = (row->ntags == ref->ntags &&
+                           row->nfields == ref->nfields);
+        if (same_layout && row != ref && n_data > 0) {
+            for (int t = 0; t < row->ntags; t++) {
+                if (strcmp(row->tag_keys[t], ref->tag_keys[t]) != 0) {
+                    same_layout = 0; break;
+                }
+            }
+            for (int f = 0; same_layout && f < row->nfields; f++) {
+                if (row->field_types[f] != ref->field_types[f] ||
+                    strcmp(row->field_keys[f], ref->field_keys[f]) != 0)
+                    same_layout = 0;
+            }
+        }
+
         for (int d = 0; d < n_data; d++) {
             const char *col_name = schema->cols[cs[d].schema_idx].name;
             if (cs[d].col_type == TSDB_TYPE_SYMBOL) {
                 const char *sval = NULL;
-                for (int t = 0; t < row->ntags; t++) {
-                    if (strcmp(row->tag_keys[t], col_name) == 0) {
-                        sval = row->tag_vals[t]; break;
+                if (same_layout) {
+                    if (res[d].kind == RES_TAG)
+                        sval = row->tag_vals[res[d].idx];
+                    else if (res[d].kind == RES_FIELD)
+                        sval = row->field_strs[res[d].idx];
+                } else {
+                    for (int t = 0; t < row->ntags; t++) {
+                        if (strcmp(row->tag_keys[t], col_name) == 0) {
+                            sval = row->tag_vals[t]; break;
+                        }
                     }
-                }
-                if (!sval) {
-                    for (int f = 0; f < row->nfields; f++) {
-                        if (strcmp(row->field_keys[f], col_name) == 0 &&
-                            row->field_types[f] == TSDB_INFLUX_STRING)
-                        {
-                            sval = row->field_strs[f]; break;
+                    if (!sval) {
+                        for (int f = 0; f < row->nfields; f++) {
+                            if (strcmp(row->field_keys[f], col_name) == 0 &&
+                                row->field_types[f] == TSDB_INFLUX_STRING)
+                            {
+                                sval = row->field_strs[f]; break;
+                            }
                         }
                     }
                 }
@@ -609,27 +678,32 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
             } else {
                 int64_t v = 0;
                 double  fv = 0;
-                int found = 0;
-                for (int f = 0; f < row->nfields; f++) {
-                    if (strcmp(row->field_keys[f], col_name) == 0) {
-                        switch (row->field_types[f]) {
-                        case TSDB_INFLUX_FLOAT:
-                            fv = row->field_vals[f].f64;
-                            memcpy(cs[d].fixed_buf + r * 8, &fv, 8);
-                            break;
-                        case TSDB_INFLUX_INT:
-                        case TSDB_INFLUX_BOOL:
-                            v = row->field_vals[f].i64;
-                            memcpy(cs[d].fixed_buf + r * 8, &v, 8);
-                            break;
-                        case TSDB_INFLUX_STRING:
-                            /* Type mismatch — keep default 0. */
-                            break;
+                int fmatch = -1;
+                if (same_layout) {
+                    if (res[d].kind == RES_FIELD) fmatch = res[d].idx;
+                } else {
+                    for (int f = 0; f < row->nfields; f++) {
+                        if (strcmp(row->field_keys[f], col_name) == 0) {
+                            fmatch = f; break;
                         }
-                        found = 1; break;
                     }
                 }
-                if (!found) {
+                if (fmatch >= 0) {
+                    switch (row->field_types[fmatch]) {
+                    case TSDB_INFLUX_FLOAT:
+                        fv = row->field_vals[fmatch].f64;
+                        memcpy(cs[d].fixed_buf + r * 8, &fv, 8);
+                        break;
+                    case TSDB_INFLUX_INT:
+                    case TSDB_INFLUX_BOOL:
+                        v = row->field_vals[fmatch].i64;
+                        memcpy(cs[d].fixed_buf + r * 8, &v, 8);
+                        break;
+                    case TSDB_INFLUX_STRING:
+                        /* Type mismatch — keep default 0. */
+                        break;
+                    }
+                } else {
                     /* Default 0 already from calloc — explicit memset
                      * just to make the intent obvious for non-Influx
                      * schemas where col was added later. */
