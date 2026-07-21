@@ -1856,6 +1856,13 @@ int tsdb_cluster_child_assigned_to_self(tsdb_db_t *db, const char *child_name) {
                                              * an owner) — data unreachable */
 }
 
+/* Monotonic milliseconds for wall-clock budgets. */
+static long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 /* Coordinator fan-out for the stable-aggregation scatter.  Sequential
  * FED_QUERY_LOCAL to every ALIVE peer (MVP; typical cluster is 3 nodes),
  * hard per-peer timeout.  All-or-nothing: one missing partial would
@@ -1867,6 +1874,7 @@ int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
                                      int *out_n,
                                      uint64_t *out_failed_peer)
 {
+    long start_ms = mono_ms();
     if (out_n) *out_n = 0;
     if (out_failed_peer) *out_failed_peer = 0;
     if (!db || !qtl || !results || cap <= 0 || !out_n) return TSDB_ERR_INVAL;
@@ -1881,14 +1889,26 @@ int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
 
     tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
 
+    /* Whole-scatter wall budget: the sequential peer loop plus the
+     * evict/redial retries below must never sum to a long client-visible
+     * stall — each leg is bounded, but N legs x retry x timeout adds up. */
+    long total_budget_ms = (timeout_ms > 0) ? 3L * (long)timeout_ms : 0;
+
     int n = 0;
     for (int i = 0; i < npeers; i++) {
+        if (total_budget_ms > 0 && mono_ms() - start_ms >= total_budget_ms) {
+            for (int k = 0; k < n; k++) tsdb_result_free(results[k]);
+            *out_n = 0;
+            if (out_failed_peer) *out_failed_peer = (uint64_t)peers[i];
+            return TSDB_ERR_IO;
+        }
         tsdb_rpc_conn_t *conn =
             rmgr ? tsdb_replica_mgr_get_conn(rmgr, peers[i]) : NULL;
         tsdb_result_t *res = NULL;
         int rc = conn ? fedrpc_query_local(conn, qtl, timeout_ms, &res)
                       : TSDB_ERR_IO;
-        if ((rc != TSDB_OK || !res) && rmgr) {
+        if ((rc != TSDB_OK || !res) && rmgr &&
+            !(total_budget_ms > 0 && mono_ms() - start_ms >= total_budget_ms)) {
             /* The pooled conn may be stale (peer restarted since it was
              * dialed; half-open socket).  Without eviction every future
              * scatter gets the same poisoned conn back and the failure is

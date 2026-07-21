@@ -1453,6 +1453,51 @@ static void conn_set_io_timeout(int fd, int timeout_ms) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+/* Acquire conn->lock but give up after timeout_ms so a hard-deadline RPC
+ * can never park unbounded behind a no-timeout data-path round-trip on
+ * the same pooled (CONNS_PER_PEER=1) socket.  Returns 0 on lock, -1 on
+ * timeout.  Portable: pthread_mutex_timedlock where available (Linux),
+ * else a trylock + short nanosleep spin to the deadline (macOS has no
+ * pthread_mutex_timedlock). */
+static int conn_lock_deadline(pthread_mutex_t *m, int timeout_ms) {
+    if (timeout_ms <= 0) {                  /* unbounded — plain lock */
+        pthread_mutex_lock(m);
+        return 0;
+    }
+#if defined(__linux__)
+    /* timedlock takes an absolute CLOCK_REALTIME deadline. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    for (;;) {
+        int rc = pthread_mutex_timedlock(m, &ts);
+        if (rc == 0) return 0;
+        if (rc == EINTR) continue;
+        return -1;                          /* ETIMEDOUT (or hard error) */
+    }
+#else
+    struct timespec dl;
+    clock_gettime(CLOCK_MONOTONIC, &dl);
+    dl.tv_sec  += timeout_ms / 1000;
+    dl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    for (;;) {
+        int rc = pthread_mutex_trylock(m);
+        if (rc == 0) return 0;
+        if (rc != EBUSY) return -1;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > dl.tv_sec ||
+            (now.tv_sec == dl.tv_sec && now.tv_nsec >= dl.tv_nsec))
+            return -1;
+        struct timespec nap = { 0, 1000000L };  /* 1 ms */
+        nanosleep(&nap, NULL);
+    }
+#endif
+}
+
 /* tsdb_rpc_call_recv with a hard per-call socket deadline.
  *
  * Pool conns are blocking sockets with no recv timeout — right for the
@@ -1472,7 +1517,7 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
 {
     if (!conn) return TSDB_ERR_INVAL;
 
-    pthread_mutex_lock(&conn->lock);
+    if (conn_lock_deadline(&conn->lock, timeout_ms) != 0) return TSDB_ERR_IO;
     conn_set_io_timeout(conn->fd, timeout_ms);
     int rc = call_recv_locked(conn, type, payload, payload_len,
                               resp_buf, resp_cap, resp_len);

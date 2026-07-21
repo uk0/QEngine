@@ -185,6 +185,14 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
                           uint8_t *resp_buf, uint32_t resp_cap,
                           uint32_t *resp_len, int timeout_ms);
 
+/* Bound for the write-replication sends (WRITE_BATCH fanout + RAW_BLOCK_PUSH).
+ * These hold the single per-peer pooled conn->lock (CONNS_PER_PEER=1) for a
+ * whole round-trip; a no-timeout send against a peer wedged on its own
+ * batch_mu pinned that lock forever and leaked the sender thread.  Generous
+ * (well above a normal apply) but far below the fanout-wait deadline so a
+ * real ring resolves in seconds, not tens of seconds. */
+#define TSDB_REPL_SEND_TIMEOUT_MS 10000
+
 /* ---- Wire helpers (used by gossip and replica layers) -------------------- */
 
 /*
