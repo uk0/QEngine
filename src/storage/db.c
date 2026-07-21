@@ -251,6 +251,12 @@ struct tsdb_db {
      * flush_and_clear_ex).  Durability is preserved via WAL fsync; crash
      * recovery replays WAL records back into memtables on open. */
     int                  wal_only_commit;
+    /* Set when wal_only_commit was turned on by the non-SSD iopolicy
+     * auto-tune (not an explicit env).  A cluster node clears it back to
+     * flush-on-commit when it registers replication hooks, so the auto-tune
+     * never silently defers replication — operators opt into deferred flush
+     * on a cluster via an explicit TSDB_WAL_ONLY_COMMIT=1. */
+    int                  wal_only_auto;
 };
 
 /* ---- Batch struct ------------------------------------------------------- */
@@ -468,8 +474,11 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
         }
     }
 
-    /* Opt-in: commit only syncs WAL, memtable flush deferred to is_full(). */
+    /* Opt-in: commit only syncs WAL, memtable flush deferred to is_full().
+     * Remember whether the operator set the env at all — an explicit value
+     * (including "0") always wins over the iopolicy auto-tune below. */
     const char *wc = getenv("TSDB_WAL_ONLY_COMMIT");
+    int wal_env_set = (wc && wc[0]) ? 1 : 0;
     db->wal_only_commit = (wc && wc[0] && wc[0] != '0') ? 1 : 0;
 
     /* Open catalog — non-fatal on failure so plain SELECT workloads
@@ -531,6 +540,27 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
     {
         const char *mb = getenv("TSDB_MEMTABLE_BUDGET_ROWS");
         if (mb && *mb) { long long v = atoll(mb); if (v >= 0) db->memtable_budget_rows = (uint64_t)v; }
+    }
+
+    /* Flush-cadence auto-tune: on rotational storage fsync dominates the
+     * write path — flush-per-commit measured 69.5k rows/s vs 188.5k with
+     * WAL-only commit (2.71x) on a 4.3 MB/s O_DSYNC disk — so default to
+     * deferred flush on HDD/SAS.  Guarded three ways:
+     *   - explicit TSDB_WAL_ONLY_COMMIT (including "0") always wins;
+     *   - SSD keeps flush-on-commit (fsync is cheap there, gap ~11%);
+     *   - requires a bounded memtable budget (> 0): deferred flush drains
+     *     via memtable_over_budget/maybe_flush_b, which are inert at
+     *     budget 0 (TSDB_MEMTABLE_BUDGET_ROWS=0 = legacy unbounded), so
+     *     auto-enabling there would grow the memtable without limit. */
+    if (!wal_env_set && db->iopolicy != TSDB_IOPOLICY_SSD &&
+        db->memtable_budget_rows > 0) {
+        db->wal_only_commit = 1;
+        db->wal_only_auto   = 1;   /* cleared if this becomes a cluster node */
+        fprintf(stderr,
+                "[db] auto-enabled wal_only_commit for iopolicy=%s "
+                "(fsync-bound); set TSDB_WAL_ONLY_COMMIT=0 to force "
+                "flush-on-commit\n",
+                tsdb_iopolicy_name(db->iopolicy));
     }
     fprintf(stderr,
             "[db] iopolicy=%s  memtable_budget_rows=%llu  wal_only_commit=%d\n",
@@ -861,6 +891,18 @@ static int create_table_impl(tsdb_db_t *db,
         pthread_mutex_unlock(&db->lock);
         return rc;
     }
+
+    /* Crash recovery for the create-over-existing path.  After a crash the
+     * in-memory table index is empty, so the influx auto-create path (which
+     * probes only that index) and idempotent SQL CREATE TABLE re-CREATE an
+     * existing on-disk table through here — never through tsdb_open_table,
+     * whose redo_recover_table (db.c:~1105) is the only other replay site.
+     * Without this, a fsynced-but-unflushed WAL tail is invisible and then
+     * destroyed by the first flush's WAL truncate — silent loss of acked
+     * rows, and worse under wal_only_commit (larger unflushed tail).  A
+     * genuinely new table has an empty WAL so this is a no-op, and the
+     * seq<=checkpoint dedup makes it idempotent vs a later open_table. */
+    redo_recover_table(db, t);
 
     db->tables[db->ntables++] = t;
     tbl_index_insert(db, t);   /* keep name index in sync with tables[] */
@@ -2359,6 +2401,17 @@ void tsdb_db_set_hooks(tsdb_db_t *db,
     db->on_replicate = on_replicate;
     db->on_create    = on_create;
     db->hook_ud      = userdata;
+    /* This DB is now a cluster node.  If wal_only_commit was enabled only by
+     * the iopolicy auto-tune (not an explicit env), revert to flush-on-commit
+     * so replication fires per commit instead of being deferred to the flush
+     * boundary — deferred replication on a cluster risks replica lag/skew that
+     * the auto-tune should not impose silently.  An explicit env is untouched. */
+    if (db->wal_only_auto && (on_replicate || on_create)) {
+        db->wal_only_commit = 0;
+        db->wal_only_auto   = 0;
+        fprintf(stderr, "[db] cluster node: reverted auto wal_only_commit to "
+                        "flush-on-commit (set TSDB_WAL_ONLY_COMMIT=1 to keep it)\n");
+    }
     pthread_mutex_unlock(&db->lock);
 }
 

@@ -299,11 +299,46 @@ static void test_d(void) {
     printf("test_d PASS\n");
 }
 
+/* Recover through the CREATE-over-existing path (influx auto-create / idempotent
+ * SQL CREATE), NOT open_table.  After a fresh open the in-memory index is empty,
+ * so create_table_impl builds the table before any open_table runs; without a
+ * redo_recover_table call there, the fsynced WAL tail is never replayed and the
+ * first flush truncates it — silent loss of acked rows (worst under wal_only). */
+static int reopen_via_create_count(const char *dir) {
+    setenv("TSDB_WAL_ONLY_COMMIT", "1", 1);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dir, &db));
+    tsdb_col_t cols[] = {
+        { "ts", TSDB_TYPE_TIMESTAMP },
+        { "v",  TSDB_TYPE_INT64     },
+    };
+    int rc = tsdb_create_table(db, "t", cols, 2, "ts");  /* -> create_table_impl */
+    if (rc != TSDB_OK && rc != TSDB_ERR_EXISTS) OK(rc);
+    int c = count_rows(db, "SELECT v FROM t");
+    tsdb_close(db);
+    return c;
+}
+
+static void test_e_create_recovers(void) {
+    const char *dir = "/tmp/tsdb_test_wal_recovery_e";
+    rm_rf(dir);
+    make_table(dir);
+    const int N = 5000;   /* < block_points: pure WAL replay, no partition */
+    int ok = run_crash_child(dir, /*wal_only=*/1, N, /*per_commit=*/4, DAY1);
+    if (ok < 0) { printf("test_e: fork unavailable, SKIP\n"); rm_rf(dir); return; }
+    ASSERT(ok == 1);
+    int c = reopen_via_create_count(dir);
+    printf("test_e: recovered %d / %d rows via CREATE-over-existing path\n", c, N);
+    ASSERT(c == N);   /* 0 without the create_table_impl recovery fix */
+    rm_rf(dir);
+}
+
 int main(void) {
     test_c();   /* default path first: must hold regardless of redo changes */
     test_a();
     test_b();
     test_d();
+    test_e_create_recovers();   /* create-over-existing recovery (this fix) */
     printf("\n=== WAL redo recovery TESTS PASSED ===\n");
     return 0;
 }
