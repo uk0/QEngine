@@ -701,10 +701,15 @@ i64 sum/avg overflow detection.
   the child owners, merge), but for ~2 s after a write to a child the
   aggregate can transiently read low/empty while the rows are still in
   the ingest node's memtable and not yet replicated to the hash owner;
-  it self-heals on the next flush. A complete fix needs the client
-  `WRITE_BATCH` path to distinguish client writes from replica traffic
-  (client writes are currently marked replica-received, so the ingester
-  doesn't advertise the delta), or a per-query presence probe
+  it self-heals on the next flush. The complete fix is to **route client
+  writes to the shard owner** (a non-owner forwards the `WRITE_BATCH` to
+  the owner with a client-origin marker, so the row is scatter-visible
+  immediately and the owner re-replicates) — but doing so safely requires
+  a **client-assigned batch UUID with owner-side dedup**: without it, a
+  forward whose ACK is lost (slow owner, conn reset) and then retried
+  locally double-writes the rows, inflating the count and mis-triggering
+  anti-entropy truncation. That idempotent-forward design is scoped but
+  not yet landed
 - **Row-level replica reconciliation** — anti-entropy converges on
   count/max(ts); divergent middle-gap replicas are preserved (never
   destructively truncated) but not yet backfilled row-by-row. Related:
