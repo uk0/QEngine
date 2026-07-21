@@ -517,7 +517,65 @@ int qparse(const char *src, tsdb_arena_t *a, qast_query_t *q, char *err, size_t 
             return TSDB_ERR_PARSE;
         }
         if (expect(&p, QTOK_BY) != TSDB_OK) return TSDB_ERR_PARSE;
-        if (parse_ident_list(&p, &q->group_by, &q->ngroup_by) != TSDB_OK) return TSDB_ERR_PARSE;
+        /* Each item is a bare column (tag/dimension -> group_by[]) or
+         * time_bucket(ts_col, interval), which routes to the existing SAMPLE BY
+         * bucketing (has_sample_by + sample_by.ns) — the streaming SAMPLE BY
+         * executor is reused unchanged.  time_bucket is mutually exclusive with
+         * an explicit SAMPLE BY clause, a second time_bucket, and any tag key:
+         * that path buckets on ts only and has no per-tag grouping, so a tag key
+         * would be silently dropped — reject instead (also closes the pre-existing
+         * SAMPLE-BY-clause + GROUP-BY-tag silent-drop). */
+        int explicit_sample_by = q->has_sample_by;
+        int saw_time_bucket = 0;
+        char *gnames[64]; int gn = 0;
+        for (;;) {
+            if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "time_bucket")) {
+                qtok_t name_tok = p.tok;   /* save: may be a plain column named time_bucket */
+                advance(&p);
+                if (p.tok.kind == QTOK_LPAREN) {
+                    if (explicit_sample_by) { perr(&p, "GROUP BY time_bucket() cannot be combined with a SAMPLE BY clause"); return TSDB_ERR_PARSE; }
+                    /* SESSION/STATE_WINDOW/EVENT_WINDOW and LATEST ON are parsed
+                     * before GROUP BY and are mutually exclusive with bucketing;
+                     * setting has_sample_by here would otherwise silently drop them
+                     * (their own SAMPLE-BY guards already ran). Reject explicitly. */
+                    if (q->has_adv_window) { perr(&p, "GROUP BY time_bucket() cannot be combined with SESSION/STATE_WINDOW/EVENT_WINDOW"); return TSDB_ERR_PARSE; }
+                    if (q->has_latest_on)  { perr(&p, "GROUP BY time_bucket() cannot be combined with LATEST ON"); return TSDB_ERR_PARSE; }
+                    if (saw_time_bucket)    { perr(&p, "only one time_bucket() is allowed in GROUP BY"); return TSDB_ERR_PARSE; }
+                    advance(&p);   /* '(' */
+                    if (p.tok.kind != QTOK_IDENT) { perr(&p, "time_bucket: expected ts column as first argument"); return TSDB_ERR_PARSE; }
+                    advance(&p);   /* ts column (bucketing is on the table ts) */
+                    if (expect(&p, QTOK_COMMA) != TSDB_OK) return TSDB_ERR_PARSE;
+                    if (p.tok.kind != QTOK_INTERVAL && p.tok.kind != QTOK_NUMBER) {
+                        perr(&p, "time_bucket: expected interval as second argument (e.g. 1m)"); return TSDB_ERR_PARSE;
+                    }
+                    if (p.tok.i <= 0) { perr(&p, "time_bucket: interval must be a positive duration"); return TSDB_ERR_PARSE; }
+                    q->sample_by.ns  = p.tok.i;
+                    q->has_sample_by = 1;
+                    saw_time_bucket  = 1;
+                    advance(&p);   /* interval */
+                    if (expect(&p, QTOK_RPAREN) != TSDB_OK) return TSDB_ERR_PARSE;
+                } else {
+                    if (gn >= 64) { perr(&p, "too many GROUP BY keys"); return TSDB_ERR_PARSE; }
+                    gnames[gn++] = tok_strdup(&p, &name_tok);
+                }
+            } else {
+                if (p.tok.kind != QTOK_IDENT) { perr(&p, "expected column or time_bucket() in GROUP BY"); return TSDB_ERR_PARSE; }
+                if (gn >= 64) { perr(&p, "too many GROUP BY keys"); return TSDB_ERR_PARSE; }
+                gnames[gn++] = tok_strdup(&p, &p.tok);
+                advance(&p);
+            }
+            if (!accept(&p, QTOK_COMMA)) break;
+        }
+        if (q->has_sample_by && gn > 0) {
+            perr(&p, "GROUP BY time_bucket()/SAMPLE BY cannot be combined with tag or column keys");
+            return TSDB_ERR_PARSE;
+        }
+        if (gn > 0) {
+            char **arr = tsdb_arena_alloc(p.arena, sizeof(char *) * (size_t)gn);
+            if (!arr) return TSDB_ERR_NOMEM;
+            memcpy(arr, gnames, sizeof(char *) * (size_t)gn);
+            q->group_by = arr; q->ngroup_by = gn;
+        }
     }
 
     /* HAVING <cond> — only meaningful after GROUP BY.  Checked here (not

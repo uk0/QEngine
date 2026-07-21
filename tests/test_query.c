@@ -197,6 +197,40 @@ int main(void) {
     assert(nrows == 5);
     tsdb_result_free(r);
 
+    /* --- Test 6b: GROUP BY time_bucket(ts, N) routes to the SAMPLE BY path --- */
+    printf("\n[6b] GROUP BY time_bucket(ts, 1m) == SAMPLE BY 1m\n");
+    int64_t sb_rows = 0, sb_total = 0;
+    OK(tsdb_query(db, "SELECT time_bucket(ts, 60000000000), count(*) FROM trades SAMPLE BY 1m", &r));
+    while (tsdb_result_next(r)) { sb_rows++; sb_total += tsdb_result_i64(r, 1); }
+    tsdb_result_free(r);
+    int64_t gb_rows = 0, gb_total = 0;
+    OK(tsdb_query(db, "SELECT time_bucket(ts, 60000000000), count(*) FROM trades GROUP BY time_bucket(ts, 1m)", &r));
+    while (tsdb_result_next(r)) { gb_rows++; gb_total += tsdb_result_i64(r, 1); }
+    tsdb_result_free(r);
+    printf("  SAMPLE BY: %lld buckets total=%lld ; GROUP BY tb: %lld buckets total=%lld\n",
+           (long long)sb_rows, (long long)sb_total, (long long)gb_rows, (long long)gb_total);
+    assert(gb_rows > 0 && gb_rows == sb_rows);          /* same buckets as SAMPLE BY */
+    assert(gb_total == 10000 && gb_total == sb_total);  /* every row bucketed */
+    /* reject: bucket + tag key (streaming SAMPLE BY has no per-tag grouping) */
+    { tsdb_result_t *er = NULL;
+      int rc = tsdb_query(db, "SELECT count(*) FROM trades GROUP BY time_bucket(ts, 1m), symbol", &er);
+      printf("  GROUP BY time_bucket + tag rc=%d (expect <0)\n", rc);
+      assert(rc < 0); if (er) tsdb_result_free(er); }
+    /* reject: two time_bucket keys */
+    { tsdb_result_t *er = NULL;
+      int rc = tsdb_query(db, "SELECT count(*) FROM trades GROUP BY time_bucket(ts, 1m), time_bucket(ts, 120000000000)", &er);
+      assert(rc < 0); if (er) tsdb_result_free(er); }
+    /* reject: time_bucket combined with an advanced window / LATEST ON — those
+     * are parsed first and set has_adv_window/has_latest_on; without the guard
+     * they'd be silently dropped when time_bucket sets has_sample_by. */
+    { tsdb_result_t *er = NULL;
+      int rc = tsdb_query(db, "SELECT count(*) FROM trades SESSION(ts, 300000000000) GROUP BY time_bucket(ts, 1m)", &er);
+      printf("  SESSION + GROUP BY time_bucket rc=%d (expect <0)\n", (int)rc);
+      assert(rc < 0); if (er) tsdb_result_free(er); }
+    { tsdb_result_t *er = NULL;
+      int rc = tsdb_query(db, "SELECT * FROM trades LATEST ON ts GROUP BY time_bucket(ts, 1m)", &er);
+      assert(rc < 0); if (er) tsdb_result_free(er); }
+
     /* --- Test 7: parse errors --- */
     printf("\n[7] parse error tests\n");
     assert(tsdb_query(db, "SELECT FROM trades", &r) < 0);
