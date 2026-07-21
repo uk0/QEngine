@@ -445,7 +445,15 @@ static void *fanout_worker(void *arg) {
             }
             continue;
         }
-        rc = tsdb_rpc_call(conn, ctx->rpc_kind, ctx->payload, ctx->payload_len);
+        /* Bounded send (see TSDB_REPL_SEND_TIMEOUT_MS): the pooled per-peer
+         * conn->lock is held for the whole round-trip, so a no-timeout call
+         * against a peer wedged on its own batch_mu pinned the conn and left
+         * this fanout worker running forever (the idle-thread leak).  Cap it
+         * so the worker exits and the conn frees; anti-entropy heals the gap. */
+        uint8_t ackbuf[1]; uint32_t acklen = 0;
+        rc = tsdb_rpc_call_recv_to(conn, ctx->rpc_kind, ctx->payload,
+                                   ctx->payload_len, ackbuf, sizeof(ackbuf),
+                                   &acklen, TSDB_REPL_SEND_TIMEOUT_MS);
         if (rc == TSDB_OK) break;
         evict_one_conn(ctx->rmgr, nid, conn);
         if (attempt + 1 < MAX_ATTEMPTS) {
@@ -585,7 +593,12 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
     static int wait_tmo_ms = -1;
     if (wait_tmo_ms < 0) {
         const char *e = getenv("TSDB_FANOUT_WAIT_TIMEOUT_MS");
-        wait_tmo_ms = (e && *e) ? atoi(e) : 45000;
+        /* 5s default (was 45s): when a lock-step ring forms — every node
+         * holding its batch_mu inside this wait while the peer ACK needs that
+         * same batch_mu — the waiter is what breaks it.  45s stalled influx
+         * ingest for the full deadline (measured 46s at 4-8 concurrent
+         * writers); 5s bounds it while still tolerating a slow HDD apply. */
+        wait_tmo_ms = (e && *e) ? atoi(e) : 5000;
     }
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);

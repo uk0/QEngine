@@ -472,8 +472,18 @@ static void *rawblk_send_thread(void *arg) {
     rawblk_send_arg_t *sa = (rawblk_send_arg_t *)arg;
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(sa->rmgr, sa->node_id);
     if (conn) {
-        int rc = tsdb_rpc_call(conn, TSDB_RPC_RAW_BLOCK_PUSH,
-                               sa->payload, sa->payload_len);
+        /* Bounded send: the pool is CONNS_PER_PEER=1, so this call holds the
+         * single per-peer conn->lock for its whole round-trip.  A no-timeout
+         * send against a peer wedged on its own batch_mu pinned that lock
+         * forever — a concurrent scatter query (or the next flush) then parked
+         * unbounded on it, and THIS worker thread never exited (the 140-277
+         * idle-thread leak).  Cap the round-trip so a stuck peer frees the
+         * conn and this thread dies; anti-entropy closes any dropped block. */
+        uint8_t ackbuf[1]; uint32_t acklen = 0;
+        int rc = tsdb_rpc_call_recv_to(conn, TSDB_RPC_RAW_BLOCK_PUSH,
+                                       sa->payload, sa->payload_len,
+                                       ackbuf, sizeof(ackbuf), &acklen,
+                                       TSDB_REPL_SEND_TIMEOUT_MS);
         if (rc == TSDB_OK) {
             pthread_mutex_lock(sa->ack_lock);
             (*sa->ack_count)++;
