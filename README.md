@@ -31,7 +31,7 @@ tsdb-cli  ──TCP v1──▶  tsdb-server ⇄ cluster (gossip + hashring + au
 |------|-----------------------------------|
 | Ingest — single-node, single TCP connection | **4.75 M rows/s** |
 | Ingest — single-node, 10 clients concurrent | **7.6 M rows/s** |
-| Ingest — **4-node HDD cluster, 64 writers** | **2.97 M rows/s** |
+| Ingest — **4-node cluster (48-core Xeon), 64 writers** | **5.95 M rows/s** (wire) · **1.13 M** (influx) |
 | Compression (trades mixed) | **92.48×** (0.30 B/point) |
 | QUERY latency p50 (TCP round-trip) | **0.27 ms** |
 | count(\*) 5 M rows (8 threads) | **2.30 ms p50** |
@@ -193,6 +193,53 @@ early-quorum replica completion, and the per-peer TCP connection
 pool. Without them the same hardware tops out around **220 k rows/s**
 — a single-TCP-connection-per-peer on the primary serialised all
 replication RPCs through one handler thread on each peer.
+
+#### Concurrent write / query / delete — validated (48-core Xeon, 2026-07)
+
+4-node cluster on one host (Xeon E5-2686 v4, 48 vCPU, 125 GiB RAM),
+`TSDB_REPLICA_CONNS_PER_PEER=1`, `TSDB_WAL_ONLY_COMMIT=1`, `TSDB_IOPOLICY=hdd`,
+2× replication. Writers spread round-robin across all 4 nodes; row counts
+verified after every run.
+
+**Write — binary `WRITE_BATCH` (wire), rows/writer = 100 k:**
+
+| Concurrent writers | Ingest rows/s |
+|---:|---:|
+|  4 |   537 k |
+|  8 |   933 k |
+| 16 | 1.83 M |
+| 32 | 3.00 M |
+| 64 | **5.95 M** |
+
+**Write — InfluxDB line protocol (HTTP), rows/writer = 25 k:**
+
+| Concurrent writers | Ingest rows/s |
+|---:|---:|
+|  4 |   311 k |
+|  8 |   588 k |
+| 16 |   886 k |
+| 32 | 1.02 M |
+| 64 | **1.13 M** |
+
+The influx path previously stalled a fixed ~46 s at 4–8 concurrent writers
+(a lock-step replication ring); bounding the pooled-conn wait and cutting the
+fanout deadline removed it — 4 writers now complete in 0.32 s.
+
+**Query (round-trip via HTTP `/sql`, cluster):**
+
+| Query | Latency |
+|-------|:---:|
+| `count(*)` on an owner-local child table | **1–2 ms** |
+| `count(*), avg, spread` over a 400 k-row 4-child super-table (scatter-gather) | **~91 ms** |
+
+**Delete & failover:**
+
+| Operation | Result |
+|-----------|:---:|
+| `DROP TABLE` (raft-replicated metadata delete) | **~39 ms** avg |
+| `DELETE FROM … WHERE ts < …` | partition-granular (drops whole partitions in range) |
+| Leader failover (`docker stop` leader → new leader elected) | **0.087 s** |
+| Write during failover / old-leader rejoin | no loss; data intact after rejoin |
 
 For a **federated** deployment spanning two regions, use
 `docker compose -f docker-compose.federation.yml up -d` which brings up
@@ -389,6 +436,28 @@ The cluster layer provides:
 | `TSDB_IOPOLICY` | unset | Set to `hdd` for spinning-disk hosts: madvise SEQUENTIAL, 256 KiB stdio write buffer, `posix_fadvise` on index reads. No-op on SSD/NVMe. |
 | `TSDB_BALANCE_ALPHA` / `BETA` / `DAMPEN` / `INTERVAL_MS` | 0.6 / 0.4 / 0.5 / 30000 | Auto-balance weighting between write-rate load and storage-usage load. |
 | `TSDB_LOG_AUTOBALANCE` | unset | When set, log each VN rebalance event to stderr. Otherwise the controller is silent. |
+| `TSDB_DATA_DIRS` | unset | Comma/semicolon-separated extra storage directories (JBOD) — see below. |
+| `TSDB_MEMTABLE_BUDGET_ROWS` | per-iopolicy (SSD 32 M / HDD·SAS 8 M) | Aggregate memtable row ceiling before write-side backpressure; `0` = unbounded. |
+
+### Multi-directory storage (JBOD)
+
+Mount several disks as one storage pool. Set `TSDB_DATA_DIRS="/disk1,/disk2"`
+(or the `data_dirs` key in `tsd.conf` — both server binaries bridge it into the
+env), with `--data-dir` as the primary. Tables are striped across the primary +
+extra dirs by `hash(table_name)`, so each disk carries a deterministic share.
+
+- **Read/write span all dirs**: a super-table's children land on different disks;
+  `SELECT count(*) FROM <stable>` sums across the stripe transparently. Verified:
+  12 children split 5/4/3 across 3 dirs, `count(*)` = the full 36 000.
+- **Compaction + retention cover every dir** (previously they only swept the
+  primary, so striped tables were never compacted or expired — fixed).
+- **Auto-recovery**: all configured dirs are re-scanned on open, so a remounted
+  disk's tables are picked up again automatically. A dir that fails a
+  write is flagged degraded (`qengine_datadir_degraded_total`) and re-adopted
+  once it probes healthy again; rows for an in-flight write stay safe in the
+  memtable and are never dropped. Placement is a pure stable hash (a create onto
+  a degraded slot fails cleanly rather than silently splitting a table across
+  disks). WAL and catalog live on the primary.
 
 ---
 
