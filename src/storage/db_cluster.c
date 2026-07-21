@@ -180,8 +180,9 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
         }
     }
 
+    int remote_acks = 0;
     int rc = tsdb_cluster_write(c, table_name, ncols, col_types,
-                                nrows, col_data);
+                                nrows, col_data, &remote_acks);
 
     for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
 
@@ -194,7 +195,16 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
      * verified by the per-peer ACKs that fanout_wait_quorum gates
      * on); on failure we fall through to local persist so the row
      * isn't lost on flaky owners. */
-    if (rc == TSDB_OK && shard_replica_n_cached() > 0) {
+    /* Phase 1 (owner-ACK-gated SKIP_LOCAL): only drop this non-owner's local
+     * copy once at least one REMOTE owner has DURABLY confirmed the rows.
+     * The old test `rc == TSDB_OK` was unsafe under TSDB_REPLICATION_QUORUM=0:
+     * async fan-out returns OK with zero remote ACKs, so the memtable was
+     * cleared and the WAL truncated (db.c) while the rows still lived only in
+     * a volatile fan-out queue — a crash there lost them.  With quorum=0
+     * (remote_acks stays 0) we now KEEP the local copy (durable) and let
+     * anti-entropy converge; the sharded-storage drop still fires whenever a
+     * remote owner ACK was actually obtained (quorum>=1). */
+    if (rc == TSDB_OK && remote_acks >= 1 && shard_replica_n_cached() > 0) {
         tsdb_node_id_t owners[TSDB_CLUSTER_MAX_NODES];
         int got = tsdb_cluster_route(c, table_name, "",
                                      shard_replica_n_cached(), owners);

@@ -144,8 +144,10 @@ tsdb_replica_mgr_t *tsdb_cluster_replica_mgr(tsdb_cluster_t *c) {
 int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
-                       int nrows, const void **col_data)
+                       int nrows, const void **col_data,
+                       int *out_remote_acks)
 {
+    if (out_remote_acks) *out_remote_acks = 0;
     if (!c || !table_name || nrows == 0) return TSDB_OK;
 
     /* Replicate to every alive non-self node.
@@ -239,12 +241,18 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
     int q = cached_quorum;
     if (q > nremote) q = nremote;
 
-    return tsdb_replica_write(c->replica_mgr,
-                              table_name,
-                              ncols, col_types,
-                              nrows, col_data,
-                              remote_replicas, nremote,
-                              q);
+    int raw_acks = 0;
+    int rc = tsdb_replica_write(c->replica_mgr,
+                                table_name,
+                                ncols, col_types,
+                                nrows, col_data,
+                                remote_replicas, nremote,
+                                q, &raw_acks);
+    /* fanout ack_count includes the already-written local copy (starts at 1),
+     * so strip it: out_remote_acks is the count of REMOTE replicas that
+     * durably ACKed.  The SKIP_LOCAL drop decision needs >=1 of these. */
+    if (out_remote_acks) *out_remote_acks = raw_acks > 1 ? raw_acks - 1 : 0;
+    return rc;
 }
 
 int tsdb_cluster_sync_schema(tsdb_cluster_t *c,

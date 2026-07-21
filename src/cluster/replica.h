@@ -61,13 +61,16 @@ void tsdb_replica_mgr_set_dr(tsdb_replica_mgr_t *rmgr,
  *               pass TSDB_WRITE_QUORUM (2) for normal operation
  *
  * Returns TSDB_OK when quorum achieved, TSDB_ERR_IO if not enough ACKs.
+ * out_acks (optional): number of REMOTE replica ACKs durably confirmed at
+ * return — used by the flush path to decide whether it is safe to drop a
+ * non-owner's local copy (SKIP_LOCAL).  0 when async (quorum=0) did not wait.
  */
 int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        const char *table_name,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
-                       int w_quorum);
+                       int w_quorum, int *out_acks);
 
 /*
  * Sync schema (SCHEMA_SYNC RPC) to all given nodes.

@@ -109,7 +109,8 @@ int tsdb_cluster_route(tsdb_cluster_t *c,
 int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
-                       int nrows, const void **col_data);
+                       int nrows, const void **col_data,
+                       int *out_remote_acks);
 
 /*
  * Propagate a CREATE TABLE to cluster peers.

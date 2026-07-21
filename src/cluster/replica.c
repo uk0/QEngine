@@ -642,8 +642,9 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
-                       int w_quorum)
+                       int w_quorum, int *out_acks)
 {
+    if (out_acks) *out_acks = 0;
     if (!rmgr || nreplicas == 0) return TSDB_OK;
 
     /* Encode the WRITE_BATCH payload once.
@@ -734,9 +735,9 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
         tsdb_metric_add("qengine_replicate_bytes_wire_total", (uint64_t)plen);
     }
 
-    return fanout_wait_quorum(rmgr, payload, (uint32_t)plen,
-                              replicas, nreplicas,
-                              w_quorum, rpc_kind);
+    return fanout_wait_quorum_ex(rmgr, payload, (uint32_t)plen,
+                                 replicas, nreplicas,
+                                 w_quorum, rpc_kind, out_acks);
 }
 
 /* ---- Schema sync --------------------------------------------------------- */
