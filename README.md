@@ -432,7 +432,7 @@ The cluster layer provides:
 | Env var | Default | What it changes |
 |---|---|---|
 | `TSDB_REPLICA_CONNS_PER_PEER` | `8` | TCP conns per peer for replication. **Default is currently kept at `1` in the shipped compose files** — values >1 expose a known UAF under sustained RPC failure (slot eviction vs in-flight call). At `1`, the lvm1 4-node HDD cluster sustains 3.3 M rows/s with zero write errors; bump only after the pool-refcount refactor lands. |
-| `TSDB_WAL_ONLY_COMMIT` | `0` | When set, `tsdb_batch_commit` only fsyncs the WAL; memtable drains lazily when `is_full()`. Sharply reduces flush count on small-batch workloads. Trade-off: replication hooks fire at flush time, so replication is deferred to the next flush boundary. Durability is preserved via WAL replay on crash. |
+| `TSDB_WAL_ONLY_COMMIT` | auto | When set, `tsdb_batch_commit` only fsyncs the WAL; memtable drains lazily when `is_full()`. **Auto-defaults to on for non-SSD iopolicy** (fsync-bound disks): benchmarked **69.5 k → 188.5 k rows/s (2.71×)** on a 4.3 MB/s O_DSYNC disk; SSD keeps flush-on-commit (fsync is cheap, ~11 % gap). An explicit value (incl. `0`) always wins, and a cluster node reverts an *auto*-enabled value to flush-on-commit when it registers replication hooks (so replication is never silently deferred). Durability is preserved via WAL replay on crash. |
 | `TSDB_IOPOLICY` | unset | Set to `hdd` for spinning-disk hosts: madvise SEQUENTIAL, 256 KiB stdio write buffer, `posix_fadvise` on index reads. No-op on SSD/NVMe. |
 | `TSDB_BALANCE_ALPHA` / `BETA` / `DAMPEN` / `INTERVAL_MS` | 0.6 / 0.4 / 0.5 / 30000 | Auto-balance weighting between write-rate load and storage-usage load. |
 | `TSDB_LOG_AUTOBALANCE` | unset | When set, log each VN rebalance event to stderr. Otherwise the controller is silent. |
@@ -696,12 +696,23 @@ i64 sum/avg overflow detection.
 
 - **Cross-cluster rebalance** — within a cluster is automatic; across
   clusters requires manual re-routing rules today
-- **Stable scatter-gather reads** — `SELECT … FROM <stable>` aggregates
-  only local children; cluster-wide aggregation from any node is
-  in progress
+- **Stable scatter-gather — fresh-write transient** — cluster-wide
+  `SELECT … FROM <stable>` aggregation from any node works (scatter to
+  the child owners, merge), but for ~2 s after a write to a child the
+  aggregate can transiently read low/empty while the rows are still in
+  the ingest node's memtable and not yet replicated to the hash owner;
+  it self-heals on the next flush. A complete fix needs the client
+  `WRITE_BATCH` path to distinguish client writes from replica traffic
+  (client writes are currently marked replica-received, so the ingester
+  doesn't advertise the delta), or a per-query presence probe
 - **Row-level replica reconciliation** — anti-entropy converges on
   count/max(ts); divergent middle-gap replicas are preserved (never
-  destructively truncated) but not yet backfilled row-by-row
+  destructively truncated) but not yet backfilled row-by-row. Related:
+  under `wal_only_commit`, a node that both ingests and owns a table can
+  hold local+received rows in one memtable and a flush replicates by the
+  triggering batch's provenance — under-replicating co-resident local
+  rows until the next same-origin flush; the complete fix needs the WAL
+  redo record to carry per-row provenance
 
 **Non-goals for 1.0**:
 
