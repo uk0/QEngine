@@ -911,21 +911,10 @@ static int compactor_should_pause(tsdb_compactor_t *c) {
     return pause;
 }
 
-static int compactor_run_once_impl(tsdb_compactor_t *c) {
-    if (compactor_should_pause(c)) {
-        tsdb_metric_inc("qengine_compaction_paused_total");
-        return TSDB_OK;
-    }
-    /* Snapshot the db's table list under db->lock. */
-    tsdb_db_t *db = c->db;
-
-    /* We need to enumerate tables.  Use the public accessor. */
-    /* Walk data_dir for table subdirs, then for each open table look up
-     * the schema via the internal API. */
-
-    const char *data_dir = tsdb_db_data_dir(db);
-    if (!data_dir) return TSDB_ERR_INVAL;
-
+/* One compaction pass over the table subdirs of a single data dir.  Split
+ * out of compactor_run_once_impl() so every striped data dir gets the same
+ * pass; the per-table logic is unchanged. */
+static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *data_dir) {
     DIR *dd = opendir(data_dir);
     if (!dd) return TSDB_ERR_IO;
 
@@ -1023,6 +1012,36 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
     }
     closedir(dd);
     return TSDB_OK;
+}
+
+static int compactor_run_once_impl(tsdb_compactor_t *c) {
+    if (compactor_should_pause(c)) {
+        tsdb_metric_inc("qengine_compaction_paused_total");
+        return TSDB_OK;
+    }
+    /* Snapshot the db's table list under db->lock. */
+    tsdb_db_t *db = c->db;
+
+    /* We need to enumerate tables.  Use the public accessor. */
+    /* Walk EVERY striped data dir for table subdirs — tables are routed
+     * onto one of the TSDB_DATA_DIRS stripes by name hash, so scanning
+     * only the primary would never compact striped tables.  Single-dir
+     * setups have count==1 → one pass over data_dir, exactly as before. */
+
+    int ndirs = tsdb_db_data_dir_count(db);
+    if (ndirs <= 0) ndirs = 1;
+
+    int rc = TSDB_ERR_IO;
+    for (int di = 0; di < ndirs; di++) {
+        const char *data_dir = tsdb_db_data_dir_at(db, di);
+        if (!data_dir || !data_dir[0]) {
+            if (di == 0) data_dir = tsdb_db_data_dir(db);
+            if (!data_dir) continue;
+        }
+        if (compactor_scan_dir(c, db, data_dir) == TSDB_OK) rc = TSDB_OK;
+        if (c->quit) break;
+    }
+    return rc;
 }
 
 /* ---- Worker thread -------------------------------------------------------- */

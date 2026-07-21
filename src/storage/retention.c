@@ -21,9 +21,11 @@
 #include <fnmatch.h>
 #include <stdatomic.h>
 
-/* Forward declaration from db.h to avoid circular include. */
+/* Forward declarations from db.h to avoid circular include. */
 struct tsdb_db;
 extern const char *tsdb_db_data_dir(struct tsdb_db *db);
+extern int tsdb_db_data_dir_count(struct tsdb_db *db);
+extern const char *tsdb_db_data_dir_at(struct tsdb_db *db, int i);
 
 /* ---- Duration parser ------------------------------------------------------ */
 
@@ -257,6 +259,11 @@ struct tsdb_retention {
     char              conf_path[4096];
     tsdb_retention_opts_t opts;
 
+    /* Set by tsdb_db_set_retention() so sweeps can enumerate every striped
+     * data dir.  NULL for standalone tsdb_retention_start() users → sweeps
+     * stay single-dir over data_dir.  Guarded by `lock`. */
+    struct tsdb_db   *db;
+
     /* Stats — updated under lock, read lock-free via copy. */
     pthread_mutex_t   lock;
     tsdb_retention_stats_t stats;
@@ -279,27 +286,21 @@ static int64_t now_realtime_ns(void) {
 
 /* ---- Core sweep implementation ------------------------------------------ */
 
-static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
+/* Sweep the table dirs under a single data dir.  Split out of do_sweep()
+ * so every striped data dir gets the same pass; the per-table logic is
+ * unchanged.  Accumulates into *deleted_io / *bytes_io; returns
+ * TSDB_ERR_IO when the dir cannot be opened, else TSDB_OK. */
+static int sweep_data_dir(struct tsdb_retention *r, retention_conf_t *conf,
+                          int64_t now_ns, const char *data_dir,
+                          int *deleted_io, uint64_t *bytes_io)
+{
     int deleted = 0;
     uint64_t bytes = 0;
 
-    /* Reload conf on each sweep so operators can update it without restart.
-     * conf is ~66 KB (256 rules × 264 B); keep it off the stack so this
-     * function is safe to call from threads with a small stack — e.g. the
-     * metrics-server HTTP handler that backs POST /retention/sweep, whose
-     * frame already reserves large buffers.  A stack-resident conf overflowed
-     * the handler thread's guard page → SIGBUS on the memset below. */
-    retention_conf_t *conf = calloc(1, sizeof(*conf));
-    if (!conf) return TSDB_ERR_NOMEM;
-    retention_conf_load(r->conf_path, conf);
-
-    int64_t now_ns = now_realtime_ns();
-
-    DIR *root = opendir(r->data_dir);
+    DIR *root = opendir(data_dir);
     if (!root) {
         TSDB_LOG_WARN("retention", "cannot open data_dir '%s': %s",
-                      r->data_dir, strerror(errno));
-        free(conf);
+                      data_dir, strerror(errno));
         return TSDB_ERR_IO;
     }
 
@@ -310,7 +311,7 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
 
         /* Skip non-directory entries (schema.bin, *.wal, etc. at root). */
         char table_dir[4096];
-        snprintf(table_dir, sizeof(table_dir), "%s/%s", r->data_dir, tde->d_name);
+        snprintf(table_dir, sizeof(table_dir), "%s/%s", data_dir, tde->d_name);
         struct stat tst;
         if (stat(table_dir, &tst) != 0 || !S_ISDIR(tst.st_mode)) continue;
 
@@ -418,6 +419,54 @@ static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
         closedir(tdir);
     }
     closedir(root);
+
+    *deleted_io += deleted;
+    *bytes_io   += bytes;
+    return TSDB_OK;
+}
+
+static int do_sweep(struct tsdb_retention *r, int *deleted_out) {
+    int deleted = 0;
+    uint64_t bytes = 0;
+
+    /* Reload conf on each sweep so operators can update it without restart.
+     * conf is ~66 KB (256 rules × 264 B); keep it off the stack so this
+     * function is safe to call from threads with a small stack — e.g. the
+     * metrics-server HTTP handler that backs POST /retention/sweep, whose
+     * frame already reserves large buffers.  A stack-resident conf overflowed
+     * the handler thread's guard page → SIGBUS on the memset below. */
+    retention_conf_t *conf = calloc(1, sizeof(*conf));
+    if (!conf) return TSDB_ERR_NOMEM;
+    retention_conf_load(r->conf_path, conf);
+
+    int64_t now_ns = now_realtime_ns();
+
+    /* Enumerate EVERY striped data dir when a db handle is attached via
+     * tsdb_db_set_retention() — tables are routed onto one of the
+     * TSDB_DATA_DIRS stripes by name hash, so sweeping only the primary
+     * would never expire striped tables.  Standalone handles (no db)
+     * keep the single-dir sweep; either way count==1 behaves as before. */
+    pthread_mutex_lock(&r->lock);
+    struct tsdb_db *db = r->db;
+    pthread_mutex_unlock(&r->lock);
+
+    int ndirs = db ? tsdb_db_data_dir_count(db) : 1;
+    if (ndirs <= 0) ndirs = 1;
+
+    int swept = 0;
+    for (int di = 0; di < ndirs; di++) {
+        const char *data_dir = db ? tsdb_db_data_dir_at(db, di) : r->data_dir;
+        if (!data_dir || !data_dir[0]) {
+            if (di != 0) continue;
+            data_dir = r->data_dir;
+        }
+        if (sweep_data_dir(r, conf, now_ns, data_dir, &deleted, &bytes) == TSDB_OK)
+            swept++;
+    }
+    if (swept == 0) {
+        free(conf);
+        return TSDB_ERR_IO;
+    }
 
     pthread_mutex_lock(&r->lock);
     r->stats.sweeps_done++;
@@ -576,6 +625,12 @@ int tsdb_db_set_retention(struct tsdb_db *db,
     tsdb_retention_t *r  = NULL;
     int rc = tsdb_retention_start(data_dir, conf_path, opts, &r);
     if (rc != TSDB_OK) return rc;
+
+    /* Record the db handle so sweeps enumerate every striped data dir,
+     * not just the primary. */
+    pthread_mutex_lock(&r->lock);
+    r->db = db;
+    pthread_mutex_unlock(&r->lock);
 
     tsdb_db_attach_retention(db, r);
     return TSDB_OK;

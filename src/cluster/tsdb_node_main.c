@@ -25,6 +25,7 @@
 #include "cluster.h"
 #include "node.h"
 #include "disk_weight.h"
+#include "../server/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1126,6 +1127,36 @@ int main(int argc, char **argv) {
      * return EPIPE/-1 which the RPC / wire-protocol layers surface as
      * an ordinary I/O error. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* Bridge tsd.conf data_dirs → engine striping.  The engine only reads
+     * extra data dirs from the TSDB_DATA_DIRS env var (db.c); the node
+     * binary otherwise never consumes the config-file key.  overwrite=0
+     * keeps an explicitly exported env var authoritative. */
+    if (!getenv("TSDB_DATA_DIRS")) {
+        tsdb_config_t cfg;
+        tsdb_config_defaults(&cfg);
+        char *cfg_path = tsdb_config_locate(NULL);
+        if (cfg_path) {
+            tsdb_config_load(&cfg, cfg_path, NULL, 0);
+            free(cfg_path);
+        }
+        if (cfg.n_data_dirs > 0) {
+            char dirs[16384];
+            size_t off = 0;
+            dirs[0] = '\0';
+            for (int i = 0; i < cfg.n_data_dirs; i++) {
+                int k = snprintf(dirs + off, sizeof(dirs) - off, "%s%s",
+                                 off ? "," : "", cfg.data_dirs[i]);
+                if (k < 0 || (size_t)k >= sizeof(dirs) - off) break;
+                off += (size_t)k;
+            }
+            if (off > 0) {
+                setenv("TSDB_DATA_DIRS", dirs, 0);
+                printf("[node] data_dirs from tsd.conf: %s\n", dirs);
+            }
+        }
+        tsdb_config_free(&cfg);
+    }
 
     tsdb_db_t *db = NULL;
     int rc = tsdb_open_cluster(data_dir, rpc_addr, seeds, &db);

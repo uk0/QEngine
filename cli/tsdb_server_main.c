@@ -400,6 +400,24 @@ int main(int argc, char **argv) {
     for (int i = 0; i < cfg.n_data_dirs; i++)
         TSDB_LOG_INFO("main", "extra data dir [%d] = %s", i, cfg.data_dirs[i]);
 
+    /* Bridge tsd.conf data_dirs → engine striping.  The engine only reads
+     * extra data dirs from the TSDB_DATA_DIRS env var (db.c); without this
+     * the config-file key is parsed but silently ignored.  overwrite=0
+     * keeps an explicitly exported env var authoritative. */
+    if (cfg.n_data_dirs > 0 && !getenv("TSDB_DATA_DIRS")) {
+        char dirs[16384];
+        size_t off = 0;
+        dirs[0] = '\0';
+        for (int i = 0; i < cfg.n_data_dirs; i++) {
+            int k = snprintf(dirs + off, sizeof(dirs) - off, "%s%s",
+                             off ? "," : "", cfg.data_dirs[i]);
+            if (k < 0 || (size_t)k >= sizeof(dirs) - off) break;
+            off += (size_t)k;
+        }
+        if (off > 0)
+            setenv("TSDB_DATA_DIRS", dirs, 0);
+    }
+
     /* 6. Open DB and start server. */
     tsdb_metrics_init();
     tsdb_db_t *db = NULL;

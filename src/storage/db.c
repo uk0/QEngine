@@ -22,6 +22,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -132,6 +133,14 @@ struct tsdb_db {
      * n_data_dirs == 0 and every callsite falls back to data_dir,
      * preserving single-dir behaviour bit-for-bit. */
     char             data_dirs[TSDB_MAX_DATA_DIRS][4096];
+    /* Per-dir health flag (auto-recovery).  1 = healthy, 0 = degraded
+     * (mkdir failed at open, statvfs/W_OK probe failed, or a partition
+     * flush hit TSDB_ERR_IO).  A degraded dir keeps its SLOT — n_data_dirs
+     * never shrinks, so hash placement of every other dir is stable — and
+     * only stops receiving NEW tables until trash_gc_main re-probes it
+     * healthy (e.g. after a remount).  All-zero via calloc; unused when
+     * n_data_dirs <= 1 (single-dir setups never consult it). */
+    uint8_t          dir_ok[TSDB_MAX_DATA_DIRS];
     int              n_data_dirs;
     pthread_mutex_t  lock;
 
@@ -285,12 +294,63 @@ static uint64_t db_fnv1a(const char *s) {
     return h;
 }
 
+/* A data dir is writable-healthy when the filesystem answers statvfs AND
+ * the dir itself grants write access.  An unmounted mountpoint typically
+ * fails one of the two (dir missing, or a root-owned 0755 stub left at
+ * the mount path).  Used at open, on flush-error degrade re-probe, and by
+ * trash_gc_main's re-adopt pass. */
+static int db_dir_healthy(const char *dir) {
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) != 0) return 0;
+    if (access(dir, W_OK) != 0) return 0;
+    return 1;
+}
+
+/* Flush hit TSDB_ERR_IO writing under `path` — find which configured data
+ * dir it lives in (longest prefix match, so "/d1" never claims "/d10/x")
+ * and mark that slot degraded.  New-table placement then routes around it
+ * (db_pick_data_dir) while every existing table still resolves via the
+ * db_resolve_table_dir probe.  The failed flush's rows stay in the
+ * memtable — nothing is moved or dropped here.  No-op on single-dir. */
+static void db_mark_dir_degraded(tsdb_db_t *db, const char *path) {
+    if (!db || !path || db->n_data_dirs <= 1) return;
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < db->n_data_dirs; i++) {
+        size_t l = strlen(db->data_dirs[i]);
+        if (l > best_len && strncmp(path, db->data_dirs[i], l) == 0 &&
+            (path[l] == '/' || path[l] == '\0')) {
+            best = i;
+            best_len = l;
+        }
+    }
+    if (best < 0 || !db->dir_ok[best]) return;
+    db->dir_ok[best] = 0;
+    tsdb_metric_inc("qengine_datadir_degraded_total");
+    fprintf(stderr, "[db] data dir [%d] %s degraded (flush I/O error) — "
+            "routing new tables away until it re-probes healthy\n",
+            best, db->data_dirs[best]);
+}
+
 /* Pick the data directory a brand-new table should live in.  Hash by
  * name so the same table always routes to the same disk and the
  * distribution stays even across heterogeneous workloads.  Returns the
- * primary data_dir when striping is disabled. */
+ * primary data_dir when striping is disabled.
+ *
+ * The modulus is always the FULL configured n_data_dirs — a degraded dir
+ * keeps its slot — so a healthy setup places tables exactly as before.
+ * Only when the hashed slot is degraded do we linear-probe forward
+ * (wrapping) to the next healthy dir; if none is healthy, fall back to
+ * the primary (slot 0).  Existing tables are unaffected: they resolve by
+ * on-disk probe in db_resolve_table_dir, not by this hash. */
 static const char *db_pick_data_dir(const tsdb_db_t *db, const char *table_name) {
     if (!db || db->n_data_dirs <= 1) return db->data_dir;
+    /* Pure stable hash — placement is deterministic and never routes AWAY
+     * from a degraded dir.  Rerouting a new table around a temporarily-dark
+     * stripe would let a later re-adopt leave the SAME table on two dirs
+     * (one copy silently unreachable); refusing the create on the degraded
+     * slot (the write simply fails, as before) is the safe choice.  dir_ok
+     * is observability + re-adopt only, not a placement input. */
     uint32_t idx = (uint32_t)(db_fnv1a(table_name) % (uint64_t)db->n_data_dirs);
     return db->data_dirs[idx];
 }
@@ -357,8 +417,12 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
             snprintf(buf, sizeof(buf), "%s", dirs_env);
             int n = 0;
             char *save = NULL;
-            /* Reserve slot 0 for the primary so it's always queried first. */
-            snprintf(db->data_dirs[n++], sizeof(db->data_dirs[0]), "%s", db->data_dir);
+            /* Reserve slot 0 for the primary so it's always queried first.
+             * mkdir_p on it already succeeded above; still health-probe it
+             * so a sick primary routes new tables to the other stripes. */
+            snprintf(db->data_dirs[n], sizeof(db->data_dirs[0]), "%s", db->data_dir);
+            db->dir_ok[n] = db_dir_healthy(db->data_dir) ? 1 : 0;
+            n++;
             for (char *tok = strtok_r(buf, ",;", &save);
                  tok && n < TSDB_MAX_DATA_DIRS;
                  tok = strtok_r(NULL, ",;", &save)) {
@@ -370,18 +434,36 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
                 for (int i = 0; i < n; i++)
                     if (strcmp(db->data_dirs[i], tok) == 0) { dup = 1; break; }
                 if (dup) continue;
+                /* Keep EVERY configured dir — a failing one is adopted
+                 * DEGRADED (dir_ok=0) instead of dropped, so n_data_dirs
+                 * never shrinks and hash placement of the healthy dirs is
+                 * identical to a fully-healthy boot.  trash_gc_main
+                 * re-adopts it once it probes healthy again. */
+                int ok = 1;
                 if (tsdb_mkdir_p(tok) < 0) {
-                    fprintf(stderr, "[db] TSDB_DATA_DIRS: mkdir %s failed (%s) — skipping\n",
+                    fprintf(stderr, "[db] TSDB_DATA_DIRS: mkdir %s failed (%s) — "
+                            "keeping slot, marked degraded\n",
                             tok, strerror(errno));
-                    continue;
+                    ok = 0;
                 }
-                snprintf(db->data_dirs[n++], sizeof(db->data_dirs[0]), "%s", tok);
+                /* Unmounted-mountpoint guard: existing is not enough — the
+                 * fs must answer statvfs and grant write access right now,
+                 * or the slot starts degraded. */
+                if (ok && !db_dir_healthy(tok)) {
+                    fprintf(stderr, "[db] TSDB_DATA_DIRS: %s failed statvfs/W_OK "
+                            "probe — keeping slot, marked degraded\n", tok);
+                    ok = 0;
+                }
+                snprintf(db->data_dirs[n], sizeof(db->data_dirs[0]), "%s", tok);
+                db->dir_ok[n] = (uint8_t)ok;
+                n++;
             }
             db->n_data_dirs = n;
             if (n > 1) {
                 fprintf(stderr, "[db] data striping enabled across %d dirs:\n", n);
                 for (int i = 0; i < n; i++)
-                    fprintf(stderr, "      [%d] %s\n", i, db->data_dirs[i]);
+                    fprintf(stderr, "      [%d] %s%s\n", i, db->data_dirs[i],
+                            db->dir_ok[i] ? "" : "  (degraded)");
             }
         }
     }
@@ -434,7 +516,9 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
      *   SAS/HDD  :  8M  — earlier backpressure; rotational devices pay
      *                     per-flush seek cost so we'd rather flush bigger,
      *                     less often, and not race the compactor.
-     * 0 = unbounded (legacy).  Env TSDB_MEMTABLE_BUDGET_ROWS overrides. */
+     * 0 = unbounded (legacy).  Env TSDB_MEMTABLE_BUDGET_ROWS overrides.
+     * These fixed values are now only the fallback when the OS won't
+     * report physical RAM — see the RAM-sized derivation just below. */
     switch (db->iopolicy) {
     case TSDB_IOPOLICY_HDD:
     case TSDB_IOPOLICY_SAS:
@@ -1078,6 +1162,16 @@ static void *trash_gc_main(void *arg) {
         int ndirs = db->n_data_dirs > 0 ? db->n_data_dirs : 1;
         for (int i = 0; i < ndirs && db->trash_gc_running; i++) {
             const char *dd = db->n_data_dirs > 0 ? db->data_dirs[i] : db->data_dir;
+            /* Auto-recovery re-adopt: a dir degraded at open (mkdir/probe
+             * failure) or by a flush I/O error is re-probed every pass and
+             * flipped healthy once its fs answers statvfs + W_OK again
+             * (e.g. operator remounted the disk).  Existing data was never
+             * moved, so the dir serves reads/writes immediately. */
+            if (db->n_data_dirs > 1 && !db->dir_ok[i] && db_dir_healthy(dd)) {
+                db->dir_ok[i] = 1;
+                fprintf(stderr, "[db] data dir [%d] %s healthy again — "
+                        "re-adopted for new-table placement\n", i, dd);
+            }
             char trash_dir[4200];
             snprintf(trash_dir, sizeof(trash_dir), "%s/.trash", dd);
             for (;;) {
@@ -1892,6 +1986,12 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
     int rc = tsdb_part_flush_ex2(t->schema, t->memtable,
                                   skip_replicate ? NULL : t->db,
                                   t->name, hwm);
+    /* Data-dir failover: an I/O error persisting this table's partitions
+     * degrades the striped dir it lives in so NEW tables route elsewhere.
+     * The rows below stay in the memtable (only TSDB_OK clears it), so
+     * nothing is lost — retries land once the dir re-probes healthy. */
+    if (rc == TSDB_ERR_IO && t->db && t->schema && t->schema->dir)
+        db_mark_dir_degraded(t->db, t->schema->dir);
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_flushes_total");
         if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
