@@ -297,6 +297,11 @@ ORDER BY ts DESC LIMIT 100;
 SELECT count(*), avg(price), min(price), max(price), sum(volume)
 FROM trades WHERE symbol = 'AAPL';
 
+-- Set / range predicates (IN / NOT IN / BETWEEN / NOT BETWEEN)
+SELECT count(*) FROM trades WHERE symbol IN ('AAPL', 'MSFT', 'GOOG');
+SELECT count(*) FROM trades WHERE volume BETWEEN 2000 AND 5999;
+SELECT count(*) FROM trades WHERE volume NOT IN (0, 1);
+
 -- SAMPLE BY (time-bucket aggregation in one pass)
 SELECT time_bucket(ts, 1m), avg(price)
 FROM trades
@@ -690,26 +695,37 @@ mTLS); percentile/stddev via T-digest; retention GC (`/retention/sweep`
 pipelined writes (Go `WritePipeline`, Java `WritePipeline`,
 ~4x per-conn throughput); zero-copy mmap block reads; SWIM failure
 detection with ~10s DEAD convergence; wire `LOGIN` + per-conn auth;
-i64 sum/avg overflow detection.
+i64 sum/avg overflow detection; `IN`/`NOT IN`/`BETWEEN`/`NOT BETWEEN`
+predicates; owner-ACK-gated `SKIP_LOCAL` (a non-owner keeps its durable
+copy until a remote owner ACKs, closing a crash-loss window under
+async `REPLICATION_QUORUM=0`); partition-mtime compaction memo (a
+steadily-appended table is no longer skip-compacted until its partition
+rolls); live `qengine_cluster_nodes_alive` gauge.
 
 **Known gaps** (shipping order tentative):
 
 - **Cross-cluster rebalance** — within a cluster is automatic; across
   clusters requires manual re-routing rules today
-- **Stable scatter-gather — fresh-write transient** — cluster-wide
-  `SELECT … FROM <stable>` aggregation from any node works (scatter to
-  the child owners, merge), but for ~2 s after a write to a child the
-  aggregate can transiently read low/empty while the rows are still in
-  the ingest node's memtable and not yet replicated to the hash owner;
-  it self-heals on the next flush. The complete fix is to **route client
-  writes to the shard owner** (a non-owner forwards the `WRITE_BATCH` to
-  the owner with a client-origin marker, so the row is scatter-visible
-  immediately and the owner re-replicates) — but doing so safely requires
-  a **client-assigned batch UUID with owner-side dedup**: without it, a
-  forward whose ACK is lost (slow owner, conn reset) and then retried
-  locally double-writes the rows, inflating the count and mis-triggering
-  anti-entropy truncation. That idempotent-forward design is scoped but
-  not yet landed
+- **Stable scatter-gather — fresh-write read-visibility transient** —
+  cluster-wide `SELECT … FROM <stable>` aggregation from any node works
+  (scatter to the child owners, merge) and converges to the exact count
+  (validated: 16-way concurrent write → 80000/80000 across all nodes),
+  but for ~5 s after a write to a child the aggregate can transiently
+  read low while the rows are still in the ingest node's memtable and not
+  yet replicated to the hash owner; it self-heals on the next idle-flush.
+  Durability across this window is now guaranteed (owner-ACK-gated
+  `SKIP_LOCAL`, above — the ingest node keeps its durable copy until an
+  owner confirms). The remaining read-your-writes fix is to **route client
+  writes to the shard owner** with a **client-assigned batch UUID +
+  owner-side dedup** (without dedup a lost-ACK retry double-writes and
+  mis-triggers anti-entropy truncation). That idempotent-forward design is
+  scoped but not yet landed
+- **Row-scalar / aggregate expressions in `SELECT`** — arithmetic and
+  scalar functions in the projection (`price*volume`, `sum(x)/count(*)`,
+  `now()`) parse but are not yet evaluated on the read path; and the
+  wire `WRITE … FROM FILE` CSV path mis-infers `INT64` columns
+  (`TSDB_ERR_SCHEMA`) — use the SDK/`WRITE_BATCH` or a `FLOAT64` column
+  meanwhile. Both scoped as follow-ups
 - **Row-level replica reconciliation** — anti-entropy converges on
   count/max(ts); divergent middle-gap replicas are preserved (never
   destructively truncated) but not yet backfilled row-by-row. Related:
