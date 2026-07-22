@@ -4,11 +4,21 @@
 
 # QEngine  <sub>(Q)</sub>
 
-A production-grade time-series database written in C11. Column-oriented
-storage, SIMD-vectorized execution, clustered with raw-block replication,
-and a purpose-built query language (QTL) with IoT group/device semantics.
+A time-series database written in C11. Column-oriented storage,
+SIMD-vectorized execution, clustered with raw-block replication, and a
+purpose-built query language (QTL) with IoT group/device semantics.
 
-> License: AGPLv3 · Status: public preview · Contributions welcome.
+> ### Status: BETA — not production-ready
+> QEngine is under active development and **not yet recommended for
+> production**. The core write/read/replication paths are stable and
+> benchmarked (below), but several capabilities are still maturing — see
+> [Limits and roadmap](#limits-and-roadmap) for the current known gaps
+> (row projections over a cluster super-table, aggregate-over-aggregate
+> expressions, row-level replica reconciliation, auth-on-by-default, etc.).
+> APIs, wire format, and on-disk layout may change between beta releases.
+> Pin a tagged release; do not track a moving branch.
+>
+> License: AGPLv3 · Contributions welcome.
 >
 > 中文文档：[README.zh-CN.md](./README.zh-CN.md) · 许可证参考：[LICENSE.zh-CN.md](./LICENSE.zh-CN.md)
 
@@ -174,6 +184,65 @@ To bring up a 5th/6th node, copy `addnode.yml`, change
 `container_name`, `hostname`, host-side ports, the volume name, and
 `TSDB_RPC_BIND`; point `TSDB_SEEDS` at any currently-ALIVE node.
 
+### Complete deployment & rolling upgrade
+
+The full lifecycle — build a verified binary, deploy it uniformly, verify, and
+upgrade in place without downtime. Ports: wire `2930N`, metrics/SQL/`/raft`
+`2931N`, influx `2932N` (N = node index).
+
+**1. Build the node binary** — either a reproducible container build or, on a
+same-arch Linux host with a toolchain, a native build (~30 s):
+
+```bash
+# (a) reproducible — build inside the pinned toolchain image
+docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq build-essential pkg-config libssl-dev
+  make CC=gcc CFLAGS="-O2 -g -std=gnu11 -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" cluster_node'
+
+# (b) native — host with gcc + libssl-dev headers (fastest)
+make CC=gcc CFLAGS="-O2 -g -std=gnu11 -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" cluster_node
+# → build/cluster/tsdb_node   (installed in the image as /usr/local/bin/tsdb-node)
+```
+
+**2. Deploy** the cluster (3 nodes + optional 4th) via the compose files above.
+
+**3. Verify** uniformity and a single leader before serving traffic:
+
+```bash
+# every node must run the SAME binary (md5 matches on all)
+for n in 1 2 3 4; do docker exec qengine-cnode-$n md5sum /usr/local/bin/tsdb-node; done
+# exactly one leader; all agree on leader_id; commit_index converged
+for n in 1 2 3 4; do echo -n "cnode-$n: "; curl -s http://localhost:2931$n/raft; echo; done
+# live membership + the alive gauge (should read the node count, not 0)
+curl -s http://localhost:29311/cluster | python3 -m json.tool
+curl -s http://localhost:29311/metrics | grep qengine_cluster_nodes_alive
+```
+
+**4. Rolling upgrade** — zero-downtime binary swap, **followers first, leader
+last**, waiting for each node to rejoin before the next. Quorum (N−1 of N) holds
+throughout, so writes never fail and there is exactly one election (when the old
+leader restarts last):
+
+```bash
+NEW=build/cluster/tsdb_node
+lead(){ for n in 1 2 3 4; do curl -s http://localhost:2931$n/raft | grep -q '"role":"leader"' && echo $n; done; }
+L=$(lead)
+for n in $(for x in 1 2 3 4; do [ "$x" != "$L" ] && echo $x; done) $L; do
+  docker cp "$NEW" qengine-cnode-$n:/usr/local/bin/tsdb-node.new
+  docker exec qengine-cnode-$n mv -f /usr/local/bin/tsdb-node.new /usr/local/bin/tsdb-node  # atomic; avoids ETXTBSY
+  docker restart qengine-cnode-$n
+  until curl -s http://localhost:2931$n/raft | grep -qE '"role":"(leader|follower)"'; do sleep 1; done
+done
+# re-run step 3 — md5 must be uniform and a single leader present
+```
+
+`docker restart` preserves the container's writable layer, so the `mv`'d binary
+survives the restart; a `compose up --force-recreate` reverts to the image.
+Changing an `environment:` value needs `--force-recreate` (not `restart`).
+
+**5. Teardown:** `docker compose -f docker-compose.cluster.yml down` (keep
+volumes) or `down -v` (wipe data).
+
 ### Cluster-mode throughput
 
 Measured on a 4-node HDD cluster (intra-host docker network) with
@@ -240,6 +309,40 @@ fanout deadline removed it — 4 writers now complete in 0.32 s.
 | `DELETE FROM … WHERE ts < …` | partition-granular (drops whole partitions in range) |
 | Leader failover (`docker stop` leader → new leader elected) | **0.087 s** |
 | Write during failover / old-leader rejoin | no loss; data intact after rejoin |
+
+#### Current build — measured on the live 4-node cluster (beta, 2026-07)
+
+Re-measured on the deployed beta build (`tsdb-node`), 4-node cluster on **one
+shared 48-core host** (co-located with other services; data filesystem at 84 %),
+`SHARD_REPLICA_N=2`, `REPLICATION_QUORUM=0` (async), `WAL_ONLY_COMMIT=1`. These
+are lower than the peak figures above precisely because the host is contended —
+the DB used only ~6–8 of 48 cores; on a dedicated host earlier virgin-cluster
+runs reached **~19.8 M rows/s**. Reported as an honest floor, not a ceiling.
+
+**Write throughput** — 4 wire ports, 30 s/config, 512 tables, `batch=8192`:
+
+| threads | pipeline | rows/s | errs |
+|---:|---:|---:|---:|
+| 16 | 1 | **1.89 M** | 0 |
+| 32 | 2 | **4.65 M** | 34 |
+| 48 | 4 | 4.54 M | 533 (oversubscribed → regresses) |
+
+**Latency:**
+
+| Path | p50 | p90 | p99 | max |
+|---|---:|---:|---:|---:|
+| wire `PING` round-trip (µs) | **445** | 546 | 745 | 2321 |
+| wire `PING` under write load (µs) | 442 | — | 639 | 2002 |
+
+SQL/HTTP query round-trips (fresh session, 200 k rows / 4 children): scatter
+`count(*) FROM <stable>` **~34 ms**, `sum+avg+min+max` **~35 ms**, single-child
+`avg(v)` **~30 ms** (the ~30 ms floor is HTTP + auth + JSON + plan; scatter over 4
+children adds only ~4 ms; the sub-ms wire `PING` is the true event-loop turnaround).
+
+**Robustness — crash under load:** `SIGKILL` a follower mid-ingest → **rejoins in
+~15 s**, ingest continues with **errs=0** (availability held on the surviving 3
+nodes), replicas re-converge to a consistent count. Single-write crash durability
+(owner-ACK-gated `SKIP_LOCAL`) verified separately at 12000/12000 recovered.
 
 For a **federated** deployment spanning two regions, use
 `docker compose -f docker-compose.federation.yml up -d` which brings up
