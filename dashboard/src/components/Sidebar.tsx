@@ -26,9 +26,9 @@ export function Sidebar({ page, onPage, cluster, role }: Props) {
   return (
     <nav className="side-nav" aria-label="Primary">
       <div className="brand">
-        <span className="brand-mark">ts</span>
+        <img className="brand-logo" src="/logo.png" alt="QEngine" width={26} height={26} />
         <span>
-          <div className="brand-name">tsdb</div>
+          <div className="brand-name">QEngine</div>
           <div className="brand-sub">console</div>
         </span>
       </div>

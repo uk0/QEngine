@@ -67,11 +67,10 @@ export function SchemaTree({ bump, onSql, onRefresh, cluster }: Props) {
   async function createDbRoot() {
     const v = await modal.form('Create database', [
       { name: 'name', label: 'Database name', placeholder: 'e.g. prod' },
-      { name: 'description', label: 'Description (optional)', placeholder: 'free-form text' },
     ]);
     if (!v || !v.name) return;
     try {
-      await ddl.createDatabase(v.name, v.description);
+      await ddl.createDatabase(v.name);
       toast.ok(`database "${v.name}" created`);
       onRefresh();
     } catch (e) {
@@ -417,7 +416,7 @@ ${scope};`;
                     <span className="caret"></span>
                     <span className="ic t">T</span>
                     <span className="nm">{t.name}</span>
-                    <span className="count">{t.ncols}c</span>
+                    <span className="count">{t.ncols ?? '?'}c</span>
                     <span className="x" title="DROP TABLE"
                           onClick={ev => { ev.stopPropagation(); drop('TABLE', t.name, () => ddl.dropTable(t.name)); }}>✕</span>
                   </div>

@@ -315,6 +315,14 @@ input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--mu) 
   font: 700 12px var(--font-mono);
   letter-spacing: -0.02em;
 }
+.brand-logo {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  object-fit: contain;
+  display: block;
+}
 .brand-name {
   font: 700 15px var(--font-mono);
   letter-spacing: 0.01em;

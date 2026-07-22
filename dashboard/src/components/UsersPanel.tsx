@@ -11,9 +11,6 @@ import { IconRefresh, IconUsers } from './icons';
  *   CREATE USER <n> IDENTIFIED BY '<pw>' [ROLE …] → create
  *   ALTER USER <n> SET PASSWORD '<pw>'            → rotate password
  *   DROP USER <n>                                 → remove
- *   LIST GRANTS                                   → best-effort; the section
- *                                                   hides when the server's
- *                                                   parser rejects it.
  * The server enforces per-statement RBAC regardless of this UI. */
 
 interface Props {
@@ -40,8 +37,6 @@ export function UsersPanel({ selfUser }: Props) {
   const [rows, setRows] = useState<UserRow[]>([]);
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(true);
-  /** null → LIST GRANTS unsupported on this server; section hidden. */
-  const [grants, setGrants] = useState<SqlResult | null>(null);
   const toast = useToastCtx();
   const modal = useModalCtx();
 
@@ -56,12 +51,6 @@ export function UsersPanel({ selfUser }: Props) {
       setRows([]);
     } finally {
       setLoading(false);
-    }
-    try {
-      const g = await api.sql('LIST GRANTS');
-      setGrants(g?.cols?.length ? g : null);
-    } catch {
-      setGrants(null); // parse error / unsupported — hide the section
     }
   }, []);
 
@@ -219,36 +208,6 @@ export function UsersPanel({ selfUser }: Props) {
           </div>
         )}
       </div>
-
-      {grants && (
-        <div className="card">
-          <h3 className="card-title">
-            Grants
-            <span className="mu">read-only · via <code>LIST GRANTS</code></span>
-            <span className="grow" />
-            <span className="badge mut">{grants.rows?.length ?? 0} rows</span>
-          </h3>
-          <div className="result">
-            <table className="rows">
-              <thead>
-                <tr>{(grants.cols ?? []).map((c, i) => <th key={i}>{c}</th>)}</tr>
-              </thead>
-              <tbody>
-                {(grants.rows ?? []).map((r, ri) => (
-                  <tr key={ri}>
-                    {(r ?? []).map((c, ci) => (
-                      <td key={ci}>{c == null ? <span className="null">NULL</span> : String(c)}</td>
-                    ))}
-                  </tr>
-                ))}
-                {!(grants.rows ?? []).length && (
-                  <tr><td colSpan={Math.max((grants.cols ?? []).length, 1)} className="null">0 rows</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
     </>
   );
 }

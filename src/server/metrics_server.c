@@ -455,6 +455,7 @@ static void *handle_connection(void *arg) {
     int route_static = 0;
     if (strncmp(req, "GET /assets/", 12) == 0 ||
         strncmp(req, "GET /favicon", 12) == 0 ||
+        strncmp(req, "GET /logo.png", 13) == 0 ||
         strncmp(req, "GET /vite.svg", 13) == 0) route_static = 1;
     /* Extract just the URL path (request-target) for static-file handlers
      * that need to know which file to read.  `req` points at the full
@@ -537,6 +538,25 @@ static void *handle_connection(void *arg) {
                 write_all(fd, r, strlen(r));
             }
             goto done;
+        }
+
+        /* RBAC: destructive / data-exfil endpoints require an ADMIN session,
+         * not merely a logged-in one.  The dashboard disables these for
+         * non-admins, but enforce it server-side too so a direct call from a
+         * `normal` user cannot sweep retention, PITR-trim, or pull /backup. */
+        if (route_ret_sweep || route_pitr || route_backup) {
+            char who[64] = {0}; int is_admin = 0;
+            if (!g_whoami_fn ||
+                g_whoami_fn(g_whoami_ud, cookie_tok, who, sizeof(who),
+                            &is_admin) != TSDB_OK || !is_admin) {
+                const char *r =
+                    "HTTP/1.1 403 Forbidden\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 27\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"admin required\"}\n";
+                write_all(fd, r, strlen(r));
+                goto done;
+            }
         }
     }
 

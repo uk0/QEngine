@@ -727,6 +727,28 @@ bench/tsbs_cpu_query /tmp/db
 scripts/tsbs_run.sh 1000 24            # larger scale
 ```
 
+### Test reports
+
+Reproducible test & benchmark **tooling** is tracked in-repo:
+
+- `tests/` — unit + integration suite (`make test`, `make test-cluster`,
+  `make test-federation`); e2e checks in `tests/e2e/`.
+- `bench/` — load/query benchmarks: `bench_4layer.c` (4-layer hierarchy),
+  `bench_ingest.c`, `load_cluster.c` (cluster wire loader), `tsbs_*`.
+- [`docs/benchmark-docker-cluster.md`](docs/benchmark-docker-cluster.md) —
+  Docker-cluster benchmark write-up.
+
+Detailed **write-ups** for recent correctness / robustness / benchmark work live
+under the `docs/` working tree (workspace notes):
+
+| Report | Path |
+|--------|------|
+| Phase 1 — owner-ACK-gated `SKIP_LOCAL` durability | `docs/tasks/phase1-owner-ack-skip-local.md` |
+| iter-30 cluster benchmark + full gap audit | `docs/tasks/iter30-bench-and-gap-report.md` |
+| ROI batch 1 (IN/BETWEEN · compaction memo · nodes-alive) | `docs/tasks/batch1-roi-fixes-report.md` |
+| 4-layer hierarchy benchmark + compute-operator latency | `docs/tasks/bench-4layer-report.md` |
+| Design notes (scatter-write consistency, SELECT expressions) | `docs/design/*.md` |
+
 ---
 
 ## Performance methodology

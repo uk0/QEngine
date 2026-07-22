@@ -110,7 +110,9 @@ export function App() {
     setRaft(r.status === 'fulfilled' ? (r.value ?? null) : null);
     setClusterAt(Date.now());
   }, []);
-  usePoll(pollCluster, 4000, authed === true);
+  /* Poll the cluster/raft pill fast on Overview; coarser elsewhere (the Topbar
+   * pill only needs a periodic refresh) to cut background load on other pages. */
+  usePoll(pollCluster, page === 'overview' ? 4000 : 12000, authed === true);
 
   const refreshTree = useCallback(() => setTreeBump(b => b + 1), []);
   const runSql = useCallback((q: string) => {
