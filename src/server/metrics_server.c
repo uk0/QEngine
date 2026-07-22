@@ -454,10 +454,12 @@ static void *handle_connection(void *arg) {
      * static bundle when TSDB_DASHBOARD_DIR is set — gated by the
      * dashboard auth cookie like the dashboard proper. */
     int route_static = 0;
-    if (strncmp(req, "GET /assets/", 12) == 0 ||
-        strncmp(req, "GET /favicon", 12) == 0 ||
-        strncmp(req, "GET /logo.png", 13) == 0 ||
-        strncmp(req, "GET /vite.svg", 13) == 0) route_static = 1;
+    int route_logo   = 0;   /* PUBLIC brand asset — served WITHOUT the auth cookie
+                             * so the pre-auth /login form (and favicon) show it. */
+    if (strncmp(req, "GET /logo.png", 13) == 0) route_logo = 1;
+    else if (strncmp(req, "GET /assets/", 12) == 0 ||
+             strncmp(req, "GET /favicon", 12) == 0 ||
+             strncmp(req, "GET /vite.svg", 13) == 0) route_static = 1;
     /* Extract just the URL path (request-target) for static-file handlers
      * that need to know which file to read.  `req` points at the full
      * request line; the path starts after "GET " and ends at SP/?. */
@@ -565,13 +567,16 @@ static void *handle_connection(void *arg) {
         /* GET /login — minimal form that POSTs back to /login. */
         static const char FORM[] =
             "<!doctype html><html><head><meta charset=utf-8>"
-            "<title>tsdb login</title>"
+            "<title>QEngine — login</title>"
+            "<link rel=icon type=image/png href=/logo.png>"
             "<style>body{font:14px/1.5 system-ui,sans-serif;display:flex;"
             "align-items:center;justify-content:center;min-height:100vh;"
             "margin:0;background:#f1f5f9}"
             ".card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;"
             "padding:24px 28px;width:320px;box-shadow:0 2px 6px rgba(0,0,0,.04)}"
-            ".card h1{margin:0 0 4px;font-size:18px}"
+            ".card h1{margin:0;font-size:18px}"
+            ".brand{display:flex;align-items:center;gap:10px;margin:0 0 6px}"
+            ".brand img{width:30px;height:30px;border-radius:7px;display:block}"
             ".card p{margin:0 0 18px;color:#64748b;font-size:12px}"
             ".card label{display:block;font-size:12px;color:#334155;margin:10px 0 4px}"
             ".card input{width:100%;padding:8px 10px;border:1px solid #cbd5e1;"
@@ -583,8 +588,8 @@ static void *handle_connection(void *arg) {
             "color:#991b1b;font-size:12px;display:none}"
             ".err.on{display:block}"
             "</style></head><body><div class=card>"
-            "<h1>tsdb dashboard</h1>"
-            "<p>Login required — default root / 123456 for fresh installs.</p>"
+            "<div class=brand><img src=/logo.png alt=QEngine><h1>QEngine</h1></div>"
+            "<p>Console login — default root / 123456 for fresh installs.</p>"
             "<form id=f method=POST action=/login>"
             "<label>Username</label><input name=user autofocus value=root>"
             "<label>Password</label><input name=pass type=password value=123456>"
@@ -1216,8 +1221,9 @@ static void *handle_connection(void *arg) {
             blen);
         write_all(fd, hdr, (size_t)hlen);
         write_all(fd, body, (size_t)blen);
-    } else if (route_static) {
-        /* Vite asset bundle — /assets/*, /favicon.ico, /vite.svg.
+    } else if (route_static || route_logo) {
+        /* Vite asset bundle — /assets/*, /favicon.ico, /vite.svg — plus the
+         * public /logo.png brand asset (route_logo, served without auth).
          * Served verbatim from TSDB_DASHBOARD_DIR with immutable caching
          * on hashed /assets/ paths.  404 when the dir isn't configured
          * or the file doesn't exist, so a stale bookmark can't confuse
