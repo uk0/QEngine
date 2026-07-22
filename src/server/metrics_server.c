@@ -156,8 +156,9 @@ static void write_all(int fd, const char *buf, size_t len);
  * Optional static-file serving.  When TSDB_DASHBOARD_DIR is set at process
  * start, GET / and GET /<path> read files from that directory instead of
  * returning the embedded HTML.  Intended use: the Vite+React dashboard
- * under repo root `dashboard/` is built into `dashboard/dist/`, the
- * operator points TSDB_DASHBOARD_DIR at it, and every request is served
+ * under repo root `dashboard/` is built into `deployment/dashboard-dist/`
+ * (the single compiled dist), the operator points TSDB_DASHBOARD_DIR at it
+ * (the compose files bind-mount it read-only), and every request is served
  * as a static asset with its MIME type.  Missing env or missing index
  * file → falls through to the embedded HTML so nothing breaks.
  * ────────────────────────────────────────────────────────────────────── */

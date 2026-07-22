@@ -1,7 +1,6 @@
 import { FormEvent, useState } from 'react';
 import { api, errMsg, HealthInfo } from '../api';
 import { usePoll } from '../hooks';
-import { IconPulse } from './icons';
 
 interface Props {
   onOk: (user: string) => void;
@@ -63,7 +62,7 @@ export function Login({ onOk, initialUser = 'root', bootErr = '' }: Props) {
 
       <div className="login-col">
         <div className="login-identity">
-          <span className="login-mark"><IconPulse size={19} /></span>
+          <span className="login-mark"><img src="/logo.png" alt="QEngine" className="login-mark-img" /></span>
           <span>
             <span className="login-word">QEngine</span>
             <span className="login-tag">time-series console</span>

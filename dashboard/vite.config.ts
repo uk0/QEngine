@@ -27,7 +27,11 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist',
+    // Single source of truth: build straight into the directory the deployment
+    // bind-mounts and the metrics_server serves (TSDB_DASHBOARD_DIR ->
+    // deployment/dashboard-dist).  There is exactly ONE compiled dist — no
+    // separate dashboard/dist copy that could drift or be served stale.
+    outDir: '../deployment/dashboard-dist',
     emptyOutDir: true,
     sourcemap: false,
     // Hashed asset names land under /assets/ which the metrics_server

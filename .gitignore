@@ -68,7 +68,7 @@ sdk/go/bin/
 example-go/example-router
 out/
 dashboard/node_modules
-dashboard/dist
+deployment/dashboard-dist
 
 # Local test/screenshot artifacts (root-level only; keeps assets/ images tracked)
 /.playwright-mcp/

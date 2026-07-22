@@ -1491,6 +1491,14 @@ textarea.sql {
   display: grid;
   place-items: center;
   box-shadow: 0 8px 22px color-mix(in srgb, var(--accent) 35%, transparent);
+  overflow: hidden;
+}
+.login-mark-img {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  object-fit: contain;
+  display: block;
 }
 .login-word {
   display: block;
