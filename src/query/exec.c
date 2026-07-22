@@ -830,6 +830,10 @@ typedef enum {
     PROJ_WIN_LAG,         /* lag(col, N=1)     value N rows back, NaN until n>N */
     PROJ_WIN_INTERP,      /* interp(col,'Xs')  (stub – not yet implemented) */
     PROJ_UDF_SCALAR,      /* user-defined scalar function, per-row call    */
+    PROJ_SCALAR_ROW,      /* per-row arithmetic over columns+constants (no agg),
+                             FLOAT64 out; placed outside every PROJ_AGG and
+                             PROJ_WIN sentinel range so the agg/stats gates
+                             auto-skip it                                       */
 } proj_kind_t;
 
 /* Range sentinels: all PROJ_AGG_* kinds.
@@ -897,6 +901,8 @@ typedef struct {
     tsdb_udf_type_t   udf_arg_types[8];
     tsdb_udf_type_t   udf_ret_type;
     char              udf_name[TSDB_UDF_NAME_MAX]; /* for runtime error msgs  */
+    /* ---- Row scalar expression (PROJ_SCALAR_ROW) ------------------------- */
+    const qast_expr_t *scalar_expr; /* arithmetic AST, evaluated per row (arena-lived) */
 } proj_t;
 
 static int is_agg_call(qast_expr_t *e) {
@@ -939,6 +945,101 @@ static void proj_tdigest_free(proj_t *p) {
     if (p->tdigest) { tsdb_tdigest_free(p->tdigest); p->tdigest = NULL; }
 }
 
+/* ---- PROJ_SCALAR_ROW: per-row arithmetic in SELECT ----------------------- *
+ * Supports arithmetic (+ - * / %, unary -) over numeric columns and numeric
+ * literals in a plain projection query.  Aggregates, SYMBOL columns, and any
+ * other node are rejected (see scalar_classify); v1 output is FLOAT64. */
+
+/* Classify an arithmetic SELECT expression.  Sets *has_agg if it contains any
+ * aggregate call, *has_symbol for a SYMBOL-column leaf, *has_bad for any
+ * unsupported node (unknown column, non-numeric column, string/NULL literal,
+ * comparison, window/UDF/time_bucket call, etc.).  A pure row scalar has all
+ * three 0. */
+static void scalar_classify(qast_expr_t *e, tsdb_schema_t *s,
+                            int *has_agg, int *has_symbol, int *has_bad) {
+    if (!e) { *has_bad = 1; return; }
+    switch (e->kind) {
+    case QAST_ADD: case QAST_SUB: case QAST_MUL: case QAST_DIV: case QAST_MOD:
+        scalar_classify(e->lhs, s, has_agg, has_symbol, has_bad);
+        scalar_classify(e->rhs, s, has_agg, has_symbol, has_bad);
+        return;
+    case QAST_NEG:
+        scalar_classify(e->lhs, s, has_agg, has_symbol, has_bad);
+        return;
+    case QAST_LIT_INT: case QAST_LIT_FLOAT:
+        return;
+    case QAST_IDENT: {
+        int c = resolve_col(s, e->v.s);
+        if (c < 0) { *has_bad = 1; return; }
+        tsdb_type_t t = s->cols[c].type;
+        if (t == TSDB_TYPE_SYMBOL) { *has_symbol = 1; return; }
+        if (t != TSDB_TYPE_FLOAT64 && t != TSDB_TYPE_INT64) { *has_bad = 1; return; }
+        return;
+    }
+    case QAST_CALL:
+        if (is_agg_call(e)) *has_agg = 1; else *has_bad = 1;
+        return;
+    default:
+        *has_bad = 1;   /* string/NULL literal, comparison, AND/OR, star, etc. */
+        return;
+    }
+}
+
+/* Evaluate a row scalar expression for row i, reading column values out of the
+ * scan buffers.  Only reached for exprs that passed scalar_classify (numeric
+ * FLOAT64/INT64 leaves + literals).  Returns FLOAT64. */
+static double scalar_eval_row(const qast_expr_t *e, tsdb_schema_t *s,
+                              void **bufs, size_t i) {
+    switch (e->kind) {
+    case QAST_ADD: return scalar_eval_row(e->lhs, s, bufs, i) + scalar_eval_row(e->rhs, s, bufs, i);
+    case QAST_SUB: return scalar_eval_row(e->lhs, s, bufs, i) - scalar_eval_row(e->rhs, s, bufs, i);
+    case QAST_MUL: return scalar_eval_row(e->lhs, s, bufs, i) * scalar_eval_row(e->rhs, s, bufs, i);
+    case QAST_DIV: return scalar_eval_row(e->lhs, s, bufs, i) / scalar_eval_row(e->rhs, s, bufs, i);
+    case QAST_MOD: return fmod(scalar_eval_row(e->lhs, s, bufs, i), scalar_eval_row(e->rhs, s, bufs, i));
+    case QAST_NEG: return -scalar_eval_row(e->lhs, s, bufs, i);
+    case QAST_LIT_INT: return (double)e->v.i;
+    case QAST_LIT_FLOAT: return e->v.f;
+    case QAST_IDENT: {
+        int c = resolve_col(s, e->v.s);
+        if (c < 0 || !bufs[c]) return NAN;
+        if (s->cols[c].type == TSDB_TYPE_FLOAT64) return ((const double *)bufs[c])[i];
+        return (double)((const int64_t *)bufs[c])[i];   /* INT64 (classify blocks others) */
+    }
+    default: return NAN;
+    }
+}
+
+/* Mark every column referenced by a row scalar expression as needed for scan. */
+static void scalar_mark_cols(const qast_expr_t *e, tsdb_schema_t *s, int *need_col) {
+    if (!e) return;
+    if (e->kind == QAST_IDENT) {
+        int c = resolve_col(s, e->v.s);
+        if (c >= 0) need_col[c] = 1;
+        return;
+    }
+    scalar_mark_cols(e->lhs, s, need_col);
+    scalar_mark_cols(e->rhs, s, need_col);
+}
+
+/* Render an arithmetic expression to a stable column name (so two unaliased
+ * scalar projections get distinct names). */
+static void render_expr(const qast_expr_t *e, char *buf, size_t cap) {
+    if (!e || cap == 0) { if (cap) buf[0] = '\0'; return; }
+    char l[48], r[48];
+    switch (e->kind) {
+    case QAST_ADD: render_expr(e->lhs,l,sizeof l); render_expr(e->rhs,r,sizeof r); snprintf(buf,cap,"%s+%s",l,r); break;
+    case QAST_SUB: render_expr(e->lhs,l,sizeof l); render_expr(e->rhs,r,sizeof r); snprintf(buf,cap,"%s-%s",l,r); break;
+    case QAST_MUL: render_expr(e->lhs,l,sizeof l); render_expr(e->rhs,r,sizeof r); snprintf(buf,cap,"%s*%s",l,r); break;
+    case QAST_DIV: render_expr(e->lhs,l,sizeof l); render_expr(e->rhs,r,sizeof r); snprintf(buf,cap,"%s/%s",l,r); break;
+    case QAST_MOD: render_expr(e->lhs,l,sizeof l); render_expr(e->rhs,r,sizeof r); snprintf(buf,cap,"%s%%%s",l,r); break;
+    case QAST_NEG: render_expr(e->lhs,l,sizeof l); snprintf(buf,cap,"-%s",l); break;
+    case QAST_LIT_INT:   snprintf(buf,cap,"%lld",(long long)e->v.i); break;
+    case QAST_LIT_FLOAT: snprintf(buf,cap,"%g",e->v.f); break;
+    case QAST_IDENT:     snprintf(buf,cap,"%s",e->v.s); break;
+    default:             snprintf(buf,cap,"expr"); break;
+    }
+}
+
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                              tsdb_db_t *db,
                              proj_t **out, int *out_n, int *out_has_agg,
@@ -952,6 +1053,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
     int has_window = 0;
     int has_ts_agg = 0;
     int has_interp = 0;
+    int has_row_scalar = 0;
 
     for (int i = 0; i < q->nsel; i++) {
         qast_sel_item_t *si = &q->sel[i];
@@ -1266,11 +1368,36 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             arr[n].col          = arr[n].udf_arg_cols[0]; /* used by scan gather */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else           snprintf(arr[n].name, sizeof(arr[n].name), "%s()", e->v.s);
+        } else if (e->kind == QAST_ADD || e->kind == QAST_SUB ||
+                   e->kind == QAST_MUL || e->kind == QAST_DIV ||
+                   e->kind == QAST_MOD || e->kind == QAST_NEG) {
+            /* Per-row arithmetic over columns + constants (PROJ_SCALAR_ROW). */
+            int sc_agg = 0, sc_sym = 0, sc_bad = 0;
+            scalar_classify(e, s, &sc_agg, &sc_sym, &sc_bad);
+            if (sc_bad) { eset(err, errcap, "unsupported expression in SELECT"); free(arr); return TSDB_ERR_UNSUPPORTED; }
+            if (sc_sym) { eset(err, errcap, "arithmetic not supported on SYMBOL column"); free(arr); return TSDB_ERR_UNSUPPORTED; }
+            if (sc_agg) { eset(err, errcap, "aggregate expressions in SELECT are not supported yet"); free(arr); return TSDB_ERR_UNSUPPORTED; }
+            arr[n].kind        = PROJ_SCALAR_ROW;
+            arr[n].scalar_expr = e;
+            arr[n].col         = -1;
+            arr[n].out_type    = TSDB_TYPE_FLOAT64;
+            has_row_scalar     = 1;
+            if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
+            else           render_expr(e, arr[n].name, sizeof(arr[n].name));
         } else {
             eset(err, errcap, "unsupported SELECT expression kind %d", e->kind);
             free(arr); return TSDB_ERR_UNSUPPORTED;
         }
         n++;
+    }
+    /* PROJ_SCALAR_ROW is emitted only by the plain per-row scan path; reject it
+     * in any context that uses a different emit (whole-query aggregate, bucketed
+     * GROUP BY/SAMPLE BY, advanced window, LATEST ON, or ASOF JOIN). */
+    if (has_row_scalar && (has_agg || has_interp || q->has_sample_by ||
+                           q->has_adv_window || q->has_latest_on ||
+                           q->ngroup_by > 0 || q->has_asof_join)) {
+        eset(err, errcap, "scalar column expressions in SELECT are only supported in a plain projection (no aggregate/GROUP BY/SAMPLE BY/window/interp/LATEST ON/JOIN) yet");
+        free(arr); return TSDB_ERR_UNSUPPORTED;
     }
     *out = arr; *out_n = n; *out_has_agg = has_agg;
     if (out_has_window)  *out_has_window  = has_window;
@@ -5933,6 +6060,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                     if (ci >= 0) need_col[ci] = 1;
                 }
             }
+            /* Row scalar expressions reference an arbitrary set of columns. */
+            if (projs[i].kind == PROJ_SCALAR_ROW)
+                scalar_mark_cols(projs[i].scalar_expr, s, need_col);
         }
         /* Scan WHERE expression for idents */
         /* Simple: just load all referenced columns; recursion */
@@ -6540,6 +6670,11 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                             goto done;
                         }
                         result_append_cell(r, pi, out_bits);
+                    } else if (p->kind == PROJ_SCALAR_ROW) {
+                        double sv = scalar_eval_row(p->scalar_expr, s, bufs, i);
+                        uint64_t bits;
+                        memcpy(&bits, &sv, 8);
+                        result_append_cell(r, pi, bits);
                     }
                 }
                 r->nrows++;

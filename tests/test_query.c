@@ -181,6 +181,35 @@ int main(void) {
       printf("  volume IN () rc=%d (expect <0)\n", rc);
       assert(rc < 0); if (er) tsdb_result_free(er); }
 
+    /* --- Test 5c: row scalar expressions in SELECT (PROJ_SCALAR_ROW) --- */
+    printf("\n[5c] row scalar expressions in SELECT\n");
+    /* SELECT price*2 -> 10000 FLOAT64 rows; sum == 2*sum(price) == 7999000 */
+    OK(tsdb_query(db, "SELECT price*2 FROM trades", &r));
+    assert(tsdb_result_ncols(r) == 1);
+    { double s2 = 0; int64_t nr = 0;
+      while (tsdb_result_next(r)) { s2 += tsdb_result_f64(r, 0); nr++; }
+      printf("  SELECT price*2: rows=%lld sum=%.1f (expect 10000, 7999000)\n", (long long)nr, s2);
+      assert(nr == 10000); assert(s2 > 7998999.0 && s2 < 7999001.0); }
+    tsdb_result_free(r);
+    /* SELECT volume+volume -> FLOAT64; sum == 2*sum(volume) == 79990000 */
+    OK(tsdb_query(db, "SELECT volume+volume FROM trades", &r));
+    { double sv = 0; while (tsdb_result_next(r)) sv += tsdb_result_f64(r, 0);
+      printf("  SELECT volume+volume: sum=%.0f (expect 79990000)\n", sv);
+      assert(sv > 79989999.0 && sv < 79990001.0); }
+    tsdb_result_free(r);
+    /* mixed columns: SELECT price*volume -> 10000 rows */
+    OK(tsdb_query(db, "SELECT price*volume AS notional FROM trades", &r));
+    { int64_t nr = 0; while (tsdb_result_next(r)) nr++; assert(nr == 10000); }
+    tsdb_result_free(r);
+    /* rejects (rc<0): SYMBOL arithmetic, aggregate-in-scalar, scalar+agg mix, scalar+GROUP BY */
+    { tsdb_result_t *er=NULL; assert(tsdb_query(db, "SELECT symbol*2 FROM trades", &er) < 0); if(er) tsdb_result_free(er); }
+    { tsdb_result_t *er=NULL; assert(tsdb_query(db, "SELECT sum(volume)/count(*) FROM trades", &er) < 0); if(er) tsdb_result_free(er); }
+    { tsdb_result_t *er=NULL; assert(tsdb_query(db, "SELECT price*2, sum(volume) FROM trades", &er) < 0); if(er) tsdb_result_free(er); }
+    { tsdb_result_t *er=NULL; assert(tsdb_query(db, "SELECT price*2 FROM trades GROUP BY symbol", &er) < 0); if(er) tsdb_result_free(er); }
+    /* interp() has its own emit path that would leave a scalar cell as 0 — reject */
+    { tsdb_result_t *er=NULL; assert(tsdb_query(db, "SELECT ts, interp(price, 1000000000), price*2 FROM trades", &er) < 0); if(er) tsdb_result_free(er); }
+    printf("  scalar rejects (symbol/agg/mix/groupby/interp) all rc<0\n");
+
     /* --- Test 6: SAMPLE BY aggregation --- */
     printf("\n[6] SELECT time_bucket(ts, 1m), avg(price) FROM trades WHERE symbol='AAPL' SAMPLE BY 1m LIMIT 5\n");
     OK(tsdb_query(db,
