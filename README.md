@@ -302,6 +302,10 @@ SELECT count(*) FROM trades WHERE symbol IN ('AAPL', 'MSFT', 'GOOG');
 SELECT count(*) FROM trades WHERE volume BETWEEN 2000 AND 5999;
 SELECT count(*) FROM trades WHERE volume NOT IN (0, 1);
 
+-- Row arithmetic in the projection (+ - * / %, unary -), FLOAT64 result
+SELECT ts, price * volume AS notional FROM trades WHERE symbol = 'AAPL';
+SELECT ts, (price - 100) / 2 FROM trades;
+
 -- SAMPLE BY (time-bucket aggregation in one pass)
 SELECT time_bucket(ts, 1m), avg(price)
 FROM trades
@@ -701,7 +705,8 @@ copy until a remote owner ACKs, closing a crash-loss window under
 async `REPLICATION_QUORUM=0`); partition-mtime compaction memo (a
 steadily-appended table is no longer skip-compacted until its partition
 rolls); live `qengine_cluster_nodes_alive` gauge; ANSI-style
-`GROUP BY time_bucket(ts, interval)` (routes to the SAMPLE BY executor).
+`GROUP BY time_bucket(ts, interval)` (routes to the SAMPLE BY executor);
+row arithmetic in `SELECT` (`price*volume`, `(a+b) AS c`, FLOAT64 out).
 
 **Known gaps** (shipping order tentative):
 
@@ -721,17 +726,18 @@ rolls); live `qengine_cluster_nodes_alive` gauge; ANSI-style
   owner-side dedup** (without dedup a lost-ACK retry double-writes and
   mis-triggers anti-entropy truncation). That idempotent-forward design is
   scoped but not yet landed
-- **Row-scalar / aggregate expressions in `SELECT`** — arithmetic and
-  scalar functions in the projection (`price*volume`, `sum(x)/count(*)`,
-  `now()`) parse but are not yet evaluated on the read path; and the
-  wire `WRITE … FROM FILE` CSV path mis-infers `INT64` columns
+- **Aggregate-scalar expressions in `SELECT`** — row arithmetic
+  (`price*volume`) now evaluates, but arithmetic *over aggregates*
+  (`sum(x)/count(*)`) and scalar functions (`now()`, `cast`) do not yet;
+  and the wire `WRITE … FROM FILE` CSV path mis-infers `INT64` columns
   (`TSDB_ERR_SCHEMA`) — use the SDK/`WRITE_BATCH` or a `FLOAT64` column
-  meanwhile. Both scoped as follow-ups
-- **Time-bucketed aggregation over a super-table** — `SAMPLE BY` /
-  `GROUP BY time_bucket(...)` work on a single table but return 0 buckets
-  over a scatter-gather `<stable>` (bucketing isn't wired into the
-  cross-child merge); query the child tables, or aggregate the stable with
-  non-bucketed aggregates (count/sum/min/max/avg), meanwhile
+  meanwhile. Scoped as follow-ups
+- **Row projections over a super-table (cluster)** — the cluster
+  scatter-gather path is aggregate-only: a *row* projection over a
+  `<stable>` (`SELECT v`, `SELECT v*2`, `SAMPLE BY` / `time_bucket`) returns
+  0 rows over the cross-child merge (mergeable aggregates count/sum/min/max/
+  avg work). Query the child tables directly, or aggregate the stable,
+  meanwhile. (Single-table and single-node row-union are unaffected.)
 - **Row-level replica reconciliation** — anti-entropy converges on
   count/max(ts); divergent middle-gap replicas are preserved (never
   destructively truncated) but not yet backfilled row-by-row. Related:
