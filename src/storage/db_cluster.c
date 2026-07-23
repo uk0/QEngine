@@ -1813,6 +1813,19 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
 
     tsdb_g_inside_shard_forward = 1;
     int rc = fedrpc_query(conn, qtl, 5000, out);
+    /* A pooled conn can be stale: the owner restarted since it was dialed
+     * (e.g. a peer restarts under this node during a rolling upgrade),
+     * leaving a half-open socket, so the first fedrpc fails fast.  Without
+     * eviction the SAME poisoned conn is handed back on every subsequent
+     * query and this node answers "I/O error" PERMANENTLY until it is
+     * restarted.  Evict so the pool redials a fresh conn, then retry the
+     * forward once — mirrors the stable-scatter coordinator's recovery. */
+    if (rc != TSDB_OK) {
+        if (*out) { tsdb_result_free(*out); *out = NULL; }
+        tsdb_replica_mgr_evict_conn(rmgr, owners[0], conn);
+        conn = tsdb_replica_mgr_get_conn(rmgr, owners[0]);
+        if (conn) rc = fedrpc_query(conn, qtl, 5000, out);
+    }
     tsdb_g_inside_shard_forward = 0;
     if (rc != TSDB_OK) {
         if (*out) { tsdb_result_free(*out); *out = NULL; }
