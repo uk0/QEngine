@@ -1208,6 +1208,15 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
 
         for (int ix = 0; ix < ci_count; ix++) {
             int ci = ci_iter[ix];
+            /* TEST-ONLY fault injection: simulate a crash AFTER every non-ts
+             * column has been published but BEFORE the ts column, to exercise
+             * partial-flush recovery.  Gated by an env var that is never set in
+             * production (getenv returns NULL → no-op), so prod behaviour is
+             * unchanged. */
+            if (ci == ts_ci && getenv("TSDB_TEST_CRASH_BEFORE_TS")) {
+                free(row_idx); free(days); free(sorted_all);
+                return TSDB_ERR_IO;
+            }
             tsdb_type_t   type  = s->cols[ci].type;
             size_t        width = tsdb_type_width(type);
             const uint8_t *col_buf = (const uint8_t *)tsdb_memtable_col(m, ci);
@@ -1290,28 +1299,33 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
 
 uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir) {
     if (!s || !partition_dir) return 0;
-    uint64_t maxv = 0;
-    /* The flush stamps every column's idx with the same hwm and writes the
-     * ts column last, so reading ts.idx alone would suffice — but taking the
-     * max over all columns is strictly safe (a partial/legacy partition with
-     * a checkpoint on only some columns still yields the right C). */
-    for (int ci = 0; ci < s->ncols; ci++) {
-        char idx_path[4096];
-        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
-                 partition_dir, s->cols[ci].name);
-        FILE *f = fopen(idx_path, "rb");
-        if (!f) continue;
-        uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-        size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
-        fclose(f);
-        uint32_t cnt = 0; uint16_t ver = 0; uint64_t tot = 0;
-        int64_t fmn = 0, fmx = 0; uint32_t esz = 0; uint64_t mseq = 0;
-        if (read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
-                               &fmn, &fmx, &esz, &mseq) > 0) {
-            if (mseq > maxv) maxv = mseq;
-        }
-    }
-    return maxv;
+    /* Recovery checkpoint = the TS column's stamped hwm ONLY, not the max over
+     * all columns.  The flush publishes non-ts columns FIRST and ts LAST (ts is
+     * the reader-visibility marker), stamping each column's idx with the flush
+     * hwm as it is written.  A crash after a non-ts column publishes but before
+     * ts leaves that column's idx at the new hwm while ts is still behind;
+     * taking the MAX would advance the WAL-replay cutoff past rows ts never
+     * received, so redo_recover_table would SKIP and permanently drop them
+     * (observed live as vanished rows + a torn val column).  Because ts is
+     * published last, ts.idx.max_seq is exactly "every column of this partition
+     * is durable up to this seq" — the only safe cutoff.  A partition with no
+     * ts.idx (ts never published) is not durable at all → 0, replay everything. */
+    int ts_ci = s->ts_col_idx;
+    if (ts_ci < 0 || ts_ci >= s->ncols) return 0;
+    char idx_path[4096];
+    snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+             partition_dir, s->cols[ts_ci].name);
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return 0;
+    uint8_t hdr[TSDB_IDX_HEADER_SIZE];
+    size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
+    fclose(f);
+    uint32_t cnt = 0; uint16_t ver = 0; uint64_t tot = 0;
+    int64_t fmn = 0, fmx = 0; uint32_t esz = 0; uint64_t mseq = 0;
+    if (read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
+                           &fmn, &fmx, &esz, &mseq) > 0)
+        return mseq;
+    return 0;
 }
 
 /* ---- tsdb_part_t (read side) ------------------------------------------- */
