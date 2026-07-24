@@ -253,8 +253,20 @@ int tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n) {
         { .iov_base = (void *)rec,  .iov_len = n },
     };
     ssize_t want = (ssize_t)(8 + n);
+    /* Capture the pre-append size so a short/failed write (ENOSPC/quota) can
+     * roll its partial bytes back.  Left in place, that torn record would — on
+     * the O_APPEND fd — shadow every record appended after it, because replay
+     * stops at the first CRC mismatch: the tail (all acked) is then silently
+     * lost, and the next successful flush truncates it away for good.  Callers
+     * serialise appends (compact_mtx / group-commit), so no concurrent writer
+     * can race this fstat/ftruncate. */
+    struct stat wst;
+    off_t pre = (fstat(w->fd, &wst) == 0) ? wst.st_size : (off_t)-1;
     ssize_t wr = writev(w->fd, iov, n > 0 ? 2 : 1);
-    if (wr != want) return TSDB_ERR_IO;
+    if (wr != want) {
+        if (pre >= 0) (void)ftruncate(w->fd, pre);
+        return TSDB_ERR_IO;
+    }
     return TSDB_OK;
 }
 
