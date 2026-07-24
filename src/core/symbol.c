@@ -2,6 +2,7 @@
 #include "../../include/tsdb.h"
 #include <stdatomic.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -43,6 +44,7 @@ struct tsdb_symtab {
     uint32_t *offsets;
     uint32_t  count;
     uint32_t  cap;
+    uint32_t  saved_count;   /* st->count at the last durable tsdb_symtab_save */
 
     /* Hash table: linear probing, stores code+1 (0 = empty). */
     uint32_t *ht;
@@ -259,21 +261,39 @@ size_t tsdb_symtab_size(tsdb_symtab_t *st) {
 #define SYMTAB_MAGIC 0x54535953u /* "SYST" */
 
 int tsdb_symtab_save(tsdb_symtab_t *st, const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return TSDB_ERR_IO;
     pthread_rwlock_rdlock(&st->lock);
-    uint32_t magic = SYMTAB_MAGIC;
     uint32_t count = st->count;
-    uint32_t hsz   = (uint32_t)st->heap_size;
+    /* Skip if nothing new since the last durable save — the flush path calls
+     * this per-flush, and re-writing an unchanged dictionary every flush is
+     * wasted I/O.  saved_count == 0 (fresh / just-loaded) always writes. */
+    if (st->saved_count > 0 && count <= st->saved_count) {
+        pthread_rwlock_unlock(&st->lock);
+        return TSDB_OK;
+    }
+    uint32_t hsz = (uint32_t)st->heap_size;
+
+    /* Atomic + durable publish: temp sibling -> fsync -> rename.  An in-place
+     * fopen("wb") truncates first, so a crash/ENOSPC mid-write left a torn or
+     * zero-length dict — durable SYMBOL-coded blocks then decode against a
+     * rebuilt, DIFFERENT dict and silently return WRONG tag values. */
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { pthread_rwlock_unlock(&st->lock); return TSDB_ERR_IO; }
+    uint32_t magic = SYMTAB_MAGIC;
     int rc = 0;
     if (fwrite(&magic, 4, 1, f) != 1) rc = TSDB_ERR_IO;
     if (!rc && fwrite(&count, 4, 1, f) != 1) rc = TSDB_ERR_IO;
     if (!rc && fwrite(&hsz,   4, 1, f) != 1) rc = TSDB_ERR_IO;
     if (!rc && count > 0 && fwrite(st->offsets, 4, count, f) != count) rc = TSDB_ERR_IO;
     if (!rc && hsz > 0 && fwrite(st->heap, 1, hsz, f) != hsz) rc = TSDB_ERR_IO;
+    if (!rc && (fflush(f) != 0 || fsync(fileno(f)) != 0)) rc = TSDB_ERR_IO;
     pthread_rwlock_unlock(&st->lock);
     fclose(f);
-    return rc;
+    if (rc) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    st->saved_count = count;   /* flush-serialised; a stale read only re-saves */
+    return TSDB_OK;
 }
 
 int tsdb_symtab_load(const char *path, tsdb_symtab_t **out) {

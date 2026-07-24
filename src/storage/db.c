@@ -2103,6 +2103,24 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
      * tsdb_part_flush_ex2 writes byte-identical v3 idx headers. */
     uint64_t hwm = t->commit_seq;
 
+    /* Persist any SYMBOL column's dictionary whose codes this flush is about to
+     * make durable, BEFORE publishing the blocks that reference them.  Without
+     * this a crash leaves durable coded blocks with no matching on-disk dict,
+     * and the reopen rebuilds a DIFFERENT one from the WAL tail — silently
+     * returning WRONG tag values.  tsdb_symtab_save is a no-op when the dict
+     * hasn't grown since the last flush. */
+    if (t->schema) {
+        for (int ci = 0; ci < t->schema->ncols; ci++) {
+            if (t->schema->cols[ci].type == TSDB_TYPE_SYMBOL &&
+                t->schema->cols[ci].symtab) {
+                char sp[4096];
+                snprintf(sp, sizeof(sp), "%s/%s.sym", t->schema->dir,
+                         t->schema->cols[ci].name);
+                (void)tsdb_symtab_save(t->schema->cols[ci].symtab, sp);
+            }
+        }
+    }
+
     /* Raw-block replication is triggered from inside tsdb_part_flush_ex
      * after each block encode — pass db + table_name so the hook has context.
      * For replica-received writes (skip_replicate=1) pass NULL to suppress. */
