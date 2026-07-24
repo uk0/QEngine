@@ -1181,6 +1181,7 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
         }
     }
 
+    int published_parts = 0;   /* TEST-ONLY: TSDB_TEST_CRASH_AFTER_PART counter */
     for (int d = 0; d < ndays; d++) {
         int64_t bucket = days[d];
 
@@ -1312,6 +1313,17 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
             if (rc != TSDB_OK) { free(row_idx); free(days); free(sorted_all); return rc; }
         }
         free(row_idx);
+        /* TEST-ONLY fault injection: after fully publishing this partition,
+         * fail as if the process crashed before the next partition — exercises
+         * multi-partition recovery (a sibling partition published, the next
+         * not).  Env unset -> getenv NULL -> no-op in production. */
+        {
+            const char *cs = getenv("TSDB_TEST_CRASH_AFTER_PART");
+            if (cs && ++published_parts >= atoi(cs)) {
+                free(days); free(sorted_all);
+                return TSDB_ERR_IO;
+            }
+        }
     }
     free(days);
     free(sorted_all);

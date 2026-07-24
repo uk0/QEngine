@@ -1827,15 +1827,51 @@ static int redo_log_locked(tsdb_table_internal_t *t) {
     return TSDB_OK;
 }
 
-/* Replay-apply context: holds the open table + the recovery cutoff C. */
+/* Per-partition durable checkpoint.  On reopen a WAL record is skipped only
+ * when its seq is covered by EVERY partition its rows land in, so a completed
+ * sibling partition of a multi-partition flush can't mask a torn one (which
+ * would drop that partition's acked rows). */
+struct redo_part_cp { char name[16]; uint64_t seq; };
+
+/* ts -> partition dir name ("YYYYMMDD" / "YYYYMMDDHH").  Local mirror of
+ * part.c's ts_to_part_str, kept here to avoid widening the storage header. */
+static void redo_ts_to_part_str(int64_t ts_ns, tsdb_partition_unit_t unit,
+                                char *buf, size_t cap) {
+    time_t secs = (time_t)(ts_ns / 1000000000LL);
+    struct tm tm;
+    gmtime_r(&secs, &tm);
+    if (unit == TSDB_PARTITION_HOUR)
+        snprintf(buf, cap, "%04d%02d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour);
+    else
+        snprintf(buf, cap, "%04d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+/* Replay-apply context: holds the open table, the global checkpoint (for
+ * commit_seq continuation), and the per-partition checkpoint map. */
 struct redo_replay_ctx {
     tsdb_table_internal_t *t;
-    uint64_t               cutoff;        /* C: skip records with seq <= cutoff */
+    uint64_t               cutoff;        /* max checkpoint over partitions */
     uint64_t               max_seq;       /* highest seq seen across all records */
     uint64_t               last_complete; /* seq of the last FULLY-applied record
                                            * (a clean checkpoint boundary) */
     int                    applied;       /* 1 if any record was applied */
+    const struct redo_part_cp *parts;     /* per-partition durable checkpoints */
+    int                    nparts;
 };
+
+/* Durable checkpoint of the partition a row with timestamp `ts` lands in; 0 if
+ * that partition has no on-disk checkpoint yet (its rows are not durable and
+ * MUST be replayed). */
+static uint64_t redo_part_checkpoint(const struct redo_replay_ctx *ctx,
+                                     int64_t ts) {
+    char name[16];
+    redo_ts_to_part_str(ts, ctx->t->schema->partition_unit, name, sizeof(name));
+    for (int i = 0; i < ctx->nparts; i++)
+        if (strcmp(ctx->parts[i].name, name) == 0) return ctx->parts[i].seq;
+    return 0;
+}
 
 /* tsdb_wal_replay callback: decode one redo record and apply rows whose
  * record seq > cutoff into the memtable.  Returns TSDB_OK or an error. */
@@ -1847,12 +1883,41 @@ static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
     uint64_t seq   = redo_get_u64le(p + 0);
     uint32_t nrows = redo_get_u32le(p + 8);
     if (seq > ctx->max_seq) ctx->max_seq = seq;
-    /* Already durable in a partition checkpoint — skip (dedup guard). */
-    if (seq <= ctx->cutoff) return TSDB_OK;
 
     tsdb_table_internal_t *t = ctx->t;
     tsdb_schema_t *s = t->schema;
     int ts_ci = s->ts_col_idx;
+
+    /* Per-partition dedup guard: skip this record only if seq is already
+     * durable in EVERY partition its rows land in.  Pre-scan the rows for the
+     * MIN checkpoint over their partitions (a partition with no checkpoint = 0
+     * = not durable).  A scalar max-over-partitions would let a completed
+     * sibling partition of the same flush mask a torn one and drop its acked
+     * rows.  Over-applying an already-durable sibling is harmless: the read
+     * model enumerates via ts and pairs non-ts blocks by (ts_min,count), so a
+     * re-flushed duplicate block is never double-counted. */
+    uint64_t rec_cutoff = UINT64_MAX;
+    {
+        size_t so = 12;
+        for (uint32_t r = 0; r < nrows && rec_cutoff > 0; r++) {
+            if (so + 8 > n) { rec_cutoff = 0; break; }   /* torn: replay it */
+            int64_t rts = (int64_t)redo_get_u64le(p + so); so += 8;
+            uint64_t cp = redo_part_checkpoint(ctx, rts);
+            if (cp < rec_cutoff) rec_cutoff = cp;
+            for (int ci = 0; ci < s->ncols && cp; ci++) {
+                if (ci == ts_ci) continue;
+                if (s->cols[ci].type == TSDB_TYPE_SYMBOL) {
+                    if (so + 4 > n) { rec_cutoff = 0; break; }
+                    so += 4 + redo_get_u32le(p + so);
+                } else {
+                    so += 8;
+                }
+            }
+        }
+    }
+    if (rec_cutoff == UINT64_MAX) rec_cutoff = 0;   /* nrows == 0 */
+    if (seq <= rec_cutoff) return TSDB_OK;
+
     size_t off = 12;
 
     /* Flush at this CLEAN record boundary if the whole record won't fit the
@@ -1936,8 +2001,13 @@ static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
 static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
     if (!t->wal || !t->schema) return;
 
-    /* C = max idx checkpoint over all on-disk partitions of this table. */
+    /* Build the per-partition checkpoint map + the global max (the latter for
+     * commit_seq continuation).  Replay uses the per-partition map so a
+     * completed sibling partition of a torn multi-partition flush can't mask
+     * the torn one — see redo_replay_cb. */
     uint64_t cutoff = 0;
+    struct redo_part_cp *parts = NULL;
+    int nparts = 0, cap = 0;
     char tbl_dir[4096];
     table_dir_db(db, t->name, tbl_dir, sizeof(tbl_dir));
     DIR *d = opendir(tbl_dir);
@@ -1951,11 +2021,21 @@ static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
             if (stat(part_dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
             uint64_t ps = tsdb_part_max_seq(t->schema, part_dir);
             if (ps > cutoff) cutoff = ps;
+            if (nparts == cap) {
+                int ncap = cap ? cap * 2 : 16;
+                struct redo_part_cp *np = realloc(parts, (size_t)ncap * sizeof(*np));
+                if (!np) continue;   /* OOM: this dir stays out of the map, so a
+                                      * row there looks up 0 = replayed — safe */
+                parts = np; cap = ncap;
+            }
+            snprintf(parts[nparts].name, sizeof(parts[nparts].name), "%s", e->d_name);
+            parts[nparts].seq = ps;
+            nparts++;
         }
         closedir(d);
     }
 
-    struct redo_replay_ctx ctx = { t, cutoff, 0, cutoff, 0 };
+    struct redo_replay_ctx ctx = { t, cutoff, 0, cutoff, 0, parts, nparts };
     pthread_mutex_lock(&t->compact_mtx);
     int rc = tsdb_wal_replay(db->data_dir, t->name, redo_replay_cb, &ctx);
     /* commit_seq must continue ABOVE every seq that ever existed (durable in
@@ -1974,6 +2054,7 @@ static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
     }
     if (ctx.applied)
         tsdb_metric_inc("qengine_wal_recovered_records_total");
+    free(parts);
 }
 
 /*
