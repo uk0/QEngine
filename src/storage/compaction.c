@@ -370,6 +370,32 @@ static int compact_column_file(const char *part_dir,
     free(ebuf);
     fclose(idx_f);
 
+    /* The .col was mmap'd BEFORE the .idx was read, so a flush that appended a
+     * block in that gap grew the .col file past our stale map while the idx we
+     * just read already references it — the bounds checks below would then
+     * silently DROP that newest block and the swap would lose it.  If the .col
+     * FILE has grown since our map, re-map it at its current size so those
+     * bytes are visible (the flush publishes .col bytes before the .idx, so an
+     * idx-referenced block is on disk).  Size to the real file, NOT to idx
+     * offsets — a lock-free idx read can hold garbage offsets for entries the
+     * decode's bounds check skips anyway.  If the file did not grow this is a
+     * no-op, so the common (race-free) path is unchanged. */
+    {
+        int rfd = open(col_path, O_RDONLY);
+        struct stat rst;
+        if (rfd >= 0 && fstat(rfd, &rst) == 0 &&
+            (uint64_t)rst.st_size > (uint64_t)map_len) {
+            uint8_t *nm = mmap(NULL, (size_t)rst.st_size, PROT_READ,
+                               MAP_PRIVATE, rfd, 0);
+            if (nm != MAP_FAILED) {
+                munmap(col_map, map_len);
+                col_map = nm;
+                map_len = (size_t)rst.st_size;
+            }
+        }
+        if (rfd >= 0) close(rfd);
+    }
+
     /* Back-fill codec and flags from BlockHeaders in the mmap. */
     for (uint32_t b = 0; b < block_count; b++) {
         uint64_t off = infos[b].offset;

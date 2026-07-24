@@ -2547,7 +2547,15 @@ int tsdb_db_flush_all(tsdb_db_t *db) {
 
     for (int i = 0; i < n; i++) {
         if (!tabs[i]) continue;
+        /* Hold the writer lock across the flush (batch_mu -> compact_mtx, the
+         * same order as the idle-flush path).  flush_and_clear_ex snapshots the
+         * memtable's sorted-permutation and clears the flushed rows; without
+         * this a concurrent out-of-order writer can append between the snapshot
+         * and the clear, so the wrong row subset is selected and freshly
+         * committed rows are dropped. */
+        tsdb_table_lock_write((tsdb_table_t *)tabs[i]);
         int rc = flush_and_clear_ex(tabs[i], /*skip_replicate=*/1);
+        tsdb_table_unlock_write((tsdb_table_t *)tabs[i]);
         if (rc != TSDB_OK)
             fprintf(stderr, "[flush_all] %s rc=%d\n", tabs[i]->name, rc);
     }
