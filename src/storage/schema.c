@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -80,10 +81,15 @@ int tsdb_mkdir_p(const char *path) {
 /* ---- schema_save -------------------------------------------------------- */
 
 static int schema_save(tsdb_schema_t *s) {
-    char path[4096];
+    char path[4096], tmp[4200];
     snprintf(path, sizeof(path), "%s/schema.bin", s->dir);
+    snprintf(tmp, sizeof(tmp), "%s/schema.bin.tmp", s->dir);
 
-    FILE *f = fopen(path, "wb");
+    /* Write to a temp file then fsync + rename onto schema.bin, so a crash /
+     * power-loss / ENOSPC mid-rewrite can never truncate or half-write the
+     * live schema (which would orphan the table and its already-acked WAL
+     * rows).  fopen("wb") in place would destroy schema.bin on any failure. */
+    FILE *f = fopen(tmp, "wb");
     if (!f) return TSDB_ERR_IO;
 
     /* Conditionally bump on-disk version: v4 only when the table opts in
@@ -131,7 +137,13 @@ static int schema_save(tsdb_schema_t *s) {
     }
 #undef WR
 
+    if (!rc) {
+        if (fflush(f) != 0) rc = TSDB_ERR_IO;
+        else if (fsync(fileno(f)) != 0) rc = TSDB_ERR_IO;
+    }
     fclose(f);
+    if (rc) { unlink(tmp); return rc; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
 
     /* Persist each SYMBOL column's symtab. */
     for (int i = 0; i < s->ncols && !rc; i++) {

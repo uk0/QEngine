@@ -99,46 +99,62 @@ static int fsync_file(FILE *fp) {
     return fsync(fileno(fp));
 }
 
+/* fsync the directory holding `path` so a rename INTO it is itself durable:
+ * POSIX only guarantees the rename survives a crash once the parent directory
+ * entry has hit the device.  Needed for raft term/vote — a rename that reverts
+ * on power loss would forget a cast vote and risk a double vote / two leaders. */
+static void fsync_parent_dir(const char *path) {
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return;
+    *slash = '\0';
+    int fd = open(dir, O_RDONLY);
+    if (fd >= 0) { (void)fsync(fd); close(fd); }
+}
+
+/* Atomically persist a small raft control file (term / vote): write a temp
+ * sibling, fsync it, rename onto the target, fsync the dir.  An in-place
+ * fopen("wb") truncates first, so a crash before the fsync leaves a torn /
+ * zero-length file that reads back as "fresh" — dropping a durable term/vote. */
+static int atomic_meta_write(const char *path, const void *buf, size_t len) {
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) return -1;
+    int ok = (fwrite(buf, 1, len, fp) == len) && (fsync_file(fp) == 0);
+    fclose(fp);
+    if (!ok) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    fsync_parent_dir(path);
+    return 0;
+}
+
 /* ---- meta / vote persistence --------------------------------------------- */
 
 static int meta_write(tsdb_raft_log_t *rl) {
-    FILE *fp = fopen(rl->meta_path, "wb");
-    if (!fp) return -1;
     uint32_t m = META_MAGIC, v = LOG_VERSION;
     uint64_t t = rl->current_term;
-    int ok = (fwrite(&m, 4, 1, fp) == 1) &&
-             (fwrite(&v, 4, 1, fp) == 1) &&
-             (fwrite(&t, 8, 1, fp) == 1) &&
-             (fsync_file(fp) == 0);
-    fclose(fp);
-    return ok ? 0 : -1;
+    uint8_t buf[16];
+    memcpy(buf + 0, &m, 4); memcpy(buf + 4, &v, 4); memcpy(buf + 8, &t, 8);
+    return atomic_meta_write(rl->meta_path, buf, sizeof(buf));
 }
 
 static int vote_write(tsdb_raft_log_t *rl) {
-    FILE *fp = fopen(rl->vote_path, "wb");
-    if (!fp) return -1;
     uint32_t m = VOTE_MAGIC, v = LOG_VERSION;
     uint64_t vf = rl->voted_for;
-    int ok = (fwrite(&m, 4, 1, fp) == 1) &&
-             (fwrite(&v, 4, 1, fp) == 1) &&
-             (fwrite(&vf, 8, 1, fp) == 1) &&
-             (fsync_file(fp) == 0);
-    fclose(fp);
-    return ok ? 0 : -1;
+    uint8_t buf[16];
+    memcpy(buf + 0, &m, 4); memcpy(buf + 4, &v, 4); memcpy(buf + 8, &vf, 8);
+    return atomic_meta_write(rl->vote_path, buf, sizeof(buf));
 }
 
 static int snap_meta_write(tsdb_raft_log_t *rl) {
-    FILE *fp = fopen(rl->snap_meta_path, "wb");
-    if (!fp) return -1;
     uint32_t m = SNAP_MAGIC, v = LOG_VERSION;
     uint64_t idx = rl->snap_index, term = rl->snap_term;
-    int ok = (fwrite(&m,    4, 1, fp) == 1) &&
-             (fwrite(&v,    4, 1, fp) == 1) &&
-             (fwrite(&idx,  8, 1, fp) == 1) &&
-             (fwrite(&term, 8, 1, fp) == 1) &&
-             (fsync_file(fp) == 0);
-    fclose(fp);
-    return ok ? 0 : -1;
+    uint8_t buf[24];
+    memcpy(buf + 0, &m, 4); memcpy(buf + 4, &v, 4);
+    memcpy(buf + 8, &idx, 8); memcpy(buf + 16, &term, 8);
+    return atomic_meta_write(rl->snap_meta_path, buf, sizeof(buf));
 }
 
 static void snap_meta_load(tsdb_raft_log_t *rl) {
