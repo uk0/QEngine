@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <time.h>
 
-/* Thread-local io_async ring used by tsdb_part_fsync_idx — lazily created
+/* Thread-local io_async ring used by tsdb_part_fsync_fd — lazily created
  * on first use, destroyed at thread exit.  Each flush thread gets its own
  * ring so submissions don't need cross-thread serialisation.
  *
@@ -32,7 +32,12 @@ static __thread tsdb_io_async_t *tl_io_async   = NULL;
 static __thread int              tl_io_async_inited = 0;
 static __thread int              tl_io_async_enabled = 0;
 
-static void tsdb_part_fsync_idx(int fd) {
+/* fsync one fd (idx OR .col) to the device.  Returns 0 on success, -1 on
+ * error — callers MUST check it before treating a publish as durable.  Routes
+ * through the thread-local io_uring ring when available (fsync_sync is one
+ * submit+wait, identical semantics to plain fsync) so future iters can batch
+ * many fsyncs in one device dispatch; falls back to plain fsync. */
+static int tsdb_part_fsync_fd(int fd) {
     if (!tl_io_async_inited) {
         tl_io_async_inited = 1;
         const char *e = getenv("TSDB_PART_IO_URING");
@@ -41,8 +46,8 @@ static void tsdb_part_fsync_idx(int fd) {
             if (tsdb_io_async_create(32, &tl_io_async) != 0) tl_io_async = NULL;
         }
     }
-    if (tl_io_async && tsdb_io_async_fsync_sync(tl_io_async, fd) == 0) return;
-    (void)fsync(fd);   /* fallback */
+    if (tl_io_async && tsdb_io_async_fsync_sync(tl_io_async, fd) == 0) return 0;
+    return fsync(fd);
 }
 
 /*
@@ -862,7 +867,16 @@ static int col_writer_close(col_writer_t *w) {
     int rc = TSDB_OK;
 
     if (w->col_fp) {
+        int col_fd = fileno(w->col_fp);
         if (fflush(w->col_fp) != 0) rc = TSDB_ERR_IO;
+        /* Durability ordering (residual C): the idx published below carries the
+         * max_seq checkpoint that gates WAL replay on reopen.  Its .col bytes
+         * MUST reach the device BEFORE that checkpoint is durable, or a power
+         * loss can leave the checkpoint claiming rows whose data never hit disk
+         * -> recovery skips their WAL records -> silent loss of ACKED rows.  On
+         * fsync failure, fall through to the rc!=OK rollback below (truncate the
+         * .col back, leave the old idx). */
+        else if (col_fd >= 0 && tsdb_part_fsync_fd(col_fd) != 0) rc = TSDB_ERR_IO;
         fclose(w->col_fp);
         w->col_fp = NULL;
     }
@@ -985,9 +999,16 @@ static int col_writer_close(col_writer_t *w) {
              * is single submit+wait — identical observable semantics to
              * plain fsync(), but the wiring runs on the new io_async
              * substrate. */
-            tsdb_part_fsync_idx(fileno(idx_w));
+            int idx_fsync_ok = (tsdb_part_fsync_fd(fileno(idx_w)) == 0);
             fclose(idx_w);
-            if (rename(tmp_path, w->idx_path) != 0) {
+            /* A failed idx fsync must NOT publish a never-durable checkpoint
+             * idx: keep the old idx (the rc!=OK path below rolls the .col
+             * back), so recovery never trusts a max_seq whose bytes aren't
+             * on the device. */
+            if (!idx_fsync_ok) {
+                unlink(tmp_path);
+                rc = TSDB_ERR_IO;
+            } else if (rename(tmp_path, w->idx_path) != 0) {
                 unlink(tmp_path);
                 rc = TSDB_ERR_IO;
             }
