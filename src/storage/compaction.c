@@ -76,7 +76,8 @@ static inline void put_i64le(uint8_t *p, int64_t v)  { put_u64le(p, (uint64_t)v)
 
 #define BLK_MAGIC       0x314B4C42u
 #define IDX_MAGIC       0x31584449u
-#define IDX_VERSION     3u
+/* IDX_VERSION removed: the output header now comes from the canonical
+ * tsdb_part_write_idx_header() in part.c, which picks V3/V4 off max_seq. */
 #define BLK_HDR_SZ      32u
 #define IDX_HDR_SZ_V1   20u
 #define IDX_HDR_SZ_V2   36u
@@ -131,25 +132,6 @@ static int is_partition_dir(const char *name) {
 }
 
 /* ---- Block I/O helpers ---------------------------------------------------- */
-
-/*
- * Write a v3 IdxHeader into buf (exactly IDX_HDR_SZ bytes).
- * Mirrors the layout in src/storage/part.c.
- */
-static void write_idx_hdr(uint8_t *buf, uint32_t nblocks, uint64_t total_rows,
-                          int64_t ts_min, int64_t ts_max)
-{
-    memset(buf, 0, IDX_HDR_SZ);
-    put_u32le(buf + 0,  IDX_MAGIC);
-    put_u32le(buf + 4,  nblocks);
-    put_u16le(buf + 8,  (uint16_t)IDX_VERSION);
-    put_u16le(buf + 10, 0);
-    put_u64le(buf + 12, total_rows);
-    put_i64le(buf + 20, ts_min);
-    put_i64le(buf + 28, ts_max);
-    put_u16le(buf + 36, (uint16_t)IDX_ENTRY_SZ);   /* entry_size */
-    put_u16le(buf + 38, 0);                         /* stats_variant */
-}
 
 /*
  * Write a BlockIndexEntry (IDX_ENTRY_SZ bytes) into buf.
@@ -285,8 +267,8 @@ static int compact_column_file(const char *part_dir,
     FILE *idx_f = fopen(idx_path, "rb");
     if (!idx_f) { munmap(col_map, map_len); return TSDB_OK; }
 
-    uint8_t hdr_buf[IDX_HDR_SZ];
-    size_t  hdr_n = fread(hdr_buf, 1, IDX_HDR_SZ, idx_f);
+    uint8_t hdr_buf[TSDB_IDX_HEADER_SIZE];
+    size_t  hdr_n = fread(hdr_buf, 1, TSDB_IDX_HEADER_SIZE, idx_f);
     if (hdr_n < IDX_HDR_SZ_V1 ||
         get_u32le(hdr_buf) != IDX_MAGIC) {
         fclose(idx_f);
@@ -321,14 +303,27 @@ static int compact_column_file(const char *part_dir,
         }
     }
 
-    /* Decide header / entry sizes based on on-disk version. */
+    /* Decide header / entry sizes based on on-disk version.  part.c emits a V4
+     * header (48 bytes, max_seq at [40..47]) whenever a WAL redo checkpoint is
+     * present — i.e. for every partition flushed under wal_only_commit.  Sizing
+     * V4 as V3 reads the entry array 8 bytes early AND at the 40-byte V2 stride,
+     * so every offset/size/count/ts_min comes from the middle of a neighbouring
+     * entry's stats payload: the merge then shreds the column. */
     int    hdr_sz   = (idx_ver == 1) ? (int)IDX_HDR_SZ_V1
                     : (idx_ver == 2) ? (int)IDX_HDR_SZ_V2
-                                     : (int)IDX_HDR_SZ;
-    size_t entry_sz = (idx_ver == 3 && hdr_n >= IDX_HDR_SZ)
+                    : (idx_ver == 3) ? (int)IDX_HDR_SZ
+                                     : (int)TSDB_IDX_HEADER_SIZE;
+    size_t entry_sz = (idx_ver >= 3 && hdr_n >= IDX_HDR_SZ)
                      ? (size_t)get_u16le(hdr_buf + 36)
                      : (size_t)IDX_ENTRY_SZ_V2;
     if (entry_sz == 0) entry_sz = IDX_ENTRY_SZ_V2;
+
+    /* Carry the redo checkpoint across the rewrite.  Dropping it (writing a V3
+     * header over a V4 partition) resets the partition's recovery cutoff to 0,
+     * so the next replay re-applies the whole WAL against already-durable rows. */
+    uint64_t src_max_seq = (idx_ver >= 4 && hdr_n >= TSDB_IDX_HEADER_SIZE)
+                         ? get_u64le(hdr_buf + 40)
+                         : 0;
 
     /* ---- 3. Read all BlockIndexEntry records ------------------------------- */
 
@@ -492,11 +487,14 @@ static int compact_column_file(const char *part_dir,
     uint32_t n_out_blocks = (uint32_t)((total_vals + COMPACT_BLOCK_POINTS - 1)
                                        / COMPACT_BLOCK_POINTS);
 
-    /* Write placeholder idx header (will be rewritten). */
+    /* Write placeholder idx header (will be rewritten).  Its size must match the
+     * real header below, which is V4 exactly when we carry a max_seq forward. */
+    const size_t out_hdr_sz = src_max_seq ? (size_t)TSDB_IDX_HEADER_SIZE
+                                          : (size_t)IDX_HDR_SZ;
     {
-        uint8_t placeholder[IDX_HDR_SZ];
-        memset(placeholder, 0, IDX_HDR_SZ);
-        if (safe_write(new_idx, placeholder, IDX_HDR_SZ) < 0) goto io_err;
+        uint8_t placeholder[TSDB_IDX_HEADER_SIZE];
+        memset(placeholder, 0, sizeof(placeholder));
+        if (safe_write(new_idx, placeholder, out_hdr_sz) < 0) goto io_err;
     }
 
     /* Allocate idx-entry accumulation buffer. */
@@ -616,11 +614,15 @@ static int compact_column_file(const char *part_dir,
     /* Rewind idx and write the real header. */
     if (fseek(new_idx, 0, SEEK_SET) != 0) goto io_err;
     {
-        uint8_t real_hdr[IDX_HDR_SZ];
+        uint8_t real_hdr[TSDB_IDX_HEADER_SIZE];
         if (file_ts_min == INT64_MAX) { file_ts_min = 0; file_ts_max = 0; }
-        write_idx_hdr(real_hdr, new_block_count, new_total_rows,
-                      file_ts_min, file_ts_max);
-        if (safe_write(new_idx, real_hdr, IDX_HDR_SZ) < 0) goto io_err;
+        /* Canonical encoder (part.c) — same bytes as the flush and raw-block
+         * paths, and it picks V3/V4 off max_seq exactly like out_hdr_sz did. */
+        size_t hn = tsdb_part_write_idx_header(real_hdr, new_block_count,
+                                               new_total_rows, file_ts_min,
+                                               file_ts_max, src_max_seq);
+        if (hn != out_hdr_sz) goto io_err;
+        if (safe_write(new_idx, real_hdr, hn) < 0) goto io_err;
     }
 
     /* fsync both tmp files before rename. */
