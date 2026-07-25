@@ -180,6 +180,106 @@ static uint32_t get_u32le_buf(const uint8_t *p) {
          | ((uint32_t)p[3] << 24);
 }
 
+/* ---- Torn-tail repair ----------------------------------------------------
+ *
+ * A power cut mid-append leaves a PARTIAL record at the end of the log.  The
+ * writer fd is O_APPEND, so every record appended after the reopen lands AFTER
+ * those garbage bytes, while tsdb_wal_replay still stops AT them: on the next
+ * recovery every one of those acked records is silently dropped.  Repair the
+ * log to the end of its last CRC-valid record BEFORE the fd can append to it.
+ *
+ * The scan is deliberately independent of tsdb_wal_replay: it allocates
+ * nothing (a garbage length field can therefore never OOM it) and it
+ * classifies its own stop reason, so a genuinely torn tail (short read / bad
+ * CRC) is distinguished from a read error, which must NEVER truncate.  It is
+ * also independent of the replay CALLBACK, whose own TSDB_ERR_CORRUPT (a
+ * CRC-valid record the decoder cannot parse) must not shorten the log either.
+ */
+
+/* Scan `path` and report the end offset of the longest prefix of CRC-valid
+ * records (*out_end) plus the file size (*out_size).  Returns TSDB_ERR_IO on a
+ * read error — the caller must NOT truncate in that case. */
+static int wal_valid_prefix(const char *path, off_t *out_end, off_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return TSDB_ERR_IO;
+
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0) { fclose(f); return TSDB_ERR_IO; }
+    off_t size = st.st_size;
+    off_t off  = 0;
+
+    crc32_init();
+
+    while (off + WAL_RECORD_HEADER <= size) {
+        uint8_t hdr[WAL_RECORD_HEADER];
+        if (fread(hdr, 1, WAL_RECORD_HEADER, f) != WAL_RECORD_HEADER) break;
+
+        uint32_t stored_crc = get_u32le_buf(hdr + 0);
+        uint32_t len        = get_u32le_buf(hdr + 4);
+
+        /* A length that runs past EOF can only be a torn tail (or a garbage
+         * header).  Stop without reading — this also bounds the work an
+         * arbitrary 4 GiB length field can cause. */
+        if ((uint64_t)off + WAL_RECORD_HEADER + (uint64_t)len > (uint64_t)size)
+            break;
+
+        uint32_t c = 0xFFFFFFFFu;
+        for (int i = 0; i < 4; i++)
+            c = crc32_table[(c ^ hdr[4 + i]) & 0xFF] ^ (c >> 8);
+
+        int torn = 0;
+        uint32_t left = len;
+        while (left > 0) {
+            uint8_t chunk[4096];
+            size_t want = (left < sizeof(chunk)) ? (size_t)left : sizeof(chunk);
+            size_t got  = fread(chunk, 1, want, f);
+            if (got != want) { torn = 1; break; }
+            for (size_t i = 0; i < got; i++)
+                c = crc32_table[(c ^ chunk[i]) & 0xFF] ^ (c >> 8);
+            left -= (uint32_t)got;
+        }
+        if (torn) break;
+        if ((c ^ 0xFFFFFFFFu) != stored_crc) break;
+
+        off += WAL_RECORD_HEADER + (off_t)len;   /* record fully verified */
+    }
+
+    int io_err = ferror(f);
+    fclose(f);
+    if (io_err) return TSDB_ERR_IO;
+
+    *out_end  = off;
+    *out_size = size;
+    return TSDB_OK;
+}
+
+int tsdb_wal_repair(tsdb_wal_t *w, uint64_t *discarded_out) {
+    if (discarded_out) *discarded_out = 0;
+    if (!w || w->fd < 0) return TSDB_ERR_INVAL;
+
+    off_t end = 0, size = 0;
+    int rc = wal_valid_prefix(w->path, &end, &size);
+    if (rc != TSDB_OK) return rc;      /* read error: leave the log untouched */
+    if (end == size) return TSDB_OK;   /* clean log (empty file included) */
+
+    /* Truncate through the WRITER's fd — the same handle every append uses, so
+     * the shortened size is what O_APPEND resolves against from here on.  No
+     * lock is needed: the caller has not published this handle yet. */
+    if (ftruncate(w->fd, end) < 0) return TSDB_ERR_IO;
+    /* Make the shorter length durable before any new record is appended past
+     * it.  fsync on the fd covers the inode; no parent-dir fsync is required
+     * because the directory entry itself is unchanged. */
+    if (fsync(w->fd) < 0) return TSDB_ERR_IO;
+
+    if (discarded_out) *discarded_out = (uint64_t)(size - end);
+    tsdb_metric_inc("qengine_wal_torn_tail_repaired_total");
+    fprintf(stderr,
+            "[wal] %s: repaired torn tail - dropped %lld byte(s) after the "
+            "last valid record ending at offset %lld\n",
+            w->path, (long long)(size - end), (long long)end);
+    return TSDB_OK;
+}
+
 /* ---- Public API --------------------------------------------------------- */
 
 int tsdb_wal_open(const char *db_dir, const char *table_name, tsdb_wal_t **out) {
@@ -197,6 +297,13 @@ int tsdb_wal_open(const char *db_dir, const char *table_name, tsdb_wal_t **out) 
 
     w->fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (w->fd < 0) { free(w); return TSDB_ERR_IO; }
+
+    /* Repair a power-loss torn tail BEFORE this fd can append past it.  This is
+     * the only choke point that hands out an appending handle, so no writer can
+     * ever run ahead of the repair — and replay then sees a log that ends
+     * cleanly.  Best-effort: a repair that cannot run (read error) leaves the
+     * log exactly as it was. */
+    (void)tsdb_wal_repair(w, NULL);
 
     if (wal_interval_ms() > 0) {
         pthread_once(&g_wal_flusher_once, wal_flusher_start);

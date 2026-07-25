@@ -55,6 +55,17 @@ int  tsdb_wal_sync(tsdb_wal_t *w);
 int  tsdb_wal_truncate(tsdb_wal_t *w);
 
 /*
+ * Repair a torn tail left by a crash/power cut: truncate the log to the end of
+ * its last CRC-valid record.  tsdb_wal_open() calls this before it returns the
+ * handle, so an appending fd can never run past a torn tail; it is exported so
+ * tests can exercise it directly.
+ * *discarded_out (may be NULL) receives the number of bytes dropped (0 = the
+ * log was already clean).  Returns TSDB_OK, or TSDB_ERR_IO if the log could
+ * not be read or truncated — in that case the file is left EXACTLY as it was.
+ */
+int  tsdb_wal_repair(tsdb_wal_t *w, uint64_t *discarded_out);
+
+/*
  * Replay all records in the WAL file.
  * For each record the callback is invoked with the payload.
  * Returns TSDB_OK, or TSDB_ERR_CORRUPT if a record has bad CRC, or
