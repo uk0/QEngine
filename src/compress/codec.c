@@ -309,6 +309,97 @@ int tsdb_codec_encode_adaptive(tsdb_type_t type,
                                          OUTER_LZ_MIN_GAIN);
 }
 
+/*
+ * Outer-LZ stage as a reusable step: wrap `dom`/`dom_bytes` when lzlite saves
+ * at least min_gain bytes, else copy the domain bytes through unchanged.
+ * Writes into `dst`; returns the final byte count, or -1 if it does not fit.
+ * *flags gets TSDB_BF_OUTER_LZ exactly when the wrap was taken.  Byte-for-byte
+ * the same wire format the inline path below produces.
+ */
+static int lz_finalize(const uint8_t *dom, size_t dom_bytes,
+                       uint8_t *dst, size_t dst_cap,
+                       int min_gain, uint16_t *flags)
+{
+    *flags = 0;
+    size_t lz_cap = tsdb_lzlite_max_output(dom_bytes);
+    uint8_t *lz_buf = malloc(lz_cap);
+    if (lz_buf) {
+        size_t lz_bytes = 0;
+        if (tsdb_lzlite_encode(dom, dom_bytes, lz_buf, lz_cap, &lz_bytes) >= 0) {
+            size_t wrapped = 4 + lz_bytes;
+            if ((int)dom_bytes - (int)wrapped >= min_gain && wrapped <= dst_cap) {
+                uint32_t o = (uint32_t)dom_bytes;
+                dst[0] = (uint8_t)(o & 0xFF);
+                dst[1] = (uint8_t)((o >> 8) & 0xFF);
+                dst[2] = (uint8_t)((o >> 16) & 0xFF);
+                dst[3] = (uint8_t)((o >> 24) & 0xFF);
+                memcpy(dst + 4, lz_buf, lz_bytes);
+                free(lz_buf);
+                *flags = TSDB_BF_OUTER_LZ;
+                return (int)wrapped;
+            }
+        }
+        free(lz_buf);
+    }
+    if (dom_bytes > dst_cap) return -1;
+    memmove(dst, dom, dom_bytes);
+    return (int)dom_bytes;
+}
+
+/*
+ * SYMBOL: choose DICT vs PFOR on FINAL size, i.e. after the outer LZ stage.
+ *
+ * tsdb_codec_encode picks between them on domain size alone, but the two
+ * compress very differently afterwards: DICT is byte-aligned varint, so lzlite
+ * finds its repeating period, while PFOR is bit-packed and leaves lzlite
+ * nothing to match.  On a clustered tag column that inverts the ranking —
+ * measured DICT 8,275 B vs PFOR 7,556 B before LZ (so PFOR is taken), but
+ * 58 B vs 2,925 B after it, a 50x miss.  End to end, a TSBS hostname column
+ * went 157,291 -> 5,076 bytes (-96.8%).
+ *
+ * Neither codec dominates — PFOR+LZ still wins on single-value, small-cycle,
+ * boolean and high-cardinality-random columns — so both are evaluated rather
+ * than swapping the default.  Returns the final byte count, or -1 to fall back
+ * to the caller's ordinary path.
+ */
+static int encode_symbol_final(const void *in, size_t in_count,
+                               uint8_t *out, size_t out_cap,
+                               tsdb_codec_t *out_codec, uint16_t *out_flags,
+                               int min_gain)
+{
+    size_t cap = out_cap + 64;
+    uint8_t *dbuf = malloc(cap), *pbuf = malloc(cap);
+    uint8_t *dfin = malloc(cap), *pfin = malloc(cap);
+    int ret = -1;
+    if (!dbuf || !pbuf || !dfin || !pfin) goto done;
+
+    size_t dbytes = 0, pbytes = 0;
+    int have_d = (tsdb_dict_encode((const uint32_t *)in, in_count,
+                                   dbuf, cap, &dbytes) == TSDB_OK);
+    int have_p = (tsdb_pfor_encode((const uint32_t *)in, in_count,
+                                   pbuf, cap, &pbytes) == TSDB_OK);
+    if (!have_d && !have_p) goto done;
+
+    uint16_t dflags = 0, pflags = 0;
+    int dfinal = have_d ? lz_finalize(dbuf, dbytes, dfin, cap, min_gain, &dflags) : -1;
+    int pfinal = have_p ? lz_finalize(pbuf, pbytes, pfin, cap, min_gain, &pflags) : -1;
+
+    /* Ties go to DICT: equal size but cheaper to decode. */
+    int use_dict = (dfinal >= 0) && (pfinal < 0 || dfinal <= pfinal);
+    const uint8_t *src = use_dict ? dfin : pfin;
+    int          final = use_dict ? dfinal : pfinal;
+    if (final < 0 || (size_t)final > out_cap) goto done;
+
+    memcpy(out, src, (size_t)final);
+    *out_codec = use_dict ? TSDB_CODEC_DICT : TSDB_CODEC_PFOR;
+    *out_flags = use_dict ? dflags : pflags;
+    ret = final;
+
+done:
+    free(dbuf); free(pbuf); free(dfin); free(pfin);
+    return ret;
+}
+
 int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
                                   const void *in, size_t in_count,
                                   uint8_t *out, size_t out_cap,
@@ -318,6 +409,13 @@ int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
 {
     if (!out_codec || !out_flags) return TSDB_ERR_INVAL;
     if (min_gain <= 0) min_gain = 1;  /* a 0/negative-gain wrap is never worth it */
+
+    if (type == TSDB_TYPE_SYMBOL && in_count > 0) {
+        int n = encode_symbol_final(in, in_count, out, out_cap,
+                                    out_codec, out_flags, min_gain);
+        if (n >= 0) return n;
+        /* allocation failure — fall through to the ordinary path */
+    }
 
     /* Step 1: domain-codec selection (existing logic). */
     tsdb_codec_t codec = TSDB_CODEC_NONE;
