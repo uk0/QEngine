@@ -4,8 +4,13 @@
  *
  *   header  : "TSM1" u32 | version u32 | table u8[64] | ncols u32
  *             | ts_col_idx u32 | { name u8[64], type u32 } * ncols
+ *   symbols : nsym u32 | { col_idx u32, len u32, .sym bytes } * nsym   (v2)
  *   record  : len u32 (>0) | tsdb_rawblock_serialize() payload
  *   end     : len u32 == 0
+ *
+ * The symbol section is not optional: a SYMBOL column's blocks hold dictionary
+ * CODES, so shipping them without the dictionary produced a target where every
+ * tag value queried back as zero rows.
  *
  * Block payloads are produced by the SAME serializer replication uses, and
  * landed by the SAME applier, so migration inherits its wire encoding and its
@@ -24,6 +29,7 @@
 #include "part.h"
 #include "schema.h"
 #include "../cluster/rawblock.h"
+#include "../core/symbol.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -149,7 +155,51 @@ static int write_header(int fd, const char *table, tsdb_schema_t *s) {
         rc = write_all(fd, c, sizeof(c));
         if (rc != TSDB_OK) return rc;
     }
-    return TSDB_OK;
+
+    /* SYMBOL dictionary section: u32 count, then { col_idx u32, len u32, bytes }.
+     * A SYMBOL column's blocks hold dictionary CODES, so without the dictionary
+     * the target decodes them against its own empty table and every tag reads
+     * back as nothing. */
+    uint32_t nsym = 0;
+    for (int i = 0; i < s->ncols; i++)
+        if (s->cols[i].type == TSDB_TYPE_SYMBOL) nsym++;
+    uint8_t nb[4]; put_u32(nb, nsym);
+    rc = write_all(fd, nb, 4);
+    if (rc != TSDB_OK) return rc;
+
+    for (int i = 0; i < s->ncols && rc == TSDB_OK; i++) {
+        if (s->cols[i].type != TSDB_TYPE_SYMBOL) continue;
+
+        /* Persist the live table's dictionary first: the on-disk .sym is only
+         * rewritten at close/flush, so reading the file alone can miss codes
+         * this process has interned. */
+        char sym_path[4400];
+        snprintf(sym_path, sizeof(sym_path), "%s/%s.sym", s->dir, s->cols[i].name);
+        if (s->cols[i].symtab) tsdb_symtab_save(s->cols[i].symtab, sym_path);
+
+        uint8_t *bytes = NULL; size_t len = 0;
+        FILE *sf = fopen(sym_path, "rb");
+        if (sf) {
+            if (fseeko(sf, 0, SEEK_END) == 0) {
+                off_t sz = ftello(sf);
+                if (sz > 0 && fseeko(sf, 0, SEEK_SET) == 0) {
+                    bytes = malloc((size_t)sz);
+                    if (bytes && fread(bytes, 1, (size_t)sz, sf) == (size_t)sz)
+                        len = (size_t)sz;
+                    else { free(bytes); bytes = NULL; }
+                }
+            }
+            fclose(sf);
+        }
+
+        uint8_t hb[8];
+        put_u32(hb, (uint32_t)i);
+        put_u32(hb + 4, (uint32_t)len);
+        rc = write_all(fd, hb, 8);
+        if (rc == TSDB_OK && len) rc = write_all(fd, bytes, len);
+        free(bytes);
+    }
+    return rc;
 }
 
 int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
@@ -400,6 +450,43 @@ int tsdb_migrate_import(tsdb_db_t *db, int fd,
         cols[i].type = (tsdb_type_t)get_u32(c + MIG_NAME_BYTES);
     }
 
+    /* SYMBOL dictionary section (v2). */
+    uint32_t nsym = 0;
+    {
+        uint8_t nb[4];
+        rc = read_all(fd, nb, 4, NULL);
+        if (rc != TSDB_OK) { free(cols); free(names); return rc; }
+        nsym = get_u32(nb);
+        if (nsym > (uint32_t)ncols) { free(cols); free(names); return TSDB_ERR_CORRUPT; }
+    }
+    uint32_t *sym_col  = nsym ? calloc(nsym, sizeof(*sym_col)) : NULL;
+    uint8_t **sym_buf  = nsym ? calloc(nsym, sizeof(*sym_buf)) : NULL;
+    size_t   *sym_len  = nsym ? calloc(nsym, sizeof(*sym_len)) : NULL;
+    if (nsym && (!sym_col || !sym_buf || !sym_len)) {
+        free(cols); free(names); free(sym_col); free(sym_buf); free(sym_len);
+        return TSDB_ERR_NOMEM;
+    }
+    for (uint32_t k = 0; k < nsym; k++) {
+        uint8_t hb[8];
+        rc = read_all(fd, hb, 8, NULL);
+        if (rc != TSDB_OK) goto sym_fail;
+        sym_col[k] = get_u32(hb);
+        uint32_t len = get_u32(hb + 4);
+        if (sym_col[k] >= (uint32_t)ncols || len > (64u << 20)) { rc = TSDB_ERR_CORRUPT; goto sym_fail; }
+        if (len) {
+            sym_buf[k] = malloc(len);
+            if (!sym_buf[k]) { rc = TSDB_ERR_NOMEM; goto sym_fail; }
+            rc = read_all(fd, sym_buf[k], len, NULL);
+            if (rc != TSDB_OK) goto sym_fail;
+            sym_len[k] = len;
+        }
+        continue;
+sym_fail:
+        for (uint32_t j = 0; j < nsym; j++) free(sym_buf[j]);
+        free(cols); free(names); free(sym_col); free(sym_buf); free(sym_len);
+        return rc;
+    }
+
     tsdb_table_internal_t *existing = tsdb_db_find_table(db, tname);
     if (existing && land == TSDB_MIG_CREATE_ONLY) { free(cols); free(names); return TSDB_ERR_EXISTS; }
     if (!existing) {
@@ -426,6 +513,48 @@ int tsdb_migrate_import(tsdb_db_t *db, int fd,
         tsdb_table_internal_t *tt = tsdb_db_find_table(db, tname);
         if (tt) tgt_schema = tsdb_tbl_schema(tt);
     }
+
+    /* Install the source dictionaries before any block lands.  The blocks carry
+     * CODES, so they are only meaningful against the dictionary that assigned
+     * them; the live symtab has to be replaced, not just the .sym file, because
+     * schema_save rewrites that file from memory at close.
+     *
+     * A target that ALREADY holds symbols for the column is refused: its codes
+     * were assigned by a different dictionary, and reconciling the two means
+     * decoding and re-encoding every block — which is exactly what this SDK
+     * exists to avoid.  Adopting into an empty dictionary is the safe case. */
+    for (uint32_t k = 0; k < nsym && tgt_schema && rc == TSDB_OK; k++) {
+        int ci = (int)sym_col[k];
+        if (ci >= tgt_schema->ncols ||
+            tgt_schema->cols[ci].type != TSDB_TYPE_SYMBOL) continue;
+        if (!sym_len[k]) continue;
+
+        if (tgt_schema->cols[ci].symtab &&
+            tsdb_symtab_size(tgt_schema->cols[ci].symtab) > 0) {
+            rc = TSDB_ERR_SCHEMA;   /* codes would collide — refuse, don't corrupt */
+            break;
+        }
+
+        char sp[4400];
+        snprintf(sp, sizeof(sp), "%s/%s.sym",
+                 tgt_schema->dir, tgt_schema->cols[ci].name);
+        FILE *sf = fopen(sp, "wb");
+        if (!sf) { rc = TSDB_ERR_IO; break; }
+        size_t w = fwrite(sym_buf[k], 1, sym_len[k], sf);
+        if (fflush(sf) != 0 || fsync(fileno(sf)) != 0) w = 0;
+        fclose(sf);
+        if (w != sym_len[k]) { rc = TSDB_ERR_IO; break; }
+
+        tsdb_symtab_t *loaded = NULL;
+        if (tsdb_symtab_load(sp, &loaded) != TSDB_OK || !loaded) {
+            rc = TSDB_ERR_CORRUPT; break;
+        }
+        tsdb_symtab_free(tgt_schema->cols[ci].symtab);
+        tgt_schema->cols[ci].symtab = loaded;
+    }
+    for (uint32_t k = 0; k < nsym; k++) free(sym_buf[k]);
+    free(sym_col); free(sym_buf); free(sym_len);
+    if (rc != TSDB_OK) return rc;
     mig_seen_t seen;
     memset(&seen, 0, sizeof(seen));
 

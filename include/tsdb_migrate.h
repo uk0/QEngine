@@ -38,7 +38,11 @@ extern "C" {
 #endif
 
 #define TSDB_MIG_MAGIC    0x314D5354u   /* "TSM1" */
-#define TSDB_MIG_VERSION  1u
+/* v2 adds the SYMBOL dictionary section.  v1 streams are rejected: they carry
+ * dictionary CODES with no dictionary, so a SYMBOL column imported from one
+ * decodes against the target's own (empty) table and every tag reads back
+ * wrong — measured as 0 rows for every tag value. */
+#define TSDB_MIG_VERSION  2u
 
 /* What to do when the target already holds the table. */
 typedef enum {
