@@ -493,8 +493,18 @@ static void *catalog_compact_thread(void *arg) {
     }
     int slept = 0;
     while (c->compact_running) {
-        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&ts, NULL);
+        /* Sleep the same one second per iteration, but in short slices with the
+         * stop flag re-checked between them.  A single 1 s nanosleep made
+         * tsdb_catalog_close's pthread_join block for up to a full second on
+         * EVERY close — a real shutdown stall, and one that also silently
+         * inflated every bench_ingest figure, since that bench times a region
+         * that includes tsdb_close (measured: a fixed ~1.00 s regardless of row
+         * count, i.e. up to 2x understated throughput). */
+        for (int i = 0; i < 20 && c->compact_running; i++) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+        if (!c->compact_running) break;
         if (++slept < interval_s) continue;
         slept = 0;
 
