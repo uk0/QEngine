@@ -135,15 +135,19 @@ static int is_partition_dir(const char *name) {
 
 /*
  * Write a BlockIndexEntry (IDX_ENTRY_SZ bytes) into buf.
- * Compaction currently does not compute per-column stats (it works on
- * raw bytes of already-compressed blocks), so the stats tail is zeroed
- * — stats_flags==0 signals absent to readers.  A future pass can fold
- * stats in during the decode/re-encode step.
+ *
+ * The stats tail used to be left zeroed here, which reads as "absent" — so a
+ * compacted partition lost zone-map skipping entirely and every aggregate over
+ * aged data fell back to decoding blocks.  We now stamp the same payload a
+ * flush would, computed by the canonical tsdb_part_compute_block_stats over the
+ * chunk we just re-encoded.  `stats` may be NULL (or all-zero for SYMBOL), in
+ * which case the tail stays zero and behaviour is exactly as before.
  */
 static void write_idx_entry(uint8_t *buf,
                             uint64_t offset, uint32_t size,
                             uint32_t count,
-                            int64_t ts_min, int64_t ts_max)
+                            int64_t ts_min, int64_t ts_max,
+                            const tsdb_block_meta_t *stats)
 {
     memset(buf, 0, IDX_ENTRY_SZ);
     put_u64le(buf + 0,  offset);
@@ -152,7 +156,14 @@ static void write_idx_entry(uint8_t *buf,
     put_i64le(buf + 16, ts_min);
     put_i64le(buf + 24, ts_max);
     put_u64le(buf + 32, 0);
-    /* bytes 40..87 already zero — stats_flags=0 means "absent" */
+    if (stats) {
+        put_i64le(buf + 40, stats->stats_min);
+        put_i64le(buf + 48, stats->stats_max);
+        put_i64le(buf + 56, stats->stats_sum);
+        put_i64le(buf + 64, stats->stats_first);
+        put_i64le(buf + 72, stats->stats_last);
+        put_u16le(buf + 80, stats->stats_flags);
+    }
 }
 
 /*
@@ -588,8 +599,12 @@ static int compact_column_file(const char *part_dir,
 
         /* Accumulate idx entry. */
         uint8_t *ep = idx_entries + new_block_count * IDX_ENTRY_SZ;
+        /* Stats over the values we just re-encoded, so a compacted partition
+         * keeps the zone-map skipping a freshly flushed one has. */
+        tsdb_block_meta_t bstats;
+        tsdb_part_compute_block_stats(col_type, chunk_ptr, chunk, &bstats);
         write_idx_entry(ep, col_offset, (uint32_t)comp_bytes,
-                        (uint32_t)chunk, blk_ts_min, blk_ts_max);
+                        (uint32_t)chunk, blk_ts_min, blk_ts_max, &bstats);
         new_block_count++;
 
         col_offset    += BLK_HDR_SZ + (uint64_t)comp_bytes

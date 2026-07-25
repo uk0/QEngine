@@ -703,6 +703,20 @@ static void compute_block_stats(tsdb_type_t type,
     }
 }
 
+/*
+ * Public wrapper over compute_block_stats — the ONE implementation of the V3
+ * stats payload, shared by the flush path and by compaction.  Compaction used
+ * to zero the payload, which silently disabled zone-map skipping on every
+ * compacted (i.e. every aged) partition; it must stamp byte-identical stats to
+ * a flush, so it calls this rather than growing a second copy that can drift.
+ */
+void tsdb_part_compute_block_stats(tsdb_type_t type, const void *raw_vals,
+                                   size_t count, tsdb_block_meta_t *out)
+{
+    compute_block_stats(type, raw_vals, count, out);
+}
+
+
 static int col_writer_write_block(col_writer_t *w,
                                   tsdb_type_t type,
                                   const void *raw_vals, size_t count,

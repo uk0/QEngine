@@ -190,6 +190,13 @@ int tsdb_part_idx_probe(const char *idx_path,
 typedef struct tsdb_part tsdb_part_t;
 
 /* Open a partition directory for reading. */
+/* Compute the V3 per-block stats payload (min/max/sum/first/last/flags) for a
+ * decoded column chunk.  Exposed so compaction stamps the SAME stats a flush
+ * would; SYMBOL and count==0 yield an all-zero payload (stats_flags == 0,
+ * meaning "absent"). */
+void tsdb_part_compute_block_stats(tsdb_type_t type, const void *raw_vals,
+                                   size_t count, tsdb_block_meta_t *out);
+
 int  tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out);
 
 /* Close a partition handle. */
