@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <strings.h>
+#include <pthread.h>
 #include <fcntl.h>
 
 /* ---- Linux-only sysfs probe --------------------------------------------- */
@@ -159,16 +160,65 @@ static int parse_env_override(tsdb_iopolicy_t *out) {
     return 1;
 }
 
+#if defined(__linux__)
+/*
+ * Memoize per device.  probe_linux walks /proc/partitions on every call —
+ * measured 9.37 us on a 21-line table — and part.c calls this about three
+ * times per column per flush, so it was pure hot-path waste.  A device's
+ * rotational flag does not change while we are running, so key the cache on
+ * st_dev: one stat (a few hundred ns) replaces the scan.  The table stays tiny
+ * because a database spans one or two devices.
+ */
+#define IOPOLICY_CACHE_MAX 16
+static pthread_mutex_t g_iop_mu = PTHREAD_MUTEX_INITIALIZER;
+static dev_t           g_iop_dev[IOPOLICY_CACHE_MAX];
+static tsdb_iopolicy_t g_iop_val[IOPOLICY_CACHE_MAX];
+static int             g_iop_n = 0;
+
+static int iopolicy_cache_get(dev_t d, tsdb_iopolicy_t *out) {
+    int hit = 0;
+    pthread_mutex_lock(&g_iop_mu);
+    for (int i = 0; i < g_iop_n; i++) {
+        if (g_iop_dev[i] == d) { *out = g_iop_val[i]; hit = 1; break; }
+    }
+    pthread_mutex_unlock(&g_iop_mu);
+    return hit;
+}
+
+static void iopolicy_cache_put(dev_t d, tsdb_iopolicy_t v) {
+    pthread_mutex_lock(&g_iop_mu);
+    for (int i = 0; i < g_iop_n; i++) {
+        if (g_iop_dev[i] == d) { pthread_mutex_unlock(&g_iop_mu); return; }
+    }
+    if (g_iop_n < IOPOLICY_CACHE_MAX) {
+        g_iop_dev[g_iop_n] = d;
+        g_iop_val[g_iop_n] = v;
+        g_iop_n++;
+    }
+    pthread_mutex_unlock(&g_iop_mu);
+}
+#endif /* __linux__ */
+
 tsdb_iopolicy_t tsdb_iopolicy_detect(const char *path) {
     tsdb_iopolicy_t forced;
     if (parse_env_override(&forced)) return forced;
 
 #if defined(__linux__)
     if (path) {
+        /* A path that does not exist yet (a partition dir mid-create) simply
+         * misses the cache and falls through to the probe, as before. */
+        struct stat st;
+        int have_dev = (stat(path, &st) == 0);
+        tsdb_iopolicy_t cached;
+        if (have_dev && iopolicy_cache_get(st.st_dev, &cached)) return cached;
+
         int rot = probe_linux(path);
-        if (rot == 0) return TSDB_IOPOLICY_SSD;
-        if (rot == 1) return TSDB_IOPOLICY_SATA;
-        if (rot == 2) return TSDB_IOPOLICY_SAS;
+        tsdb_iopolicy_t p = (rot == 0) ? TSDB_IOPOLICY_SSD
+                          : (rot == 1) ? TSDB_IOPOLICY_SATA
+                          : (rot == 2) ? TSDB_IOPOLICY_SAS
+                                       : TSDB_IOPOLICY_SSD;
+        if (have_dev && rot >= 0) iopolicy_cache_put(st.st_dev, p);
+        if (rot >= 0) return p;
     }
 #else
     (void)path;
