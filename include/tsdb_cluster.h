@@ -160,6 +160,19 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
                                          uint64_t best_count,
                                          int64_t  best_max_ts);
 
+/* Rows THIS node holds for `table_name`, and the newest ts among them
+ * (exposed for unit testing).
+ *
+ * Anti-entropy must not measure itself with `SELECT count(*) FROM <t>`: plain
+ * tables are mirrored as childless super-tables, so that query scatters and a
+ * node with no local rows gets back the CLUSTER-WIDE count — it then believes
+ * it is up to date and never pulls.  This counts partitions (ts.idx headers)
+ * plus an atomic memtable snapshot.  An empty table yields (0, INT64_MIN).
+ * Out-params may be NULL.  Returns TSDB_OK, or TSDB_ERR_* if the measurement
+ * could not be taken — callers must not guess on failure. */
+int tsdb_cluster_local_table_stats(tsdb_db_t *db, const char *table_name,
+                                   uint64_t *out_count, int64_t *out_max_ts);
+
 /* Partition-level backfill primitive (exposed for unit testing).
  *
  * Materialises `res` — every row of ONE partition, as pulled from a fuller

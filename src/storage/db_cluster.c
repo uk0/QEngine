@@ -23,6 +23,7 @@
 #include "../catalog/stable.h"
 #include "schema.h"
 #include "memtable.h"
+#include "part.h"    /* tsdb_part_idx_probe — local row/ts measurement */
 #include "../cluster/cluster.h"
 #include <strings.h> /* strcasecmp for TSDB_NODE_ROLE parsing */
 #include "../cluster/node.h"
@@ -1419,6 +1420,92 @@ out:
  *   - equal max_ts, best_count>local,
  *       local_count == 0                 -> FULL_PULL  (nothing to lose)
  *   - otherwise                          -> UP_TO_DATE */
+
+/*
+ * Count the rows THIS node actually holds for `table_name`, plus the newest
+ * timestamp among them.
+ *
+ * Anti-entropy cannot use `SELECT count(*), max(ts) FROM <t>` for this: every
+ * plain table is mirrored as a childless data-bearing super-table, so exec
+ * routes that query through exec_stable_select, and on a node holding no local
+ * rows the cluster-agg coordinator fires and returns the CLUSTER-WIDE total.
+ * The node would compare the cluster's number against its peers', find nothing
+ * higher, and never pull — staying empty forever while believing it is current.
+ *
+ * Disk rows come from each partition's ts.idx header (total_rows + file_ts_max,
+ * the same fields the reader trusts).  Memtable rows are added from an atomic
+ * snapshot, so an un-flushed tail counts too and max_ts is never understated —
+ * understating it would make the tail pull re-fetch rows we already hold.
+ *
+ * An empty table yields (0, INT64_MIN), which tsdb_antientropy_decide maps to
+ * TAIL_PULL/FULL_PULL against any populated peer.  Returns TSDB_ERR_* only when
+ * the measurement itself could not be taken; callers must not guess on failure.
+ */
+int tsdb_cluster_local_table_stats(tsdb_db_t *db, const char *table_name,
+                                   uint64_t *out_count, int64_t *out_max_ts)
+{
+    if (!db || !table_name) return TSDB_ERR_INVAL;
+
+    uint64_t total = 0;
+    int64_t  maxts = INT64_MIN;
+
+    /* ---- durable rows: one ts.idx header per partition ---- */
+    int ndirs = tsdb_db_data_dir_count(db);
+    for (int i = 0; i < ndirs; i++) {
+        const char *dd = tsdb_db_data_dir_at(db, i);
+        if (!dd) continue;
+        char tdir[4096];
+        snprintf(tdir, sizeof(tdir), "%s/%s", dd, table_name);
+        DIR *d = opendir(tdir);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;      /* ., .., .trash */
+            char idx_path[5200];
+            snprintf(idx_path, sizeof(idx_path), "%s/%s/ts.idx", tdir, e->d_name);
+            uint64_t rows = 0;
+            int64_t  fmax = INT64_MIN;
+            /* Returns the header size on success; 0 = absent/short, -1 =
+             * corrupt.  Skip anything that is not a readable partition idx
+             * (schema.bin and friends land here too). */
+            if (tsdb_part_idx_probe(idx_path, NULL, NULL, NULL, &rows,
+                                    NULL, &fmax, NULL) <= 0)
+                continue;
+            total += rows;
+            if (rows > 0 && fmax > maxts) maxts = fmax;
+        }
+        closedir(d);
+    }
+
+    /* ---- un-flushed rows still in the memtable ---- */
+    tsdb_table_internal_t *ti = tsdb_db_find_table(db, table_name);
+    if (ti) {
+        tsdb_memtable_t *mt = tsdb_tbl_memtable(ti);
+        tsdb_schema_t   *ms = tsdb_tbl_schema(ti);
+        if (mt && ms && ms->ncols > 0) {
+            void **bufs = calloc((size_t)ms->ncols, sizeof(void *));
+            if (!bufs) return TSDB_ERR_NOMEM;
+            size_t nr = 0;
+            if (tsdb_memtable_snapshot(mt, bufs, &nr) == TSDB_OK && nr > 0) {
+                const int64_t *ts = (const int64_t *)bufs[0];   /* ts is col 0 */
+                total += (uint64_t)nr;
+                /* Scan rather than take ts[nr-1]: a memtable accepting
+                 * out-of-order rows is not necessarily ts-sorted. */
+                if (ts) {
+                    for (size_t k = 0; k < nr; k++)
+                        if (ts[k] > maxts) maxts = ts[k];
+                }
+            }
+            for (int c = 0; c < ms->ncols; c++) free(bufs[c]);
+            free(bufs);
+        }
+    }
+
+    if (out_count)  *out_count  = total;
+    if (out_max_ts) *out_max_ts = maxts;
+    return TSDB_OK;
+}
+
 tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
                                          int64_t  local_max_ts,
                                          uint64_t best_count,
@@ -1464,21 +1551,19 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         tsdb_cluster_broadcast_delete_range(db, table_name, wm, 1, 0, &a, &tot);
     }
 
+    /* Measure OUR OWN rows, not the cluster's.  `SELECT count(*) FROM <t>` is
+     * not a local measurement here: hierarchy mirroring registers every plain
+     * table as a childless data-bearing super-table, so exec routes it through
+     * exec_stable_select, and for a node with no local rows the cluster-agg
+     * coordinator fires and answers with the CLUSTER-WIDE total.  The node then
+     * compares that against its peers, concludes it is already up to date, and
+     * never pulls — the table stays empty here forever.  Anti-entropy has to
+     * count what is actually on THIS node. */
     uint64_t local_count = 0;
     int64_t  local_max_ts = 0;
-    {
-        char qtl[256];
-        snprintf(qtl, sizeof(qtl),
-                 "SELECT count(*), max(ts) FROM %s", table_name);
-        tsdb_result_t *res = NULL;
-        if (tsdb_query(db, qtl, &res) == TSDB_OK && res &&
-            tsdb_result_next(res))
-        {
-            local_count  = (uint64_t)tsdb_result_i64(res, 0);
-            local_max_ts = tsdb_result_ts(res, 1);
-        }
-        if (res) tsdb_result_free(res);
-    }
+    if (tsdb_cluster_local_table_stats(db, table_name,
+                                       &local_count, &local_max_ts) != TSDB_OK)
+        return TSDB_OK;   /* cannot measure ourselves — never guess, never pull */
 
     /* Find the peer with the highest (count, max_ts). */
     tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
