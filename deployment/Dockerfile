@@ -49,8 +49,13 @@ ARG ARCH="-O2 -g -fno-omit-frame-pointer"
 #   docker build --build-arg CC_BIN=clang -t qengine/tsdb:dev .
 ARG CC_BIN=gcc
 
+# TSDB_NO_AVX2_FILTER is deliberately NOT set: the AVX2 predicate kernels now
+# build on gcc/clang alike (one kernel per comparison predicate, so the
+# _mm256_cmp_pd immediate is a literal), and they are 3-14x faster than the
+# scalar fallback this image used to ship.  Selection is still a runtime CPU
+# check, so a non-AVX2 host keeps working.
 RUN make CC=${CC_BIN} \
-         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" \
+         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE" \
          tcp_cli server_cli cluster_node
 
 # -----------------------------------------------------------------------------

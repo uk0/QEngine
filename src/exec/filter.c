@@ -253,63 +253,88 @@ static int filter_u32_eq_neon(const uint32_t *v, size_t n, uint32_t rhs,
  * === AVX2 KERNELS ===  (x86-64 only)
  *
  * Compile-out escape hatch: -DTSDB_NO_AVX2_FILTER skips these kernels
- * entirely so the scalar path remains.  Needed on toolchains (alpine
- * clang-17, alpine gcc-13) where constant-propagation through the
- * avx2_pred helper fails and _mm256_cmp_pd rejects the runtime `pred`.
+ * entirely so the scalar path remains.  It used to be REQUIRED — the f64
+ * kernels read their compare predicate out of a helper into a local, which
+ * only builds where the compiler happens to constant-fold it back before the
+ * intrinsic; gcc rejects it outright.  Every deployment image therefore set
+ * the flag and shipped scalar filtering.  The kernels below are now emitted
+ * one per predicate, so the immediate is always a literal and no toolchain
+ * needs the hatch; it is kept only as a debugging switch.
  * --------------------------------------------------------------------- */
 #if (defined(__x86_64__) || defined(__i386__)) && !defined(TSDB_NO_AVX2_FILTER)
 #include <immintrin.h>
 
-static inline __attribute__((target("avx2"))) int avx2_pred(tsdb_cmp_t op) {
-    switch (op) {
-    case TSDB_CMP_EQ: return _CMP_EQ_OQ;
-    case TSDB_CMP_NE: return _CMP_NEQ_OQ;
-    case TSDB_CMP_LT: return _CMP_LT_OQ;
-    case TSDB_CMP_LE: return _CMP_LE_OQ;
-    case TSDB_CMP_GT: return _CMP_GT_OQ;
-    case TSDB_CMP_GE: return _CMP_GE_OQ;
-    default:          return _CMP_FALSE_OQ;
-    }
+/*
+ * _mm256_cmp_pd's predicate must be a compile-time immediate.  Reading it out
+ * of a helper into a local and passing that compiles only on toolchains that
+ * happen to constant-fold it after inlining; gcc rejects it outright ("the last
+ * argument must be a 5-bit immediate").  That is why the whole AVX2 filter set
+ * used to be switched off with -DTSDB_NO_AVX2_FILTER — which every deployment
+ * image does (deployment/Dockerfile), so production has been filtering doubles
+ * with the scalar path.
+ *
+ * Emit one kernel per predicate instead: PRED is then a literal at every
+ * intrinsic, which every compiler accepts, and the dispatch below is a single
+ * branch per block rather than per value.
+ */
+#define GEN_FILTER_F64_AVX2(NAME, PRED)                                        \
+__attribute__((target("avx2")))                                                \
+static int NAME(const double *v, size_t n, tsdb_cmp_t op,                      \
+                double rhs, uint64_t *bm) {                                    \
+    __m256d r   = _mm256_set1_pd(rhs);                                         \
+    size_t nw   = (n + 63) / 64;                                               \
+                                                                               \
+    for (size_t w = 0; w < nw; w++) {                                          \
+        uint64_t pass = 0;                                                     \
+        size_t base = w * 64;                                                  \
+        size_t end  = base + 64 < n ? base + 64 : n;                           \
+        size_t i    = base;                                                    \
+                                                                               \
+        /* Load 16 doubles / iter = 4 x _mm256_cmp_pd -> 4 x 4-bit mask */     \
+        for (; i + 15 < end; i += 16) {                                        \
+            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);                       \
+            uint64_t m0 = (uint64_t)(unsigned)_mm256_movemask_pd(              \
+                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  0), r, (PRED)));        \
+            uint64_t m1 = (uint64_t)(unsigned)_mm256_movemask_pd(              \
+                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  4), r, (PRED)));        \
+            uint64_t m2 = (uint64_t)(unsigned)_mm256_movemask_pd(              \
+                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  8), r, (PRED)));        \
+            uint64_t m3 = (uint64_t)(unsigned)_mm256_movemask_pd(              \
+                _mm256_cmp_pd(_mm256_loadu_pd(v + i + 12), r, (PRED)));        \
+            pass |= (m0 | (m1 << 4) | (m2 << 8) | (m3 << 12)) << (i - base);   \
+        }                                                                      \
+        for (; i + 3 < end; i += 4) {                                          \
+            uint64_t m = (uint64_t)(unsigned)_mm256_movemask_pd(               \
+                _mm256_cmp_pd(_mm256_loadu_pd(v + i), r, (PRED)));             \
+            pass |= m << (i - base);                                           \
+        }                                                                      \
+        for (; i < end; i++)                                                   \
+            if (cmp_f64(v[i], rhs, op))                                        \
+                pass |= (uint64_t)1 << (i - base);                             \
+        bm[w] &= pass;                                                         \
+    }                                                                          \
+    return TSDB_OK;                                                            \
 }
 
+GEN_FILTER_F64_AVX2(filter_f64_avx2_eq, _CMP_EQ_OQ)
+GEN_FILTER_F64_AVX2(filter_f64_avx2_ne, _CMP_NEQ_OQ)
+GEN_FILTER_F64_AVX2(filter_f64_avx2_lt, _CMP_LT_OQ)
+GEN_FILTER_F64_AVX2(filter_f64_avx2_le, _CMP_LE_OQ)
+GEN_FILTER_F64_AVX2(filter_f64_avx2_gt, _CMP_GT_OQ)
+GEN_FILTER_F64_AVX2(filter_f64_avx2_ge, _CMP_GE_OQ)
+
 /* AVX2 f64: load 16 doubles per word iteration (4 per SIMD op × 4 ops) */
-__attribute__((target("avx2")))
 static int filter_f64_avx2(const double *v, size_t n, tsdb_cmp_t op,
                             double rhs, uint64_t *bm) {
-    __m256d r   = _mm256_set1_pd(rhs);
-    int pred    = avx2_pred(op);
-    size_t nw   = (n + 63) / 64;
-
-    for (size_t w = 0; w < nw; w++) {
-        uint64_t pass = 0;
-        size_t base = w * 64;
-        size_t end  = base + 64 < n ? base + 64 : n;
-        size_t i    = base;
-
-        /* Load 16 doubles / iter = 4 × _mm256_cmp_pd → 4 × 4-bit mask */
-        for (; i + 15 < end; i += 16) {
-            __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            uint64_t m0 = (uint64_t)(unsigned)_mm256_movemask_pd(
-                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  0), r, pred));
-            uint64_t m1 = (uint64_t)(unsigned)_mm256_movemask_pd(
-                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  4), r, pred));
-            uint64_t m2 = (uint64_t)(unsigned)_mm256_movemask_pd(
-                _mm256_cmp_pd(_mm256_loadu_pd(v + i +  8), r, pred));
-            uint64_t m3 = (uint64_t)(unsigned)_mm256_movemask_pd(
-                _mm256_cmp_pd(_mm256_loadu_pd(v + i + 12), r, pred));
-            pass |= (m0 | (m1 << 4) | (m2 << 8) | (m3 << 12)) << (i - base);
-        }
-        for (; i + 3 < end; i += 4) {
-            uint64_t m = (uint64_t)(unsigned)_mm256_movemask_pd(
-                _mm256_cmp_pd(_mm256_loadu_pd(v + i), r, pred));
-            pass |= m << (i - base);
-        }
-        for (; i < end; i++)
-            if (cmp_f64(v[i], rhs, op))
-                pass |= (uint64_t)1 << (i - base);
-        bm[w] &= pass;
+    switch (op) {
+    case TSDB_CMP_EQ: return filter_f64_avx2_eq(v, n, op, rhs, bm);
+    case TSDB_CMP_NE: return filter_f64_avx2_ne(v, n, op, rhs, bm);
+    case TSDB_CMP_LT: return filter_f64_avx2_lt(v, n, op, rhs, bm);
+    case TSDB_CMP_LE: return filter_f64_avx2_le(v, n, op, rhs, bm);
+    case TSDB_CMP_GT: return filter_f64_avx2_gt(v, n, op, rhs, bm);
+    case TSDB_CMP_GE: return filter_f64_avx2_ge(v, n, op, rhs, bm);
+    default:          return filter_f64_scalar(v, n, op, rhs, bm);
     }
-    return TSDB_OK;
 }
 
 __attribute__((target("avx2")))

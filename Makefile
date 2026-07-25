@@ -199,9 +199,14 @@ bench: $(BENCH_BINS)
 	  echo "--- $$b ---"; $$b; \
 	done
 
-build/bench/%: bench/%.c $(OBJS)
+# Five benches drive a server over the wire protocol (bench_docker_cluster,
+# lat_probe, load_cluster, verify_count, enospc_writer) and need frame_send /
+# frame_recv from cli/tsdb_wire.c.  Linking it into every bench is harmless —
+# unused objects contribute no symbols — and keeps one rule instead of five.
+# Without it `make bench` died on the first wire bench and never built the rest.
+build/bench/%: bench/%.c $(OBJS) $(WIRE_OBJ)
 	@mkdir -p build/bench
-	@$(CC) $(CFLAGS) -o $@ $< $(OBJS) $(LDFLAGS)
+	@$(CC) $(CFLAGS) -Icli -o $@ $< $(OBJS) $(WIRE_OBJ) $(LDFLAGS)
 	@echo "LD  $@"
 
 cli: $(CLI_BIN)

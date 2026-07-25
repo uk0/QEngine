@@ -29,8 +29,11 @@ COPY . .
 RUN find . -name '*.o' -delete && rm -rf build
 
 ARG ARCH="-O2 -g -fno-omit-frame-pointer"
+# See deployment/Dockerfile: TSDB_NO_AVX2_FILTER is no longer needed now that
+# the AVX2 predicate kernels compile under gcc, and dropping it is a 3-14x win
+# on f64/i64 filtering.
 RUN make CC=gcc \
-         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE -DTSDB_NO_AVX2_FILTER" \
+         CFLAGS="${ARCH} -std=gnu11 -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -Wno-error -Iinclude -D_GNU_SOURCE" \
          cluster_node server_cli
 
 FROM scratch AS out
