@@ -1,11 +1,38 @@
 /* test_enospc.c — disk-full / write-failure durability contract.
  *
- * tsdb has no WAL replay (the WAL is vestigial — see wal.c: tsdb_wal_replay
- * has zero callers and only a 4-byte commit marker is ever appended).
- * Durability instead comes from tsdb_part_flush_ex on every batch_commit:
- * rows are "acked" once the partition flush publishes the ts.idx manifest
- * via atomic temp+rename.  flush_and_clear_locked only clears the memtable
- * and truncates the WAL when that flush returns TSDB_OK.
+ * THE CONTRACT (one rule, two modes):
+ *   A commit that returns TSDB_OK means the rows are on stable storage and
+ *   come back after a crash with no graceful close.  A write that cannot get
+ *   them there must return a clean error and must leave every live file
+ *   byte-identical — never a partial publish, never a silent success.
+ *
+ * The engine has two durability modes and they put that ack at DIFFERENT
+ * writes, so a disk-full injection reaches them at different calls:
+ *
+ *   flush-on-commit (default)   tsdb_batch_commit runs the partition flush
+ *                               itself; rows are acked once tsdb_part_flush_ex
+ *                               publishes the ts.idx manifest via atomic
+ *                               temp+rename.  The COMMIT is the write.
+ *
+ *   deferred flush              TSDB_WAL_ONLY_COMMIT=1, and auto-enabled at
+ *                               open for a rotational/sata iopolicy — i.e. the
+ *                               cluster's configuration.  tsdb_batch_commit
+ *                               appends a redo record to <data_dir>/wal/ and
+ *                               fsyncs it; the rows reach a partition later on
+ *                               a size/idle/close flush and are rebuilt from
+ *                               the redo log by redo_recover_table on reopen.
+ *                               The WAL APPEND is the write that must fail on
+ *                               a full disk (phase [11]); the partition write
+ *                               is the later flush, which must report its own
+ *                               failure rather than swallow it (phases [2a],
+ *                               [6], [7]).
+ *
+ * Every phase below therefore asserts against "the call that writes the
+ * partition in this mode", obtained by following each commit with
+ * tsdb_db_flush_all() where the mode defers it — a no-op under flush-on-commit,
+ * since the memtable is already empty.  Phase [10] pins the two modes to the
+ * same promise from the outside: it crashes a child process and asserts the
+ * row count implied by what that child was ACKED.
  *
  * This test forces the partition flush to fail (by making the data/table/
  * partition dir read-only, so col_writer_open's fopen / mkdir / idx
@@ -44,6 +71,18 @@
  *       reads back as "no delete ever happened" and anti-entropy stops
  *       re-asserting the delete.
  *
+ * Phases [10]-[11] cover the ack itself rather than a single write:
+ *  [10] acked => durable, from OUTSIDE the process: a child commits, is told
+ *       yes or no, then _exit()s without tsdb_close (so nothing is flushed on
+ *       the way out), and the parent asserts the row count that answer
+ *       implies.  Runs in both modes and names neither.
+ *  [11] src/storage/db.c redo_log_locked / wal.c — deferred flush only, since
+ *       flush-on-commit never takes this path.  A commit whose redo record
+ *       cannot be made durable must FAIL, and must leave the log
+ *       byte-identical: commit_seq is only advanced on success, so a record
+ *       left live carries a seq the next commit re-uses, and replay applies
+ *       both — duplicating every row they overlap on.
+ *
  * Skips gracefully (exit 0) if run as root, since root bypasses the
  * read-only permission check and the injection would not fire.
  */
@@ -62,6 +101,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <utime.h>
 
@@ -70,6 +110,13 @@
 #define OK(rc)    do { int _r=(rc); if (_r!=TSDB_OK) \
     FAIL("rc=%d (%s)", _r, tsdb_errstr(_r)); } while (0)
 #define ASSERT(c) do { if (!(c)) FAIL("%s", #c); } while (0)
+
+/* Deferred-flush mode (TSDB_WAL_ONLY_COMMIT=1, or auto-enabled for a
+ * rotational/sata iopolicy).  Read from the DB, not from getenv, because the
+ * iopolicy can turn it on with no env var set — and because the mode is the
+ * PREMISE of each phase, never its assertion: if the engine regressed the
+ * assertions below must fail, not quietly select the other branch. */
+static int g_deferred = 0;
 
 static void rm_rf(const char *p) {
     DIR *d = opendir(p);
@@ -203,6 +250,12 @@ static void p8_seed(const char *dbdir, tsdb_db_t **out_db) {
             OK(tsdb_batch_row_end(bt));
         }
         OK(tsdb_batch_commit(bt));
+        /* One on-disk block per commit — that is what gives the compactor
+         * P8_BLK blocks to merge, and it is the phase's precondition, not
+         * something it may discover.  Under flush-on-commit the commit already
+         * published it and this is a no-op on an empty memtable; under
+         * deferred flush the commit only fsynced a redo record, so drain it. */
+        OK(tsdb_db_flush_all(db));
     }
     *out_db = db;
 }
@@ -358,6 +411,10 @@ static void phase9_delwm(void) {
     OK(try_insert(db, "d", 50, D1,           10));
     OK(try_insert(db, "d", 50, D1 + DAY,     20));
     OK(try_insert(db, "d", 50, D1 + 2 * DAY, 30));
+    /* tsdb_delete_range drops partition DIRS, so the three days have to BE on
+     * disk for the first delete to be a real delete and not a watermark bump
+     * over nothing.  No-op under flush-on-commit. */
+    OK(tsdb_db_flush_all(db));
 
     int removed = 0;
     OK(tsdb_delete_range(db, "d", D1 + DAY, /*op_lt*/1, /*inclusive*/0, &removed));
@@ -392,6 +449,155 @@ static void phase9_delwm(void) {
     printf("[9] OK\n");
 }
 
+/* ===== Phase [10]: acked => durable, observed from outside the process =====
+ *
+ * The two modes make an ack durable by different means — flush-on-commit
+ * publishes the partition manifest before returning, deferred flush fsyncs the
+ * redo record before returning — but they promise the same thing, and this
+ * phase states it without naming either one.
+ *
+ * A child writes one batch that must succeed, then a second one under a
+ * read-only table dir, then _exit()s.  No tsdb_close, so nothing is flushed on
+ * the way out, no memtable is drained and no WAL is truncated: whatever the
+ * parent reads back is exactly what the ack had already made durable.  The
+ * child reports the SECOND commit's answer through its exit status and the
+ * parent asserts the row count that answer implies — acked rows must ALL be
+ * there, refused rows must not be.  Under deferred flush that is the proof
+ * that a commit acked over an unwritable partition dir was not a lie; under
+ * flush-on-commit it is the proof that the refusal was not a silent loss of
+ * the earlier durable batch.
+ */
+static void phase10_crash_durability(void) {
+    const char *pdir = "/tmp/tsdb_test_enospc_crash";
+    rm_rf(pdir);
+
+    const int64_t D   = 1735689600LL * 1000000000LL;   /* 2025-01-01 */
+    const int64_t DAY = 86400LL * 1000000000LL;
+    const int     NC  = 500;
+
+    char tdir[4096];
+    snprintf(tdir, sizeof(tdir), "%s/x", pdir);
+
+    fflush(NULL);                       /* no buffered output into the child */
+    pid_t pid = fork();
+    if (pid < 0) FAIL("[10] fork");
+    if (pid == 0) {
+        tsdb_db_t *c = NULL;
+        tsdb_col_t cc[] = {
+            { "ts", TSDB_TYPE_TIMESTAMP },
+            { "v",  TSDB_TYPE_INT64     },
+        };
+        if (tsdb_open(pdir, &c) != TSDB_OK)                    _exit(90);
+        if (tsdb_create_table(c, "x", cc, 2, "ts") != TSDB_OK) _exit(91);
+        if (try_insert(c, "x", NC, D, 1) != TSDB_OK)           _exit(92);
+        if (chmod(tdir, 0500) != 0)                            _exit(93);
+        int rc = try_insert(c, "x", NC, D + DAY, 2);
+        /* CRASH HERE: no tsdb_close — no final flush, no WAL truncate. */
+        _exit(rc == TSDB_OK ? 0 : 1);
+    }
+
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) FAIL("[10] child died");
+    int acked = WEXITSTATUS(st);
+    if (acked > 1) FAIL("[10] child setup failed at step %d", acked);
+    if (chmod(tdir, 0700) != 0) FAIL("[10] chmod 0700 %s", tdir);
+
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(pdir, &db));
+    int got  = count_rows(db, "SELECT v FROM x");
+    int want = (acked == 0) ? 2 * NC : NC;
+    printf("[10] child %s the 2nd commit; after crash + reopen count=%d "
+           "(expect %d)\n", acked == 0 ? "ACKED" : "REFUSED", got, want);
+    ASSERT(got == want);
+    tsdb_close(db);
+    rm_rf(pdir);
+    printf("[10] OK\n");
+}
+
+/* ===== Phase [11]: a commit that cannot log its rows must refuse ============
+ *
+ * Deferred flush moves the ack onto <data_dir>/wal/<table>.log, and nothing
+ * else in this file reaches a write failure THERE — phases [2]/[6]/[7] all
+ * land on partition writes, which a wal-only commit never performs.  A full
+ * disk hits the log first, and the commit must refuse rather than ack a record
+ * that never made it to stable storage.
+ *
+ * Injection: RLIMIT_FSIZE pinned PAST the log's current length but short of
+ * one more record, so the next append is a genuine SHORT write (EFBIG — the
+ * same clean errno path as ENOSPC) rather than a refused one: the header
+ * lands, the payload does not.  A cap at exactly the current length would be
+ * rejected whole by the kernel and would never exercise the rollback.
+ * Asserts (a) the commit fails and (b) the log is left byte-identical.  (b) is
+ * not cosmetic: redo_log_locked only advances commit_seq after a successful
+ * append+fsync, so a record left live carries a seq the NEXT commit re-uses,
+ * and replay applies both records — duplicating every row they overlap on.
+ *
+ * Flush-on-commit does not run this path at all (its first write is the
+ * partition, pinned by [7]); the phase reports that instead of asserting on a
+ * code path the mode does not have.
+ */
+static void phase11_wal_full(void) {
+    if (!g_deferred) {
+        printf("[11] flush-on-commit: a commit performs no wal-only append; "
+               "the same rule on its first write is phase [7].\n");
+        return;
+    }
+
+    const char *pdir = "/tmp/tsdb_test_enospc_walfull";
+    rm_rf(pdir);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(pdir, &db));
+    tsdb_col_t cols[] = {
+        { "ts", TSDB_TYPE_TIMESTAMP },
+        { "v",  TSDB_TYPE_INT64     },
+    };
+    OK(tsdb_create_table(db, "w", cols, 2, "ts"));
+
+    const int64_t D = 1767225600LL * 1000000000LL;   /* 2026-01-01 UTC */
+    const int     NW = 100;
+    OK(try_insert(db, "w", NW, D, 1));
+
+    char wp[4096];
+    snprintf(wp, sizeof(wp), "%s/wal/w.log", pdir);
+    off_t    wsz = file_size(wp);
+    uint64_t wdg = file_digest(wp);
+    /* Loudly, not quietly: if an acked wal-only commit ever stops writing the
+     * log, the cap below would cap nothing and the phase would pass for the
+     * wrong reason — and the ack would have had no durable record behind it. */
+    if (wsz <= 0 || wdg == 0)
+        FAIL("[11] an acked wal-only commit left %s empty — nothing backs the ack",
+             wp);
+    printf("[11] redo log after one acked commit: %lld bytes\n", (long long)wsz);
+
+    /* Second commit logs a record of the same shape, so half of one lands
+     * inside the cap and half does not. */
+    off_t cap = wsz + wsz / 2;
+    struct rlimit saved;
+    fsize_cap((rlim_t)cap, &saved);
+    int rc = try_insert(db, "w", NW, D + NW, 2);
+    fsize_uncap(&saved);
+
+    printf("[11] commit with the redo log capped at %lld returned rc=%d (%s); "
+           "log %lld -> %lld bytes\n", (long long)cap, rc, tsdb_errstr(rc),
+           (long long)wsz, (long long)file_size(wp));
+    ASSERT(rc != TSDB_OK);                 /* never ack an unlogged commit */
+    ASSERT(file_digest(wp) == wdg);        /* no half record left under a
+                                            * seq the next commit re-uses  */
+
+    /* Not wedged: with room again the rows commit, and the refused batch is
+     * still in the memtable, so a clean close drains all three exactly once. */
+    OK(try_insert(db, "w", NW, D + 2 * NW, 3));
+    tsdb_close(db);
+    db = NULL;
+    OK(tsdb_open(pdir, &db));
+    int n = count_rows(db, "SELECT v FROM w");
+    printf("[11] after close + reopen count=%d (expect %d)\n", n, 3 * NW);
+    ASSERT(n == 3 * NW);
+    tsdb_close(db);
+    rm_rf(pdir);
+    printf("[11] OK\n");
+}
+
 int main(void) {
     if (geteuid() == 0) {
         printf("test_enospc: running as root — read-only injection cannot fire, "
@@ -409,6 +615,10 @@ int main(void) {
 
     tsdb_db_t *db = NULL;
     OK(tsdb_open(dir, &db));
+    g_deferred = tsdb_db_wal_only_commit(db);
+    printf("[0] durability mode: %s\n", g_deferred
+           ? "deferred flush (commit = redo append + fsync)"
+           : "flush-on-commit (commit = partition publish)");
 
     tsdb_col_t cols[] = {
         { "ts", TSDB_TYPE_TIMESTAMP },
@@ -429,7 +639,24 @@ int main(void) {
      * table dir (not the data root).  The next commit targets a DIFFERENT
      * day, so the flush must mkdir a brand-new partition dir under a 0500
      * table dir -> EACCES — the same clean errno path an ENOSPC mid-flush
-     * takes (col_writer_open's fopen / tsdb_mkdir_p both fail with errno). */
+     * takes (col_writer_open's fopen / tsdb_mkdir_p both fail with errno).
+     *
+     * WHICH call has to report that depends on where the mode puts the ack,
+     * and this injection blocks only the partition write:
+     *   flush-on-commit — the commit IS the partition write, so the COMMIT
+     *                     must fail;
+     *   deferred flush  — the commit is a redo append + fsync under
+     *                     <data_dir>/wal/, which a read-only TABLE dir does
+     *                     not touch.  The rows really are on stable storage,
+     *                     so TSDB_OK is honest, not a lie — phase [10] kills
+     *                     a process mid-flight to prove they come back.  The
+     *                     partition write is the deferred flush, and THAT is
+     *                     what must not swallow the error: tsdb_db_flush_all
+     *                     returning TSDB_OK here is the same lie, one call
+     *                     later, and it is the only "put my rows on disk now"
+     *                     entry point there is.
+     * Same rule either way: the call that writes the partition fails, and no
+     * call claims a write it did not perform. */
     char tbl_dir[4096];
     snprintf(tbl_dir, sizeof(tbl_dir), "%s/%s", dir, "t");
     if (chmod(tbl_dir, 0500) != 0) FAIL("chmod 0500 on table dir failed");
@@ -439,7 +666,15 @@ int main(void) {
     int rc_fail = try_insert(db, "t", N2, DAY2, 200);
     printf("[2] commit under read-only table dir returned rc=%d (%s)\n",
            rc_fail, tsdb_errstr(rc_fail));
-    ASSERT(rc_fail != TSDB_OK);   /* clean error, no crash/abort */
+    if (!g_deferred) {
+        ASSERT(rc_fail != TSDB_OK);   /* clean error, no crash/abort */
+    } else {
+        ASSERT(rc_fail == TSDB_OK);   /* redo record fsynced: honest ack */
+        int rc_flush = tsdb_db_flush_all(db);
+        printf("[2a] deferred flush under read-only table dir returned "
+               "rc=%d (%s)\n", rc_flush, tsdb_errstr(rc_flush));
+        ASSERT(rc_flush != TSDB_OK);  /* the partition write must be reported */
+    }
 
     /* ---- Phase 3: no corruption — prior data intact, failed rows linger. ----
      * On a failed flush, flush_and_clear_locked does NOT clear the memtable
@@ -448,9 +683,11 @@ int main(void) {
      * (no silent loss; the next successful commit re-flushes them).  The
      * critical correctness property is that the EARLIER durable N1 rows are
      * untouched and nothing is corrupted: count == N1 + N2, never < N1,
-     * never garbage. */
+     * never garbage.  (Under deferred flush both batches sit in the memtable
+     * and both are redo-durable; the count and the reason it must hold are
+     * the same.) */
     int mid = count_rows(db, "SELECT v FROM t");
-    printf("[3] after failed flush, live count=%d (durable N1=%d retained-in-mem N2=%d)\n",
+    printf("[3] after failed flush, live count=%d (N1=%d + retained N2=%d)\n",
            mid, N1, N2);
     ASSERT(mid >= N1);            /* prior durable data never lost */
     ASSERT(mid == N1 + N2);       /* failed-flush rows retained in memtable */
@@ -459,10 +696,10 @@ int main(void) {
      * tsdb_close() flushes pending memtable rows, so once writes are possible
      * again a clean close+reopen surfaces N1 + N2 — the failed-flush rows are
      * NOT lost, they were retried on close.  (The un-acked-rows-lost boundary
-     * applies only to a hard CRASH with no graceful close, since there is no
-     * WAL replay; that path is covered by the Docker SIGKILL recovery test.)
-     * The correctness property here: exactly N1 + N2, no duplication, no
-     * corruption. */
+     * applies only to a hard CRASH with no graceful close — under
+     * flush-on-commit nothing replays those rows, under deferred flush the
+     * redo log does; phase [10] pins both.)  The correctness property here:
+     * exactly N1 + N2, no duplication, no corruption. */
     if (chmod(tbl_dir, 0700) != 0) FAIL("chmod 0700 on table dir failed");
     tsdb_close(db);
     db = NULL;
@@ -510,6 +747,15 @@ int main(void) {
     const int N4 = 300;
     if (chmod(p1_dir, 0500) != 0) FAIL("chmod 0500 on partition dir failed");
     int rc_app = try_insert(db, "t", N4, DAY1b, 90000);   /* append -> flush fails */
+    if (g_deferred) {
+        /* The .col append this phase guards happens in the flush, and under
+         * deferred flush the commit is not it — the commit only fsynced a redo
+         * record, which the read-only PARTITION dir does not touch.  Drive the
+         * partition write and assert on that instead; the .col rollback
+         * requirement below is identical. */
+        ASSERT(rc_app == TSDB_OK);
+        rc_app = tsdb_db_flush_all(db);
+    }
     if (chmod(p1_dir, 0700) != 0) FAIL("chmod 0700 on partition dir failed");
     off_t sz_after = file_size(vcol);
     printf("[6b] failed append rc=%d (%s); v.col size after = %lld (expect == %lld)\n",
@@ -551,8 +797,14 @@ int main(void) {
     };
     OK(tsdb_create_table(db, "t7", cols7, 2, "ts"));
     const int64_t D7 = 1767225600LL * 1000000000LL;   /* 2026-01-01 UTC */
-    for (int k = 0; k < K7; k++)
+    for (int k = 0; k < K7; k++) {
         OK(try_insert(db, "t7", B7, D7 + (int64_t)k * B7, 1));
+        /* One manifest entry per commit is the whole injection: it is what
+         * makes the .idx outgrow the .col so a cap can land between them.
+         * No-op under flush-on-commit (empty memtable); under deferred flush
+         * the commit published nothing, so drain it. */
+        OK(tsdb_db_flush_all(db));
+    }
 
     char p7[4][4096];
     snprintf(p7[0], sizeof(p7[0]), "%s/t7/20260101/ts.col", dir);
@@ -578,6 +830,12 @@ int main(void) {
     struct rlimit saved7;
     fsize_cap((rlim_t)(max_col + 4096), &saved7);
     int rc7 = try_insert(db, "t7", B7, D7 + (int64_t)K7 * B7, 1);
+    if (g_deferred && rc7 == TSDB_OK) {
+        /* Deferred flush: the redo record is far below the cap, so the commit
+         * legitimately acks; the .idx rewrite this phase is about happens in
+         * the flush.  Assert on the call that performs it. */
+        rc7 = tsdb_db_flush_all(db);
+    }
     fsize_uncap(&saved7);
 
     printf("[7b] commit under FSIZE cap=%lld returned rc=%d (%s); "
@@ -631,6 +889,12 @@ int main(void) {
 
     /* ---- Phase 9: a failed delete-watermark bump keeps the OLD watermark. -- */
     phase9_delwm();
+
+    /* ---- Phase 10: what the engine ACKED is what survives a crash. -------- */
+    phase10_crash_durability();
+
+    /* ---- Phase 11: a commit that cannot log its rows must refuse. --------- */
+    phase11_wal_full();
 
     printf("\n=== ENOSPC / write-failure durability TESTS PASSED ===\n");
     return 0;

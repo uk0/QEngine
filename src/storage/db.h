@@ -128,14 +128,29 @@ int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
 
 /* Flush every open table's memtable to its on-disk partition so a
  * subsequent on-disk snapshot (e.g. /backup tar) captures all rows.
- * Best-effort: per-table failures log but don't abort.  Defined in
- * db.c. */
+ * One table's failure never stops the sweep, but the FIRST failure is
+ * RETURNED — a caller that asked for its rows on disk has to be able to
+ * find out that they are not.  Defined in db.c. */
 int                    tsdb_db_flush_all(tsdb_db_t *db);
+
+/* Flush a SINGLE table's memtable to its on-disk partitions.  Required before
+ * any operation that reads partition files directly (Parquet export), which
+ * would otherwise see nothing at all under deferred-flush mode.  Returns
+ * TSDB_OK, or TSDB_ERR_NOTFOUND for an unknown table.  Defined in db.c. */
+int                    tsdb_table_flush(tsdb_db_t *db, const char *name);
 
 /* Detected hardware class — set once at open from tsdb_iopolicy_detect().
  * Drives write-path defaults: memtable budget, compactor backoff
  * threshold.  Env vars still override individual knobs. */
 tsdb_iopolicy_t        tsdb_db_iopolicy(tsdb_db_t *db);
+
+/* Non-zero when this db defers the partition flush (TSDB_WAL_ONLY_COMMIT=1,
+ * or auto-enabled at open for a rotational/sata iopolicy).  The flag moves
+ * a commit's durability point: the ack means "redo record fsynced", and the
+ * partition write happens later on a size/idle flush.  Anything that needs
+ * the rows on DISK rather than merely durable — snapshot, export, a
+ * disk-level assertion — must tsdb_db_flush_all() first, and check it. */
+int                    tsdb_db_wal_only_commit(tsdb_db_t *db);
 
 /* Monotonic flush counter — bumped once per successful memtable→disk
  * flush in flush_and_clear_locked.  Used by the compactor's adaptive

@@ -214,11 +214,15 @@ static double bench_full_contention(tsdb_db_t *db, tsdb_table_t *tbl, int second
 
 /* ---- DELETE partition-boundary test ----
  *
- * Because tsdb_batch_commit auto-flushes the memtable, rows are on disk
- * before DELETE sees them.  DELETE then drops partitions whose FULL
- * time range satisfies the predicate; partitions that partially overlap
- * the predicate boundary are left untouched (documented behavior in
- * tsdb_delete_range: per-row DELETE is "not yet implemented").
+ * DELETE drops partitions whose FULL time range satisfies the predicate;
+ * partitions that partially overlap the predicate boundary are left
+ * untouched (documented behavior in tsdb_delete_range: per-row DELETE is
+ * "not yet implemented").
+ *
+ * No flush is forced here on purpose: the rows must be deleted whether
+ * tsdb_batch_commit wrote them through (default) or left them in the
+ * memtable (TSDB_WAL_ONLY_COMMIT=1, the cluster's mode).  tsdb_delete_range
+ * materialises the memtable itself when it holds rows the predicate covers.
  *
  * We write rows that straddle the cutoff and confirm:
  *   - rows strictly below cutoff are dropped

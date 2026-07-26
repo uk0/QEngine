@@ -1492,6 +1492,58 @@ static int part_dir_to_range(const char *dname, tsdb_partition_unit_t unit,
     return 0;
 }
 
+/* Does a partition spanning [pstart,pend] fall ENTIRELY inside the delete
+ * predicate?  DELETE is partition-granular: a partition that straddles the
+ * cutoff is left alone (a partial delete would need a per-row rewrite, which
+ * is not implemented), so only fully-covered partitions are dropped. */
+static int part_fully_covered(int64_t pstart, int64_t pend,
+                              int64_t cutoff_ns, int op_lt, int inclusive)
+{
+    if (op_lt) {
+        /* Delete ts < cutoff (or ts <= cutoff when inclusive). */
+        return inclusive ? (pend <= cutoff_ns) : (pend <  cutoff_ns);
+    }
+    /* Delete ts > cutoff (or ts >= cutoff when inclusive). */
+    return inclusive ? (pstart >= cutoff_ns) : (pstart > cutoff_ns);
+}
+
+/* Inclusive [start,end] ns range of the partition a timestamp flushes into.
+ * Mirrors ts_part_index() in part.c — floor division, so pre-epoch
+ * timestamps land in the same bucket the flush would put them in. */
+static void ts_part_range(int64_t ts_ns, tsdb_partition_unit_t unit,
+                          int64_t *out_start, int64_t *out_end)
+{
+    int64_t span = (unit == TSDB_PARTITION_HOUR) ? 3600000000000LL
+                                                 : 86400000000000LL;
+    int64_t idx = (ts_ns >= 0) ? (ts_ns / span)
+                               : ((ts_ns - span + 1) / span);
+    *out_start = idx * span;
+    *out_end   = *out_start + span - 1;
+}
+
+/* 1 if the memtable currently holds a row that lands in a partition this
+ * delete would drop whole.  part_fully_covered is monotone in ts, so the
+ * extreme row decides: the minimum ts for a "delete old data" (op_lt)
+ * predicate, the maximum for "delete new data".  Caller holds compact_mtx. */
+static int memtable_has_covered_row(tsdb_table_internal_t *t,
+                                    int64_t cutoff_ns, int op_lt, int inclusive)
+{
+    if (!t->memtable || !t->schema) return 0;
+    size_t n = tsdb_memtable_rows(t->memtable);
+    if (n == 0) return 0;
+    const int64_t *ts =
+        (const int64_t *)tsdb_memtable_col(t->memtable, t->schema->ts_col_idx);
+    if (!ts) return 0;
+
+    int64_t extreme = ts[0];
+    for (size_t i = 1; i < n; i++) {
+        if (op_lt ? (ts[i] < extreme) : (ts[i] > extreme)) extreme = ts[i];
+    }
+    int64_t pstart = 0, pend = 0;
+    ts_part_range(extreme, t->schema->partition_unit, &pstart, &pend);
+    return part_fully_covered(pstart, pend, cutoff_ns, op_lt, inclusive);
+}
+
 /* Per-table delete watermark: "every row with ts < W has been deleted".
  * Persisted as 8 bytes LE in <tabledir>/_delwm.  Only op_lt deletes (the
  * retention "drop old data" pattern) advance it.  Anti-entropy re-asserts it
@@ -1560,6 +1612,28 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
 
     pthread_mutex_lock(&t->compact_mtx);
 
+    /* Rows still in the memtable are invisible to the partition scan below.
+     * With TSDB_WAL_ONLY_COMMIT (deferred flush — the cluster's configuration,
+     * and auto-enabled on rotational disks) a commit leaves rows in the
+     * memtable, so DELETE walked the partition dirs, matched nothing and still
+     * returned TSDB_OK: the client is told the rows are gone while they are
+     * not, and the next size-triggered flush writes them straight back to
+     * disk.  Materialise them first so the partition rule below is applied to
+     * the whole table, in both durability modes.
+     *
+     * Only when the memtable actually holds a row inside a partition this
+     * delete would drop: the retention / delwm-reassert pattern (drop old data
+     * while the memtable buffers recent rows) must not degrade into a forced
+     * flush of every table on every 30s re-assert sweep.
+     *
+     * skip_replicate=1 — an internal materialisation step, not a client write
+     * event peers should observe (same reasoning as tsdb_db_flush_all).  It
+     * also keeps a peer applying APPLY_DELETE_RANGE from replicating the rows
+     * back at the node that just deleted them. */
+    int flush_rc = TSDB_OK;
+    if (memtable_has_covered_row(t, cutoff_ns, op_lt, inclusive))
+        flush_rc = flush_and_clear_locked(t, /*skip_replicate=*/1);
+
     char tbl_dir[4096];
     table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
     DIR *d = opendir(tbl_dir);
@@ -1575,15 +1649,7 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
             if (part_dir_to_range(ent->d_name, unit, &pstart, &pend) != 0)
                 continue;  /* not a recognisable partition dir */
 
-            int drop = 0;
-            if (op_lt) {
-                /* Delete ts < cutoff (or ts <= cutoff when inclusive). */
-                drop = inclusive ? (pend <= cutoff_ns) : (pend <  cutoff_ns);
-            } else {
-                /* Delete ts > cutoff (or ts >= cutoff when inclusive). */
-                drop = inclusive ? (pstart >= cutoff_ns) : (pstart > cutoff_ns);
-            }
-            if (drop) {
+            if (part_fully_covered(pstart, pend, cutoff_ns, op_lt, inclusive)) {
                 char sub[4096];
                 snprintf(sub, sizeof(sub), "%s/%s", tbl_dir, ent->d_name);
                 rm_rf(sub);
@@ -1594,6 +1660,16 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
     }
 
     pthread_mutex_unlock(&t->compact_mtx);
+
+    /* Materialisation failed → rows the predicate covers are still buffered.
+     * Report that instead of a silent partial delete, and don't record a
+     * watermark we did not achieve.  Partitions already dropped stay dropped;
+     * delete is idempotent, so the caller (or the re-assert sweep) can retry. */
+    if (flush_rc != TSDB_OK) {
+        tsdb_db_scan_release(db, t);
+        if (out_removed) *out_removed = removed;
+        return flush_rc;
+    }
 
     /* Advance the persisted delete watermark for op_lt ("delete old data")
      * deletes, so anti-entropy can re-assert it and a peer that missed this
@@ -1850,11 +1926,12 @@ static int redo_log_locked(tsdb_table_internal_t *t) {
     int rc = redo_serialize(t, seq, t->mem_logged, nrows, &payload, &plen);
     if (rc != TSDB_OK) return rc;
 
-    rc = tsdb_wal_append(t->wal, payload, plen);
+    /* Append + fsync as one unit: commit_seq only advances on success, so a
+     * record left live by a half-failed write would have its seq reused by the
+     * next commit and replay would apply both.  _durable rolls the record back
+     * on either failure. */
+    rc = tsdb_wal_append_durable(t->wal, payload, plen);
     free(payload);
-    if (rc != TSDB_OK) return rc;
-
-    rc = tsdb_wal_sync(t->wal);
     if (rc != TSDB_OK) return rc;
 
     t->commit_seq = seq;
@@ -2196,6 +2273,11 @@ uint64_t tsdb_db_table_set_gen(tsdb_db_t *db) {
 tsdb_iopolicy_t tsdb_db_iopolicy(tsdb_db_t *db) {
     if (!db) return TSDB_IOPOLICY_SSD;
     return db->iopolicy;
+}
+
+int tsdb_db_wal_only_commit(tsdb_db_t *db) {
+    if (!db) return 0;
+    return db->wal_only_commit;
 }
 
 /* Public wrapper: serialises concurrent batch_commit calls on the same
@@ -2665,8 +2747,18 @@ void tsdb_db_scan_release(tsdb_db_t *db, tsdb_table_internal_t *t) {
  * tarball missed any rows still buffered in memtable, so a 100-row
  * SELECT returned 0 on a freshly-restored sidecar.  Best-effort: a
  * single table's flush failure logs but doesn't abort the whole
- * sweep.  skip_replicate=1 because the local-flush-for-snapshot path
- * is not a write event peers should observe. */
+ * sweep.
+ *
+ * skip_replicate=0: replication (row-level on_replicate and the
+ * raw-block hook) fires from flush_and_clear_locked, and a memtable
+ * flushes exactly once — clearing it destroys the only opportunity to
+ * ship those rows.  Under flush-on-commit the memtable is already empty
+ * here, so this sweep replicates nothing new; under TSDB_WAL_ONLY_COMMIT
+ * (the cluster's mode) the memtable holds up to block_points rows that
+ * peers have never seen, and suppressing the hook silently dropped them
+ * from replication for good.  A flush that skips replication is only
+ * correct when the rows came *from* a peer (batch local_only), which is
+ * not this path. */
 int tsdb_db_flush_all(tsdb_db_t *db) {
     if (!db) return TSDB_ERR_INVAL;
     pthread_mutex_lock(&db->lock);
@@ -2679,6 +2771,7 @@ int tsdb_db_flush_all(tsdb_db_t *db) {
     for (int i = 0; i < n; i++) tabs[i] = db->tables[i];
     pthread_mutex_unlock(&db->lock);
 
+    int first_err = TSDB_OK;
     for (int i = 0; i < n; i++) {
         if (!tabs[i]) continue;
         /* Hold the writer lock across the flush (batch_mu -> compact_mtx, the
@@ -2688,13 +2781,33 @@ int tsdb_db_flush_all(tsdb_db_t *db) {
          * and the clear, so the wrong row subset is selected and freshly
          * committed rows are dropped. */
         tsdb_table_lock_write((tsdb_table_t *)tabs[i]);
-        int rc = flush_and_clear_ex(tabs[i], /*skip_replicate=*/1);
+        int rc = flush_and_clear_ex(tabs[i], /*skip_replicate=*/0);
         tsdb_table_unlock_write((tsdb_table_t *)tabs[i]);
-        if (rc != TSDB_OK)
+        if (rc != TSDB_OK) {
             fprintf(stderr, "[flush_all] %s rc=%d\n", tabs[i]->name, rc);
+            if (first_err == TSDB_OK) first_err = rc;
+        }
     }
     free(tabs);
-    return TSDB_OK;
+    return first_err;
+}
+
+/* Flush ONE table's memtable to its on-disk partitions.  Needed by any
+ * operation that reads partition files directly — under deferred-flush mode
+ * the freshly committed rows are still buffered and such an operation would
+ * otherwise see an empty table.  skip_replicate=0 so the forced drain is
+ * indistinguishable from the size/idle flush it front-runs: the cluster hook
+ * still observes the rows.  Writer lock held across the flush for the reason
+ * spelled out in tsdb_db_flush_all.  TSDB_ERR_NOTFOUND for an unknown table. */
+int tsdb_table_flush(tsdb_db_t *db, const char *name) {
+    if (!db || !name) return TSDB_ERR_INVAL;
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, name);
+    if (!t) return TSDB_ERR_NOTFOUND;
+    tsdb_table_lock_write((tsdb_table_t *)t);
+    int rc = flush_and_clear_ex(t, /*skip_replicate=*/0);
+    tsdb_table_unlock_write((tsdb_table_t *)t);
+    tsdb_db_scan_release(db, t);
+    return rc;
 }
 
 int tsdb_db_list_table_names(tsdb_db_t *db, char (*out_names)[64], int max) {

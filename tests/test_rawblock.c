@@ -217,6 +217,14 @@ static void test_flush_apply(void) {
     }
     ASSERT(tsdb_batch_commit(b) == TSDB_OK);
 
+    /* The raw-block hook fires from the memtable→partition flush, not from
+     * commit.  Under TSDB_WAL_ONLY_COMMIT=1 a commit is WAL-fsync + memtable
+     * insert only, so 100 rows never reach a partition on their own.  Force
+     * the flush so the precondition ("a flush happened") is explicit in both
+     * durability modes — this must still fire the hook, which is exactly what
+     * the assertion below checks. */
+    ASSERT(tsdb_db_flush_all(src_db) == TSDB_OK);
+
     /* Hook should have captured 3 blocks (ts, value, tag). */
     ASSERT(ctx.n >= 3);
     printf("    captured %d blocks from flush\n", ctx.n);
@@ -276,17 +284,62 @@ static void test_flush_apply(void) {
                    col_names[c], sl, dl);
             free(sb); free(db_b);
 
-            /* .idx comparison. */
+            /* .idx comparison.
+             *
+             * Everything the primary REPLICATES must match exactly: the block
+             * entry array plus every header field derived from it (count,
+             * total_rows, zone map, entry size).
+             *
+             * The one field that must NOT match is max_seq — the local WAL
+             * redo checkpoint in the V4 header.  It is that node's own WAL
+             * sequence; a replica that inherited it would skip replaying its
+             * own not-yet-flushed WAL records on restart.  rawblock.c
+             * deliberately carries only the *target* partition's max_seq
+             * forward, so a replica-only partition stays V3/max_seq=0.
+             *
+             * Under flush-on-commit the primary never stamps a checkpoint
+             * either (max_seq==0 → V3, 40-byte header) so the two files are
+             * byte-identical; under TSDB_WAL_ONLY_COMMIT=1 the primary writes
+             * V4 (48-byte header) and the files differ by exactly those 8
+             * bytes.  Assert the replicated payload, and assert the
+             * node-local field is node-local. */
             snprintf(src_col, sizeof(src_col), "%s/%s.idx", src_part, col_names[c]);
             snprintf(dst_col, sizeof(dst_col), "%s/%s.idx", dst_part, col_names[c]);
             r1 = file_bytes(src_col, &sb, &sl);
             r2 = file_bytes(dst_col, &db_b, &dl);
             ASSERT(r1 == 0);
             ASSERT(r2 == 0);
-            ASSERT_EQ(sl, dl);
-            ASSERT(memcmp(sb, db_b, sl) == 0);
-            printf("    idx=%s src=%zu dst=%zu bytes — match\n",
-                   col_names[c], sl, dl);
+
+            uint16_t sver = 0, dver = 0;
+            uint32_t scnt = 0, dcnt = 0, sesz = 0, desz = 0;
+            uint64_t stot = 0, dtot = 0, sseq = 0, dseq = 0;
+            int64_t  smn = 0, smx = 0, dmn = 0, dmx = 0;
+            int shdr = tsdb_part_idx_probe(src_col, &sver, &scnt, &sesz,
+                                           &stot, &smn, &smx, &sseq);
+            int dhdr = tsdb_part_idx_probe(dst_col, &dver, &dcnt, &desz,
+                                           &dtot, &dmn, &dmx, &dseq);
+            ASSERT(shdr > 0); ASSERT(dhdr > 0);
+            ASSERT_EQ(scnt, dcnt);
+            ASSERT_EQ(sesz, desz);
+            ASSERT_EQ(stot, dtot);
+            ASSERT(smn == dmn); ASSERT(smx == dmx);
+            /* Node-local: never inherited from the primary. */
+            ASSERT_EQ(dseq, 0);
+            /* Replicated payload: entry array byte-for-byte. */
+            ASSERT(sl > (size_t)shdr); ASSERT(dl > (size_t)dhdr);
+            ASSERT_EQ(sl - (size_t)shdr, dl - (size_t)dhdr);
+            ASSERT(memcmp(sb + shdr, db_b + dhdr, sl - (size_t)shdr) == 0);
+            /* When the primary has no checkpoint to stamp either, the whole
+             * file must still match byte-for-byte — the original guarantee. */
+            if (sseq == 0) {
+                ASSERT_EQ(shdr, dhdr);
+                ASSERT_EQ(sl, dl);
+                ASSERT(memcmp(sb, db_b, sl) == 0);
+            }
+            printf("    idx=%s src=%zu dst=%zu bytes (v%u/v%u max_seq=%llu/%llu)"
+                   " — entries match\n",
+                   col_names[c], sl, dl, (unsigned)sver, (unsigned)dver,
+                   (unsigned long long)sseq, (unsigned long long)dseq);
             free(sb); free(db_b);
         }
     }
@@ -539,6 +592,10 @@ static void test_benchmark(void) {
         tsdb_batch_row_end(b);
     }
     ASSERT(tsdb_batch_commit(b) == TSDB_OK);
+    /* Keep the encode+flush work inside the timed region under both
+     * durability modes — with TSDB_WAL_ONLY_COMMIT=1 the commit above only
+     * syncs the WAL. */
+    ASSERT(tsdb_db_flush_all(db) == TSDB_OK);
 
     int64_t t1 = now_ns();
     int64_t row_level_ns = t1 - t0;
@@ -557,6 +614,8 @@ static void test_benchmark(void) {
         tsdb_batch_row_end(b);
     }
     ASSERT(tsdb_batch_commit(b) == TSDB_OK);
+    /* Force the flush that drives the raw-block hook (see test 1). */
+    ASSERT(tsdb_db_flush_all(db) == TSDB_OK);
 
     /* Now apply captured blocks to a replica dir (measures apply cost). */
     const char *rdir = "/tmp/tsdb_bench_rawblk_replica";

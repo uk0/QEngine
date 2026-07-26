@@ -416,6 +416,30 @@ int tsdb_wal_sync(tsdb_wal_t *w) {
     return wal_async_fsync(w->fd) == 0 ? TSDB_OK : TSDB_ERR_IO;
 }
 
+int tsdb_wal_append_durable(tsdb_wal_t *w, const void *rec, size_t n) {
+    if (!w || w->fd < 0) return TSDB_ERR_INVAL;
+
+    /* Pre-append length, so a fsync that fails after a COMPLETE writev can put
+     * the log back.  tsdb_wal_append covers the short-write case itself. */
+    struct stat st;
+    off_t pre = (fstat(w->fd, &st) == 0) ? st.st_size : (off_t)-1;
+
+    int rc = tsdb_wal_append(w, rec, n);
+    if (rc != TSDB_OK) return rc;          /* already rolled back */
+
+    rc = tsdb_wal_sync(w);
+    if (rc != TSDB_OK && pre >= 0) {
+        /* The record is in the file but not on stable storage, and the caller
+         * is about to be told the commit failed — so it will not advance the
+         * seq this record carries and the next commit re-logs the same rows
+         * under it.  Two live records with one seq replay as two, duplicating
+         * the overlap.  Drop the record instead: its rows stay in the memtable
+         * and are unacked, which is exactly what the returned error means. */
+        (void)ftruncate(w->fd, pre);
+    }
+    return rc;
+}
+
 /* Legacy direct-fsync path kept available for code that explicitly wants
  * to bypass the async ring (e.g. test harnesses that don't want a
  * thread-local instance leaked).  Not currently called. */

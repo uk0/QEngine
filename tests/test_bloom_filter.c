@@ -19,6 +19,7 @@
 #include "../src/storage/schema.h"
 #include "../src/storage/memtable.h"
 #include "../src/storage/part.h"
+#include "../src/storage/db.h"
 #include "../src/query/exec.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,6 +152,19 @@ static void test_write_read_roundtrip(tsdb_db_t *db, const char *data_dir) {
         }
     }
     ASSERT_OK(tsdb_batch_commit(batch));
+
+    /* Bloom pruning is a *disk-block* optimisation: exec.c only consults a
+     * block's bloom when the scan source is a partition (src->part), never
+     * for memtable rows, so rows still in the memtable are always scanned and
+     * always counted.  That means the pruning assertions below are only
+     * meaningful once every row owns an on-disk block.
+     *
+     * Under TSDB_WAL_ONLY_COMMIT=1 the commit above is WAL-fsync + memtable
+     * insert; only the 8192 rows that overflowed the memtable reached a
+     * partition, leaving one block that legitimately contains sym_A and
+     * nothing to skip.  Force the tail out so the block layout is the same
+     * 8192+1808 split in both durability modes. */
+    ASSERT_OK(tsdb_db_flush_all(db));
 
     /* Find partition directory (should be 20260415). */
     char part_dir[4096];
@@ -368,6 +382,9 @@ static void test_high_cardinality(tsdb_db_t *db) {
         }
     }
     ASSERT_OK(tsdb_batch_commit(batch));
+    /* Same reason as above: put the rows on disk so the single-block
+     * sentinel/bloom path is what answers the query in both modes. */
+    ASSERT_OK(tsdb_db_flush_all(db));
 
     /* Query a single device. */
     tsdb_result_t *r = NULL;

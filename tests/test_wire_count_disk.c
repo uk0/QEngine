@@ -184,6 +184,19 @@ static void test_write_batch_path(void) {
     printf("  A wire: rows=%d err=%d count=%lld\n", wn, we, (long long)wc);
     CHECK(we==0 && wn==1 && wc==NROWS, "A: wire count(*) == NROWS (not empty set)");
 
+    /* Deferred flush (TSDB_WAL_ONLY_COMMIT=1) commits to WAL+memtable and only
+     * drains a full block at a time, so the counts above were served from the
+     * on-disk blocks PLUS a 1024-row memtable tail.  They must already equal
+     * NROWS: a count that reports only what reached a partition is the silent
+     * wrong-number bug this file exists to catch.  Draining the tail must not
+     * change the answer either — the same rows now on disk must not be counted
+     * twice.  Under flush-on-commit the memtable is already empty here and
+     * flush_all is a no-op, so both modes assert the identical value. */
+    CHECK(tsdb_db_flush_all(db)==TSDB_OK, "A: flush_all drains the memtable tail");
+    wc = wire_count_star(port,"trades",&wn,&we);
+    printf("  A wire post-flush: rows=%d err=%d count=%lld\n", wn, we, (long long)wc);
+    CHECK(we==0 && wn==1 && wc==NROWS, "A: wire count(*) == NROWS after tail flush");
+
     tsdb_server_stop(srv); tsdb_close(db);
     { char c[300]; snprintf(c,sizeof(c),"rm -rf %s",dir); (void)system(c); }
 }
@@ -254,6 +267,15 @@ static void test_rawblock_path(int order, const char *label) {
         tsdb_batch_row_end(b);
     }
     CHECK(tsdb_batch_commit(b)==TSDB_OK, "B: src commit");
+    /* Raw blocks only exist once a flush encodes them, and under deferred flush
+     * (TSDB_WAL_ONLY_COMMIT=1) commit is WAL+memtable only — the size path has
+     * emitted 6 of the 7 blocks and the last 1024 rows are still in RAM.  Drain
+     * them the same way a live node does, so the capture below covers ALL of
+     * NROWS in both modes; under flush-on-commit the memtable is already empty
+     * and this is a no-op.  The 3*NBLOCKS assertion stays exact: it still fails
+     * if the flush stops emitting one block per block_points rows per column,
+     * or if the drain stops firing the replication hook. */
+    CHECK(tsdb_db_flush_all(src)==TSDB_OK, "B: src flush_all (drain tail)");
     printf("  B captured %d raw blocks (expect %d cols x %d blocks)\n",
            ctx.n, 3, NBLOCKS);
     CHECK(ctx.n == 3*NBLOCKS, "B: captured 3*NBLOCKS raw blocks");
@@ -388,6 +410,9 @@ static void test_replica_state_wire(void) {
         tsdb_batch_row_f64(b,1,(double)(i%1000)); tsdb_batch_row_i64(b,2,(int64_t)(i+1));
         tsdb_batch_row_end(b);}
     CHECK(tsdb_batch_commit(b)==TSDB_OK,"E: src commit");
+    /* Same precondition as Part B: drain the deferred-flush tail so all NROWS
+     * rows have been encoded into raw blocks before they are replicated. */
+    CHECK(tsdb_db_flush_all(src)==TSDB_OK,"E: src flush_all (drain tail)");
     CHECK(ctx.n==3*NBLOCKS,"E: captured 3*NBLOCKS raw blocks");
 
     /* --- replica node: build the three independent pieces --- */

@@ -8359,6 +8359,28 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     case QAST_STMT_EXPORT_PARQUET: {
         const char *tname   = stmt.u.export_parquet.table;
         const char *out_dir = stmt.u.export_parquet.out_dir;
+        /* The exporter reads on-disk partitions only.  Under deferred-flush
+         * mode (TSDB_WAL_ONLY_COMMIT, also auto-enabled on rotational disks)
+         * freshly committed rows are still in the memtable, so EXPORT wrote
+         * ZERO files and still answered OK — an empty export is data loss as
+         * far as the caller is concerned.  Drain the table first so the export
+         * covers every committed row, exactly as it does in flush-on-commit
+         * mode.
+         *
+         * Before scan_acquire, not after: the flush takes its own scan ref and
+         * nesting one would deadlock against a concurrent ALTER TABLE, which
+         * gates new refs while it drains the outstanding ones. */
+        int frc = tsdb_table_flush(db, tname);
+        if (frc == TSDB_ERR_NOTFOUND) {
+            result_status(r, "ERR: table not found");
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
+        if (frc != TSDB_OK) {
+            result_status(r, "ERR: flush before export failed");
+            rc = frc;
+            break;
+        }
         /* Locate the table + schema.  scan_acquire (not find_table) so a
          * concurrent DROP TABLE waits until the export finishes before freeing
          * the schema we hold across the partition loop (tsdb_part_open(s,...)). */

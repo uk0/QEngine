@@ -51,6 +51,21 @@ int  tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n);
 /* fsync the WAL file to durable storage. */
 int  tsdb_wal_sync(tsdb_wal_t *w);
 
+/*
+ * Append a record AND make it durable as one all-or-nothing unit: on any
+ * failure the log is left byte-identical to what it was before the call.
+ * tsdb_wal_append already rolls back its own short/failed write; this adds
+ * the same rollback to a fsync that fails AFTER the bytes reached the file
+ * (the normal disk-full shape on a delayed-allocation filesystem: the
+ * writev lands in the page cache and only fsync reports ENOSPC).
+ *
+ * Callers that key a record's identity on a sequence number they only
+ * advance on success MUST use this: a record left live under a seq that is
+ * then reused makes replay apply both records, duplicating the rows they
+ * overlap on.  Serialised by the caller, exactly like tsdb_wal_append.
+ */
+int  tsdb_wal_append_durable(tsdb_wal_t *w, const void *rec, size_t n);
+
 /* Truncate the WAL file to zero (called after successful memtable flush). */
 int  tsdb_wal_truncate(tsdb_wal_t *w);
 
