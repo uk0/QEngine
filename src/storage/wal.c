@@ -472,6 +472,13 @@ int tsdb_wal_replay(const char *db_dir, const char *table_name,
         return TSDB_OK;
     }
 
+    /* Size snapshot for the torn-length guard below.  Replay runs only during
+     * recovery, before the table is published, so no writer is appending and
+     * the snapshot cannot go stale.  A failed fstat just disables the guard. */
+    struct stat rst;
+    off_t size = (fstat(fileno(f), &rst) == 0) ? rst.st_size : (off_t)-1;
+    off_t off  = 0;
+
     crc32_init();
 
     int rc = TSDB_OK;
@@ -486,6 +493,16 @@ int tsdb_wal_replay(const char *db_dir, const char *table_name,
 
         uint32_t stored_crc = get_u32le_buf(hdr + 0);
         uint32_t len        = get_u32le_buf(hdr + 4);
+
+        /* A length running past EOF is a torn tail or a garbage header, exactly
+         * as in wal_valid_prefix.  Without this a bogus 4 GiB length field
+         * fails the realloc below and surfaces as TSDB_ERR_NOMEM — which the
+         * caller must treat as a transient allocation failure, the opposite
+         * recovery decision from "these bytes are not records". */
+        if (size >= 0 &&
+            (uint64_t)off + WAL_RECORD_HEADER + (uint64_t)len > (uint64_t)size) {
+            rc = TSDB_ERR_CORRUPT; break;
+        }
 
         /* Ensure buffer capacity. */
         if (len > buf_cap) {
@@ -509,6 +526,7 @@ int tsdb_wal_replay(const char *db_dir, const char *table_name,
         c ^= 0xFFFFFFFFu;
 
         if (c != stored_crc) { rc = TSDB_ERR_CORRUPT; break; }
+        off += WAL_RECORD_HEADER + (off_t)len;   /* record fully verified */
 
         rc = cb(buf, len, ctx);
         if (rc != TSDB_OK) break;

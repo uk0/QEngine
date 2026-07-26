@@ -119,6 +119,41 @@ int main(void) {
         ASSERT(a == TSDB_AE_UP_TO_DATE || a == TSDB_AE_SKIP_UNSAFE);
     }
 
+    /* PEERS THAT ARE BEHIND US IN TIME.  Every case above uses a peer whose
+     * max_ts is equal to or greater than ours, so the "peer_max_ts <
+     * local_max_ts" half of the decision surface was never exercised.  It is
+     * reachable: the resync admits any peer with a strictly higher count (the
+     * single-`best` loop did too, and the candidate list keeps exactly that
+     * predicate), so a peer that holds more rows but stopped receiving writes
+     * earlier lands here.  It must never win anything destructive. */
+    printf("case 9: peer BEHIND us in time never truncates a populated local\n");
+    ASSERT(decide(3620864, MAXTS, 3700000, MAXTS - 1) == TSDB_AE_SKIP_UNSAFE);
+    ASSERT(decide(3620864, MAXTS, 1303104000000ULL, MAXTS - 1000000)
+               == TSDB_AE_SKIP_UNSAFE);
+    /* Behind in time AND not ahead in count — nothing to do at all. */
+    ASSERT(decide(3620864, MAXTS, 1000, MAXTS - 1) == TSDB_AE_UP_TO_DATE);
+
+    printf("case 10: invariant sweep with the peer BEHIND us in time\n");
+    for (uint64_t pc = 0; pc < 5000000000000ULL; pc += 137000000ULL) {
+        tsdb_ae_action_t a = tsdb_antientropy_decide(3620864, MAXTS,
+                                                     pc, MAXTS - 1000000);
+        ASSERT(a != TSDB_AE_FULL_PULL);   /* would truncate durable rows */
+        ASSERT(a != TSDB_AE_TAIL_PULL);   /* nothing newer to pull */
+        ASSERT(a == TSDB_AE_UP_TO_DATE || a == TSDB_AE_SKIP_UNSAFE);
+    }
+
+    /* The one shape that makes FULL_PULL unreachable for a table with rows,
+     * stated as a fact rather than a side effect: a table measuring 0 rows
+     * measures max_ts == INT64_MIN (tsdb_cluster_local_table_stats), so no
+     * peer can be behind it, and a peer holding real data is always a
+     * TAIL_PULL — the non-destructive path. */
+    printf("case 11: an EMPTY local table pulls the tail, never truncates\n");
+    ASSERT(decide(0, INT64_MIN, 1, INT64_MIN + 1) == TSDB_AE_TAIL_PULL);
+    for (uint64_t pc = 1; pc < 5000000000000ULL; pc += 137000000ULL) {
+        ASSERT(tsdb_antientropy_decide(0, INT64_MIN, pc, MAXTS)
+                   == TSDB_AE_TAIL_PULL);
+    }
+
     printf("PASS test_antientropy_safety\n");
     return 0;
 }

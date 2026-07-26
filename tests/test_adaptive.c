@@ -67,6 +67,12 @@ typedef struct {
     tsdb_type_t type;
     size_t      n;
     void       *values;
+    /* Expected outer-LZ decision: 1 = must wrap, 0 = must not, -1 = unpinned.
+     * The float gate skips the LZ stage only when the domain output is dense
+     * (>= 50% of raw) AND a probe over the raw input finds no byte-level
+     * redundancy, so quantized and heterogeneous float shapes must still take
+     * the wrapper even though their domain output is dense. */
+    int         expect_lz;
 } test_case_t;
 
 static void run_case(const test_case_t *tc, int print_header) {
@@ -107,6 +113,23 @@ static void run_case(const test_case_t *tc, int print_header) {
     /* Adaptive must be <= legacy (never worse). */
     CHECK((size_t)ad_bytes <= (size_t)lg_bytes,
           "adaptive produced more bytes than legacy");
+
+    /* No format change: only the pre-existing OUTER_LZ flag bit is ever set. */
+    CHECK((ad_flags & ~(uint16_t)TSDB_BF_OUTER_LZ) == 0,
+          "adaptive set an unknown block flag");
+
+    if (tc->expect_lz >= 0) {
+        int has_lz = (ad_flags & TSDB_BF_OUTER_LZ) ? 1 : 0;
+        if (has_lz != tc->expect_lz) {
+            fprintf(stderr, "FAIL: %s expected lz=%d got %d (adaptive=%d legacy=%d)\n",
+                    tc->label, tc->expect_lz, has_lz, ad_bytes, lg_bytes);
+            abort();
+        }
+        /* When the stage runs, the win must be real, not a 16-byte rounding. */
+        if (has_lz)
+            CHECK((size_t)ad_bytes * 100 <= (size_t)lg_bytes * 95,
+                  "outer LZ accepted for a < 5% gain");
+    }
 
     /* --- Adaptive decode round-trip --- */
     void *decoded = malloc(raw_bytes);
@@ -241,6 +264,43 @@ static void fill_float_large_range(double *buf, size_t n) {
     }
 }
 
+/* Quantized telemetry — the shape real TSBS-style agents actually emit.  Its
+ * domain output is dense (~80% of raw) so the density half of the float LZ gate
+ * arms, but the quantisation leaves repeated byte patterns that lzlite crushes.
+ * Without a shape like this in the suite there is no CI signal on that gate. */
+static void fill_float_sensor_2dp(double *buf, size_t n) {
+    g_rng = 0x5e5c0f2d;
+    double a = 50.0;
+    for (size_t i = 0; i < n; i++) {
+        a += (rng_f64() - 0.5) * 2.0;
+        if (a < 0.0) a = 0.0;
+        if (a > 100.0) a = 100.0;
+        buf[i] = (double)((long long)(a * 100.0 + 0.5)) / 100.0;
+    }
+}
+
+/* Heterogeneous block: a high-entropy head followed by a quantized tail — one
+ * flush spanning a regime change.  A gate that sampled only the head of the
+ * block would call this incompressible and throw the tail's win away. */
+static void fill_float_het_head(double *buf, size_t n) {
+    g_rng = 0x71cb3a95;
+    size_t head = n / 16;
+    if (head > 512) head = 512;
+    for (size_t i = 0; i < head; i++) {
+        uint64_t b = ((uint64_t)rng_next() << 32) | rng_next();
+        b &= ~(0x7FFULL << 52);
+        b |= ((uint64_t)(1000 + (rng_next() % 24)) << 52);
+        memcpy(&buf[i], &b, 8);
+    }
+    double a = 50.0;
+    for (size_t i = head; i < n; i++) {
+        a += (rng_f64() - 0.5) * 2.0;
+        if (a < 0.0) a = 0.0;
+        if (a > 100.0) a = 100.0;
+        buf[i] = (double)((long long)(a * 100.0 + 0.5)) / 100.0;
+    }
+}
+
 static void fill_symbol_low_card(uint32_t *buf, size_t n) {
     /* 4 distinct symbols — very compressible. */
     for (size_t i = 0; i < n; i++)
@@ -323,11 +383,14 @@ int main(void) {
     double   *f_sine       = malloc(N * 8);
     double   *f_rw         = malloc(N * 8);
     double   *f_large      = malloc(N * 8);
+    double   *f_2dp        = malloc(N * 8);
+    double   *f_het        = malloc(N * 8);
     uint32_t *sym_low      = malloc(N * 4);
     uint32_t *sym_high     = malloc(N * 4);
 
     CHECK(ts_uniform && ts_jitter && i64_seq && i64_rand &&
-          f_const && f_sine && f_rw && f_large && sym_low && sym_high,
+          f_const && f_sine && f_rw && f_large && f_2dp && f_het &&
+          sym_low && sym_high,
           "alloc test buffers");
 
     fill_ts_uniform  (ts_uniform,  N);
@@ -338,20 +401,24 @@ int main(void) {
     fill_float_sine  (f_sine,      N);
     fill_float_random_walk(f_rw,   N);
     fill_float_large_range(f_large, N);
+    fill_float_sensor_2dp(f_2dp,   N);
+    fill_float_het_head(f_het,     N);
     fill_symbol_low_card(sym_low,  N);
     fill_symbol_high_card(sym_high, N);
 
     test_case_t cases[] = {
-        { "ts:uniform",        TSDB_TYPE_TIMESTAMP, N, ts_uniform },
-        { "ts:jitter",         TSDB_TYPE_TIMESTAMP, N, ts_jitter  },
-        { "i64:sequential",    TSDB_TYPE_INT64,     N, i64_seq    },
-        { "i64:random",        TSDB_TYPE_INT64,     N, i64_rand   },
-        { "f64:constant",      TSDB_TYPE_FLOAT64,   N, f_const    },
-        { "f64:sine",          TSDB_TYPE_FLOAT64,   N, f_sine     },
-        { "f64:random-walk",   TSDB_TYPE_FLOAT64,   N, f_rw       },
-        { "f64:large-range",   TSDB_TYPE_FLOAT64,   N, f_large    },
-        { "sym:low-card(4)",   TSDB_TYPE_SYMBOL,    N, sym_low    },
-        { "sym:high-card(64k)",TSDB_TYPE_SYMBOL,    N, sym_high   },
+        { "ts:uniform",        TSDB_TYPE_TIMESTAMP, N, ts_uniform, -1 },
+        { "ts:jitter",         TSDB_TYPE_TIMESTAMP, N, ts_jitter,  -1 },
+        { "i64:sequential",    TSDB_TYPE_INT64,     N, i64_seq,    -1 },
+        { "i64:random",        TSDB_TYPE_INT64,     N, i64_rand,   -1 },
+        { "f64:constant",      TSDB_TYPE_FLOAT64,   N, f_const,     1 },
+        { "f64:sine",          TSDB_TYPE_FLOAT64,   N, f_sine,     -1 },
+        { "f64:random-walk",   TSDB_TYPE_FLOAT64,   N, f_rw,       -1 },
+        { "f64:large-range",   TSDB_TYPE_FLOAT64,   N, f_large,    -1 },
+        { "f64:sensor-2dp",    TSDB_TYPE_FLOAT64,   N, f_2dp,       1 },
+        { "f64:het-head+2dp",  TSDB_TYPE_FLOAT64,   N, f_het,       1 },
+        { "sym:low-card(4)",   TSDB_TYPE_SYMBOL,    N, sym_low,     1 },
+        { "sym:high-card(64k)",TSDB_TYPE_SYMBOL,    N, sym_high,   -1 },
     };
     int ncases = (int)(sizeof(cases) / sizeof(cases[0]));
 
@@ -373,9 +440,9 @@ int main(void) {
     fill_symbol_low_card(sym_s, N2);
 
     test_case_t small_cases[] = {
-        { "ts:uniform",      TSDB_TYPE_TIMESTAMP, N2, ts_s  },
-        { "f64:random-walk", TSDB_TYPE_FLOAT64,   N2, f_s   },
-        { "sym:low-card",    TSDB_TYPE_SYMBOL,    N2, sym_s },
+        { "ts:uniform",      TSDB_TYPE_TIMESTAMP, N2, ts_s,  -1 },
+        { "f64:random-walk", TSDB_TYPE_FLOAT64,   N2, f_s,   -1 },
+        { "sym:low-card",    TSDB_TYPE_SYMBOL,    N2, sym_s, -1 },
     };
     for (int i = 0; i < 3; i++)
         run_case(&small_cases[i], i == 0);
@@ -384,6 +451,7 @@ int main(void) {
     free(ts_uniform); free(ts_jitter);
     free(i64_seq);    free(i64_rand);
     free(f_const);    free(f_sine);    free(f_rw);    free(f_large);
+    free(f_2dp);      free(f_het);
     free(sym_low);    free(sym_high);
     free(ts_s);       free(f_s);       free(sym_s);
 

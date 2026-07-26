@@ -17,14 +17,62 @@
 /* Minimum byte saving required to accept lzlite outer-wrapper. */
 #define OUTER_LZ_MIN_GAIN 16
 
-/* Skip the outer lzlite pass for a float XOR codec (Gorilla/Chimp) whose output
- * already reaches this percent of the raw double size.  Measured across varying
- * float distributions (price-band, wide-range, full-entropy, random-walk, sine)
- * the domain output is always >= 50% of raw and lzlite loses by ~200 B (rejected
- * for gain < min_gain) — running it only burns CPU.  Only constant/near-constant
- * float compresses far below this (~1.6% of raw), and there lzlite wins ~60x;
- * such blocks stay below the threshold and still take the LZ path. */
+/* First half of the float outer-LZ gate: the domain codec's output reaches this
+ * percent of the raw double size.  On its own this is NOT evidence that lzlite
+ * cannot help.  Measured on quantized telemetry, f64_sensor_2dp lands at 81% of
+ * raw and lzlite still takes 36% off it, f64_sensor_1dp 68% / -50%, f64_pct_2dp
+ * 89% / -31% — while f64_walk_full at 80% genuinely gains nothing.  What
+ * separates them is whether the values are quantized, not how big the domain
+ * output is, so this threshold only *arms* the skip; lz_probe_futile() decides
+ * it.  (The original comment here claimed the domain output is "always >= 50% of
+ * raw and lzlite loses by ~200 B" on varying distributions; the shapes above
+ * falsify that.) */
 #define FLOAT_LZ_SKIP_PCT 50
+
+/* Second half of the gate: one lzlite pass over a sample of the RAW input.
+ * Quantized doubles repeat byte patterns that survive into the XOR stream;
+ * full-precision ones do not.  The probe sees that difference directly instead
+ * of inferring it from an output size.
+ *
+ * The sample is drawn as LZ_PROBE_CHUNKS evenly spaced windows rather than one
+ * head window: a block whose head is high-entropy and whose tail is compressible
+ * (a regime change inside one flush) is exactly what a head-only window
+ * mispredicts.  Cost is one pass over 4 KB — 0.6-6 ns/value, against 100-150
+ * ns/value for the full pass it is deciding about. */
+#define LZ_PROBE_BYTES    4096
+#define LZ_PROBE_CHUNKS   4
+/* Probe out/in at or above this percent means "no byte-level redundancy". */
+#define LZ_PROBE_SKIP_PCT 99
+
+/*
+ * Return 1 when a sample of the raw column bytes shows no byte-level redundancy,
+ * i.e. a full lzlite pass is predicted to be futile.  Returns 0 whenever the
+ * probe cannot tell, so the caller falls back to running the real pass — the
+ * probe may only ever add confidence to a skip, never force one.
+ */
+static int lz_probe_futile(const void *in, size_t raw_bytes)
+{
+    uint8_t sample[LZ_PROBE_BYTES];
+    uint8_t probe_out[LZ_PROBE_BYTES + LZ_PROBE_BYTES / 255 + 16];
+    size_t n;
+
+    if (raw_bytes == 0) return 1;
+    if (raw_bytes <= LZ_PROBE_BYTES) {
+        n = raw_bytes;
+        memcpy(sample, in, n);
+    } else {
+        size_t chunk  = LZ_PROBE_BYTES / LZ_PROBE_CHUNKS;
+        size_t stride = (raw_bytes - chunk) / (LZ_PROBE_CHUNKS - 1);
+        for (size_t c = 0; c < LZ_PROBE_CHUNKS; c++)
+            memcpy(sample + c * chunk, (const uint8_t *)in + c * stride, chunk);
+        n = chunk * LZ_PROBE_CHUNKS;
+    }
+
+    size_t out_n = 0;
+    if (tsdb_lzlite_encode(sample, n, probe_out, sizeof(probe_out), &out_n) < 0)
+        return 0;
+    return out_n * 100 >= n * LZ_PROBE_SKIP_PCT;
+}
 
 /*
  * Routing:
@@ -443,18 +491,23 @@ int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
         }
     }
 
-    /* Early-exit: skip the outer LZ pass for a dense float block.  When a float
-     * XOR codec's output already reaches FLOAT_LZ_SKIP_PCT% of the raw double
-     * size, byte-level lzlite cannot find matches and the wrapper is rejected for
-     * gain < min_gain anyway (measured: ~-200 B on every varying distribution).
-     * Skipping produces byte-identical output (flags = 0) at no CPU cost.  Only
-     * constant/near-constant float falls below the threshold, where LZ wins and
-     * the normal path below runs. */
+    /* Early-exit: skip the outer LZ pass for a float block only when BOTH halves
+     * of the gate agree — the domain output is dense (>= FLOAT_LZ_SKIP_PCT% of
+     * raw) AND a probe over the raw input finds no byte-level redundancy.
+     *
+     * Density alone mispredicts quantized telemetry, where lzlite still takes
+     * 31-50% off a domain output sitting at 68-89% of raw.  The probe alone
+     * mispredicts a block whose sampled windows miss a compressible region, and
+     * density catches those.  Requiring both means this can only ever skip a
+     * subset of what density alone skipped, so for every input the encoded size
+     * is <= what the old rule produced.  Skipping produces byte-identical output
+     * (flags = 0). */
     if ((codec == TSDB_CODEC_GORILLA || codec == TSDB_CODEC_CHIMP ||
          codec == TSDB_CODEC_CHIMP128) && in_count > 0) {
         size_t raw_bytes = in_count * 8;
-        if ((size_t)domain_bytes * 100 >= raw_bytes * FLOAT_LZ_SKIP_PCT) {
-            return domain_bytes;  /* dense float — LZ cannot help */
+        if ((size_t)domain_bytes * 100 >= raw_bytes * FLOAT_LZ_SKIP_PCT &&
+            lz_probe_futile(in, raw_bytes)) {
+            return domain_bytes;  /* dense float with no raw redundancy */
         }
     }
 

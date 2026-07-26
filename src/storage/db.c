@@ -116,6 +116,28 @@ typedef struct tsdb_table_internal {
      * replica would duplicate it (the memtable has no ts-dedup).  The local tail
      * stays visible + WAL-durable locally and drains via the size path. */
     int                  mem_has_received;
+
+    /* ---- WAL redo replay state (compact_mtx-guarded) ----
+     *  replaying      : a redo replay is READING this table's WAL right now.
+     *               A flush forced from inside the replay (redo_replay_apply's
+     *               memtable-overflow guard) must NOT truncate the log the
+     *               replay is still iterating: ftruncate(fd,0) makes the
+     *               reader's next fread return 0, which replay reads as a clean
+     *               EOF, so every record past that point is destroyed AND
+     *               reported as a successful replay.
+     *  wal_incomplete : the replay ABORTED and the records it never read are
+     *               not covered by any partition checkpoint.  Those acked rows
+     *               survive ONLY in the log, so the table is frozen: no flush
+     *               (hence no checkpoint advance over them), no WAL truncate,
+     *               and no new redo commits (a record appended above the
+     *               aborting one can never be replayed, so acking it would be
+     *               a lie).  Reads are untouched — a table whose tail we cannot
+     *               apply is still a table, and refusing to open it would turn
+     *               a recoverable state into an outage.  Cleared by TRUNCATE
+     *               TABLE, or simply by an operator repairing/removing the log:
+     *               the verdict is a pure function of on-disk state. */
+    int                  replaying;
+    int                  wal_incomplete;
 } tsdb_table_internal_t;
 
 /* ---- DB handle ---------------------------------------------------------- */
@@ -1436,6 +1458,16 @@ int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
 
     if (t->memtable) tsdb_memtable_clear(t->memtable);
     if (t->wal)     (void)tsdb_wal_truncate(t->wal);
+    /* The emptied memtable has nothing logged in the emptied WAL.  Leaving the
+     * old high-water mark behind makes redo_log_locked skip every commit until
+     * the memtable grows back past it, so the first rows written after a
+     * TRUNCATE would never reach the redo log at all. */
+    t->mem_logged = 0;
+    /* Unfreeze a table whose replay aborted (see wal_incomplete): TRUNCATE
+     * discards the very rows the freeze was protecting, and the log it was
+     * protecting them in has just been emptied — deliberately, by an operator.
+     * This is the escape hatch that keeps the freeze from being permanent. */
+    t->wal_incomplete = 0;
 
     /* Remove every entry under the table dir except schema.bin and *.sym.
      * This kills all partition directories verbatim. */
@@ -1918,6 +1950,11 @@ static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
  */
 static int redo_log_locked(tsdb_table_internal_t *t) {
     if (!t->wal) return TSDB_OK;
+    /* Frozen log (see wal_incomplete): a record appended here would sit ABOVE
+     * the record that aborts every replay, so it could never be read back and
+     * — with the flush frozen too — never reach a partition either.  Acking it
+     * would be a silent loss; refuse the commit instead. */
+    if (t->wal_incomplete) return TSDB_ERR_BUSY;
     size_t nrows = tsdb_memtable_rows(t->memtable);
     if (nrows <= t->mem_logged) return TSDB_OK;
 
@@ -1971,6 +2008,12 @@ struct redo_replay_ctx {
     int                    applied;       /* 1 if any record was applied */
     const struct redo_part_cp *parts;     /* per-partition durable checkpoints */
     int                    nparts;
+    /* Latched by the redo_replay_cb wrapper on the FIRST callback abort, so a
+     * decode failure is distinguishable from tsdb_wal_replay's own torn-tail
+     * TSDB_ERR_CORRUPT (which travels through the same return channel but means
+     * "the bytes past here are not records at all" — they carry no acked seq). */
+    int                    abort_rc;
+    uint64_t               abort_seq;     /* seq of the record that aborted */
 };
 
 /* Durable checkpoint of the partition a row with timestamp `ts` lands in; 0 if
@@ -1985,10 +2028,86 @@ static uint64_t redo_part_checkpoint(const struct redo_replay_ctx *ctx,
     return 0;
 }
 
-/* tsdb_wal_replay callback: decode one redo record and apply rows whose
- * record seq > cutoff into the memtable.  Returns TSDB_OK or an error. */
-static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
-    struct redo_replay_ctx *ctx = (struct redo_replay_ctx *)vctx;
+/*
+ * Durable checkpoint covering a whole redo record: the MIN over its rows of the
+ * checkpoint of the partition each row lands in (a partition with no checkpoint
+ * = 0 = not durable).  A scalar max-over-partitions would let a completed
+ * sibling partition of the same flush mask a torn one and drop its acked rows.
+ *
+ * Sets *ok = 0 when the record cannot be walked under the CURRENT schema — the
+ * length checks below are exactly the ones the apply loop makes, plus the
+ * requirement that the walk land exactly on `n`, so *ok answers precisely "will
+ * the apply loop be able to decode every row of this record?".  The usual cause
+ * is benign: an ALTER TABLE ADD COLUMN under an untruncated log leaves records
+ * serialised with fewer columns than the schema now has.
+ *
+ * When *ok is 0 the per-row partition lookup is meaningless past row 0, so the
+ * caller must fall back — see redo_rec_cutoff_fallback.
+ */
+static uint64_t redo_rec_cutoff(const struct redo_replay_ctx *ctx,
+                                const uint8_t *p, size_t n, uint32_t nrows,
+                                int *ok)
+{
+    const tsdb_schema_t *s = ctx->t->schema;
+    int ts_ci = s->ts_col_idx;
+    uint64_t rec_cutoff = UINT64_MAX;
+    size_t so = 12;
+    *ok = 1;
+
+    for (uint32_t r = 0; r < nrows; r++) {
+        if (so + 8 > n) { *ok = 0; return 0; }
+        int64_t rts = (int64_t)redo_get_u64le(p + so); so += 8;
+        uint64_t cp = redo_part_checkpoint(ctx, rts);
+        if (cp < rec_cutoff) rec_cutoff = cp;
+        /* No `&& cp` short-circuit here: `so` must advance for EVERY column of
+         * EVERY row or the walk desynchronises and later rows resolve garbage
+         * timestamps to arbitrary partitions. */
+        for (int ci = 0; ci < s->ncols; ci++) {
+            if (ci == ts_ci) continue;
+            if (s->cols[ci].type == TSDB_TYPE_SYMBOL) {
+                if (so + 4 > n) { *ok = 0; return 0; }
+                uint32_t sl = redo_get_u32le(p + so); so += 4;
+                if (so + sl > n) { *ok = 0; return 0; }
+                so += sl;
+            } else {
+                if (so + 8 > n) { *ok = 0; return 0; }
+                so += 8;
+            }
+        }
+    }
+    /* A record serialised under a NARROWER schema leaves bytes over; one whose
+     * declared nrows outruns its payload was caught above.  Either way the
+     * layout does not match, so the per-row lookups cannot be trusted. */
+    if (so != n) { *ok = 0; return 0; }
+    if (rec_cutoff == UINT64_MAX) rec_cutoff = 0;   /* nrows == 0 */
+    return rec_cutoff;
+}
+
+/*
+ * Durability estimate for a record redo_rec_cutoff could not walk.  Row 0's
+ * timestamp sits at a fixed offset (12) and is therefore readable WITHOUT
+ * trusting the column layout, so its partition's checkpoint is the one honest
+ * datum such a record still offers; that is exactly the value the pre-ALTER
+ * code computed for the single-row records ALTER leaves behind.  With no
+ * readable timestamp the record counts as not durable (0).
+ *
+ * Deliberately NOT the global max checkpoint: that would declare a record
+ * durable on the strength of a SIBLING partition's flush, which is the very
+ * masking the per-partition map exists to prevent.
+ */
+static uint64_t redo_rec_cutoff_fallback(const struct redo_replay_ctx *ctx,
+                                         const uint8_t *p, size_t n,
+                                         uint32_t nrows)
+{
+    if (nrows == 0 || n < 20) return 0;
+    return redo_part_checkpoint(ctx, (int64_t)redo_get_u64le(p + 12));
+}
+
+/* Decode one redo record and apply rows whose record seq > cutoff into the
+ * memtable.  Returns TSDB_OK or an error; see redo_replay_cb for the wrapper
+ * that latches an abort. */
+static int redo_replay_apply(const void *rec, size_t n,
+                             struct redo_replay_ctx *ctx) {
     const uint8_t *p = (const uint8_t *)rec;
     if (n < 12) return TSDB_OK;   /* legacy 4-byte WTMC marker or junk — skip */
 
@@ -2001,34 +2120,21 @@ static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
     int ts_ci = s->ts_col_idx;
 
     /* Per-partition dedup guard: skip this record only if seq is already
-     * durable in EVERY partition its rows land in.  Pre-scan the rows for the
-     * MIN checkpoint over their partitions (a partition with no checkpoint = 0
-     * = not durable).  A scalar max-over-partitions would let a completed
-     * sibling partition of the same flush mask a torn one and drop its acked
-     * rows.  Over-applying an already-durable sibling is harmless: the read
-     * model enumerates via ts and pairs non-ts blocks by (ts_min,count), so a
-     * re-flushed duplicate block is never double-counted. */
-    uint64_t rec_cutoff = UINT64_MAX;
-    {
-        size_t so = 12;
-        for (uint32_t r = 0; r < nrows && rec_cutoff > 0; r++) {
-            if (so + 8 > n) { rec_cutoff = 0; break; }   /* torn: replay it */
-            int64_t rts = (int64_t)redo_get_u64le(p + so); so += 8;
-            uint64_t cp = redo_part_checkpoint(ctx, rts);
-            if (cp < rec_cutoff) rec_cutoff = cp;
-            for (int ci = 0; ci < s->ncols && cp; ci++) {
-                if (ci == ts_ci) continue;
-                if (s->cols[ci].type == TSDB_TYPE_SYMBOL) {
-                    if (so + 4 > n) { rec_cutoff = 0; break; }
-                    so += 4 + redo_get_u32le(p + so);
-                } else {
-                    so += 8;
-                }
-            }
-        }
-    }
-    if (rec_cutoff == UINT64_MAX) rec_cutoff = 0;   /* nrows == 0 */
+     * durable in EVERY partition its rows land in.  Over-applying an
+     * already-durable sibling is harmless: the read model enumerates via ts and
+     * pairs non-ts blocks by (ts_min,count), so a re-flushed duplicate block is
+     * never double-counted. */
+    int cut_ok = 1;
+    uint64_t rec_cutoff = redo_rec_cutoff(ctx, p, n, nrows, &cut_ok);
+    if (!cut_ok) rec_cutoff = redo_rec_cutoff_fallback(ctx, p, n, nrows);
     if (seq <= rec_cutoff) return TSDB_OK;
+
+    /* Un-walkable AND not covered by a checkpoint: the apply loop below would
+     * decode a PREFIX of the rows and then fail, leaving a partial record
+     * applied — which the next open would replay again, duplicating it.  A redo
+     * record is atomic; refuse the whole thing and let the caller decide what
+     * the un-read remainder of the log is worth. */
+    if (!cut_ok) return TSDB_ERR_CORRUPT;
 
     size_t off = 12;
 
@@ -2099,6 +2205,61 @@ static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
     return TSDB_OK;
 }
 
+/* tsdb_wal_replay callback.  A wrapper rather than per-return-site bookkeeping
+ * so no abort path inside redo_replay_apply can be missed. */
+static int redo_replay_cb(const void *rec, size_t n, void *vctx) {
+    struct redo_replay_ctx *ctx = (struct redo_replay_ctx *)vctx;
+    int rc = redo_replay_apply(rec, n, ctx);
+    if (rc != TSDB_OK && ctx->abort_rc == TSDB_OK) {
+        ctx->abort_rc  = rc;
+        ctx->abort_seq = (n >= 12) ? redo_get_u64le((const uint8_t *)rec) : 0;
+    }
+    return rc;
+}
+
+/*
+ * Second, header-only pass over the SAME log, run only after a callback abort.
+ * tsdb_wal_replay stops at the aborting record, so everything past it is acked
+ * but UN-READ; this pass answers the only two questions that matter about it:
+ *
+ *   max_seq      — the highest seq anywhere in the log, so the reopened table's
+ *                  commit_seq can continue above it and never hand a NEW commit
+ *                  a seq that an un-read record already owns.
+ *   n_unapplied  — how many un-read records are NOT already covered by a
+ *                  partition checkpoint.  Zero means the tail is redundant and
+ *                  the table can open, flush and truncate exactly as usual.
+ *
+ * Durability is judged with the same rule the apply path uses, so the two can
+ * never disagree.  This callback NEVER aborts: a record it cannot walk is
+ * scored, not fatal.
+ */
+struct redo_tail_scan {
+    const struct redo_replay_ctx *rctx;
+    uint64_t from_seq;         /* first UN-READ seq (abort_seq + 1) */
+    uint64_t max_seq;
+    uint64_t n_unapplied;
+    uint64_t first_unapplied;
+};
+
+static int redo_tail_scan_cb(const void *rec, size_t n, void *vctx) {
+    struct redo_tail_scan *s = (struct redo_tail_scan *)vctx;
+    if (n < 12) return TSDB_OK;                  /* legacy WTMC marker */
+    const uint8_t *p = (const uint8_t *)rec;
+    uint64_t seq   = redo_get_u64le(p + 0);
+    uint32_t nrows = redo_get_u32le(p + 8);
+    if (seq > s->max_seq) s->max_seq = seq;
+    if (seq < s->from_seq) return TSDB_OK;        /* the replay already read it */
+
+    int ok = 1;
+    uint64_t cp = redo_rec_cutoff(s->rctx, p, n, nrows, &ok);
+    if (!ok) cp = redo_rec_cutoff_fallback(s->rctx, p, n, nrows);
+    if (seq > cp) {
+        s->n_unapplied++;
+        if (s->first_unapplied == 0) s->first_unapplied = seq;
+    }
+    return TSDB_OK;
+}
+
 /*
  * Recover a freshly-opened table's unflushed WAL tail into its memtable.
  * Computes C = max durable commit-seq checkpoint across this table's
@@ -2147,26 +2308,84 @@ static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
         closedir(d);
     }
 
-    struct redo_replay_ctx ctx = { t, cutoff, 0, cutoff, 0, parts, nparts };
+    /* Designated: the struct carries abort state now, and a positional
+     * initialiser silently mis-assigns the moment it grows again. */
+    struct redo_replay_ctx ctx = { .t = t, .cutoff = cutoff,
+                                   .last_complete = cutoff,
+                                   .parts = parts, .nparts = nparts };
     pthread_mutex_lock(&t->compact_mtx);
+    t->replaying = 1;
     int rc = tsdb_wal_replay(db->data_dir, t->name, redo_replay_cb, &ctx);
     /* commit_seq must continue ABOVE every seq that ever existed (durable in
      * partitions OR replayed) so future commits never reuse a seq. */
     uint64_t hi = (ctx.max_seq > cutoff) ? ctx.max_seq : cutoff;
-    if (hi > t->commit_seq) t->commit_seq = hi;
-    t->mem_logged = tsdb_memtable_rows(t->memtable);
-    pthread_mutex_unlock(&t->compact_mtx);
 
-    if (rc != TSDB_OK && rc != TSDB_ERR_CORRUPT) {
-        /* Corruption stops replay at the first bad record (a torn tail from a
-         * crash mid-append) — that's expected and safe; anything else is
-         * logged but non-fatal so the table still opens. */
+    if (ctx.abort_rc != TSDB_OK) {
+        /* The replay stopped on a record it could not apply, so every record
+         * after it is acked but UN-READ.  Find out whether that matters before
+         * anything is allowed to destroy it. */
+        struct redo_tail_scan sc = { .rctx = &ctx, .from_seq = ctx.abort_seq + 1 };
+        (void)tsdb_wal_replay(db->data_dir, t->name, redo_tail_scan_cb, &sc);
+        if (sc.max_seq > hi) hi = sc.max_seq;
+        if (sc.n_unapplied == 0) {
+            /* Every un-read record is already durable in the partitions its
+             * rows land in.  Opening normally is not just safe, it is required:
+             * freezing a table whose data is entirely on disk would turn a
+             * recoverable state into an outage. */
+            fprintf(stderr,
+                    "[db] table '%s': WAL replay aborted at seq %llu (rc=%d); "
+                    "every un-read record is already durable - opening normally\n",
+                    t->name, (unsigned long long)ctx.abort_seq, ctx.abort_rc);
+            tsdb_metric_inc("qengine_wal_replay_aborted_benign_total");
+        } else {
+            t->wal_incomplete = 1;
+            fprintf(stderr,
+                    "[db] table '%s': WAL replay ABORTED at seq %llu (rc=%d); "
+                    "%llu un-read record(s) from seq %llu up to seq %llu are NOT "
+                    "durable in any partition - table stays READABLE but its log "
+                    "is frozen (no flush, no checkpoint advance, no truncate, no "
+                    "new commits) until %s/wal/%s.log is repaired or removed\n",
+                    t->name, (unsigned long long)ctx.abort_seq, ctx.abort_rc,
+                    (unsigned long long)sc.n_unapplied,
+                    (unsigned long long)sc.first_unapplied,
+                    (unsigned long long)sc.max_seq, db->data_dir, t->name);
+            tsdb_metric_inc("qengine_wal_replay_incomplete_total");
+        }
+    } else if (rc != TSDB_OK && rc != TSDB_ERR_CORRUPT) {
+        /* tsdb_wal_replay's own TSDB_ERR_CORRUPT means the bytes past the last
+         * record are not CRC-valid records (tsdb_wal_open already repaired a
+         * torn tail), so they carry no acked seq — expected and safe.  Anything
+         * else is logged but non-fatal so the table still opens. */
         fprintf(stderr, "[db] WAL replay for table '%s' returned rc=%d\n",
                 t->name, rc);
     }
+
+    t->replaying = 0;
+    if (hi > t->commit_seq) t->commit_seq = hi;
+    t->mem_logged = tsdb_memtable_rows(t->memtable);
+    pthread_mutex_unlock(&t->compact_mtx);
     if (ctx.applied)
         tsdb_metric_inc("qengine_wal_recovered_records_total");
     free(parts);
+}
+
+/*
+ * The ONE place a flush is allowed to shorten the redo log.  Both callers below
+ * reach it after the rows they logged are durable elsewhere, but two states
+ * make the truncate destructive rather than merely redundant:
+ *
+ *   replaying      — tsdb_wal_replay is iterating this very file through its own
+ *                    FILE*.  ftruncate(fd,0) makes the reader's next fread
+ *                    return 0, which it reads as a clean EOF: the rest of the
+ *                    log is destroyed and the replay still returns TSDB_OK.
+ *   wal_incomplete — the log holds acked records that no partition covers.
+ *
+ * Skipping is always safe: the seq > checkpoint skip dedups a re-read prefix,
+ * so the truncate only bounds WAL size (see the call sites).
+ */
+static void wal_truncate_if_safe(tsdb_table_internal_t *t) {
+    if (t->wal && !t->replaying && !t->wal_incomplete)
+        (void)tsdb_wal_truncate(t->wal);
 }
 
 /*
@@ -2178,6 +2397,20 @@ static void redo_recover_table(tsdb_db_t *db, tsdb_table_internal_t *t) {
  */
 static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_rows(t->memtable) == 0) return TSDB_OK;
+    /* Frozen log: publishing a partition here would stamp it with commit_seq,
+     * which covers the un-read records too — the checkpoint would then declare
+     * acked rows durable that were never applied, and the next open would skip
+     * them for good.  Stamping a LOWER seq is no better: it leaves the flushed
+     * rows above the checkpoint, so the next open replays them on top of the
+     * partition this flush just wrote.  A single scalar checkpoint cannot
+     * express "these rows are durable but those records are not", so the flush
+     * has to wait.  Nothing is lost: every row in the memtable came from the
+     * log, which wal_truncate_if_safe is keeping intact.
+     *
+     * This gate also covers tsdb_close, which flushes through this path — and
+     * therefore truncates — so without it the first clean shutdown after a
+     * frozen open would delete the tail the freeze exists to protect. */
+    if (t->wal_incomplete) return TSDB_ERR_BUSY;
 
     /* Row-level cluster replication: fires BEFORE flush so data still in
      * memtable.  Skipped when raw-block mode is active (on_raw_block != NULL)
@@ -2198,7 +2431,7 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
     }
     if (hook_rc == TSDB_SKIP_LOCAL) {
         tsdb_memtable_clear(t->memtable);
-        if (t->wal) tsdb_wal_truncate(t->wal);
+        wal_truncate_if_safe(t);
         t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
         t->mem_has_local = 0;     /* memtable drained: reset content provenance */
         t->mem_has_received = 0;
@@ -2255,7 +2488,7 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         /* Truncate WAL after the partition (with its checkpoint) is durably
          * published.  Correctness does NOT depend on this — the seq>checkpoint
          * skip dedups even if truncate is skipped — it only bounds WAL size. */
-        if (t->wal) tsdb_wal_truncate(t->wal);
+        wal_truncate_if_safe(t);
     }
     return rc;
 }

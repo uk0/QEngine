@@ -1739,16 +1739,43 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
      * Columns added after earlier flushes have fewer (or zero) blocks than
      * the TS column for this partition. Pad the front with synthetic
      * block-meta records so readers that walk TS-aligned blocks always
-     * find a matching entry. Sentinel: offset=0, codec=TSDB_CODEC_NONE,
+     * find a matching entry. Sentinel: offset=UINT64_MAX, codec=TSDB_CODEC_NONE,
      * no col file mapped for the synthesised block range.
      * tsdb_part_read_block zero-fills when it sees the sentinel.
      *
      * Only a column whose IDX genuinely declares fewer blocks than ts is an
      * ALTER-added column; a same-idx-count column that merely lost tail blocks
      * to a tear was already clamped (handled above), so it can't reach here
-     * with a short count and be mistaken for a late add. */
+     * with a short count and be mistaken for a late add.
+     *
+     * The idx count is necessary but NOT sufficient, because it says nothing
+     * about WHERE the shortfall is.  A second producer reaches this gate: the
+     * per-column raw-block replication hook is applied one (column, block) at
+     * a time and its errors are discarded (see the w->raw_block_fn call in the
+     * flush path above), so a peer — or a half-finished migration — can end up
+     * with a val.idx that simply never learned about a block ts.idx has.  That
+     * gap can be anywhere, and prepending assumes it is at the FRONT: every
+     * surviving real block then sits one slot too far and the reader, which
+     * pairs by (ts_min,count), matches the partition's leading ts blocks
+     * against fabricated sentinels — a pruned query returns a whole block of
+     * silent zeros with rc=0, and any ts block left unpaired kills the query.
+     *
+     * So verify the ALTER hypothesis against CONTENT before acting on it: a
+     * genuinely later-added column's real blocks are a contiguous SUFFIX of
+     * ts's block list, block for block, on the same key the reader pairs with.
+     * When that holds, prepend as before.  When it does not, pair by content
+     * and mark every ts block the column has no block for as a HOLE.
+     *
+     * Either way the column array comes out 1:1 with ts, so no ts block is
+     * ever hidden: `SELECT ts`, count(*), max(ts) and every healthy column
+     * keep returning exactly what they return on an intact partition.  The
+     * difference is what an unanswerable cell reads as — a HOLE is
+     * TSDB_ERR_CORRUPT, not a zero.  Zero is a value; fabricating it silently
+     * poisons every aggregate and hides the loss from anti-entropy, which
+     * compares count/max(ts). */
     if (ts_ci >= 0 && ts_ci < s->ncols && p->col_meta_n[ts_ci] > 0) {
         size_t nb_ts = p->col_meta_n[ts_ci];
+        const tsdb_block_meta_t *ts_m = p->col_metas[ts_ci];
         for (int ci = 0; ci < s->ncols; ci++) {
             if (ci == ts_ci)                  continue;
             size_t nb_col = p->col_meta_n[ci];
@@ -1760,24 +1787,63 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
             if (idx_decl_count[ci] >= idx_decl_count[ts_ci]) continue;
 
             size_t nmiss = nb_ts - nb_col;
+            const tsdb_block_meta_t *cm = p->col_metas[ci];
+
+            /* Is the shortfall shaped like a late add?  Compare against ts on
+             * the reader's own key. */
+            int alter_shaped;
+            if (nb_col > 0) {
+                alter_shaped = 1;
+                for (size_t b = 0; b < nb_col; b++) {
+                    if (cm[b].ts_min != ts_m[nmiss + b].ts_min ||
+                        cm[b].count  != ts_m[nmiss + b].count) {
+                        alter_shaped = 0; break;
+                    }
+                }
+            } else {
+                /* No readable blocks at all, so there is no content to check.
+                 * That is only credible as a late add when the idx declares
+                 * none either — a column whose idx declares blocks the .col
+                 * filter then dropped LOST them, and zero-filling the whole
+                 * column would fabricate every one of its values. */
+                alter_shaped = (idx_decl_count[ci] == 0);
+            }
+
             tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
             if (!merged) { tsdb_part_close(p); return TSDB_ERR_NOMEM; }
 
-            /* Synthesise the leading blocks that pre-date the column. */
-            for (size_t b = 0; b < nmiss; b++) {
+            size_t holes = 0;
+            for (size_t b = 0; b < nb_ts; b++) {
+                const tsdb_block_meta_t *use = NULL;
+                if (alter_shaped) {
+                    if (b >= nmiss) use = &cm[b - nmiss];
+                } else {
+                    /* Exactly the first-match the readers do, so this pass can
+                     * never place a block the reader would fail to find. */
+                    for (size_t k = 0; k < nb_col; k++)
+                        if (cm[k].ts_min == ts_m[b].ts_min &&
+                            cm[k].count  == ts_m[b].count) { use = &cm[k]; break; }
+                }
+                if (use) { merged[b] = *use; continue; }
                 memset(&merged[b], 0, sizeof(merged[b]));
                 merged[b].offset = UINT64_MAX;                /* sentinel */
-                merged[b].count  = p->col_metas[ts_ci][b].count;
-                merged[b].ts_min = p->col_metas[ts_ci][b].ts_min;
-                merged[b].ts_max = p->col_metas[ts_ci][b].ts_max;
+                merged[b].count  = ts_m[b].count;
+                merged[b].ts_min = ts_m[b].ts_min;
+                merged[b].ts_max = ts_m[b].ts_max;
                 merged[b].codec  = TSDB_CODEC_NONE;
+                if (!alter_shaped) { merged[b].flags = TSDB_BLOCK_FLAG_HOLE; holes++; }
             }
-            /* Append existing real blocks after the synthetic prefix. */
-            if (nb_col > 0 && p->col_metas[ci]) {
-                memcpy(&merged[nmiss], p->col_metas[ci],
-                       nb_col * sizeof(*merged));
-                free(p->col_metas[ci]);
-            }
+
+            if (holes)
+                fprintf(stderr,
+                        "[part] %s: column %s declares %u blocks against ts's %u "
+                        "and they are not a late-added suffix; %zu ts block(s) "
+                        "have no value for it and now read as an error, not as "
+                        "zero\n",
+                        partition_dir, s->cols[ci].name,
+                        idx_decl_count[ci], idx_decl_count[ts_ci], holes);
+
+            free(p->col_metas[ci]);
             p->col_metas[ci]  = merged;
             p->col_meta_n[ci] = nb_ts;
         }
@@ -1888,8 +1954,13 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
 
     /* ALTER TABLE ADD COLUMN sentinel: offset == UINT64_MAX marks a block
      * that pre-dates the column's creation — zero-fill with the type's
-     * default value. Works whether the column file is mapped or not. */
+     * default value. Works whether the column file is mapped or not.
+     *
+     * The HOLE flag marks the other producer of a missing block: the column
+     * DID exist for these rows, it just lost the block (see tsdb_part_open).
+     * The value is unknown, so refuse rather than invent one. */
     if (meta->offset == UINT64_MAX) {
+        if (meta->flags & TSDB_BLOCK_FLAG_HOLE) return TSDB_ERR_CORRUPT;
         tsdb_type_t type = p->schema->cols[col_idx].type;
         size_t w = tsdb_type_width(type);
         memset(out_buf, 0, (size_t)meta->count * w);
@@ -1927,8 +1998,10 @@ int tsdb_part_read_block_ref(tsdb_part_t *p, int col_idx,
     size_t need = (size_t)meta->count * w;
 
     /* ALTER ADD COLUMN sentinel: there are no on-disk bytes to point at —
-     * materialise the zero-fill into an owned buffer. */
+     * materialise the zero-fill into an owned buffer.  A HOLE is a lost
+     * block, not a pre-dating one: it has no value to serve. */
     if (meta->offset == UINT64_MAX) {
+        if (meta->flags & TSDB_BLOCK_FLAG_HOLE) return TSDB_ERR_CORRUPT;
         void *buf = calloc(1, need ? need : 1);
         if (!buf) return TSDB_ERR_NOMEM;
         *out_owned = buf;

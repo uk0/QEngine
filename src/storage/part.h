@@ -76,6 +76,17 @@ extern "C" {
                                                 trailer (forward-compat). */
 #define TSDB_BLOCK_CRC_TRAILER_SIZE 4u
 
+/* IN-MEMORY ONLY (never written to a block header, never read from one).
+ * Set by tsdb_part_open on a synthesised meta whose offset is UINT64_MAX to
+ * distinguish the two kinds of "this column has no block here":
+ *   flag clear → ALTER TABLE ADD COLUMN: the rows pre-date the column, so
+ *                zero IS the value and the readers zero-fill;
+ *   flag set   → HOLE: the column lost a block ts still has (a dropped
+ *                raw-block replication push, a half-finished migration), so
+ *                the value is UNKNOWN and the readers return
+ *                TSDB_ERR_CORRUPT rather than fabricating one. */
+#define TSDB_BLOCK_FLAG_HOLE      (1u << 4)
+
 /* Index header sizes.
  *   V1 = legacy (no zone map)
  *   V2 = adds file-level ts zone map

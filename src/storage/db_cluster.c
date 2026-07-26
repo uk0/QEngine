@@ -24,6 +24,7 @@
 #include "schema.h"
 #include "memtable.h"
 #include "part.h"    /* tsdb_part_idx_probe — local row/ts measurement */
+#include "antientropy.h" /* pull-candidate ranking + bounded retry driver */
 #include "../cluster/cluster.h"
 #include <strings.h> /* strcasecmp for TSDB_NODE_ROLE parsing */
 #include "../cluster/node.h"
@@ -38,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <time.h>
 #include <pthread.h>
 #include <dirent.h>
@@ -1571,13 +1573,185 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
 
     if (best_max_ts > local_max_ts) return TSDB_AE_TAIL_PULL;
 
-    /* From here best_max_ts == local_max_ts (peers with a lower max_ts never
-     * become "best").  Only a strictly higher peer count is a candidate gap. */
+    /* From here best_max_ts <= local_max_ts.  A peer BEHIND us in time can
+     * reach this point — the caller admits any peer with a strictly higher
+     * count, which is what the pre-candidate-list selection loop did too —
+     * and it still cannot obtain anything destructive: the only truncating
+     * branch below needs local_count == 0, and a table that measures 0 rows
+     * measures local_max_ts == INT64_MIN (tsdb_cluster_local_table_stats),
+     * which no peer's max_ts can be below.  Only a strictly higher peer count
+     * is a candidate gap. */
     if (best_count <= local_count) return TSDB_AE_UP_TO_DATE;
 
     if (best_count >= IMPLAUSIBLE_COUNT) return TSDB_AE_SKIP_UNSAFE;
     if (local_count > 0)                 return TSDB_AE_SKIP_UNSAFE;
     return TSDB_AE_FULL_PULL;
+}
+
+/* ---- Pull-candidate ranking + bounded retry ------------------------------
+ *
+ * See src/storage/antientropy.h for why a single "best" peer is not enough. */
+
+/* Strict "a ranks before b" (see the header for why count leads). */
+static int ae_cand_better(const tsdb_ae_cand_t *a, const tsdb_ae_cand_t *b) {
+    if (a->count  != b->count)  return a->count  > b->count;
+    if (a->max_ts != b->max_ts) return a->max_ts > b->max_ts;
+    return a->node_id < b->node_id;
+}
+
+void tsdb_antientropy_rank_candidates(tsdb_ae_cand_t *c, int n) {
+    if (!c || n < 2) return;
+    for (int i = 1; i < n; i++) {           /* insertion sort; n <= 64 peers */
+        tsdb_ae_cand_t x = c[i];
+        int j = i;
+        while (j > 0 && ae_cand_better(&x, &c[j - 1])) { c[j] = c[j - 1]; j--; }
+        c[j] = x;
+    }
+}
+
+int tsdb_antientropy_run_candidates(const tsdb_ae_cand_t *c, int n,
+                                    const tsdb_ae_driver_t *drv,
+                                    tsdb_ae_run_t *out)
+{
+    if (!out) return TSDB_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    if (!c || n <= 0 || !drv || !drv->local_stats || !drv->attempt)
+        return TSDB_ERR_INVAL;
+
+    long start_ms = drv->now_ms ? drv->now_ms(drv->ctx) : 0;
+
+    for (int i = 0; i < n; i++) {
+        /* Wall budget: without it the worst case is n (<= 64) x the 60 s
+         * delta-pull timeout, serially, for every table in the catalog, on the
+         * one startup pass.  Checked here so candidate 0 is always tried. */
+        if (drv->budget_ms > 0 && drv->now_ms &&
+            drv->now_ms(drv->ctx) - start_ms >= drv->budget_ms) {
+            out->budget_hit = 1;
+            break;
+        }
+
+        /* Re-measure before EVERY decision.  The loop mutates local storage,
+         * so a stale measurement would let a later candidate be classified
+         * against rows we no longer (or now do) hold.  It also means the
+         * destructive gate below always sees the CURRENT state, which is a
+         * fresher input than the pre-change code used — that took one
+         * measurement before any peer round-trip and truncated on it. */
+        uint64_t before = 0; int64_t before_ts = 0;
+        if (drv->local_stats(drv->ctx, &before, &before_ts) != 0) {
+            out->hard_err = 1;      /* cannot measure ourselves — never guess */
+            break;
+        }
+
+        tsdb_ae_action_t act = tsdb_antientropy_decide(before, before_ts,
+                                                       c[i].count, c[i].max_ts);
+        if (act == TSDB_AE_UP_TO_DATE) continue;   /* not even contacted */
+
+        int64_t since = (act == TSDB_AE_FULL_PULL) ? 0 : before_ts;
+        int rc = drv->attempt(drv->ctx, &c[i], act, since);
+        out->visited++;
+        if (act == TSDB_AE_TAIL_PULL || act == TSDB_AE_FULL_PULL) out->pulls++;
+        if (rc < 0) out->hard_err = 1;
+
+        /* Progress is MEASURED, not reported.  The delta pull counts rows the
+         * peer handed back and discards tsdb_batch_row_end's status, so "it
+         * returned 10000" is not "10000 landed" — schema drift or a symbol it
+         * could not intern drops every one of them.  Compare the local row
+         * count instead; that is the only thing that means convergence. */
+        uint64_t after = 0; int64_t after_ts = 0;
+        if (drv->local_stats(drv->ctx, &after, &after_ts) != 0) {
+            out->hard_err = 1;
+            break;
+        }
+        if (after > before) {
+            out->rows   = after - before;
+            out->chosen = c[i].node_id;
+            break;
+        }
+        /* Reported a gap, delivered nothing — advance to the next candidate. */
+    }
+    return TSDB_OK;
+}
+
+/* Wall budget for ONE table's candidate loop. */
+#define AE_RESYNC_BUDGET_MS  30000L
+
+/* Defined further down with the scatter helpers. */
+static long mono_ms(void);
+
+/* Production wiring for tsdb_ae_driver_t. */
+typedef struct {
+    tsdb_db_t      *db;
+    tsdb_cluster_t *c;
+    const char     *table;
+    int64_t         delwm;
+    int             bf_attempted;   /* partition backfill: once per resync */
+} ae_resync_ctx_t;
+
+static int ae_local_stats_cb(void *vctx, uint64_t *count, int64_t *max_ts) {
+    ae_resync_ctx_t *x = (ae_resync_ctx_t *)vctx;
+    return tsdb_cluster_local_table_stats(x->db, x->table, count, max_ts)
+             == TSDB_OK ? 0 : -1;
+}
+
+static long ae_now_ms_cb(void *vctx) { (void)vctx; return mono_ms(); }
+
+static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
+                         tsdb_ae_action_t act, int64_t since_ts)
+{
+    ae_resync_ctx_t *x = (ae_resync_ctx_t *)vctx;
+    tsdb_node_id_t peer = (tsdb_node_id_t)cand->node_id;
+
+    switch (act) {
+    case TSDB_AE_TAIL_PULL:
+        return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
+
+    case TSDB_AE_FULL_PULL:
+        /* The ONLY destructive step in anti-entropy.  tsdb_antientropy_decide
+         * hands it out only when the table measured EMPTY, and the driver
+         * re-measures immediately before this call, so the truncate is a
+         * no-op on an empty table.  since_ts = 0 catches every row. */
+        fprintf(stderr,
+                "[anti-entropy] %s: empty local, full pull from peer %llu "
+                "(peer count=%llu, max_ts %lld)\n",
+                x->table, (unsigned long long)cand->node_id,
+                (unsigned long long)cand->count, (long long)cand->max_ts);
+        if (tsdb_truncate_table(x->db, x->table) != TSDB_OK) return -1;
+        return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
+
+    case TSDB_AE_SKIP_UNSAFE: {
+        /* Opt-in convergence: swap ONE cold divergent partition from the
+         * fuller peer (temp build + atomic rename under compact_mtx with a
+         * staleness guard).  Never reduces durable rows — the swap helper
+         * refuses unless the pulled copy is strictly fuller.  Default OFF.
+         *
+         * Capped to ONE attempt per resync even though several candidates can
+         * now classify SKIP_UNSAFE: each attempt is a full local partition
+         * scan plus a SAMPLE BY against the peer plus a possible temp build,
+         * and running that once per candidate would amplify the most expensive
+         * path in this file N-fold.  The cap lands on the highest-count
+         * candidate because the list is already ranked. */
+        const char *bfe = getenv("TSDB_AE_PARTITION_BACKFILL");
+        if (bfe && strcmp(bfe, "1") == 0 && !x->bf_attempted &&
+            cand->count < 100000000000ULL) {
+            x->bf_attempted = 1;
+            int bf = ae_partition_backfill(x->db, x->c, peer, x->table, x->delwm);
+            if (bf > 0) return bf;
+        }
+        /* Would shrink durable data on a peer-count comparison — refuse. */
+        fprintf(stderr,
+                "[anti-entropy] %s: middle-gap vs peer %llu (peer=%llu rows, "
+                "max_ts %lld) — peer not provably a superset%s; "
+                "skipping destructive truncate to preserve local rows\n",
+                x->table, (unsigned long long)cand->node_id,
+                (unsigned long long)cand->count, (long long)cand->max_ts,
+                cand->count >= 100000000000ULL ? " (timestamp-scale count)" : "");
+        return 0;
+    }
+
+    case TSDB_AE_UP_TO_DATE:
+    default:
+        return 0;
+    }
 }
 
 int tsdb_cluster_resync_table(tsdb_db_t *db,
@@ -1619,97 +1793,91 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                                        &local_count, &local_max_ts) != TSDB_OK)
         return TSDB_OK;   /* cannot measure ourselves — never guess, never pull */
 
-    /* Find the peer with the highest (count, max_ts). */
+    /* Ask EVERY alive peer for its (count, max_ts) and KEEP EVERY ANSWER.
+     *
+     * Collapsing them to one "best" is what stalls convergence.  Peers can be
+     * indistinguishable at the sort key and yet only one of them can hand the
+     * rows over — most importantly a peer on an OLDER binary, which does not
+     * know TSDB_RPC_LOCAL_TABLE_STATS, so the probe falls back to
+     * `SELECT count(*), max(ts) FROM <t>`; on a peer holding nothing that
+     * resolves through the childless data-bearing mirror and exec's cluster-agg
+     * coordinator answers with the CLUSTER-WIDE aggregate — the holder's exact
+     * numbers.  The old first-wins tie-break then picked whichever of the two
+     * gossip happened to list first, and when that was the empty peer,
+     * `SELECT * FROM <t> WHERE ts > N` handed back nothing and the resync
+     * reported success having converged zero rows — permanently, because the
+     * startup resync runs exactly once. */
     tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
     int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
-    tsdb_node_id_t best = 0;
-    uint64_t best_count = local_count;
-    int64_t  best_max_ts = local_max_ts;
 
+    tsdb_ae_cand_t cand[TSDB_CLUSTER_MAX_NODES];
+    int ncand = 0;
     for (int i = 0; i < npeers; i++) {
         uint64_t pc = 0; int64_t pmax = 0;
+        /* A peer that cannot answer the probe never becomes a candidate, so no
+         * delta pull is ever aimed at a peer we already know is unreachable. */
         if (peer_table_stats(c, peers[i], table_name, &pc, &pmax) != 0) continue;
-        if (pc > best_count ||
-            (pc == best_count && pmax > best_max_ts))
-        {
-            best = peers[i];
-            best_count = pc;
-            best_max_ts = pmax;
-        }
+
+        /* Admission is EXACTLY the predicate the single-`best` loop used: that
+         * loop seeded `best` with the LOCAL stats and replaced it only on a
+         * strictly greater (count, max_ts), so a peer could be selected iff it
+         * was strictly greater than local in that order.  Keeping the same
+         * predicate means NO candidate reaches tsdb_antientropy_decide that
+         * could not reach it before — the retry widens how many peers we try,
+         * never what any one of them is allowed to do. */
+        if (!(pc > local_count || (pc == local_count && pmax > local_max_ts)))
+            continue;
+
+        cand[ncand].node_id = (uint64_t)peers[i];
+        cand[ncand].count   = pc;
+        cand[ncand].max_ts  = pmax;
+        ncand++;
     }
+    if (ncand == 0) return TSDB_OK;  /* nobody is ahead of us — up-to-date */
 
-    if (best == 0) return TSDB_OK; /* already up-to-date */
+    tsdb_antientropy_rank_candidates(cand, ncand);
 
-    /* Gap classification + safety guard (see tsdb_antientropy_decide):
-     *
-     *   tail gap   — best_max_ts > local_max_ts.  We missed recent writes;
-     *                pulling everything past local_max_ts catches up cheaply.
-     *
-     *   middle gap — equal max_ts but a higher peer count.  A tail-only pull
-     *                returns 0 rows, so the old code truncated + full re-pulled.
-     *                That was the data-loss bug: a bogus/smaller peer count
-     *                wiped durable local rows.  We now refuse to truncate a
-     *                populated table (and refuse a timestamp-scale "count"
-     *                outright); only an EMPTY local table is safely full-pulled.
-     *                A true middle-gap backfill needs row-level reconciliation
-     *                (partition Merkle), tracked separately — it must not be
-     *                faked with a destructive wipe. */
-    int pulled = 0;
-    tsdb_ae_action_t act = tsdb_antientropy_decide(local_count, local_max_ts,
-                                                   best_count, best_max_ts);
-    switch (act) {
-    case TSDB_AE_TAIL_PULL:
-        pulled = pull_table_delta(db, c, best, table_name, local_max_ts);
-        break;
+    /* Try candidates best-first until one actually DELIVERS rows.  The gap
+     * classification and its safety guard are unchanged (see
+     * tsdb_antientropy_decide): a tail gap pulls everything past our max_ts; a
+     * middle gap (equal max_ts, higher peer count) is REFUSED rather than
+     * healed with the truncate + re-pull that once destroyed durable rows.
+     * The driver only sequences — it re-measures this node before every
+     * decision and after every attempt, so the destructive branch sees fresher
+     * state than the pre-change code did and "delivered rows" means the local
+     * row count actually went up. */
+    ae_resync_ctx_t ctx = { db, c, table_name, wm, 0 };
+    tsdb_ae_driver_t drv = {
+        .ctx         = &ctx,
+        .local_stats = ae_local_stats_cb,
+        .attempt     = ae_attempt_cb,
+        .now_ms      = ae_now_ms_cb,
+        .budget_ms   = AE_RESYNC_BUDGET_MS,
+    };
+    tsdb_ae_run_t run;
+    if (tsdb_antientropy_run_candidates(cand, ncand, &drv, &run) != TSDB_OK)
+        return TSDB_ERR_INVAL;
 
-    case TSDB_AE_FULL_PULL:
-        /* local empty — truncate is a no-op; full pull lets a fresh node
-         * converge.  since_ts = 0 catches every row (ns-epoch ts are > 0). */
-        fprintf(stderr,
-                "[anti-entropy] %s: empty local, full pull from peer "
-                "(peer=%llu, max_ts %lld)\n",
-                table_name,
-                (unsigned long long)best_count,
-                (long long)local_max_ts);
-        if (tsdb_truncate_table(db, table_name) != TSDB_OK) {
-            return TSDB_ERR_IO;
-        }
-        pulled = pull_table_delta(db, c, best, table_name, 0);
-        break;
-
-    case TSDB_AE_SKIP_UNSAFE: {
-        /* Opt-in convergence: swap ONE cold divergent partition from the
-         * fuller peer (temp build + atomic rename under compact_mtx with a
-         * staleness guard).  Never reduces durable rows — the swap helper
-         * refuses unless the pulled copy is strictly fuller.  Default OFF. */
-        const char *bfe = getenv("TSDB_AE_PARTITION_BACKFILL");
-        if (bfe && strcmp(bfe, "1") == 0 && best_count < 100000000000ULL) {
-            int bf = ae_partition_backfill(db, c, best, table_name, wm);
-            if (bf > 0) { pulled = bf; break; }
-        }
-        /* Would shrink durable data on a peer-count comparison — refuse. */
-        fprintf(stderr,
-                "[anti-entropy] %s: middle-gap (local=%llu/peer=%llu, "
-                "equal max_ts %lld) — peer not provably a superset%s; "
-                "skipping destructive truncate to preserve local rows\n",
-                table_name,
-                (unsigned long long)local_count,
-                (unsigned long long)best_count,
-                (long long)local_max_ts,
-                best_count >= 100000000000ULL ? " (timestamp-scale count)" : "");
-        if (out_rows_pulled) *out_rows_pulled = 0;
+    if (run.rows > 0) {
+        int pulled = run.rows > (uint64_t)INT_MAX ? INT_MAX : (int)run.rows;
+        if (out_rows_pulled) *out_rows_pulled = pulled;
+        tsdb_metric_add("qengine_antientropy_rows_pulled_total", run.rows);
         return TSDB_OK;
     }
-
-    case TSDB_AE_UP_TO_DATE:
-    default:
-        if (out_rows_pulled) *out_rows_pulled = 0;
-        return TSDB_OK;
+    if (run.hard_err) return TSDB_ERR_IO;   /* preserve the TSDB_ERR_IO contract */
+    if (run.pulls > 0) {
+        /* Every peer that claimed to be ahead delivered nothing.  Do not
+         * truncate, do not spin, do not record the table as converged: leave
+         * it byte-for-byte as it is, make the condition loud and scrapeable,
+         * and let the next resync retry against a fresh membership snapshot. */
+        fprintf(stderr,
+                "[anti-entropy] %s: %d peer(s) reported rows but delivered "
+                "none%s — local still %llu rows; no source found\n",
+                table_name, run.pulls,
+                run.budget_hit ? " (wall budget expired)" : "",
+                (unsigned long long)local_count);
+        tsdb_metric_inc("qengine_antientropy_no_source_total");
     }
-
-    if (pulled < 0) return TSDB_ERR_IO;
-    if (out_rows_pulled) *out_rows_pulled = pulled;
-    tsdb_metric_add("qengine_antientropy_rows_pulled_total", (uint64_t)pulled);
     return TSDB_OK;
 }
 

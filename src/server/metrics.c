@@ -162,6 +162,9 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_rows_pulled_total",
       "Rows pulled from a peer via anti-entropy resync (catch-up after downtime)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_antientropy_no_source_total",
+      "Anti-entropy resyncs where every candidate peer reported rows but delivered none (empty peer echoing the cluster aggregate, or a peer that lost the table)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_shard_local_skipped_total",
       "Memtable flushes a non-owner skipped because owners ACKed the rows (Phase β.2)", MT_COUNTER, { .c = { 0 } } },
 
