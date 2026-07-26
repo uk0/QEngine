@@ -51,7 +51,11 @@ int main(void) {
         tsdb_io_async_t *io = NULL;
         ASSERT(tsdb_io_async_create(8, &io) == 0);
 
-        const int N = 8;
+        /* enum, not `const int`: in C a const int is not a constant
+         * expression, so `uint64_t tags[N + 4] = {0}` below became a VLA —
+         * which clang initialises as an extension but gcc rejects outright,
+         * breaking the whole test build on the deployment compiler. */
+        enum { N = 8 };
         for (int i = 0; i < N; i++) {
             char b[8]; snprintf(b, sizeof(b), "row%d\n", i);
             ASSERT(write(fd, b, strlen(b)) > 0);
