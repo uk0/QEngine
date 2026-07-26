@@ -747,6 +747,50 @@ static void *connection_handler(void *arg) {
             handle_fed_query(db, fd, tls, &msg, 1 /* scatter-local */);
             break;
 
+        case TSDB_RPC_LOCAL_TABLE_STATS: {
+            /* Anti-entropy peer probe.  Report what THIS node actually holds
+             * for the named table — partitions on disk plus the un-flushed
+             * memtable — never what the cluster holds.
+             *
+             * Answering this with the query engine is what the caller is
+             * escaping: hierarchy mirroring registers every plain table as a
+             * childless data-bearing super-table, so `SELECT count(*) FROM <t>`
+             * on a node with NO local rows fires the cluster-agg coordinator
+             * and returns the CLUSTER-WIDE total.  A peer holding nothing then
+             * looks exactly like the peer that holds everything, and a resync
+             * that picks it pulls zero rows while reporting success.
+             * tsdb_cluster_local_table_stats has no such escape hatch: it
+             * reads ts.idx headers and the memtable directly, so an empty peer
+             * answers (0, INT64_MIN) and is never mistaken for a source.
+             *
+             * A table this node has never heard of is EMPTY, not an error —
+             * that is a truthful measurement and the caller needs it. */
+            uint64_t cnt = 0;
+            int64_t  mx  = 0;
+            char stbl[128];
+            if (!db || msg.payload_len < 1) {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            uint32_t nlen = msg.payload[0];
+            if (nlen == 0 || nlen + 1u > msg.payload_len ||
+                nlen >= sizeof(stbl)) {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            memcpy(stbl, msg.payload + 1, nlen);
+            stbl[nlen] = '\0';
+            if (tsdb_cluster_local_table_stats(db, stbl, &cnt, &mx) != TSDB_OK) {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            uint8_t body[16];
+            memcpy(body,     &cnt, 8);
+            memcpy(body + 8, &mx,  8);
+            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, body, sizeof(body));
+            break;
+        }
+
         case TSDB_RPC_RAW_BLOCK_PUSH:
             /* Replica receive: parse block, write verbatim to .col/.idx. */
             if (db && msg.payload_len > 0) {
@@ -1524,6 +1568,45 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
     conn_set_io_timeout(conn->fd, 0);
     pthread_mutex_unlock(&conn->lock);
     return rc;
+}
+
+/* ---- Anti-entropy peer probe (client side) ------------------------------- */
+
+int tsdb_rpc_local_table_stats(tsdb_rpc_conn_t *conn, const char *table_name,
+                               uint64_t *out_count, int64_t *out_max_ts)
+{
+    if (!conn || !table_name || !out_count || !out_max_ts) return TSDB_ERR_INVAL;
+    size_t nlen = strlen(table_name);
+    if (nlen == 0 || nlen > 255) return TSDB_ERR_INVAL;
+
+    uint8_t req[256];
+    req[0] = (uint8_t)nlen;
+    memcpy(req + 1, table_name, nlen);
+
+    /* Plain tsdb_rpc_call_recv, NOT the _to variant: this probe replaces a
+     * fedrpc_query on the same pooled per-peer conn, and fedrpc_query never
+     * armed a socket deadline either.  Arming SO_RCVTIMEO here would leave a
+     * late reply unread in the socket and desynchronise the next call on the
+     * shared replication conn — a strictly new failure mode.  Blocking
+     * behaviour is therefore identical to the call this replaces. */
+    uint8_t resp[16];
+    uint32_t rlen = 0;
+    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_LOCAL_TABLE_STATS,
+                                req, (uint32_t)(1 + nlen),
+                                resp, sizeof(resp), &rlen);
+    if (rc != TSDB_OK) return rc;   /* ERR reply → TSDB_ERR_INTERNAL */
+
+    /* An ACK that is not exactly the 16-byte body is a peer whose dispatch
+     * fell through to `default:` — it has never heard of this opcode. */
+    if (rlen != sizeof(resp)) return TSDB_ERR_UNSUPPORTED;
+
+    uint64_t cnt;
+    int64_t  mx;
+    memcpy(&cnt, resp,     8);
+    memcpy(&mx,  resp + 8, 8);
+    *out_count  = cnt;
+    *out_max_ts = mx;
+    return TSDB_OK;
 }
 
 /* ---- Write-batch payload encode / decode --------------------------------- */

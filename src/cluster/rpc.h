@@ -93,7 +93,7 @@ typedef enum {
                                          dashboard auth gate (session cookies
                                          are node-local).  Payload format is
                                          the same as APPLY_CATALOG_QTL. */,
-    TSDB_RPC_FED_QUERY_LOCAL    = 22  /* FED_QUERY variant executed in
+    TSDB_RPC_FED_QUERY_LOCAL    = 22, /* FED_QUERY variant executed in
                                          scatter-local mode: the handler sets
                                          tsdb_g_scatter_local_mode around
                                          tsdb_query so a super-table read (a)
@@ -103,6 +103,28 @@ typedef enum {
                                          Used by the cluster-wide stable
                                          aggregation coordinator; wire format
                                          identical to FED_QUERY. */
+    TSDB_RPC_LOCAL_TABLE_STATS  = 23  /* anti-entropy peer probe: "how many
+                                         rows do YOU YOURSELF hold for this
+                                         table, and what is your newest ts?".
+                                         The receiver answers from its own
+                                         storage (tsdb_cluster_local_table_stats)
+                                         — no query engine, no scatter, no
+                                         hashring filter.
+
+                                         Request payload:
+                                           name_len u8
+                                           name     [name_len bytes]
+                                         Response: ACK with a FIXED 16-byte body
+                                           count  u64 LE
+                                           max_ts i64 LE   (INT64_MIN = empty)
+
+                                         A receiver that predates this opcode
+                                         falls through the dispatch switch to
+                                         `default:`, which ACKs with an EMPTY
+                                         body — so "ACK whose body is not 16
+                                         bytes" is the unambiguous too-old
+                                         signal and the caller degrades to the
+                                         legacy FED_QUERY probe. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
@@ -327,6 +349,27 @@ int tsdb_rpc_decode_delete_range(const uint8_t *buf, uint32_t len,
 int tsdb_rpc_encode_catalog_qtl(uint8_t *buf, uint32_t cap, const char *qtl);
 int tsdb_rpc_decode_catalog_qtl(const uint8_t *buf, uint32_t len,
                                 char *out_qtl, int qtl_cap);
+
+/* ---- Anti-entropy peer probe (TSDB_RPC_LOCAL_TABLE_STATS) ---------------- */
+
+/*
+ * Ask the peer behind `conn` how many rows IT ITSELF holds for `table_name`
+ * and what its newest ts is.  The peer answers straight from its storage, so
+ * unlike `SELECT count(*), max(ts) FROM <t>` over FED_QUERY the answer can
+ * never be the CLUSTER-WIDE aggregate: a peer holding nothing reports
+ * (0, INT64_MIN) instead of echoing back the numbers of whichever node
+ * actually has the data.
+ *
+ * Returns:
+ *   TSDB_OK              — *out_count / *out_max_ts filled from the peer.
+ *   TSDB_ERR_UNSUPPORTED — the peer's binary predates this opcode (it ACKed
+ *                          with an empty body from the dispatch `default:`).
+ *                          The caller must fall back to the legacy probe.
+ *   TSDB_ERR_INTERNAL    — the peer knows the opcode and could not answer.
+ *   TSDB_ERR_IO / TSDB_ERR_INVAL — transport / argument failure.
+ */
+int tsdb_rpc_local_table_stats(tsdb_rpc_conn_t *conn, const char *table_name,
+                               uint64_t *out_count, int64_t *out_max_ts);
 
 #ifdef __cplusplus
 }

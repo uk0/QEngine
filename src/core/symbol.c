@@ -258,7 +258,7 @@ size_t tsdb_symtab_size(tsdb_symtab_t *st) {
 
 /* --- persistence: [magic u32][count u32][heap_size u32]
  *                  [offsets u32 × count][heap u8 × heap_size] */
-#define SYMTAB_MAGIC 0x54535953u /* "SYST" */
+#define SYMTAB_MAGIC TSDB_SYMTAB_MAGIC   /* declared in symbol.h */
 
 int tsdb_symtab_save(tsdb_symtab_t *st, const char *path) {
     pthread_rwlock_rdlock(&st->lock);

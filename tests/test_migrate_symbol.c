@@ -8,11 +8,13 @@
  * queried back as ZERO rows.  Silent, total loss of every tag column.
  *
  * THE FIX (stream v2): export persists each SYMBOL column's live symtab and
- * ships the .sym bytes in the header; import installs them into the target's
- * live symtab before any block lands.  A target that already holds symbols for
- * the column is refused rather than merged — its codes came from a different
- * dictionary, and reconciling them would mean decoding every block, which is
- * the one thing this SDK exists to avoid.
+ * ships the .sym bytes in the header; import reconciles them with the target's
+ * live symtab before any block lands.  A target whose dictionary DISAGREES is
+ * refused rather than merged — its codes came from a different dictionary, and
+ * reconciling them would mean decoding every block, which is the one thing this
+ * SDK exists to avoid.  A dictionary that agrees (identical, or a prefix of the
+ * stream's — what a resumed migration finds) is adopted and extended; see
+ * tests/test_migrate_resolve.c for that case.
  */
 #include "tsdb.h"
 #include "tsdb_migrate.h"

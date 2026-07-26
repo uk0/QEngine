@@ -257,12 +257,14 @@ static int compact_column_file(const char *part_dir,
                                uint64_t   *out_bytes_written,
                                uint64_t   *out_bytes_saved,
                                int        *out_produced,
+                               int        *out_eligible,
                                uint32_t   *out_src_blocks)
 {
     char col_path[4096], idx_path[4096];
     char col_tmp[4096],  idx_tmp[4096];
 
     if (out_produced) *out_produced = 0;
+    if (out_eligible) *out_eligible = 0;
     if (out_src_blocks) *out_src_blocks = 0;
 
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
@@ -273,7 +275,18 @@ static int compact_column_file(const char *part_dir,
     /* ---- 1. mmap the existing .col file ----------------------------------- */
 
     int fd = open(col_path, O_RDONLY);
-    if (fd < 0) return TSDB_OK;   /* column doesn't exist yet — nothing to do */
+    if (fd < 0) {
+        /* ENOENT is the one benign case: this column has no data in this
+         * partition (e.g. added by ALTER after the partition was written), so
+         * skipping it is the normal no-op.  ANY other errno (EACCES, EMFILE,
+         * ENFILE — the same resource-exhaustion family as ENOSPC) means the
+         * column IS there and we merely could not read it.  Reporting TSDB_OK
+         * there let compact_partition swap this column's SIBLINGS while this
+         * one kept the old block layout, desyncing the partition's single
+         * shared layout: count(*) (served from ts) keeps answering while every
+         * value read returns TSDB_ERR_CORRUPT.  Report the failure. */
+        return (errno == ENOENT) ? TSDB_OK : TSDB_ERR_IO;
+    }
 
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return TSDB_OK; }
@@ -288,7 +301,11 @@ static int compact_column_file(const char *part_dir,
     /* ---- 2. Read .idx header to get block count --------------------------- */
 
     FILE *idx_f = fopen(idx_path, "rb");
-    if (!idx_f) { munmap(col_map, map_len); return TSDB_OK; }
+    if (!idx_f) {
+        int e = errno;
+        munmap(col_map, map_len);
+        return (e == ENOENT) ? TSDB_OK : TSDB_ERR_IO;   /* see open() above */
+    }
 
     uint8_t hdr_buf[TSDB_IDX_HEADER_SIZE];
     size_t  hdr_n = fread(hdr_buf, 1, TSDB_IDX_HEADER_SIZE, idx_f);
@@ -325,6 +342,17 @@ static int compact_column_file(const char *part_dir,
             return TSDB_OK;
         }
     }
+
+    /* From here on this column IS compactable, so a run that ends without a
+     * .tmp pair is a FAILURE, not a no-op — even on the paths below that
+     * return TSDB_OK (count-overflow bail, block decode error, skip_col).
+     * compact_partition keys its all-or-nothing swap on this flag: swapping
+     * only the columns that produced would leave ts on the compacted layout
+     * and this one on the old one, and every column of a partition shares ONE
+     * block layout.  Everything ABOVE stays "not eligible" so the normal
+     * no-ops (below threshold / already compacted / column absent) still let
+     * the partition's other columns swap. */
+    if (out_eligible) *out_eligible = 1;
 
     /* Decide header / entry sizes based on on-disk version.  part.c emits a V4
      * header (48 bytes, max_seq at [40..47]) whenever a WAL redo checkpoint is
@@ -667,17 +695,34 @@ static int compact_column_file(const char *part_dir,
         if (safe_write(new_idx, real_hdr, hn) < 0) goto io_err;
     }
 
-    /* fsync both tmp files before rename. */
-    fflush(new_col);
-    fflush(new_idx);
+    /* fsync both tmp files before rename — and CHECK every step.
+     *
+     * safe_write() only ever sees the BUFFERED copy: the trailing partial
+     * stdio buffer does not reach the device until fflush, so a short write
+     * at the tail of a full .col lands HERE, not in safe_write.  Discarding
+     * these return values published a truncated .col.tmp under a COMPLETE
+     * .idx.tmp — the manifest then references bytes that were never written,
+     * the reader's torn-column clamp refuses the whole column, and the
+     * pre-compaction .col it replaced is gone.  On failure fall into io_err,
+     * which removes both .tmp files and leaves the live pair untouched.
+     *
+     * new_col/new_idx are NULLed before the goto: io_err starts with
+     * `if (new_col) fclose(new_col);`, so a non-NULL handle would double-close. */
     {
-        int fc = fileno(new_col);
-        int fi = fileno(new_idx);
-        if (fc >= 0) fsync(fc);
-        if (fi >= 0) fsync(fi);
+        int ok = (fflush(new_col) == 0) && !ferror(new_col)
+              && (fflush(new_idx) == 0) && !ferror(new_idx);
+        if (ok) {
+            int fc = fileno(new_col);
+            int fi = fileno(new_idx);
+            if (fc < 0 || fsync(fc) != 0) ok = 0;
+            if (fi < 0 || fsync(fi) != 0) ok = 0;
+        }
+        if (fclose(new_col) != 0) ok = 0;
+        new_col = NULL;
+        if (fclose(new_idx) != 0) ok = 0;
+        new_idx = NULL;
+        if (!ok) goto io_err;
     }
-    fclose(new_col); new_col = NULL;
-    fclose(new_idx); new_idx = NULL;
 
     /* Hand the ts column's decoded values to the caller: every other column of
      * this partition derives its block ts ranges from them. */
@@ -747,6 +792,7 @@ static int compact_partition(tsdb_schema_t   *schema,
                              tsdb_compactor_stats_t *stats)
 {
     int any_compacted = 0;
+    int col_failed    = 0;   /* an eligible column produced nothing -> never swap */
 
     int *produced = calloc((size_t)schema->ncols, sizeof(int));
     uint32_t *src_blocks = calloc((size_t)schema->ncols, sizeof(uint32_t));
@@ -768,7 +814,7 @@ static int compact_partition(tsdb_schema_t   *schema,
         int ci = (order == 0) ? schema->ts_col_idx
                : (order <= schema->ts_col_idx) ? order - 1 : order;
         uint64_t bw = 0, bs = 0;
-        int prod = 0;
+        int prod = 0, elig = 0;
         uint32_t srcb = 0;
         int is_ts = (ci == schema->ts_col_idx);
         int rc = compact_column_file(part_dir,
@@ -779,7 +825,7 @@ static int compact_partition(tsdb_schema_t   *schema,
                                      is_ts ? 0    : ts_flat_n,
                                      is_ts ? &ts_flat : NULL,
                                      is_ts ? &ts_flat_n : NULL,
-                                     &bw, &bs, &prod, &srcb);
+                                     &bw, &bs, &prod, &elig, &srcb);
         if (rc == TSDB_OK && prod) {
             produced[ci]   = 1;
             src_blocks[ci] = srcb;
@@ -791,8 +837,22 @@ static int compact_partition(tsdb_schema_t   *schema,
                 stats->compactions_done++;
             }
         }
-        /* Non-fatal errors: continue with next column (its .tmp, if any, was
-         * already removed by compact_column_file). */
+        /* A column that was COMPACTABLE but produced no .tmp pair must veto the
+         * whole partition.  Phase 2 would otherwise swap only its SIBLINGS,
+         * leaving ts on the compacted layout and this column on the old one —
+         * exactly the hazard phase 2's own comment warns about, and the reason
+         * a partition has ONE block layout shared by every column.  The symptom
+         * is not an obvious outage: count(*) is served from ts and keeps
+         * returning the right number while every value read fails the
+         * (ts_min,count) pairing and returns TSDB_ERR_CORRUPT.
+         *
+         * Keying on eligibility, not on rc, is required: compact_column_file
+         * returns TSDB_OK with produced=0 on the count-overflow bail, on a
+         * block decode error and via skip_col.  Keying on rc alone leaves all
+         * three reachable.  A column that was never eligible (below threshold /
+         * already compacted / .col absent) is the normal no-op and is
+         * deliberately still tolerated. */
+        if (rc != TSDB_OK || (elig && !prod)) col_failed = 1;
     }
 
     /* Phase 2 — swap EVERY produced column atomically under one lock hold, so
@@ -812,7 +872,7 @@ static int compact_partition(tsdb_schema_t   *schema,
          * cross-column block alignment consistent; a later pass compacts the
          * settled files.  flush holds compact_mtx for its append, so reading
          * the live counts here (under the same lock) is a consistent check. */
-        int stale = 0;
+        int stale = col_failed;
         for (int ci = 0; ci < schema->ncols && !stale; ci++) {
             if (!produced[ci]) continue;
             if (live_idx_block_count(part_dir, schema->cols[ci].name) != src_blocks[ci])

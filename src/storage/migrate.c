@@ -208,8 +208,16 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
     (void)opts;
     if (!db || !table || fd < 0) return TSDB_ERR_INVAL;
 
+    /* Resolve through tsdb_open_table, not tsdb_db_find_table: the latter only
+     * walks the tables this process has already opened, so a table sitting on
+     * disk untouched reported NOTFOUND even though a SELECT on the same handle
+     * reads it fine.  Its rc IS the answer — NOTFOUND when the table really is
+     * absent, anything else a real error. */
+    tsdb_table_t *th = NULL;
+    int orc = tsdb_open_table(db, table, &th);
+    if (orc != TSDB_OK) return orc;
     tsdb_table_internal_t *ti = tsdb_db_find_table(db, table);
-    if (!ti) return TSDB_ERR_NOTFOUND;
+    if (!ti) return TSDB_ERR_INTERNAL;
     tsdb_schema_t *s = tsdb_tbl_schema(ti);
     if (!s) return TSDB_ERR_INTERNAL;
 
@@ -409,6 +417,81 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
     fclose(f);
 }
 
+/* ---- import-side dictionary reconciliation --------------------------------
+ *
+ * Merge a streamed dictionary into the target column's LIVE symtab.
+ *
+ * v2 refused any target whose dictionary was non-empty, on the theory that its
+ * codes must have come from somewhere else.  That is wrong for the one case
+ * the SDK promises to handle: a RESUMED migration.  The second run finds the
+ * dictionary the FIRST run installed — identical, by construction — and the
+ * count-based guard rejected it, so every interrupted migration of a table
+ * with a tag column became permanently unresumable.  (It only escaped notice
+ * because resolving the target with tsdb_db_find_table hid the table from the
+ * second run entirely.)
+ *
+ * So compare instead of count.  Codes are assigned densely from 0 in intern
+ * order, so two dictionaries agree exactly when one is a prefix of the other.
+ * While the target's codes match, the tail can simply be interned — intern
+ * appends, so string N lands at code N and the prefix property is preserved.
+ * One disagreeing code means the dictionaries really were built independently:
+ * refuse, because landing the blocks would silently retag every row.
+ *
+ * Interning in place also avoids swapping schema->cols[ci].symtab out from
+ * under a reader: exec.c snapshots that pointer for the life of a query, and
+ * the old code freed it.
+ */
+static int mig_sym_adopt(tsdb_schema_t *s, int ci, const uint8_t *b, size_t len)
+{
+    /* Wire bytes are a .sym file — see core/symbol.h for the layout. */
+    uint32_t magic = 0, cnt = 0, hsz = 0;
+    if (len < 12) return TSDB_ERR_CORRUPT;
+    memcpy(&magic, b + 0, 4);
+    memcpy(&cnt,   b + 4, 4);
+    memcpy(&hsz,   b + 8, 4);
+    if (magic != TSDB_SYMTAB_MAGIC) return TSDB_ERR_CORRUPT;
+    if ((uint64_t)len < 12ull + (uint64_t)cnt * 4u + (uint64_t)hsz)
+        return TSDB_ERR_CORRUPT;
+
+    const uint8_t *offs = b + 12;
+    const char    *heap = (const char *)(b + 12 + (size_t)cnt * 4u);
+    /* Every interned string is NUL-terminated, so a heap that does not end in
+     * one is truncated — bail before strcmp/intern walk off the end. */
+    if (cnt && (hsz == 0 || heap[hsz - 1] != '\0')) return TSDB_ERR_CORRUPT;
+
+    tsdb_symtab_t *cur = s->cols[ci].symtab;
+    if (!cur) {
+        if (tsdb_symtab_new(&cur) != TSDB_OK || !cur) return TSDB_ERR_NOMEM;
+        s->cols[ci].symtab = cur;
+    }
+    size_t have = tsdb_symtab_size(cur);
+
+    for (uint32_t c = 0; c < cnt; c++) {
+        uint32_t off = 0;
+        memcpy(&off, offs + (size_t)c * 4u, 4);
+        if (off >= hsz) return TSDB_ERR_CORRUPT;
+        const char *str = heap + off;
+
+        if (c < have) {                     /* shared prefix: must be identical */
+            const char *mine = tsdb_symtab_str(cur, c);
+            if (!mine || strcmp(mine, str) != 0) return TSDB_ERR_SCHEMA;
+            continue;
+        }
+        /* Fresh code.  intern assigns count++, which is exactly c here; if it
+         * does not, the dictionaries disagree and landing the blocks would
+         * mislabel rows. */
+        uint32_t got = tsdb_symtab_intern(cur, str);
+        if (got == TSDB_SYMBOL_INVALID) return TSDB_ERR_NOMEM;
+        if (got != c) return TSDB_ERR_SCHEMA;
+    }
+    /* Codes the target holds beyond the stream's are its own and stay: the
+     * arriving blocks can only name codes < cnt. */
+
+    char sp[4400];
+    snprintf(sp, sizeof(sp), "%s/%s.sym", s->dir, s->cols[ci].name);
+    return tsdb_symtab_save(cur, sp);
+}
+
 /* ---- import -------------------------------------------------------------- */
 
 int tsdb_migrate_import(tsdb_db_t *db, int fd,
@@ -487,23 +570,36 @@ sym_fail:
         return rc;
     }
 
-    tsdb_table_internal_t *existing = tsdb_db_find_table(db, tname);
-    if (existing && land == TSDB_MIG_CREATE_ONLY) { free(cols); free(names); return TSDB_ERR_EXISTS; }
+    /* Does the target exist?  tsdb_db_find_table answers "is it OPEN", which is
+     * not the same question: a table this process never touched looked ABSENT,
+     * so CREATE_ONLY landed instead of refusing and tsdb_create_table rewrote
+     * the target's schema.bin out from under its own rows.  tsdb_open_table
+     * answers the real question and its rc is authoritative. */
+    tsdb_table_t *th = NULL;
+    int orc = tsdb_open_table(db, tname, &th);
+    if (orc != TSDB_OK && orc != TSDB_ERR_NOTFOUND) { rc = orc; goto resolve_fail; }
+
+    tsdb_table_internal_t *existing = NULL;
+    if (orc == TSDB_OK) {
+        existing = tsdb_db_find_table(db, tname);
+        if (!existing) { rc = TSDB_ERR_INTERNAL; goto resolve_fail; }
+    }
+    if (existing && land == TSDB_MIG_CREATE_ONLY) { rc = TSDB_ERR_EXISTS; goto resolve_fail; }
     if (!existing) {
         rc = tsdb_create_table(db, tname, cols, (size_t)ncols, cols[ts_idx].name);
-        if (rc != TSDB_OK) { free(cols); free(names); return rc; }
+        if (rc != TSDB_OK) goto resolve_fail;
     } else {
         /* Landing writes by column INDEX, so a disagreeing schema would write
          * one column's bytes into another's file.  Refuse instead. */
         tsdb_schema_t *es = tsdb_tbl_schema(existing);
-        if (!es || es->ncols != ncols) { free(cols); free(names); return TSDB_ERR_SCHEMA; }
+        if (!es || es->ncols != ncols) { rc = TSDB_ERR_SCHEMA; goto resolve_fail; }
         for (int i = 0; i < ncols; i++) {
             if (strcmp(es->cols[i].name, cols[i].name) != 0 ||
-                es->cols[i].type != cols[i].type) { free(cols); free(names); return TSDB_ERR_SCHEMA; }
+                es->cols[i].type != cols[i].type) { rc = TSDB_ERR_SCHEMA; goto resolve_fail; }
         }
     }
-    free(cols);
-    free(names);
+    free(cols);  cols  = NULL;
+    free(names); names = NULL;
 
     tsdb_mig_stats_t st;
     memset(&st, 0, sizeof(st));
@@ -514,43 +610,17 @@ sym_fail:
         if (tt) tgt_schema = tsdb_tbl_schema(tt);
     }
 
-    /* Install the source dictionaries before any block lands.  The blocks carry
-     * CODES, so they are only meaningful against the dictionary that assigned
-     * them; the live symtab has to be replaced, not just the .sym file, because
-     * schema_save rewrites that file from memory at close.
-     *
-     * A target that ALREADY holds symbols for the column is refused: its codes
-     * were assigned by a different dictionary, and reconciling the two means
-     * decoding and re-encoding every block — which is exactly what this SDK
-     * exists to avoid.  Adopting into an empty dictionary is the safe case. */
+    /* Reconcile the source dictionaries before any block lands.  The blocks
+     * carry CODES, so they are only meaningful against the dictionary that
+     * assigned them; the live symtab has to agree, not just the .sym file,
+     * because schema_save rewrites that file from memory at close. */
     for (uint32_t k = 0; k < nsym && tgt_schema && rc == TSDB_OK; k++) {
         int ci = (int)sym_col[k];
         if (ci >= tgt_schema->ncols ||
             tgt_schema->cols[ci].type != TSDB_TYPE_SYMBOL) continue;
         if (!sym_len[k]) continue;
 
-        if (tgt_schema->cols[ci].symtab &&
-            tsdb_symtab_size(tgt_schema->cols[ci].symtab) > 0) {
-            rc = TSDB_ERR_SCHEMA;   /* codes would collide — refuse, don't corrupt */
-            break;
-        }
-
-        char sp[4400];
-        snprintf(sp, sizeof(sp), "%s/%s.sym",
-                 tgt_schema->dir, tgt_schema->cols[ci].name);
-        FILE *sf = fopen(sp, "wb");
-        if (!sf) { rc = TSDB_ERR_IO; break; }
-        size_t w = fwrite(sym_buf[k], 1, sym_len[k], sf);
-        if (fflush(sf) != 0 || fsync(fileno(sf)) != 0) w = 0;
-        fclose(sf);
-        if (w != sym_len[k]) { rc = TSDB_ERR_IO; break; }
-
-        tsdb_symtab_t *loaded = NULL;
-        if (tsdb_symtab_load(sp, &loaded) != TSDB_OK || !loaded) {
-            rc = TSDB_ERR_CORRUPT; break;
-        }
-        tsdb_symtab_free(tgt_schema->cols[ci].symtab);
-        tgt_schema->cols[ci].symtab = loaded;
+        rc = mig_sym_adopt(tgt_schema, ci, sym_buf[k], sym_len[k]);
     }
     for (uint32_t k = 0; k < nsym; k++) free(sym_buf[k]);
     free(sym_col); free(sym_buf); free(sym_len);
@@ -603,6 +673,16 @@ sym_fail:
 
     if (rc == TSDB_OK && out) *out = st;
     return rc;
+
+    /* Every exit taken while resolving the target has to drop BOTH the header
+     * allocations and the symbol section — four of them used to return straight
+     * out, leaking the dictionaries (up to 64 MB each), and the schema-mismatch
+     * path runs on every test_migrate run. */
+resolve_fail:
+    for (uint32_t k = 0; k < nsym; k++) free(sym_buf[k]);
+    free(cols); free(names);
+    free(sym_col); free(sym_buf); free(sym_len);
+    return rc;
 }
 
 /* ---- digest -------------------------------------------------------------- */
@@ -610,8 +690,12 @@ sym_fail:
 int tsdb_migrate_digest(tsdb_db_t *db, const char *table, tsdb_mig_stats_t *out)
 {
     if (!db || !table || !out) return TSDB_ERR_INVAL;
+    /* Same resolution as export: on-disk existence, not "already open". */
+    tsdb_table_t *th = NULL;
+    int orc = tsdb_open_table(db, table, &th);
+    if (orc != TSDB_OK) return orc;
     tsdb_table_internal_t *ti = tsdb_db_find_table(db, table);
-    if (!ti) return TSDB_ERR_NOTFOUND;
+    if (!ti) return TSDB_ERR_INTERNAL;
     tsdb_schema_t *s = tsdb_tbl_schema(ti);
     if (!s) return TSDB_ERR_INTERNAL;
 

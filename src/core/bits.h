@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/types.h>
 
 typedef struct {
@@ -75,8 +76,50 @@ static inline void tsdb_br_init(tsdb_br_t *r, const uint8_t *buf, size_t cap) {
     r->buf = buf; r->cap = cap; r->bytes = 0; r->scratch = 0; r->nbits = 0; r->underflow = 0;
 }
 
-/* Refill scratch to have at least `n` bits available. */
+/* Refill scratch to have at least `n` bits available.
+ *
+ * Bulk path: when a whole 8-byte load fits inside the buffer and scratch still
+ * has room for at least one byte, absorb up to 8 bytes with one unaligned
+ * 64-bit load instead of stepping the byte loop 1..8 times.  `take` is how many
+ * WHOLE bytes fit above `nbits`; the load always brings in 8, so the bits past
+ * `nbits + 8*take` must be masked back off — the reader's contract is that
+ * everything above `nbits` in scratch reads as zero, and leaving those bits
+ * behind corrupts every later read.
+ *
+ * The bulk path deliberately falls THROUGH to the byte loop instead of
+ * returning: `take` is 0 once nbits >= 57 (so the branch is skipped entirely
+ * and the loop must still run), and even when it does run it only tops scratch
+ * up to 57..64 bits, which is short of a 58..64-bit request.  The byte loop
+ * below stays the single authority on "enough bits", on end-of-buffer zero
+ * padding, and on the underflow flag.
+ *
+ * Bit-for-bit equivalent to the pure byte loop.  Both keep
+ *     scratch == bits[off, off + nbits)   with zeros above nbits
+ *     off     == 8*bytes - nbits          (off = next unread bit)
+ * and nbits is congruent to -off mod 8 in both, so the bulk path only changes
+ * HOW MANY bytes are banked ahead — never the value of the next `n` bits, never
+ * which byte a >56-bit request truncates against, and never the point at which
+ * the buffer runs out (padding starts at bytes == cap with nbits == 8*cap - off
+ * either way).  The 8-byte load is fully in bounds, so the tail near the end of
+ * the buffer is handled by the byte loop exactly as before.
+ */
 static inline void tsdb_br_refill(tsdb_br_t *r, unsigned n) {
+    if (r->nbits < n && r->nbits <= 56 && r->bytes + 8 <= r->cap) {
+        uint64_t w;
+        memcpy(&w, r->buf + r->bytes, 8);           /* unaligned-safe */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        w = __builtin_bswap64(w);                   /* stream is LSB-first */
+#endif
+        unsigned take = (64u - r->nbits) >> 3;      /* whole bytes, 1..8 */
+        unsigned have = r->nbits + (take << 3);     /* 57..64 */
+        r->scratch |= w << r->nbits;
+        /* have is 57..64, so the shift count is 0..7 — never the UB that
+         * ((uint64_t)1 << 64) would be. */
+        r->scratch &= ~(uint64_t)0 >> (64u - have);
+        r->bytes += take;
+        r->nbits  = have;
+    }
     while (r->nbits < n) {
         if (r->bytes >= r->cap) {
             /* Pad with zeros but flag underflow if too short */

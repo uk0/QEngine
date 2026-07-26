@@ -74,9 +74,10 @@ typedef struct {
  * `opts` is accepted for symmetry and may be NULL (there is nothing to
  * configure on the export side in this version).  `out` may be NULL.
  *
- * Returns TSDB_OK, TSDB_ERR_NOTFOUND if the table does not exist, or an
- * IO/NOMEM error.  A short write is an error; the stream is not resumable
- * mid-record, only mid-migration.
+ * Returns TSDB_OK, TSDB_ERR_NOTFOUND if the table does not exist ON DISK —
+ * whether this process has opened it yet is irrelevant — or an IO/NOMEM
+ * error.  A short write is an error; the stream is not resumable mid-record,
+ * only mid-migration.
  */
 int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
                         const tsdb_mig_opts_t *opts, tsdb_mig_stats_t *out);
@@ -86,9 +87,15 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
  * schema carried in the stream when needed.  `opts` may be NULL for defaults.
  * `out` may be NULL.
  *
+ * "The target already holds the table" means it exists ON DISK, not that this
+ * process has it open.
+ *
  * Returns TSDB_OK, TSDB_ERR_CORRUPT on a malformed/truncated stream,
  * TSDB_ERR_SCHEMA when the target's existing schema disagrees with the
- * stream's, TSDB_ERR_EXISTS under TSDB_MIG_CREATE_ONLY, or an IO/NOMEM error.
+ * stream's — or when a SYMBOL column's dictionary does (the codes in the
+ * blocks would then name different strings; an identical dictionary, which is
+ * what a resumed migration finds, is fine) — TSDB_ERR_EXISTS under
+ * TSDB_MIG_CREATE_ONLY, or an IO/NOMEM error.
  */
 int tsdb_migrate_import(tsdb_db_t *db, int fd,
                         const tsdb_mig_opts_t *opts, tsdb_mig_stats_t *out);

@@ -333,12 +333,57 @@ static void test_e_create_recovers(void) {
     rm_rf(dir);
 }
 
+/* Graceful tsdb_close must persist the memtable through the SAME path a normal
+ * flush uses (flush_and_clear_locked), not a bare tsdb_part_flush.  Only that
+ * path stamps the WAL redo checkpoint (commit_seq) into the partitions it
+ * publishes and truncates the log; a bare part_flush passes max_seq=0 and
+ * tsdb_part_flush_ex2 only RAISES a checkpoint, so the rows become durable
+ * while their redo records stay live with seq > checkpoint — and the next open
+ * replays them ON TOP of the partition close just wrote.
+ *
+ * This needs THREE reopen cycles to be visible: the duplication compounds by
+ * exactly N per graceful restart (measured 100 -> 200 -> 300 -> 400 on the
+ * unfixed path), and reopen_count() alone (one open/count/close) cannot tell
+ * the first duplicate from a correct recovery of a never-flushed memtable. */
+static void test_f_graceful_close_no_dup(void) {
+    const char *dir = "/tmp/tsdb_test_wal_recovery_f";
+    rm_rf(dir);
+    make_table(dir);
+
+    const int N = 100;   /* << TSDB_BLOCK_POINTS: only close ever flushes */
+    setenv("TSDB_WAL_ONLY_COMMIT", "1", 1);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dir, &db));
+    write_rows(db, "t", N, /*per_commit=*/1, DAY1, 0);
+    tsdb_close(db);              /* GRACEFUL close — the path under test */
+
+    for (int cycle = 1; cycle <= 3; cycle++) {
+        int c = reopen_count(dir, /*wal_only=*/1);
+        printf("[F] graceful close, reopen #%d: count=%d (expect %d)\n",
+               cycle, c, N);
+        ASSERT(c == N);          /* unfixed: 200, 300, 400 */
+    }
+
+    /* Count alone could in principle mask a loss that offsets a duplicate, so
+     * pin one row: v=0 must exist exactly once after all those cycles. */
+    setenv("TSDB_WAL_ONLY_COMMIT", "1", 1);
+    OK(tsdb_open(dir, &db));
+    int zeros = count_rows(db, "SELECT v FROM t WHERE v = 0");
+    tsdb_close(db);
+    printf("[F] rows with v=0: %d (expect 1)\n", zeros);
+    ASSERT(zeros == 1);
+
+    rm_rf(dir);
+    printf("test_f PASS\n");
+}
+
 int main(void) {
     test_c();   /* default path first: must hold regardless of redo changes */
     test_a();
     test_b();
     test_d();
     test_e_create_recovers();   /* create-over-existing recovery (this fix) */
+    test_f_graceful_close_no_dup();   /* close flushes via flush_and_clear */
     printf("\n=== WAL redo recovery TESTS PASSED ===\n");
     return 0;
 }

@@ -766,21 +766,55 @@ int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
 
 /* ---- Anti-entropy resync ------------------------------------------------ */
 
-/* Ask peer `peer_id` for (count, max_ts) of `table_name`.  Returns 0
- * on success with out_count / out_max_ts populated; -1 on failure. */
-static int peer_table_stats(tsdb_cluster_t *c,
-                             tsdb_node_id_t peer_id,
-                             const char *table_name,
-                             uint64_t *out_count,
-                             int64_t  *out_max_ts)
+/* Ask the peer behind `conn` for (count, max_ts) of `table_name`.  Returns 0
+ * on success with out_count / out_max_ts populated; -1 on failure.
+ * Exposed (via include/tsdb_cluster.h) so the probe can be unit-tested
+ * against a real RPC server and against a stub that models an old peer.
+ *
+ * PREFERRED PATH — TSDB_RPC_LOCAL_TABLE_STATS: the peer measures ITSELF with
+ * tsdb_cluster_local_table_stats and hands back its own (count, max_ts).
+ *
+ * Why that matters: `SELECT count(*), max(ts) FROM <t>` is NOT a measurement
+ * of the peer.  Hierarchy mirroring registers every plain table as a childless
+ * data-bearing super-table, so exec routes the query through exec_stable_select
+ * and, on a peer that holds NO local rows, the cluster-agg coordinator fires
+ * and the peer answers with the CLUSTER-WIDE aggregate — byte-identical to
+ * what the real holder reports.  The selection loop below then cannot tell the
+ * two apart, and if it lands on the empty one the follow-up
+ * `SELECT * FROM <t> WHERE ts > N` (not a scalar agg, so no coordinator)
+ * returns nothing: the resync reports success having converged zero rows, and
+ * the startup resync runs exactly once, so that is permanent.  The tree
+ * already fixed the LOCAL half of this comparison for the same reason
+ * (tsdb_cluster_local_table_stats, tests/test_ae_local_stats.c); this is the
+ * symmetric peer half.
+ *
+ * FALLBACK — a peer running an older binary has no such opcode: its dispatch
+ * hits `default:` and ACKs with an empty body, which the client helper reports
+ * as TSDB_ERR_UNSUPPORTED.  We then run exactly the query this function has
+ * always run, so a mixed-version cluster keeps behaving as it does today
+ * rather than erroring.  A transport failure degrades the same way (the legacy
+ * path gets one more chance on the same pooled conn).
+ *
+ * NOT a fallback: TSDB_ERR_INTERNAL, i.e. the peer knows the opcode and could
+ * not answer.  That is a peer which failed to measure itself, and guessing on
+ * its behalf with a query that can return the cluster's numbers is what this
+ * change exists to stop; treat it as "no answer" so the peer is skipped. */
+int tsdb_cluster_peer_table_stats_conn(struct tsdb_rpc_conn *conn,
+                                       const char *table_name,
+                                       uint64_t *out_count,
+                                       int64_t  *out_max_ts)
 {
-    if (!c || !table_name) return -1;
+    if (!conn || !table_name || !out_count || !out_max_ts) return -1;
 
-    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
-    if (!rmgr) return -1;
-
-    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
-    if (!conn) return -1;
+    uint64_t lc = 0;
+    int64_t  lm = 0;
+    int prc = tsdb_rpc_local_table_stats(conn, table_name, &lc, &lm);
+    if (prc == TSDB_OK) {
+        *out_count  = lc;
+        *out_max_ts = lm;
+        return 0;
+    }
+    if (prc == TSDB_ERR_INTERNAL) return -1;   /* understood, could not answer */
 
     char qtl[256];
     snprintf(qtl, sizeof(qtl),
@@ -824,6 +858,26 @@ static int peer_table_stats(tsdb_cluster_t *c,
     }
     tsdb_result_free(res);
     return ok ? 0 : -1;
+}
+
+/* Resolve peer_id to a pooled conn and probe it.  Returns 0 on success,
+ * -1 if the peer is undialable or did not answer. */
+static int peer_table_stats(tsdb_cluster_t *c,
+                             tsdb_node_id_t peer_id,
+                             const char *table_name,
+                             uint64_t *out_count,
+                             int64_t  *out_max_ts)
+{
+    if (!c || !table_name) return -1;
+
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    if (!rmgr) return -1;
+
+    tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
+    if (!conn) return -1;
+
+    return tsdb_cluster_peer_table_stats_conn(conn, table_name,
+                                              out_count, out_max_ts);
 }
 
 /* Pull every row at ts > since_ts from `peer_id` and insert locally

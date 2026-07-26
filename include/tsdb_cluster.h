@@ -173,6 +173,22 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
 int tsdb_cluster_local_table_stats(tsdb_db_t *db, const char *table_name,
                                    uint64_t *out_count, int64_t *out_max_ts);
 
+/* The PEER half of the same measurement (exposed for unit testing).
+ *
+ * `conn` is an open connection to the peer (struct tsdb_rpc_conn, i.e. the
+ * tsdb_rpc_conn_t of src/cluster/rpc.h — forward-declared here so the public
+ * header keeps no dependency on the cluster wire layer).
+ *
+ * Asks the peer what IT ITSELF holds via TSDB_RPC_LOCAL_TABLE_STATS, and only
+ * if the peer's binary is too old to know that opcode falls back to the legacy
+ * `SELECT count(*), max(ts) FROM <t>` probe.  Returns 0 with *out_count /
+ * *out_max_ts populated, -1 if the peer gave no usable answer. */
+struct tsdb_rpc_conn;
+int tsdb_cluster_peer_table_stats_conn(struct tsdb_rpc_conn *conn,
+                                       const char *table_name,
+                                       uint64_t *out_count,
+                                       int64_t  *out_max_ts);
+
 /* Partition-level backfill primitive (exposed for unit testing).
  *
  * Materialises `res` — every row of ONE partition, as pulled from a fuller

@@ -35,6 +35,14 @@ extern int tsdb_mkdir_p(const char *path);
 static void *trash_gc_main(void *arg);
 static void  trash_or_rm(tsdb_db_t *db, const char *tbl_dir);
 
+/* Forward decl: definitions below. Needed by tsdb_close and
+ * tsdb_alter_table_add_column.
+ * `_locked` variant assumes the caller already holds t->compact_mtx and is
+ * what alter_table / future callers-with-the-lock should use; `_ex` is the
+ * public entry point that takes/releases the lock for callers without it. */
+static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate);
+static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate);
+
 /* ---- Table handle ------------------------------------------------------- */
 
 /*
@@ -593,9 +601,27 @@ void tsdb_close(tsdb_db_t *db) {
         tsdb_table_internal_t *t = db->tables[i];
         if (!t) continue;
 
-        /* Flush remaining memtable data. */
-        if (t->memtable && tsdb_memtable_rows(t->memtable) > 0) {
-            tsdb_part_flush(t->schema, t->memtable);
+        /* Flush remaining memtable data through the normal flush path, NOT a
+         * bare tsdb_part_flush: only flush_and_clear_locked stamps the WAL redo
+         * checkpoint (commit_seq) into the partitions it publishes and truncates
+         * the log afterwards.  A bare part_flush passes max_seq=0, and
+         * tsdb_part_flush_ex2 only ever RAISES a partition's checkpoint, so the
+         * rows land on disk while their redo records stay live with
+         * seq > checkpoint — the next open replays them ON TOP of the partition
+         * close just wrote, and every graceful restart duplicates the tail again.
+         * It also persists SYMBOL dictionaries before publishing the blocks that
+         * reference them.
+         *
+         * Lock order is db->lock → compact_mtx, already established by
+         * redo_recover_table under tsdb_open_table; nothing in the tree takes
+         * compact_mtx and then db->lock (the compactor acquires/releases the
+         * table under db->lock strictly outside its compact_mtx swap window),
+         * so there is no inversion.  skip_replicate=1 keeps today's semantics:
+         * a bare part_flush fired no replication hook. */
+        if (t->memtable) {
+            pthread_mutex_lock(&t->compact_mtx);
+            (void)flush_and_clear_locked(t, /*skip_replicate=*/1);
+            pthread_mutex_unlock(&t->compact_mtx);
         }
 
         /* Stop group-commit bg thread before closing WAL. */
@@ -1137,13 +1163,6 @@ int tsdb_open_table(tsdb_db_t *db, const char *name, tsdb_table_t **out) {
 
 /* ---- tsdb_drop_table ---------------------------------------------------- */
 
-/* Forward decl: definitions below. Needed by tsdb_alter_table_add_column.
- * `_locked` variant assumes the caller already holds t->compact_mtx and is
- * what alter_table / future callers-with-the-lock should use; `_ex` is the
- * public entry point that takes/releases the lock for callers without it. */
-static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate);
-static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate);
-
 /*
  * Recursively remove a directory and its contents.
  * Only goes one level deep for partition dirs (no recursive descent needed
@@ -1492,16 +1511,32 @@ int64_t tsdb_table_delwm_load(tsdb_db_t *db, const char *name) {
     fclose(f);
     return w;
 }
-/* Advance the watermark to max(existing, W) and persist.  Best-effort: a
- * write failure leaves the old watermark (a later delete re-advances it). */
+/* Advance the watermark to max(existing, W) and persist via tmp+fsync+rename.
+ * Best-effort in the sense that a write failure leaves the OLD watermark
+ * intact (a later delete re-advances it) — which the previous fopen(p,"wb")
+ * did NOT deliver: "wb" truncates _delwm to 0 bytes BEFORE the write is
+ * attempted, so a failed (or crash-interrupted) write left a 0-byte file that
+ * tsdb_table_delwm_load reads back as "no watermark".  Anti-entropy then stops
+ * re-asserting the delete (db_cluster.c gates on wm > 0), a peer that missed
+ * the original delete wins the count comparison, and the deleted rows are
+ * pulled back cluster-wide and stay back.  The tmp name carries the pid so two
+ * concurrent tsdb_delete_range calls cannot share (and tear) one temp file.
+ * The load-then-write lost-update race below pre-exists and is unchanged. */
 static void delwm_bump(tsdb_db_t *db, const char *name, int64_t w) {
     if (w <= 0) return;
     if (tsdb_table_delwm_load(db, name) >= w) return;
     char p[4096]; delwm_path(db, name, p, sizeof(p));
-    FILE *f = fopen(p, "wb");
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", p, (long)getpid());
+    FILE *f = fopen(tmp, "wb");
     if (!f) return;
-    fwrite(&w, sizeof(w), 1, f);
-    fclose(f);
+    int ok = (fwrite(&w, sizeof(w), 1, f) == 1);
+    if (ok && fflush(f) != 0)         ok = 0;
+    if (ok && ferror(f))              ok = 0;
+    if (ok && fsync(fileno(f)) != 0)  ok = 0;
+    if (fclose(f) != 0)               ok = 0;
+    if (!ok)                       { unlink(tmp); return; }
+    if (rename(tmp, p) != 0)         unlink(tmp);
 }
 
 int tsdb_delete_range(tsdb_db_t *db, const char *name,

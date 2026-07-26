@@ -997,13 +997,30 @@ static int col_writer_close(col_writer_t *w) {
             uint8_t  hdr[TSDB_IDX_HEADER_SIZE];
             size_t   hdr_sz = write_idx_header(hdr, total_count, w->total_rows,
                                                fmn, fmx, w->max_seq);
-            fwrite(hdr, 1, hdr_sz, idx_w);
-            if (old_count > 0 && old_entries_v3) {
-                fwrite(old_entries_v3, 1,
-                       (size_t)old_count * TSDB_IDX_ENTRY_SIZE, idx_w);
+            /* Every write MUST be checked.  This publish is a FULL REWRITE
+             * (header + all OLD entries + this flush's new ones), so a short
+             * write drops manifest entries for blocks that were ALREADY
+             * durable — and the header still declares the full count, so the
+             * partition reads back short (a non-ts column even routes through
+             * the ALTER-add-column zero-fill sentinel and reads WRONG values).
+             * The failure is observable ONLY here: after a short fwrite the
+             * subsequent fflush, fsync, fclose and rename all report success,
+             * so an unchecked chain publishes the truncated manifest and
+             * returns TSDB_OK — which lets flush_and_clear_locked clear the
+             * memtable and truncate the WAL, losing acked rows permanently.
+             * ferror() is checked as well as the fwrite returns because a
+             * short write inside fwrite can leave fflush returning 0. */
+            int io_ok = (fwrite(hdr, 1, hdr_sz, idx_w) == hdr_sz);
+            if (io_ok && old_count > 0 && old_entries_v3) {
+                size_t on = (size_t)old_count * TSDB_IDX_ENTRY_SIZE;
+                io_ok = (fwrite(old_entries_v3, 1, on, idx_w) == on);
             }
-            fwrite(w->idx_entries, 1, w->idx_n * TSDB_IDX_ENTRY_SIZE, idx_w);
-            fflush(idx_w);
+            if (io_ok) {
+                size_t nn = w->idx_n * TSDB_IDX_ENTRY_SIZE;
+                io_ok = (fwrite(w->idx_entries, 1, nn, idx_w) == nn);
+            }
+            if (io_ok && fflush(idx_w) != 0) io_ok = 0;
+            if (io_ok && ferror(idx_w))      io_ok = 0;
             /* fsync the idx file before rename: POSIX guarantees rename
              * is atomic only after the bytes have hit the device.
              *
@@ -1013,12 +1030,14 @@ static int col_writer_close(col_writer_t *w) {
              * is single submit+wait — identical observable semantics to
              * plain fsync(), but the wiring runs on the new io_async
              * substrate. */
-            int idx_fsync_ok = (tsdb_part_fsync_fd(fileno(idx_w)) == 0);
-            fclose(idx_w);
-            /* A failed idx fsync must NOT publish a never-durable checkpoint
-             * idx: keep the old idx (the rc!=OK path below rolls the .col
-             * back), so recovery never trusts a max_seq whose bytes aren't
-             * on the device. */
+            int idx_fsync_ok = io_ok &&
+                               (tsdb_part_fsync_fd(fileno(idx_w)) == 0);
+            if (fclose(idx_w) != 0) idx_fsync_ok = 0;
+            /* A short idx write or a failed idx fsync must NOT publish a
+             * truncated or never-durable checkpoint idx: keep the old idx
+             * (the rc!=OK path below rolls the .col back), so recovery never
+             * trusts a manifest whose entries or max_seq aren't on the
+             * device. */
             if (!idx_fsync_ok) {
                 unlink(tmp_path);
                 rc = TSDB_ERR_IO;

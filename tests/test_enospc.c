@@ -21,19 +21,49 @@
  *       partial append would otherwise leak (regression guard for the fix in
  *       src/storage/part.c).
  *
+ * Phases [7]-[9] extend the same contract to the paths a SHORT WRITE reaches,
+ * injected with RLIMIT_FSIZE (portable POSIX, no root, no loopback device;
+ * errno EFBIG takes the same clean path as the EACCES above).  A short write
+ * is observable ONLY at the fwrite return / ferror(): afterwards fflush,
+ * fsync, fclose and rename all report success, so an unchecked chain publishes
+ * truncated bytes and returns TSDB_OK.
+ *   [7] src/storage/part.c col_writer_close — the .idx publish is a FULL
+ *       rewrite (header + every OLD entry + the new ones).  A short write
+ *       there drops manifest entries for ALREADY-durable blocks while the
+ *       header still declares the full count, and the false TSDB_OK lets
+ *       flush_and_clear_locked clear the memtable AND truncate the WAL.
+ *   [8] src/storage/compaction.c — a per-column failure must abort the WHOLE
+ *       partition swap.  Every column of a partition shares ONE block layout,
+ *       so swapping only the columns that produced leaves ts compacted and a
+ *       value column on the old layout.  That is not an obvious outage:
+ *       count(*) is served from ts and keeps answering correctly while every
+ *       value read fails the (ts_min,count) pairing — which is why the
+ *       assertions here scan the VALUE column, not count(*).
+ *   [9] src/storage/db.c delwm_bump — fopen(_delwm,"wb") truncated the live
+ *       watermark before writing, so a failed write left a 0-byte file that
+ *       reads back as "no delete ever happened" and anti-entropy stops
+ *       re-asserting the delete.
+ *
  * Skips gracefully (exit 0) if run as root, since root bypasses the
  * read-only permission check and the injection would not fire.
  */
 
 #include "tsdb.h"
+#include "../src/storage/db.h"           /* tsdb_delete_range, delwm_load */
+#include "../src/storage/compaction.h"   /* phase [8] drives the compactor */
 
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utime.h>
 
 #define FAIL(fmt, ...) do { fprintf(stderr, "FAIL %s:%d: " fmt "\n", \
     __FILE__, __LINE__, ##__VA_ARGS__); abort(); } while (0)
@@ -92,12 +122,287 @@ static off_t file_size(const char *path) {
     return (stat(path, &st) == 0) ? st.st_size : -1;
 }
 
+/* FNV-1a over a whole file.  0 means "unreadable" (never a valid digest here,
+ * since every file we digest is asserted non-empty first). */
+static uint64_t file_digest(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint64_t h = 1469598103934665603ULL;
+    unsigned char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        for (size_t i = 0; i < n; i++)
+            h = (h ^ buf[i]) * 1099511628211ULL;
+    fclose(f);
+    return h;
+}
+
+/* Lower ONLY rlim_cur.  Lowering rlim_max is irreversible for an unprivileged
+ * process and would wedge every later phase (including the drain-on-close
+ * assertions), so the hard limit is left alone. */
+static void fsize_cap(rlim_t cap, struct rlimit *saved) {
+    if (getrlimit(RLIMIT_FSIZE, saved) != 0) FAIL("getrlimit(RLIMIT_FSIZE)");
+    struct rlimit r = *saved;
+    r.rlim_cur = cap;
+    if (setrlimit(RLIMIT_FSIZE, &r) != 0) FAIL("setrlimit(RLIMIT_FSIZE, %lld)",
+                                               (long long)cap);
+}
+static void fsize_uncap(const struct rlimit *saved) {
+    if (setrlimit(RLIMIT_FSIZE, saved) != 0) FAIL("setrlimit restore");
+}
+
+/* Back-date a partition dir: the compactor skips anything touched in the last
+ * 60 s, so without this phase [8] is a silent no-op. */
+static void backdate(const char *part_dir) {
+    struct stat st;
+    if (stat(part_dir, &st) != 0) FAIL("stat %s", part_dir);
+    struct utimbuf ut = { st.st_atime, st.st_mtime - 120 };
+    if (utime(part_dir, &ut) != 0) FAIL("utime %s", part_dir);
+}
+
+/* ===== Phase [8] scaffolding: compaction under a per-column failure ======== */
+
+#define P8_BLK    40                        /* commits -> blocks per column   */
+#define P8_ROWS   200                       /* rows per commit                */
+#define P8_TOTAL  (P8_BLK * P8_ROWS)        /* 8000                           */
+#define P8_DAY    "20260101"
+#define P8_BASE   (1767225600LL * 1000000000LL)   /* 2026-01-01 UTC */
+
+/* Full-entropy 52-bit mantissa under a fixed exponent: always finite, but
+ * incompressible, so the FLOAT64 column stays an order of magnitude larger
+ * than the ts column.  That size gap is what lets one cap fail the value
+ * column's .tmp while the ts column's .tmp is written in full. */
+static double p8_val(int i) {
+    uint64_t x = (uint64_t)i * 6364136223846793005ULL + 1442695040888963407ULL;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+    x = (x & 0x000FFFFFFFFFFFFFULL) | 0x4000000000000000ULL;
+    double d;
+    memcpy(&d, &x, sizeof(d));
+    return d;
+}
+
+static void p8_seed(const char *dbdir, tsdb_db_t **out_db) {
+    rm_rf(dbdir);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dbdir, &db));
+    tsdb_col_t cols[] = {
+        { "ts", TSDB_TYPE_TIMESTAMP },
+        { "v",  TSDB_TYPE_FLOAT64   },
+    };
+    OK(tsdb_create_table(db, "c", cols, 2, "ts"));
+    tsdb_table_t *t = NULL;
+    OK(tsdb_open_table(db, "c", &t));
+    int i = 0;
+    for (int b = 0; b < P8_BLK; b++) {
+        tsdb_batch_t *bt = NULL;
+        OK(tsdb_batch_begin(t, &bt));
+        for (int r = 0; r < P8_ROWS; r++, i++) {
+            OK(tsdb_batch_row_ts(bt, P8_BASE + (int64_t)i * 1000000LL));
+            OK(tsdb_batch_row_f64(bt, 1, p8_val(i)));
+            OK(tsdb_batch_row_end(bt));
+        }
+        OK(tsdb_batch_commit(bt));
+    }
+    *out_db = db;
+}
+
+static void p8_paths(const char *dbdir, char pd[4096], char f[4][4096]) {
+    snprintf(pd, 4096, "%s/c/%s", dbdir, P8_DAY);
+    snprintf(f[0], 4096, "%s/ts.col", pd);
+    snprintf(f[1], 4096, "%s/ts.idx", pd);
+    snprintf(f[2], 4096, "%s/v.col",  pd);
+    snprintf(f[3], 4096, "%s/v.idx",  pd);
+}
+
+static int p8_compact(tsdb_db_t *db) {
+    tsdb_compactor_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.min_blocks_to_compact = 4;
+    opts.interval_ns           = 10000000LL;
+    opts.worker_threads        = -1;   /* manual: no background thread */
+    tsdb_compactor_t *c = NULL;
+    OK(tsdb_compactor_start(db, &opts, &c));
+    int rc = tsdb_compactor_run_once(c);
+    tsdb_compactor_stop(c);
+    return rc;
+}
+
+/* Compact an identical, UNCAPPED copy so the torn-tail cap can be derived from
+ * the real compacted size instead of hard-coded (a hard-coded cap silently
+ * decays into a no-op the moment the codec changes). */
+static off_t p8_probe_compacted_vcol(void) {
+    const char *pdir = "/tmp/tsdb_test_enospc_c_probe";
+    tsdb_db_t *db = NULL;
+    p8_seed(pdir, &db);
+    char pd[4096], f[4][4096];
+    p8_paths(pdir, pd, f);
+    backdate(pd);
+    OK(p8_compact(db));
+    off_t s = file_size(f[2]);
+    tsdb_close(db);
+    rm_rf(pdir);
+    return s;
+}
+
+/*
+ * One phase-[8] injection.  Exactly one of these is used per case:
+ *   cap             — RLIMIT_FSIZE while the compactor runs (0 = none)
+ *   chmod_zero      — make the value .col unreadable (a non-ENOSPC resource
+ *                     failure; compact_column_file's open() used to swallow it
+ *                     and report TSDB_OK with produced=0)
+ *   poke_total_rows — rewrite v.idx's header total_rows (offset 12, u64 LE) so
+ *                     the per-block counts sum past it and the re-encode takes
+ *                     its count-overflow bail.  That bail returns TSDB_OK with
+ *                     produced=0, so the return code says nothing at all —
+ *                     only the eligibility flag distinguishes it from a
+ *                     legitimate no-op.  tsdb_part_open reads this field and
+ *                     never uses it, so the poke is invisible to readers.
+ *
+ * Contract in every case: an aborted compaction leaves ALL FOUR live files
+ * byte-identical, and the partition still reads back every value.
+ */
+static void phase8_case(const char *label, rlim_t cap, int chmod_zero,
+                        uint64_t poke_total_rows) {
+    const char *pdir = "/tmp/tsdb_test_enospc_cmp";
+    tsdb_db_t *db = NULL;
+    p8_seed(pdir, &db);
+
+    char pd[4096], f[4][4096];
+    p8_paths(pdir, pd, f);
+    static const char *fname[4] = { "ts.col", "ts.idx", "v.col", "v.idx" };
+
+    if (poke_total_rows) {
+        FILE *pf = fopen(f[3], "r+b");
+        if (!pf) FAIL("[8:%s] open v.idx", label);
+        unsigned char le[8];
+        for (int k = 0; k < 8; k++) le[k] = (unsigned char)(poke_total_rows >> (8 * k));
+        if (fseek(pf, 12, SEEK_SET) != 0 || fwrite(le, 1, 8, pf) != 8)
+            FAIL("[8:%s] poke v.idx total_rows", label);
+        fclose(pf);
+    }
+
+    off_t    sz[4];
+    uint64_t dg[4];
+    for (int i = 0; i < 4; i++) {
+        sz[i] = file_size(f[i]);
+        dg[i] = file_digest(f[i]);
+        if (sz[i] <= 0 || dg[i] == 0) FAIL("[8:%s] %s missing/empty", label, fname[i]);
+    }
+    if (sz[2] <= sz[0])
+        FAIL("[8:%s] v.col (%lld) is not larger than ts.col (%lld) — the "
+             "injection cannot discriminate; make the values less compressible",
+             label, (long long)sz[2], (long long)sz[0]);
+    backdate(pd);
+
+    struct rlimit saved;
+    if (chmod_zero && chmod(f[2], 0000) != 0) FAIL("[8:%s] chmod 000 v.col", label);
+    if (cap) fsize_cap(cap, &saved);
+    int rc = p8_compact(db);
+    if (cap) fsize_uncap(&saved);
+    if (chmod_zero && chmod(f[2], 0600) != 0) FAIL("[8:%s] chmod 600 v.col", label);
+
+    printf("[8:%s] compact rc=%d; ts.col %lld->%lld ts.idx %lld->%lld "
+           "v.col %lld->%lld v.idx %lld->%lld\n", label, rc,
+           (long long)sz[0], (long long)file_size(f[0]),
+           (long long)sz[1], (long long)file_size(f[1]),
+           (long long)sz[2], (long long)file_size(f[2]),
+           (long long)sz[3], (long long)file_size(f[3]));
+
+    for (int i = 0; i < 4; i++) {
+        if (file_digest(f[i]) != dg[i])
+            FAIL("[8:%s] %s CHANGED by an aborted compaction (%lld -> %lld bytes)"
+                 " — the partition's columns are now on different block layouts",
+                 label, fname[i], (long long)sz[i], (long long)file_size(f[i]));
+    }
+    /* The aborted swap must also leave no .tmp pair behind. */
+    for (int i = 0; i < 4; i++) {
+        char tmp[4200];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", f[i]);
+        if (file_size(tmp) >= 0) FAIL("[8:%s] leftover %s.tmp", label, fname[i]);
+    }
+
+    tsdb_close(db);
+    db = NULL;
+    OK(tsdb_open(pdir, &db));
+    /* MUST scan the VALUE column.  A desynced partition still answers
+     * count(ts) with the right number (it is served from the ts column) while
+     * every value read fails the (ts_min,count) pairing — a count-only
+     * assertion is green on the broken build and worthless. */
+    int vrows = count_rows(db, "SELECT v FROM c");
+    int trows = count_rows(db, "SELECT ts FROM c");
+    printf("[8:%s] after reopen: SELECT v -> %d rows, SELECT ts -> %d rows "
+           "(expect %d both)\n", label, vrows, trows, P8_TOTAL);
+    ASSERT(vrows == P8_TOTAL);
+    ASSERT(trows == P8_TOTAL);
+    tsdb_close(db);
+    rm_rf(pdir);
+    printf("[8:%s] OK\n", label);
+}
+
+/* ===== Phase [9]: the delete watermark survives a failed bump ============== */
+
+static void phase9_delwm(void) {
+    const char *pdir = "/tmp/tsdb_test_enospc_delwm";
+    rm_rf(pdir);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(pdir, &db));
+    tsdb_col_t cols[] = {
+        { "ts", TSDB_TYPE_TIMESTAMP },
+        { "v",  TSDB_TYPE_INT64     },
+    };
+    OK(tsdb_create_table(db, "d", cols, 2, "ts"));
+
+    const int64_t D1 = 1735689600LL * 1000000000LL;   /* 2025-01-01 */
+    const int64_t DAY = 86400LL * 1000000000LL;
+    OK(try_insert(db, "d", 50, D1,           10));
+    OK(try_insert(db, "d", 50, D1 + DAY,     20));
+    OK(try_insert(db, "d", 50, D1 + 2 * DAY, 30));
+
+    int removed = 0;
+    OK(tsdb_delete_range(db, "d", D1 + DAY, /*op_lt*/1, /*inclusive*/0, &removed));
+    int64_t wm1 = tsdb_table_delwm_load(db, "d");
+    char wmp[4096];
+    snprintf(wmp, sizeof(wmp), "%s/d/_delwm", pdir);
+    printf("[9] first delete removed %d partition(s); _delwm size=%lld wm=%lld\n",
+           removed, (long long)file_size(wmp), (long long)wm1);
+    ASSERT(wm1 == D1 + DAY);
+    ASSERT(file_size(wmp) == 8);
+
+    /* Now fail the SECOND bump.  tsdb_delete_range itself only rm_rf's whole
+     * partition dirs (no writes), so a zero file-size cap isolates the one
+     * write that matters: delwm_bump's. */
+    struct rlimit saved;
+    fsize_cap(0, &saved);
+    int rc = tsdb_delete_range(db, "d", D1 + 2 * DAY, 1, 0, &removed);
+    fsize_uncap(&saved);
+
+    off_t   sz  = file_size(wmp);
+    int64_t wm2 = tsdb_table_delwm_load(db, "d");
+    printf("[9] failed bump (rc=%d): _delwm size=%lld wm=%lld (expect 8 / %lld)\n",
+           rc, (long long)sz, (long long)wm2, (long long)wm1);
+    /* The old watermark must SURVIVE — a 0-byte _delwm reads back as "no
+     * delete ever happened", which stops anti-entropy re-asserting the delete
+     * and lets a peer that missed it resurrect the rows cluster-wide. */
+    ASSERT(sz == 8);
+    ASSERT(wm2 >= wm1);
+
+    tsdb_close(db);
+    rm_rf(pdir);
+    printf("[9] OK\n");
+}
+
 int main(void) {
     if (geteuid() == 0) {
         printf("test_enospc: running as root — read-only injection cannot fire, "
                "SKIP (covered by the Docker loopback test).\n");
         return 0;
     }
+
+    /* RLIMIT_FSIZE raises SIGXFSZ (default: kill) on the offending write.
+     * Ignoring it turns the same event into a short write + EFBIG, which is
+     * exactly the errno path a real ENOSPC takes. */
+    signal(SIGXFSZ, SIG_IGN);
 
     const char *dir = "/tmp/tsdb_test_enospc";
     rm_rf(dir);
@@ -225,8 +530,108 @@ int main(void) {
     ASSERT(after == N1 + N2 + N3 + N4);   /* drained once, no loss, no dup */
     ASSERT(n4_rows == N4);
 
+    /* ---- Phase 7: a SHORT .idx write must not publish a truncated manifest.
+     * The idx publish rewrites the whole manifest (header + every OLD entry +
+     * this flush's new ones), so a short write there drops entries for blocks
+     * that were already durable while the header keeps declaring the full
+     * count.  Pre-fix nothing observed it — fflush, fsync, fclose and rename
+     * all returned success after the short fwrite — so col_writer_close
+     * returned TSDB_OK and flush_and_clear_locked cleared the memtable and
+     * truncated the WAL, losing acked rows from disk, RAM and WAL at once.
+     *
+     * Injection: build one partition whose .idx is much larger than its .col,
+     * then cap RLIMIT_FSIZE between them.  The .col append fits; the .idx
+     * rewrite does not.  The cap is DERIVED from the real file sizes, and the
+     * phase fails loudly rather than degrading into a no-op if the window is
+     * empty. */
+    const int K7 = 400, B7 = 20;
+    tsdb_col_t cols7[] = {
+        { "ts", TSDB_TYPE_TIMESTAMP },
+        { "v",  TSDB_TYPE_INT64     },
+    };
+    OK(tsdb_create_table(db, "t7", cols7, 2, "ts"));
+    const int64_t D7 = 1767225600LL * 1000000000LL;   /* 2026-01-01 UTC */
+    for (int k = 0; k < K7; k++)
+        OK(try_insert(db, "t7", B7, D7 + (int64_t)k * B7, 1));
+
+    char p7[4][4096];
+    snprintf(p7[0], sizeof(p7[0]), "%s/t7/20260101/ts.col", dir);
+    snprintf(p7[1], sizeof(p7[1]), "%s/t7/20260101/v.col",  dir);
+    snprintf(p7[2], sizeof(p7[2]), "%s/t7/20260101/ts.idx", dir);
+    snprintf(p7[3], sizeof(p7[3]), "%s/t7/20260101/v.idx",  dir);
+    off_t max_col = file_size(p7[0]) > file_size(p7[1])
+                    ? file_size(p7[0]) : file_size(p7[1]);
+    off_t min_idx = file_size(p7[2]) < file_size(p7[3])
+                    ? file_size(p7[2]) : file_size(p7[3]);
+    printf("[7a] %d blocks: max(.col)=%lld min(.idx)=%lld\n",
+           K7, (long long)max_col, (long long)min_idx);
+    /* Self-calibrating, and loudly so: if the window ever closes (fewer blocks
+     * per commit, a wider idx entry, ...) the phase FAILS instead of quietly
+     * degrading into a no-op that passes for the wrong reason. */
+    if (max_col <= 0 || min_idx <= 0 || max_col + 4096 >= min_idx)
+        FAIL("[7] cap window empty (max .col=%lld, min .idx=%lld) — raise K7",
+             (long long)max_col, (long long)min_idx);
+
+    uint64_t d_ts = file_digest(p7[2]), d_v = file_digest(p7[3]);
+    ASSERT(d_ts != 0 && d_v != 0);
+
+    struct rlimit saved7;
+    fsize_cap((rlim_t)(max_col + 4096), &saved7);
+    int rc7 = try_insert(db, "t7", B7, D7 + (int64_t)K7 * B7, 1);
+    fsize_uncap(&saved7);
+
+    printf("[7b] commit under FSIZE cap=%lld returned rc=%d (%s); "
+           "ts.idx %lld->%lld v.idx %lld->%lld\n",
+           (long long)(max_col + 4096), rc7, tsdb_errstr(rc7),
+           (long long)min_idx, (long long)file_size(p7[2]),
+           (long long)min_idx, (long long)file_size(p7[3]));
+    ASSERT(rc7 != TSDB_OK);                    /* never a silent success */
+    ASSERT(file_digest(p7[2]) == d_ts);        /* manifest untouched... */
+    ASSERT(file_digest(p7[3]) == d_v);         /* ...for BOTH columns   */
+
+    int live7 = count_rows(db, "SELECT v FROM t7");
+    printf("[7c] live count=%d (expect %d durable + %d retained)\n",
+           live7, K7 * B7, B7);
+    ASSERT(live7 == K7 * B7 + B7);             /* failed rows retained in RAM */
+
     tsdb_close(db);
+    db = NULL;
+    OK(tsdb_open(dir, &db));
+    int post7 = count_rows(db, "SELECT v FROM t7");
+    printf("[7d] after close+reopen: count=%d (expect %d)\n",
+           post7, K7 * B7 + B7);
+    ASSERT(post7 == K7 * B7 + B7);             /* nothing lost, nothing dup'd */
+
+    tsdb_close(db);
+    db = NULL;
+
+    /* ---- Phase 8: an aborted compaction leaves the partition untouched. ---- */
+    {
+        off_t s = p8_probe_compacted_vcol();
+        printf("[8] uncapped compaction produces v.col=%lld bytes\n",
+               (long long)s);
+        ASSERT(s > 8192);
+        /* (a) the value column's .tmp fails mid-write (checked safe_write); */
+        phase8_case("cap-mid",  (rlim_t)(4096 + s / 2), 0, 0);
+        /* (b) only the FINAL buffered tail is cut — the failure lands in the
+         *     fflush that used to be discarded, so a truncated .col.tmp was
+         *     renamed over live data under a COMPLETE .idx.tmp; */
+        phase8_case("cap-tail", (rlim_t)(s - 1),        0, 0);
+        /* (c) the value .col cannot be opened at all — a resource failure that
+         *     compact_column_file reported as TSDB_OK/produced=0, so keying
+         *     the abort on rc alone leaves it reachable; */
+        phase8_case("unreadable", 0, 1, 0);
+        /* (d) the value column takes its count-overflow bail: TSDB_OK, no .tmp
+         *     pair, nothing in the return code — only the eligibility flag
+         *     tells this apart from a column that was simply below threshold. */
+        phase8_case("bail", 0, 0, (uint64_t)(P8_ROWS * 3));
+    }
+
     rm_rf(dir);
+
+    /* ---- Phase 9: a failed delete-watermark bump keeps the OLD watermark. -- */
+    phase9_delwm();
+
     printf("\n=== ENOSPC / write-failure durability TESTS PASSED ===\n");
     return 0;
 }

@@ -32,7 +32,12 @@ const char *tsdb_symtab_str(tsdb_symtab_t *st, uint32_t code);
 /* Count of distinct symbols. */
 size_t tsdb_symtab_size(tsdb_symtab_t *st);
 
-/* Persist to / load from file. Binary, versioned. */
+/* Persist to / load from file:
+ *   [magic u32]["SYST"] [count u32] [heap_size u32]
+ *   [offsets u32 x count] [heap u8 x heap_size]
+ * The layout is public because the migration SDK ships these bytes between
+ * clusters and has to check the codes agree before adopting them. */
+#define TSDB_SYMTAB_MAGIC 0x54535953u   /* "SYST" */
 int tsdb_symtab_save(tsdb_symtab_t *st, const char *path);
 int tsdb_symtab_load(const char *path, tsdb_symtab_t **out);
 
