@@ -239,6 +239,28 @@ int result_reserve_rows_grow(tsdb_result_t *r, size_t want) {
     return TSDB_OK;
 }
 
+/* Ceiling on how much a caller may pre-size a result by upper bound, across
+ * all its columns.  Above this the incremental doubling takes over again. */
+#define RESULT_PREALLOC_MAX_BYTES ((size_t)256 * 1024 * 1024)
+
+/* Size the result to exactly `want` rows.  Used when the caller already knows
+ * a tight upper bound on the output (a row projection emits at most one row
+ * per scanned input row, and the scan plan knows every source's row count),
+ * so the doubling ladder above — log2(N) reallocs and ~2N bytes of memmove
+ * per column — can be skipped in favour of a single sizing.  Never shrinks,
+ * and never allocates more than result_reserve_rows_grow would have. */
+static int result_reserve_rows_exact(tsdb_result_t *r, size_t want) {
+    if (want <= r->cap_rows) return TSDB_OK;
+    if (want > SIZE_MAX / 8) return TSDB_ERR_NOMEM;
+    for (int c = 0; c < r->ncols; c++) {
+        void *np = realloc(r->col_data[c], 8 * want);
+        if (!np) return TSDB_ERR_NOMEM;
+        r->col_data[c] = np;
+    }
+    r->cap_rows = want;
+    return TSDB_OK;
+}
+
 /* Hot path: caller already knows nrows + N will fit under cap_rows in the
  * common case.  Compiler inlines the comparison; the grow branch is cold. */
 static inline __attribute__((always_inline))
@@ -901,6 +923,13 @@ typedef struct {
     tsdb_udf_type_t   udf_arg_types[8];
     tsdb_udf_type_t   udf_ret_type;
     char              udf_name[TSDB_UDF_NAME_MAX]; /* for runtime error msgs  */
+    /* ---- UDF nested inside an aggregate: agg(udf(args...)) ----------------
+     * kind stays PROJ_AGG_*; the aggregate's input column is the UDF output
+     * rather than a stored column, so `col` is -1 and the udf_* fields above
+     * describe how to produce one block of input values.  udf_slot indexes the
+     * per-scan materialisation scratch (see udf_agg_scratch_t). */
+    int               udf_agg;
+    int               udf_slot;
     /* ---- Row scalar expression (PROJ_SCALAR_ROW) ------------------------- */
     const qast_expr_t *scalar_expr; /* arithmetic AST, evaluated per row (arena-lived) */
 } proj_t;
@@ -1040,6 +1069,84 @@ static void render_expr(const qast_expr_t *e, char *buf, size_t cap) {
     }
 }
 
+/* Resolve a QAST_CALL against the UDF catalog and fill p's udf_* fields
+ * (per-arg source column + type, function pointer, return type, name).
+ * Shared by the scalar projection path and the aggregate-over-UDF path.
+ * Returns the catalog's rc on lookup failure so callers keep surfacing
+ * TSDB_ERR_NOTFOUND / TSDB_ERR_UNSUPPORTED verbatim. */
+static int resolve_udf_call(tsdb_db_t *db, const qast_expr_t *e,
+                            tsdb_schema_t *s, proj_t *p,
+                            char *err, size_t errcap)
+{
+    tsdb_udf_catalog_t *udfcat = db ? tsdb_db_udf(db) : NULL;
+    const tsdb_udf_entry_t *ue = NULL;
+    char ebuf[256] = {0};
+    int lrc = udfcat ? tsdb_udf_catalog_lookup(udfcat, e->v.s, &ue, ebuf, sizeof(ebuf))
+                     : TSDB_ERR_NOTFOUND;
+    if (lrc != TSDB_OK) {
+        if (lrc == TSDB_ERR_UNSUPPORTED) {
+            eset(err, errcap, "UDF '%s': %s", e->v.s,
+                 ebuf[0] ? ebuf : "ABI version mismatch");
+        } else if (ebuf[0]) {
+            eset(err, errcap, "UDF '%s' not callable: %s", e->v.s, ebuf);
+        } else {
+            eset(err, errcap, "unknown function '%s' (not a builtin or registered UDF)",
+                 e->v.s);
+        }
+        return lrc;
+    }
+    if (e->nargs != ue->nargs) {
+        eset(err, errcap, "UDF '%s' expects %d args, got %d",
+             e->v.s, ue->nargs, e->nargs);
+        return TSDB_ERR_PARSE;
+    }
+    /* Each argument must be a bare column reference in v1. */
+    for (int ai = 0; ai < e->nargs; ai++) {
+        if (e->args[ai]->kind != QAST_IDENT) {
+            eset(err, errcap,
+                 "UDF '%s': arg %d must be a column reference (v1 restriction)",
+                 e->v.s, ai);
+            return TSDB_ERR_UNSUPPORTED;
+        }
+        int ci = resolve_col(s, e->args[ai]->v.s);
+        if (ci < 0) {
+            eset(err, errcap, "UDF '%s': unknown column '%s'",
+                 e->v.s, e->args[ai]->v.s);
+            return TSDB_ERR_SCHEMA;
+        }
+        /* Per-arg type match. */
+        tsdb_udf_type_t wire = (tsdb_udf_type_t)s->cols[ci].type;
+        if (wire != ue->arg_types[ai]) {
+            eset(err, errcap, "UDF '%s': arg %d column '%s' type mismatch",
+                 e->v.s, ai, e->args[ai]->v.s);
+            return TSDB_ERR_SCHEMA;
+        }
+        p->udf_arg_cols[ai]  = ci;
+        p->udf_arg_types[ai] = wire;
+    }
+    p->udf_fn       = ue->fn;
+    p->udf_nargs    = ue->nargs;
+    p->udf_ret_type = ue->ret_type;
+    snprintf(p->udf_name, sizeof(p->udf_name), "%s", ue->name);
+    return TSDB_OK;
+}
+
+/* Render "fn(a, b)" for a resolved UDF call, used to name agg(udf(...))
+ * output columns. */
+static void render_udf_call(const qast_expr_t *e, char *buf, size_t cap) {
+    size_t off = 0;
+    int w = snprintf(buf, cap, "%s(", e->v.s);
+    off = (w > 0 && (size_t)w < cap) ? (size_t)w : cap;
+    for (int i = 0; i < e->nargs && off < cap; i++) {
+        w = snprintf(buf + off, cap - off, "%s%s",
+                     i ? "," : "", e->args[i]->v.s);
+        if (w < 0) break;
+        off += (size_t)w;
+        if (off >= cap) { off = cap; break; }
+    }
+    if (off < cap) snprintf(buf + off, cap - off, ")");
+}
+
 static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                              tsdb_db_t *db,
                              proj_t **out, int *out_n, int *out_has_agg,
@@ -1054,6 +1161,7 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
     int has_ts_agg = 0;
     int has_interp = 0;
     int has_row_scalar = 0;
+    int has_udf_agg = 0;
 
     for (int i = 0; i < q->nsel; i++) {
         qast_sel_item_t *si = &q->sel[i];
@@ -1113,14 +1221,33 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                 arr[n].col = c;
             } else if (k == PROJ_AGG_COUNT && (e->nargs == 0 || (e->nargs == 1 && e->args[0]->kind == QAST_STAR))) {
                 arr[n].col = s->ts_col_idx; /* count uses row count */
+            } else if (e->nargs >= 1 && e->args[0]->kind == QAST_CALL &&
+                       !is_agg_call(e->args[0]) && !is_window_call(e->args[0]) &&
+                       strcasecmp(e->args[0]->v.s, "time_bucket") != 0) {
+                /* ---- agg(udf(cols...)) ----------------------------------
+                 * The UDF turns one decoded block into another block of the
+                 * same length; the aggregate then consumes that block.  No
+                 * rows are materialised to the client.  `col` stays -1: the
+                 * aggregate's input is not a stored column, so every place
+                 * that derives a type or a scan-column set from `col` must
+                 * consult the udf_* fields instead. */
+                int urc = resolve_udf_call(db, e->args[0], s, &arr[n], err, errcap);
+                if (urc != TSDB_OK) {
+                    for (int pi = 0; pi < n; pi++) proj_tdigest_free(&arr[pi]);
+                    free(arr); return urc;
+                }
+                arr[n].udf_agg = 1;
+                arr[n].col     = -1;
+                has_udf_agg    = 1;
             } else if (k >= PROJ_AGG_TS_KIND_FIRST) {
                 /* TS agg requires a column argument */
-                if (e->nargs < 1 || e->args[0]->kind != QAST_IDENT) {
-                    eset(err, errcap, "%s() requires a column argument", name);
-                    free(arr); return TSDB_ERR_PARSE;
-                }
-                /* col already resolved above */
-            } else if (k < PROJ_AGG_TDIGEST_FIRST) {
+                eset(err, errcap, "%s() requires a column argument", name);
+                free(arr); return TSDB_ERR_PARSE;
+            } else {
+                /* Reaches here for e.g. sum(1), avg('x'), stddev(a+b).  The
+                 * t-digest kinds used to fall through this chain silently and
+                 * aggregate column 0 (the ts column) instead — a wrong answer,
+                 * not a refusal. */
                 eset(err, errcap, "unsupported aggregate argument");
                 free(arr); return TSDB_ERR_UNSUPPORTED;
             }
@@ -1162,11 +1289,18 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
                  * labelled (and emitted) as an 8-byte double — otherwise the
                  * binary wire writes an unhandled type-5 cell and clients
                  * (Go SDK) decode it as nil. */
-                arr[n].out_type = (arr[n].col >= 0) ? qcoltype(s->cols[arr[n].col].type) : TSDB_TYPE_FLOAT64;
+                arr[n].out_type = arr[n].udf_agg
+                                  ? qcoltype((tsdb_type_t)arr[n].udf_ret_type)
+                                  : ((arr[n].col >= 0) ? qcoltype(s->cols[arr[n].col].type)
+                                                       : TSDB_TYPE_FLOAT64);
 
             /* Build output column name. */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
-            else {
+            else if (arr[n].udf_agg) {
+                char inner[96];
+                render_udf_call(e->args[0], inner, sizeof(inner));
+                snprintf(arr[n].name, sizeof(arr[n].name), "%s(%s)", name, inner);
+            } else {
                 if (arr[n].col >= 0)
                     snprintf(arr[n].name, sizeof(arr[n].name), "%s(%s)", name, s->cols[arr[n].col].name);
                 else
@@ -1312,59 +1446,10 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
             /* ---- UDF scalar call --------------------------------------------
              * Not a builtin — look up in the UDF catalog, resolve dlopen/dlsym
              * lazily, and wire an entry that the emit path invokes per row. */
-            tsdb_udf_catalog_t *udfcat = tsdb_db_udf(db);
-            const tsdb_udf_entry_t *ue = NULL;
-            char ebuf[256] = {0};
-            int lrc = udfcat ? tsdb_udf_catalog_lookup(udfcat, e->v.s, &ue, ebuf, sizeof(ebuf))
-                             : TSDB_ERR_NOTFOUND;
-            if (lrc != TSDB_OK) {
-                if (lrc == TSDB_ERR_UNSUPPORTED) {
-                    eset(err, errcap, "UDF '%s': %s", e->v.s,
-                         ebuf[0] ? ebuf : "ABI version mismatch");
-                } else if (ebuf[0]) {
-                    eset(err, errcap, "UDF '%s' not callable: %s", e->v.s, ebuf);
-                } else {
-                    eset(err, errcap, "unknown function '%s' (not a builtin or registered UDF)",
-                         e->v.s);
-                }
-                free(arr); return lrc;
-            }
-            if (e->nargs != ue->nargs) {
-                eset(err, errcap, "UDF '%s' expects %d args, got %d",
-                     e->v.s, ue->nargs, e->nargs);
-                free(arr); return TSDB_ERR_PARSE;
-            }
-            /* Each argument must be a bare column reference in v1. */
-            for (int ai = 0; ai < e->nargs; ai++) {
-                if (e->args[ai]->kind != QAST_IDENT) {
-                    eset(err, errcap,
-                         "UDF '%s': arg %d must be a column reference (v1 restriction)",
-                         e->v.s, ai);
-                    free(arr); return TSDB_ERR_UNSUPPORTED;
-                }
-                int ci = resolve_col(s, e->args[ai]->v.s);
-                if (ci < 0) {
-                    eset(err, errcap, "UDF '%s': unknown column '%s'",
-                         e->v.s, e->args[ai]->v.s);
-                    free(arr); return TSDB_ERR_SCHEMA;
-                }
-                /* Per-arg type match. */
-                tsdb_udf_type_t wire = (tsdb_udf_type_t)s->cols[ci].type;
-                if (wire != ue->arg_types[ai]) {
-                    eset(err, errcap,
-                         "UDF '%s': arg %d column '%s' type mismatch",
-                         e->v.s, ai, e->args[ai]->v.s);
-                    free(arr); return TSDB_ERR_SCHEMA;
-                }
-                arr[n].udf_arg_cols[ai]  = ci;
-                arr[n].udf_arg_types[ai] = wire;
-            }
+            int lrc = resolve_udf_call(db, e, s, &arr[n], err, errcap);
+            if (lrc != TSDB_OK) { free(arr); return lrc; }
             arr[n].kind         = PROJ_UDF_SCALAR;
-            arr[n].udf_fn       = ue->fn;
-            arr[n].udf_nargs    = ue->nargs;
-            arr[n].udf_ret_type = ue->ret_type;
-            snprintf(arr[n].udf_name, sizeof(arr[n].udf_name), "%s", ue->name);
-            arr[n].out_type     = (tsdb_type_t)ue->ret_type;
+            arr[n].out_type     = (tsdb_type_t)arr[n].udf_ret_type;
             arr[n].col          = arr[n].udf_arg_cols[0]; /* used by scan gather */
             if (si->alias) snprintf(arr[n].name, sizeof(arr[n].name), "%s", si->alias);
             else           snprintf(arr[n].name, sizeof(arr[n].name), "%s()", e->v.s);
@@ -1399,6 +1484,27 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
         eset(err, errcap, "scalar column expressions in SELECT are only supported in a plain projection (no aggregate/GROUP BY/SAMPLE BY/window/interp/LATEST ON/JOIN) yet");
         free(arr); return TSDB_ERR_UNSUPPORTED;
     }
+    /* agg(udf(...)) is wired into the whole-query aggregate and the GROUP BY
+     * hash-aggregate only.  SAMPLE BY buckets, the advanced window kinds and
+     * LATEST ON run their own accumulators that never see the materialised UDF
+     * output; refuse rather than silently aggregate something else. */
+    if (has_udf_agg && (q->has_sample_by || q->has_adv_window ||
+                        q->has_latest_on || q->has_asof_join)) {
+        eset(err, errcap,
+             "a UDF inside an aggregate is not supported with SAMPLE BY, "
+             "SESSION/STATE_WINDOW/EVENT_WINDOW, LATEST ON or ASOF JOIN yet");
+        for (int pi = 0; pi < n; pi++) proj_tdigest_free(&arr[pi]);
+        free(arr); return TSDB_ERR_UNSUPPORTED;
+    }
+    /* Assign one materialisation scratch slot per value-consuming UDF
+     * aggregate.  count(udf(x)) needs no values (v1 UDFs never produce NULLs,
+     * so it equals count(*)) and gets no slot. */
+    {
+        int slot = 0;
+        for (int pi = 0; pi < n; pi++)
+            if (arr[pi].udf_agg && arr[pi].kind != PROJ_AGG_COUNT)
+                arr[pi].udf_slot = slot++;
+    }
     *out = arr; *out_n = n; *out_has_agg = has_agg;
     if (out_has_window)  *out_has_window  = has_window;
     if (out_has_ts_agg) *out_has_ts_agg = has_ts_agg;
@@ -1412,14 +1518,21 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
  * alignment 32 preferred. Used as gather destination when bm is not all-set.
  * Passing the scratch in from the caller avoids per-block malloc/free and
  * keeps the hot path allocation-free. */
-static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
-                       const uint64_t *bm, void *scratch) {
-    tsdb_type_t t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
-
+/* Fold one block of aggregate INPUT values into p's running state.
+ *
+ * `vals` is the decoded input column (n values of type `t`) and `tscol` the
+ * matching ts column, needed only by the TS-specialised kinds.  Split out of
+ * agg_update so an aggregate can be fed a materialised UDF output block
+ * instead of a stored column — the two callers differ only in where the
+ * values come from. */
+static void agg_update_vals(proj_t *p, tsdb_type_t t, const void *vals,
+                            const int64_t *tscol, size_t n,
+                            const uint64_t *bm, void *scratch) {
     if (p->kind == PROJ_AGG_COUNT) {
         p->agg_count += tsdb_bitmap_popcount(bm, n);
         return;
     }
+    if (!vals) return;
 
     /* Determine selectivity once per block so we can take the all-set fast path. */
     uint64_t popcnt = tsdb_bitmap_popcount(bm, n);
@@ -1432,7 +1545,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
         size_t cn;
         /* For non-f64 columns: gather into scratch as f64 via cast. */
         if (t == TSDB_TYPE_FLOAT64) {
-            const double *v = (const double *)bufs[p->col];
+            const double *v = (const double *)vals;
             if (popcnt == n) {
                 src = v; cn = n;
             } else {
@@ -1442,7 +1555,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
             }
         } else {
             /* int64 / timestamp → cast to double */
-            const int64_t *iv = (const int64_t *)bufs[p->col];
+            const int64_t *iv = (const int64_t *)vals;
             double *tmp = (double *)scratch;
             if (popcnt == n) {
                 for (size_t i = 0; i < n; i++) tmp[i] = (double)iv[i];
@@ -1459,7 +1572,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     }
 
     if (t == TSDB_TYPE_FLOAT64) {
-        const double *v = (const double *)bufs[p->col];
+        const double *v = (const double *)vals;
         const double *src;
         size_t cn;
         if (popcnt == n) {
@@ -1505,7 +1618,7 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
         default: break;
         }
     } else if (t == TSDB_TYPE_INT64 || t == TSDB_TYPE_TIMESTAMP) {
-        const int64_t *v = (const int64_t *)bufs[p->col];
+        const int64_t *v = (const int64_t *)vals;
         const int64_t *src;
         size_t cn;
         if (popcnt == n) {
@@ -1557,13 +1670,12 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     }
 
     /* ---- TS-specialised aggregates: FIRST / LAST / LAST_ROW / TWA --------
-     * These iterate rows one-by-one using the ts column (bufs[ts_col_idx]).  */
+     * These iterate rows one-by-one, pairing each value with its timestamp. */
     if (p->kind == PROJ_AGG_TS_FIRST || p->kind == PROJ_AGG_TS_LAST ||
         p->kind == PROJ_AGG_TS_LAST_ROW || p->kind == PROJ_AGG_TS_TWA) {
-        const int64_t *ts_col = (bufs && s->ts_col_idx >= 0)
-                                ? (const int64_t *)bufs[s->ts_col_idx] : NULL;
-        if (!ts_col || p->col < 0) return;
-        tsdb_type_t vt = qcoltype(s->cols[p->col].type);
+        const int64_t *ts_col = tscol;
+        if (!ts_col) return;
+        tsdb_type_t vt = t;
         for (size_t i = 0; i < n; i++) {
             if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
             int64_t ts = ts_col[i];
@@ -1572,9 +1684,9 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
             uint32_t vu  = 0;
             int is_f64 = (vt == TSDB_TYPE_FLOAT64);
             int is_sym = (vt == TSDB_TYPE_SYMBOL );
-            if (is_f64)      vf = ((const double *)  bufs[p->col])[i];
-            else if (is_sym) vu = ((const uint32_t *) bufs[p->col])[i];
-            else             vi = ((const int64_t *)  bufs[p->col])[i];
+            if (is_f64)      vf = ((const double *)  vals)[i];
+            else if (is_sym) vu = ((const uint32_t *) vals)[i];
+            else             vi = ((const int64_t *)  vals)[i];
 
             /* FIRST / LAST / LAST_ROW */
             if (p->kind != PROJ_AGG_TS_TWA) {
@@ -1617,6 +1729,187 @@ static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
     }
 }
 
+/* Fold one block into p, reading the aggregate's input from the stored
+ * column p->col.  Thin wrapper preserved so the many existing call sites
+ * keep their shape; agg(udf(...)) goes through agg_update_vals directly. */
+static void agg_update(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
+                       const uint64_t *bm, void *scratch) {
+    tsdb_type_t t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
+    const void *vals = (bufs && p->col >= 0) ? bufs[p->col] : NULL;
+    const int64_t *tscol = (bufs && s->ts_col_idx >= 0)
+                           ? (const int64_t *)bufs[s->ts_col_idx] : NULL;
+    agg_update_vals(p, t, vals, tscol, n, bm, scratch);
+}
+
+/* ---- agg(udf(...)) block materialisation -------------------------------- *
+ *
+ * A UDF nested in an aggregate is evaluated once per decoded block, exactly
+ * the shape tsdb_udf.h describes: n values in, n values out.  The aggregate
+ * then consumes that output block instead of a stored column, so nothing is
+ * materialised to the client.
+ *
+ * Rows the WHERE clause excluded are compacted out BEFORE the call, so the
+ * UDF only ever sees rows that are part of the aggregate — same rule the
+ * per-row scalar projection path follows.  When every row survives (the
+ * common case) the argument columns are passed through with no copy.
+ *
+ * Scratch layout, `stride` bytes (= max block rows * 8, 32-aligned) per slot:
+ *   [0 .. nslots)                 per-projection UDF output, dense
+ *   [nslots]                      compacted ts, only when want_ts
+ *   [nslots+want_ts .. +maxargs)  compacted UDF arguments, reused per call
+ */
+typedef struct {
+    uint8_t  *base;      /* one aligned allocation; NULL when unused */
+    uint64_t *dense_bm;  /* all-ones bitmap over the compacted rows   */
+    size_t    stride;    /* bytes per slot                            */
+    int       nslots;    /* per-projection output slots               */
+    int       maxargs;   /* widest UDF argument list among them       */
+    int       want_ts;   /* 1 when a TS-specialised UDF agg is present*/
+} udf_agg_scratch_t;
+
+/* Count the slots a projection list needs.  nslots == 0 means the scan can
+ * skip every UDF hook. */
+static void udf_agg_plan(const proj_t *projs, int nprojs,
+                         int *out_nslots, int *out_maxargs, int *out_want_ts) {
+    int nslots = 0, maxargs = 0, want_ts = 0;
+    for (int i = 0; i < nprojs; i++) {
+        const proj_t *p = &projs[i];
+        if (!p->udf_agg || p->kind == PROJ_AGG_COUNT) continue;
+        nslots++;
+        if (p->udf_nargs > maxargs) maxargs = p->udf_nargs;
+        if (p->kind >= PROJ_AGG_TS_KIND_FIRST) want_ts = 1;
+    }
+    *out_nslots = nslots; *out_maxargs = maxargs; *out_want_ts = want_ts;
+}
+
+static void udf_agg_scratch_free(udf_agg_scratch_t *sc) {
+    if (!sc) return;
+    free(sc->base);     sc->base = NULL;
+    free(sc->dense_bm); sc->dense_bm = NULL;
+    sc->nslots = 0;
+}
+
+/* Size the scratch for `rows` (the largest block the scan will visit).
+ * A zero-slot plan allocates nothing and every hook below no-ops. */
+static int udf_agg_scratch_init(udf_agg_scratch_t *sc, const proj_t *projs,
+                                int nprojs, size_t rows) {
+    memset(sc, 0, sizeof(*sc));
+    udf_agg_plan(projs, nprojs, &sc->nslots, &sc->maxargs, &sc->want_ts);
+    if (sc->nslots == 0) return TSDB_OK;
+    sc->stride = (rows * 8 + 31) & ~(size_t)31;
+    size_t nseg = (size_t)sc->nslots + (size_t)sc->want_ts + (size_t)sc->maxargs;
+    sc->base = aligned_alloc(32, sc->stride * nseg);
+    if (!sc->base) { sc->nslots = 0; return TSDB_ERR_NOMEM; }
+    size_t nw = (rows + 63) / 64;
+    sc->dense_bm = malloc(nw * sizeof(uint64_t));
+    if (!sc->dense_bm) {
+        free(sc->base); sc->base = NULL; sc->nslots = 0;
+        return TSDB_ERR_NOMEM;
+    }
+    return TSDB_OK;
+}
+
+static inline uint8_t *udf_agg_out(const udf_agg_scratch_t *sc, int slot) {
+    return sc->base + (size_t)slot * sc->stride;
+}
+static inline int64_t *udf_agg_ts(const udf_agg_scratch_t *sc) {
+    return (int64_t *)(sc->base + (size_t)sc->nslots * sc->stride);
+}
+
+/* Evaluate every value-consuming UDF aggregate over one decoded block.
+ * *out_cn receives the compacted row count; the dense bitmap covering it is
+ * sc->dense_bm.  Returns TSDB_ERR_INTERNAL (and names the UDF in *out_failed)
+ * when a UDF reports failure — the query must abort, never emit zeros. */
+static int udf_agg_materialise(const proj_t *projs, int nprojs, tsdb_schema_t *s,
+                               void **bufs, size_t n, const uint64_t *bm,
+                               udf_agg_scratch_t *sc, size_t *out_cn,
+                               const proj_t **out_failed)
+{
+    *out_cn = n;
+    if (out_failed) *out_failed = NULL;
+    if (sc->nslots == 0) return TSDB_OK;
+
+    uint64_t popcnt = tsdb_bitmap_popcount(bm, n);
+    size_t   cn     = (size_t)popcnt;
+    int      dense  = (cn == n);
+    *out_cn = cn;
+
+    /* Dense all-ones bitmap over the compacted rows. */
+    size_t nw = (cn + 63) / 64;
+    for (size_t i = 0; i < nw; i++) sc->dense_bm[i] = ~(uint64_t)0;
+    if (nw) {
+        size_t tail = nw * 64 - cn;
+        if (tail) sc->dense_bm[nw - 1] &= (~(uint64_t)0) >> tail;
+    }
+    if (cn == 0) return TSDB_OK;
+
+    if (sc->want_ts && !dense && s->ts_col_idx >= 0 && bufs[s->ts_col_idx])
+        tsdb_bitmap_gather_i64(bm, (const int64_t *)bufs[s->ts_col_idx], n,
+                               udf_agg_ts(sc));
+
+    uint8_t *argbase = sc->base + ((size_t)sc->nslots + (size_t)sc->want_ts) * sc->stride;
+    for (int i = 0; i < nprojs; i++) {
+        const proj_t *p = &projs[i];
+        if (!p->udf_agg || p->kind == PROJ_AGG_COUNT) continue;
+        const void *argp[TSDB_UDF_MAX_ARGS];
+        for (int ai = 0; ai < p->udf_nargs; ai++) {
+            int ci = p->udf_arg_cols[ai];
+            if (ci < 0 || !bufs[ci]) {
+                if (out_failed) *out_failed = p;
+                return TSDB_ERR_INTERNAL;
+            }
+            if (dense) {
+                argp[ai] = bufs[ci];
+            } else {
+                /* v1 UDF types are all 8 bytes wide, so one gather kernel
+                 * moves any of them. */
+                int64_t *dst = (int64_t *)(argbase + (size_t)ai * sc->stride);
+                tsdb_bitmap_gather_i64(bm, (const int64_t *)bufs[ci], n, dst);
+                argp[ai] = dst;
+            }
+        }
+        tsdb_udf_ctx_t ctx = { .abi_version = TSDB_UDF_ABI_V1, .reserved = 0 };
+        if (p->udf_fn(&ctx, argp, cn, udf_agg_out(sc, p->udf_slot)) != TSDB_UDF_OK) {
+            if (out_failed) *out_failed = p;
+            return TSDB_ERR_INTERNAL;
+        }
+    }
+    return TSDB_OK;
+}
+
+/* Fold one block into p, routing UDF-fed aggregates to their materialised
+ * output.  `cn` / `dense_bm` come from udf_agg_materialise. */
+static void agg_update_blk(proj_t *p, tsdb_schema_t *s, void **bufs, size_t n,
+                           const uint64_t *bm, void *scratch,
+                           const udf_agg_scratch_t *sc, size_t cn)
+{
+    if (!p->udf_agg || p->kind == PROJ_AGG_COUNT) {
+        agg_update(p, s, bufs, n, bm, scratch);
+        return;
+    }
+    int dense = (cn == n);
+    const int64_t *tscol = NULL;
+    if (p->kind >= PROJ_AGG_TS_KIND_FIRST && s->ts_col_idx >= 0 && bufs[s->ts_col_idx])
+        tscol = dense ? (const int64_t *)bufs[s->ts_col_idx] : udf_agg_ts(sc);
+    agg_update_vals(p, qcoltype((tsdb_type_t)p->udf_ret_type),
+                    udf_agg_out(sc, p->udf_slot), tscol, cn,
+                    sc->dense_bm, scratch);
+}
+
+/* Mark every source column a projection reads, including the extra argument
+ * columns of a UDF call (which p->col alone does not cover). */
+static void proj_mark_cols(const proj_t *p, tsdb_schema_t *s, int *need_col) {
+    if (p->col >= 0) need_col[p->col] = 1;
+    if (p->kind == PROJ_UDF_SCALAR || p->udf_agg) {
+        for (int ai = 0; ai < p->udf_nargs; ai++)
+            if (p->udf_arg_cols[ai] >= 0) need_col[p->udf_arg_cols[ai]] = 1;
+    }
+    if (p->kind == PROJ_SCALAR_ROW)
+        scalar_mark_cols(p->scalar_expr, s, need_col);
+    if (p->udf_agg && p->kind >= PROJ_AGG_TS_KIND_FIRST && s->ts_col_idx >= 0)
+        need_col[s->ts_col_idx] = 1;
+}
+
 /* Guard for t-digest aggregate emission (stddev / percentile / p50/p90/p99).
  *
  * Distinguishes the two states agg_write's NaN fallback used to conflate:
@@ -1645,7 +1938,11 @@ static int tdigest_emit_guard(const proj_t *p, int check_empty,
 }
 
 static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx) {
-    tsdb_type_t src_t = (p->col >= 0) ? qcoltype(s->cols[p->col].type) : TSDB_TYPE_INT64;
+    /* For agg(udf(...)) the accumulated values are the UDF's return type,
+     * not any stored column's. */
+    tsdb_type_t src_t = p->udf_agg ? qcoltype((tsdb_type_t)p->udf_ret_type)
+                      : ((p->col >= 0) ? qcoltype(s->cols[p->col].type)
+                                       : TSDB_TYPE_INT64);
     double out_f = 0.0;
     int64_t out_i = 0;
     int is_int = (p->out_type == TSDB_TYPE_INT64 || p->out_type == TSDB_TYPE_TIMESTAMP);
@@ -1751,10 +2048,15 @@ typedef struct {
 /* Classify a projection kind for the stats-fast-path gate.
  *   bits: bit0=HAS_MIN_MAX, bit1=HAS_SUM, bit2=HAS_FIRST_LAST
  *   eligible: 1 if this kind can be served from stats at all. */
-static int agg_stats_requires(int kind, uint16_t *bits, int *eligible) {
+static int agg_stats_requires(const proj_t *p, uint16_t *bits, int *eligible) {
     *bits = 0;
     *eligible = 1;
-    switch (kind) {
+    /* Precomputed min/max/sum/first/last describe the STORED column.  An
+     * aggregate over a UDF output cannot be served from them — the UDF is not
+     * order- or value-preserving.  count() is the exception: it only needs the
+     * row count, which the UDF does not change. */
+    if (p->udf_agg && p->kind != PROJ_AGG_COUNT) { *eligible = 0; return 0; }
+    switch (p->kind) {
         case PROJ_AGG_COUNT:                                    return 0;
         case PROJ_AGG_MIN: case PROJ_AGG_MAX: case PROJ_AGG_SPREAD:
             *bits = TSDB_STATS_HAS_MIN_MAX;                     return 0;
@@ -1873,7 +2175,7 @@ static int try_stats_fastpath(scan_src_t *src,
         if (p->kind < PROJ_AGG_RANGE_BEGIN || p->kind > PROJ_AGG_RANGE_END)
             return 0;
         uint16_t bits = 0; int eligible = 0;
-        agg_stats_requires(p->kind, &bits, &eligible);
+        agg_stats_requires(p, &bits, &eligible);
         if (!eligible) return 0;
     }
 
@@ -1910,7 +2212,7 @@ static int try_stats_fastpath(scan_src_t *src,
         for (int pi = 0; pi < nprojs && ok; pi++) {
             proj_t *p = &projs[pi];
             uint16_t bits = 0; int eligible = 0;
-            agg_stats_requires(p->kind, &bits, &eligible);
+            agg_stats_requires(p, &bits, &eligible);
             if (bits == 0) continue;              /* COUNT(*): no stats */
             if (p->col < 0) { ok = 0; break; }
             tsdb_block_meta_t *hit = col_hits[p->col];
@@ -1996,8 +2298,15 @@ void tsdb_par_scan_task(void *arg) {
     /* Per-worker scratch for SIMD gather. Allocated once per task, reused
      * across every block this worker processes; sized to the worker's largest
      * assigned block so compacted (>8192-row) blocks don't overflow it. */
-    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(t->srcs, t->nsrcs));
+    size_t max_rows = scan_max_block_rows(t->srcs, t->nsrcs);
+    void *agg_scratch = agg_scratch_alloc(max_rows);
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
+
+    /* Per-worker scratch for agg(udf(...)) block materialisation. */
+    udf_agg_scratch_t usc;
+    if (udf_agg_scratch_init(&usc, t->projs, t->nprojs, max_rows) != TSDB_OK) {
+        free(agg_scratch); t->rc = TSDB_ERR_NOMEM; return;
+    }
 
     /* Kill switch — TSDB_DISABLE_STATS_FASTPATH=1 forces the scan path for
      * every aggregate, so we can A/B against precomputed stats. */
@@ -2018,7 +2327,7 @@ void tsdb_par_scan_task(void *arg) {
                 stats_gate_ok = 0; break;
             }
             uint16_t bits = 0; int eligible = 0;
-            agg_stats_requires(p->kind, &bits, &eligible);
+            agg_stats_requires(p, &bits, &eligible);
             if (!eligible) { stats_gate_ok = 0; break; }
         }
     }
@@ -2053,13 +2362,13 @@ void tsdb_par_scan_task(void *arg) {
         }
 
         void **bufs = calloc((size_t)t->schema->ncols, sizeof(void *));
-        if (!bufs) { t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
+        if (!bufs) { t->rc = TSDB_ERR_NOMEM; free(agg_scratch); udf_agg_scratch_free(&usc); return; }
         tsdb_symtab_t **syms = calloc((size_t)t->schema->ncols, sizeof(tsdb_symtab_t *));
-        if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
+        if (!syms) { free(bufs); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); udf_agg_scratch_free(&usc); return; }
         /* owned[c]: malloc to free after use; NULL for memtable buffers and
          * zero-copy mmap pointers (see scan_load_col_block). */
         void **owned = calloc((size_t)t->schema->ncols, sizeof(void *));
-        if (!owned) { free(bufs); free(syms); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); return; }
+        if (!owned) { free(bufs); free(syms); t->rc = TSDB_ERR_NOMEM; free(agg_scratch); udf_agg_scratch_free(&usc); return; }
 
         int load_rc = TSDB_OK;
         for (int c = 0; c < t->schema->ncols; c++) {
@@ -2077,7 +2386,7 @@ void tsdb_par_scan_task(void *arg) {
                 if (owned[c]) free(owned[c]);
             free(bufs); free(syms); free(owned);
             t->rc = load_rc;
-            free(agg_scratch);
+            free(agg_scratch); udf_agg_scratch_free(&usc);
             return;
         }
 
@@ -2089,7 +2398,7 @@ void tsdb_par_scan_task(void *arg) {
                 if (owned[c]) free(owned[c]);
             free(bufs); free(syms); free(owned);
             t->rc = TSDB_ERR_NOMEM;
-            free(agg_scratch);
+            free(agg_scratch); udf_agg_scratch_free(&usc);
             return;
         }
         for (size_t i = 0; i < nw; i++) bm[i] = ~(uint64_t)0;
@@ -2110,15 +2419,33 @@ void tsdb_par_scan_task(void *arg) {
                     if (owned[c]) free(owned[c]);
                 free(bufs); free(syms); free(owned);
                 t->rc = frc;
-                free(agg_scratch);
+                free(agg_scratch); udf_agg_scratch_free(&usc);
                 return;
             }
+        }
+
+        /* Materialise any agg(udf(...)) inputs for this block, then fold. */
+        size_t ucn = n;
+        const proj_t *ufail = NULL;
+        int urc = udf_agg_materialise(t->projs, t->nprojs, t->schema,
+                                      bufs, n, bm, &usc, &ucn, &ufail);
+        if (urc != TSDB_OK) {
+            snprintf(t->err, sizeof(t->err), "UDF '%s' failed",
+                     ufail ? ufail->udf_name : "?");
+            free(bm);
+            for (int c = 0; c < t->schema->ncols; c++)
+                if (owned[c]) free(owned[c]);
+            free(bufs); free(syms); free(owned);
+            t->rc = urc;
+            free(agg_scratch); udf_agg_scratch_free(&usc);
+            return;
         }
 
         /* Update private aggregate state. */
         for (int pi = 0; pi < t->nprojs; pi++) {
             if (t->projs[pi].kind >= PROJ_AGG_RANGE_BEGIN && t->projs[pi].kind <= PROJ_AGG_RANGE_END)
-                agg_update(&t->projs[pi], t->schema, bufs, n, bm, agg_scratch);
+                agg_update_blk(&t->projs[pi], t->schema, bufs, n, bm,
+                               agg_scratch, &usc, ucn);
         }
 
         free(bm);
@@ -2127,6 +2454,7 @@ void tsdb_par_scan_task(void *arg) {
         free(bufs); free(syms); free(owned);
     }
     free(agg_scratch);
+    udf_agg_scratch_free(&usc);
 }
 
 /* ---- LATEST ON execution ---------------------------------------------
@@ -2309,33 +2637,44 @@ static tsdb_symtab_t *result_new_owned_symtab(tsdb_result_t *r);
  * right.ts <= left.ts among rows where all ON key pairs match.
  * Right columns are encoded as 0 (NULL) when no match exists.
  *
- * Algorithm: materialise right table, then two-pointer with a per-key
- * cursor hashmap.  O(N log N) sort + O(N+M) scan.
+ * Algorithm: materialise the right table once, then a single linear merge —
+ * one right cursor that only ever moves forward, plus a "newest right row so
+ * far" slot per ON-key group.  O(M) materialise + O(N+M) merge.
+ *
+ * The ON keys are resolved into a dense integer id space ONCE per query (see
+ * asof_key_t) rather than per row.  The previous implementation FNV-hashed the
+ * *decoded string* of every SYMBOL key on both sides and then re-verified the
+ * candidate with two more tsdb_symtab_str() calls plus strcmp() — four symbol
+ * table lookups per output row, each taking the symtab rwlock.  A 1 ms leaf
+ * profile of `SELECT ts, price, bid FROM trades ASOF JOIN quotes ON
+ * symbol=symbol` at 1M x 1M put 50% of the whole query in that work
+ * (pthread_rwlock_* 20%, asof_keys_eq + strcmp + tsdb_symtab_str 30%) against
+ * 46% in block decode.  Dense ids also make the group lookup exact: the old
+ * map keyed slots on the hash alone, so two colliding keys shared one cursor
+ * and the verification step then reported "no match" for a row that had one.
  */
-/* Per-key cursor: scan_pos is how far into the right table we've scanned
- * (advances monotonically as left_ts grows); best is the index of the
- * best-matching right row seen so far for this key (SIZE_MAX = no match). */
-typedef struct { uint64_t key; size_t best; } asof_cursor_t;
+#define ASOF_NOMATCH SIZE_MAX
 
 typedef struct {
     size_t         nrows, ncols;
     int            ts_col;
-    int64_t       *ts_buf;
-    void         **col_bufs;
+    const int64_t *ts;              /* alias into col_bufs[ts_col]; not owned */
+    void         **col_bufs;        /* NULL for columns the query never reads */
     tsdb_type_t   *col_types;
     tsdb_symtab_t **col_syms;
 } right_mat_t;
 
 static void right_mat_free(right_mat_t *m) {
     if (!m) return;
-    free(m->ts_buf);
     if (m->col_bufs) { for (size_t c = 0; c < m->ncols; c++) free(m->col_bufs[c]); free(m->col_bufs); }
     free(m->col_types); free(m->col_syms);
+    m->col_bufs = NULL; m->col_types = NULL; m->col_syms = NULL; m->ts = NULL;
 }
 
 static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs, size_t off) {
     size_t n = src->row_count;
     for (size_t c = 0; c < m->ncols; c++) {
+        if (!m->col_bufs[c]) continue;          /* column pruned away */
         size_t w = tsdb_type_width(rs->cols[c].type);
         if (src->mem) {
             memcpy((char *)m->col_bufs[c] + off * w, src->mem_bufs[c], n * w);
@@ -2356,14 +2695,40 @@ static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs
     return TSDB_OK;
 }
 
-static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m) {
+/* Stable sort of `idx` by ts[]. Bottom-up merge sort: the old insertion sort
+ * is O(M^2) and turns any genuinely out-of-order right table into a hang at
+ * scale. Both are stable, so the resulting permutation — and therefore every
+ * ASOF match on duplicate timestamps — is identical. */
+static int right_mat_sort_idx(size_t *idx, size_t *tmp, const int64_t *ts, size_t n) {
+    for (size_t width = 1; width < n; width *= 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * width) {
+            size_t mid = lo + width, hi = lo + 2 * width;
+            if (mid > n) mid = n;
+            if (hi  > n) hi  = n;
+            size_t a = lo, b = mid, o = lo;
+            while (a < mid && b < hi)
+                tmp[o++] = (ts[idx[b]] < ts[idx[a]]) ? idx[b++] : idx[a++];
+            while (a < mid) tmp[o++] = idx[a++];
+            while (b < hi)  tmp[o++] = idx[b++];
+        }
+        memcpy(idx, tmp, n * sizeof(size_t));
+    }
+    return TSDB_OK;
+}
+
+/* `need[c]` selects which right columns to decode. ts is always forced on. */
+static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m,
+                           const unsigned char *need) {
     tsdb_schema_t *rs = tsdb_tbl_schema(rtbl);
     m->ncols = (size_t)rs->ncols; m->ts_col = rs->ts_col_idx;
     m->col_types = calloc(m->ncols, sizeof(tsdb_type_t));
     m->col_syms  = calloc(m->ncols, sizeof(tsdb_symtab_t *));
     m->col_bufs  = calloc(m->ncols, sizeof(void *));
-    m->ts_buf = NULL; m->nrows = 0;
+    m->ts = NULL; m->nrows = 0;
     if (!m->col_types || !m->col_syms || !m->col_bufs) return TSDB_ERR_NOMEM;
+    for (size_t c = 0; c < m->ncols; c++) {
+        m->col_types[c] = qcoltype(rs->cols[c].type); m->col_syms[c] = rs->cols[c].symtab;
+    }
 
     scan_plan_t rplan; memset(&rplan, 0, sizeof(rplan));
     int rc = scan_plan_build(&rplan, rtbl);
@@ -2375,7 +2740,7 @@ static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m) {
     if (total == 0) { scan_plan_free(&rplan); return TSDB_OK; }
 
     for (size_t c = 0; c < m->ncols; c++) {
-        m->col_types[c] = qcoltype(rs->cols[c].type); m->col_syms[c] = rs->cols[c].symtab;
+        if (!need[c] && (int)c != m->ts_col) continue;
         m->col_bufs[c] = malloc(tsdb_type_width(rs->cols[c].type) * total);
         if (!m->col_bufs[c]) { scan_plan_free(&rplan); right_mat_free(m); return TSDB_ERR_NOMEM; }
     }
@@ -2387,108 +2752,212 @@ static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m) {
     }
     scan_plan_free(&rplan);
 
-    m->ts_buf = malloc(total * sizeof(int64_t));
-    if (!m->ts_buf) { right_mat_free(m); return TSDB_ERR_NOMEM; }
-    memcpy(m->ts_buf, m->col_bufs[m->ts_col], total * sizeof(int64_t));
-
     /* Sort columns together by ts if not already sorted. */
+    const int64_t *ts = (const int64_t *)m->col_bufs[m->ts_col];
     int sorted = 1;
-    for (size_t i = 1; i < total; i++) if (m->ts_buf[i] < m->ts_buf[i-1]) { sorted = 0; break; }
+    for (size_t i = 1; i < total; i++) if (ts[i] < ts[i-1]) { sorted = 0; break; }
     if (!sorted) {
         size_t *idx = malloc(total * sizeof(size_t));
-        if (!idx) { right_mat_free(m); return TSDB_ERR_NOMEM; }
-        for (size_t i = 0; i < total; i++) idx[i] = i;
-        int64_t *ts = m->ts_buf;
-        for (size_t i = 1; i < total; i++) {   /* insertion sort, fast for nearly-sorted */
-            size_t x = idx[i]; int64_t tv = ts[x]; size_t j = i;
-            while (j > 0 && ts[idx[j-1]] > tv) { idx[j] = idx[j-1]; j--; }
-            idx[j] = x;
+        size_t *scratch = malloc(total * sizeof(size_t));
+        void   *tmp = malloc(total * 8);
+        if (!idx || !scratch || !tmp) {
+            free(idx); free(scratch); free(tmp); right_mat_free(m); return TSDB_ERR_NOMEM;
         }
-        void *tmp = malloc(total * 8);
-        if (!tmp) { free(idx); right_mat_free(m); return TSDB_ERR_NOMEM; }
+        for (size_t i = 0; i < total; i++) idx[i] = i;
+        right_mat_sort_idx(idx, scratch, ts, total);
         for (size_t c = 0; c < m->ncols; c++) {
+            if (!m->col_bufs[c]) continue;
             size_t w = tsdb_type_width(m->col_types[c]);
             for (size_t i = 0; i < total; i++)
                 memcpy((char *)tmp + i * w, (char *)m->col_bufs[c] + idx[i] * w, w);
             memcpy(m->col_bufs[c], tmp, total * w);
         }
-        memcpy(m->ts_buf, m->col_bufs[m->ts_col], total * sizeof(int64_t));
-        free(tmp); free(idx);
+        free(tmp); free(scratch); free(idx);
     }
+    m->ts = (const int64_t *)m->col_bufs[m->ts_col];
     return TSDB_OK;
 }
 
-static uint64_t asof_rkey_hash(right_mat_t *m, size_t row, int *rcol_idx, int nkeys) {
-    uint64_t h = 14695981039346656037ULL;
-    for (int k = 0; k < nkeys; k++) {
-        int c = rcol_idx[k]; tsdb_type_t t = m->col_types[c]; size_t w = tsdb_type_width(t);
-        if (t == TSDB_TYPE_SYMBOL && m->col_syms[c]) {
-            uint32_t code; memcpy(&code, (const uint8_t *)m->col_bufs[c] + row * w, 4);
-            const char *s = tsdb_symtab_str(m->col_syms[c], code); if (!s) s = "";
-            for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
-            h ^= 0u; h *= 1099511628211ULL;
-        } else {
-            const uint8_t *p = (const uint8_t *)m->col_bufs[c] + row * w;
-            for (size_t i = 0; i < w; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-        }
-    }
-    return h ? h : 1;
+/* ---- ON-key resolution -------------------------------------------------
+ *
+ * Each ON pair is classified once, before any row is touched:
+ *
+ *   ASOF_K_SYM   both sides SYMBOL with a dictionary — the right dictionary
+ *                defines the id space (right code == id, they are already
+ *                dense), and lmap[] translates a left code into it.  A left
+ *                symbol absent from the right dictionary maps to the reserved
+ *                id `rn`, which no right row ever writes, so it can never
+ *                match — same answer the old strcmp gave, without the strcmp.
+ *   ASOF_K_RAW8  both sides 8 bytes wide — compare the raw value.
+ *   ASOF_K_RAW4  both sides 4 bytes wide — compare the raw value.
+ *   ASOF_K_DEAD  widths differ (SYMBOL vs anything else is the only way).
+ *                The bytewise comparison this replaces hashed a different
+ *                number of bytes per side, so such a pair never matched
+ *                either; the join is short-circuited to "no matches". */
+enum { ASOF_K_RAW8 = 0, ASOF_K_RAW4, ASOF_K_SYM, ASOF_K_DEAD };
+
+typedef struct {
+    int       lcol, rcol;
+    int       mode;
+    uint32_t *lmap;      /* SYM: left code -> right code (id space) */
+    uint32_t  ln;        /* SYM: entries in lmap                    */
+    uint32_t  rn;        /* SYM: right dictionary size; rn == "no such symbol" */
+} asof_key_t;
+
+static void asof_keys_free(asof_key_t *keys, int nkeys) {
+    for (int k = 0; k < nkeys; k++) free(keys[k].lmap);
 }
 
-static uint64_t asof_lkey_hash(tsdb_schema_t *ls, void **lb, size_t row, int *lcol_idx, int nkeys) {
-    uint64_t h = 14695981039346656037ULL;
+static int asof_keys_build(asof_key_t *keys, int nkeys,
+                           tsdb_schema_t *ls, const int *lcol_idx,
+                           const right_mat_t *m, const int *rcol_idx, int *dead)
+{
+    *dead = 0;
     for (int k = 0; k < nkeys; k++) {
-        int c = lcol_idx[k]; tsdb_type_t t = ls->cols[c].type; size_t w = tsdb_type_width(t);
-        if (t == TSDB_TYPE_SYMBOL && ls->cols[c].symtab) {
-            uint32_t code; memcpy(&code, (const uint8_t *)lb[c] + row * w, 4);
-            const char *s = tsdb_symtab_str(ls->cols[c].symtab, code); if (!s) s = "";
-            for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
-            h ^= 0u; h *= 1099511628211ULL;
-        } else {
-            const uint8_t *p = (const uint8_t *)lb[c] + row * w;
-            for (size_t i = 0; i < w; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-        }
-    }
-    return h ? h : 1;
-}
-
-static int asof_keys_eq(tsdb_schema_t *ls, void **lb, size_t lr, int *lcol_idx,
-                         right_mat_t *m, size_t rr, int *rcol_idx, int nkeys) {
-    for (int k = 0; k < nkeys; k++) {
-        int lc = lcol_idx[k], rc2 = rcol_idx[k];
-        tsdb_type_t lt = qcoltype(ls->cols[lc].type), rt = m->col_types[rc2];
+        asof_key_t *K = &keys[k];
+        memset(K, 0, sizeof(*K));
+        K->lcol = lcol_idx[k]; K->rcol = rcol_idx[k];
+        tsdb_type_t lt = qcoltype(ls->cols[K->lcol].type);
+        tsdb_type_t rt = m->col_types[K->rcol];
         size_t lw = tsdb_type_width(lt), rw = tsdb_type_width(rt);
+        if (lw == 0 || lw != rw) { K->mode = ASOF_K_DEAD; *dead = 1; continue; }
         if (lt == TSDB_TYPE_SYMBOL && rt == TSDB_TYPE_SYMBOL) {
-            uint32_t a, b2;
-            memcpy(&a, (const uint8_t *)lb[lc] + lr * lw, 4);
-            memcpy(&b2, (const uint8_t *)m->col_bufs[rc2] + rr * rw, 4);
-            const char *sa = tsdb_symtab_str(ls->cols[lc].symtab, a); if (!sa) sa = "";
-            const char *sb = tsdb_symtab_str(m->col_syms[rc2], b2); if (!sb) sb = "";
-            if (strcmp(sa, sb) != 0) return 0;
-        } else {
-            if (memcmp((const uint8_t *)lb[lc] + lr * lw,
-                       (const uint8_t *)m->col_bufs[rc2] + rr * rw,
-                       lw < rw ? lw : rw) != 0) return 0;
+            tsdb_symtab_t *lsym = ls->cols[K->lcol].symtab;
+            tsdb_symtab_t *rsym = m->col_syms[K->rcol];
+            if (!lsym || !rsym) { K->mode = ASOF_K_RAW4; continue; }
+            K->rn = (uint32_t)tsdb_symtab_size(rsym);
+            K->ln = (uint32_t)tsdb_symtab_size(lsym);
+            K->lmap = malloc(((size_t)K->ln + 1) * sizeof(uint32_t));
+            if (!K->lmap) return TSDB_ERR_NOMEM;
+            for (uint32_t c = 0; c < K->ln; c++) {
+                const char *s = tsdb_symtab_str(lsym, c);
+                uint32_t rcode = s ? tsdb_symtab_lookup(rsym, s) : TSDB_SYMBOL_INVALID;
+                K->lmap[c] = (rcode == TSDB_SYMBOL_INVALID || rcode >= K->rn) ? K->rn : rcode;
+            }
+            K->mode = ASOF_K_SYM;
+            continue;
         }
+        K->mode = (lw == 8) ? ASOF_K_RAW8 : ASOF_K_RAW4;
     }
-    return 1;
-}
-
-static asof_cursor_t *asof_slot(asof_cursor_t *map, size_t cap, uint64_t key) {
-    size_t pos = (size_t)key & (cap - 1);
-    while (map[pos].key && map[pos].key != key) pos = (pos + 1) & (cap - 1);
-    return &map[pos];
-}
-
-static int asof_grow(asof_cursor_t **pm, size_t *pc) {
-    size_t nc = (*pc) * 2;
-    asof_cursor_t *nm = calloc(nc, sizeof(asof_cursor_t));
-    if (!nm) return TSDB_ERR_NOMEM;
-    for (size_t i = 0; i < *pc; i++)
-        if ((*pm)[i].key) *asof_slot(nm, nc, (*pm)[i].key) = (*pm)[i];
-    free(*pm); *pm = nm; *pc = nc;
     return TSDB_OK;
 }
+
+static inline uint64_t asof_lkey(const asof_key_t *k, void *const *lb, size_t row) {
+    if (k->mode == ASOF_K_SYM) {
+        uint32_t c = ((const uint32_t *)lb[k->lcol])[row];
+        return c < k->ln ? k->lmap[c] : k->rn;
+    }
+    if (k->mode == ASOF_K_RAW8) return ((const uint64_t *)lb[k->lcol])[row];
+    return ((const uint32_t *)lb[k->lcol])[row];
+}
+
+static inline uint64_t asof_rkey(const asof_key_t *k, const right_mat_t *m, size_t row) {
+    if (k->mode == ASOF_K_SYM) {
+        uint32_t c = ((const uint32_t *)m->col_bufs[k->rcol])[row];
+        return c < k->rn ? c : k->rn;
+    }
+    if (k->mode == ASOF_K_RAW8) return ((const uint64_t *)m->col_bufs[k->rcol])[row];
+    return ((const uint32_t *)m->col_bufs[k->rcol])[row];
+}
+
+/* Group cursor map for the cases the direct-index fast path cannot serve
+ * (0 keys, >1 key, or a non-SYMBOL key).  Open addressing; the full key tuple
+ * is stored out-of-line and compared on every probe, so a hash collision costs
+ * a memcmp instead of a wrong answer. */
+typedef struct { uint64_t h; size_t best; uint32_t tup; uint32_t used; } asof_slot_t;
+
+typedef struct {
+    asof_slot_t *slots;
+    uint64_t    *tups;
+    size_t       cap, n, tcap;
+    int          nk;
+} asof_map_t;
+
+static void asof_map_free(asof_map_t *m) { free(m->slots); free(m->tups); m->slots = NULL; m->tups = NULL; }
+
+static int asof_map_init(asof_map_t *m, int nk) {
+    memset(m, 0, sizeof(*m));
+    m->nk = nk; m->cap = 256; m->tcap = 128;
+    m->slots = calloc(m->cap, sizeof(asof_slot_t));
+    m->tups  = (nk > 0) ? malloc(m->tcap * (size_t)nk * sizeof(uint64_t)) : NULL;
+    if (!m->slots || (nk > 0 && !m->tups)) { asof_map_free(m); return TSDB_ERR_NOMEM; }
+    return TSDB_OK;
+}
+
+static inline uint64_t asof_khash(const uint64_t *key, int nk) {
+    if (nk <= 0) return 0x9E3779B97F4A7C15ULL;
+    return (uint64_t)tsdb_crc32c(key, (size_t)nk * sizeof(uint64_t)) * 0x9E3779B97F4A7C15ULL;
+}
+
+static size_t asof_map_probe(const asof_map_t *m, const uint64_t *key, uint64_t h) {
+    size_t mask = m->cap - 1, pos = (size_t)h & mask;
+    while (m->slots[pos].used) {
+        if (m->slots[pos].h == h &&
+            (m->nk == 0 ||
+             memcmp(&m->tups[(size_t)m->slots[pos].tup * (size_t)m->nk], key,
+                    (size_t)m->nk * sizeof(uint64_t)) == 0))
+            break;
+        pos = (pos + 1) & mask;
+    }
+    return pos;
+}
+
+static int asof_map_grow(asof_map_t *m) {
+    size_t nc = m->cap * 2, mask = nc - 1;
+    asof_slot_t *ns = calloc(nc, sizeof(asof_slot_t));
+    if (!ns) return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (!m->slots[i].used) continue;
+        size_t pos = (size_t)m->slots[i].h & mask;
+        while (ns[pos].used) pos = (pos + 1) & mask;
+        ns[pos] = m->slots[i];
+    }
+    free(m->slots); m->slots = ns; m->cap = nc;
+    return TSDB_OK;
+}
+
+/* Right side: find or create the cursor slot for this key tuple. */
+static asof_slot_t *asof_map_upsert(asof_map_t *m, const uint64_t *key, uint64_t h) {
+    size_t pos = asof_map_probe(m, key, h);
+    if (m->slots[pos].used) return &m->slots[pos];
+    if ((m->n + 1) * 2 > m->cap) {
+        if (asof_map_grow(m) != TSDB_OK) return NULL;
+        pos = asof_map_probe(m, key, h);
+    }
+    uint32_t tup = 0;
+    if (m->nk > 0) {
+        if (m->n >= m->tcap) {
+            size_t nt = m->tcap * 2;
+            uint64_t *p = realloc(m->tups, nt * (size_t)m->nk * sizeof(uint64_t));
+            if (!p) return NULL;
+            m->tups = p; m->tcap = nt;
+        }
+        tup = (uint32_t)m->n;
+        memcpy(&m->tups[(size_t)tup * (size_t)m->nk], key, (size_t)m->nk * sizeof(uint64_t));
+    }
+    m->slots[pos].used = 1; m->slots[pos].h = h;
+    m->slots[pos].tup = tup; m->slots[pos].best = ASOF_NOMATCH;
+    m->n++;
+    return &m->slots[pos];
+}
+
+/* Left side: read-only probe. A key no right row ever carried has no match. */
+static inline size_t asof_map_best(const asof_map_t *m, const uint64_t *key, uint64_t h) {
+    size_t pos = asof_map_probe(m, key, h);
+    return m->slots[pos].used ? m->slots[pos].best : ASOF_NOMATCH;
+}
+
+/* One output column, resolved once instead of per cell. */
+typedef struct {
+    int             is_right;
+    int             zero;        /* projection is not a plain column: emit NULL */
+    int             col;         /* left schema col, or right materialised col */
+    int             w8;          /* source element is 8 bytes (else 4) */
+    const void     *rsrc;        /* right column buffer (is_right only) */
+    uint32_t       *symmap;      /* right SYMBOL: code -> result-symtab code */
+    uint32_t        symn;
+    tsdb_symtab_t  *rsym, *osym;
+} asof_emit_t;
 
 /* Flag for right-side projection columns encoded in proj_t.col. */
 #define PROJ_RFLAG  0x8000
@@ -2584,19 +3053,74 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
         if (rc != TSDB_OK) { free(projs); return rc; }
     }
 
+    /* Decode only the right columns the query actually reads: the ON keys and
+     * whatever it projects (ts is forced on by right_mat_build). */
+    unsigned char need_rcol[TSDB_MAX_COLS]; memset(need_rcol, 0, sizeof(need_rcol));
+    for (int i = 0; i < nprojs; i++)
+        if (PROJ_IS_R(&projs[i]) && projs[i].kind == PROJ_COL) need_rcol[PROJ_RC(&projs[i])] = 1;
+    for (int k = 0; k < nkeys; k++) need_rcol[rcol_idx[k]] = 1;
+
     right_mat_t rm; memset(&rm, 0, sizeof(rm));
-    rc = right_mat_build(rtbl, &rm);
+    rc = right_mat_build(rtbl, &rm, need_rcol);
     if (rc != TSDB_OK) { free(projs); return rc; }
 
     scan_plan_t lplan; memset(&lplan, 0, sizeof(lplan));
     rc = scan_plan_build(&lplan, ltbl);
     if (rc != TSDB_OK) { right_mat_free(&rm); free(projs); return rc; }
 
-    size_t cursor_cap = 256;
-    asof_cursor_t *cursor_map = calloc(cursor_cap, sizeof(asof_cursor_t));
-    if (!cursor_map) { rc = TSDB_ERR_NOMEM; goto done; }
-    size_t cursor_n = 0;
-    /* Global scan pointer into right table — advances monotonically as left_ts grows. */
+    asof_key_t keys[32]; memset(keys, 0, sizeof(keys));
+    asof_map_t cmap; memset(&cmap, 0, sizeof(cmap));
+    asof_emit_t *emits = NULL;
+    size_t *best_arr = NULL, *rpos = NULL;
+    int join_dead = 0, direct = 0;
+
+    rc = asof_keys_build(keys, nkeys, ls, lcol_idx, &rm, rcol_idx, &join_dead);
+    if (rc != TSDB_OK) goto done;
+
+    /* Fast path: a single SYMBOL key is already a dense id, so the group
+     * cursor is a flat array indexed by the right dictionary code — no hash,
+     * no probe, no comparison.  Skipped if the dictionary is far larger than
+     * the data (the array would dwarf the right table itself). */
+    direct = (nkeys == 1 && keys[0].mode == ASOF_K_SYM &&
+              (size_t)keys[0].rn <= rm.nrows + 65536);
+    if (direct) {
+        size_t nslots = (size_t)keys[0].rn + 1;
+        best_arr = malloc(nslots * sizeof(size_t));
+        if (!best_arr) { rc = TSDB_ERR_NOMEM; goto done; }
+        memset(best_arr, 0xFF, nslots * sizeof(size_t));   /* == ASOF_NOMATCH */
+    } else {
+        rc = asof_map_init(&cmap, nkeys);
+        if (rc != TSDB_OK) goto done;
+    }
+
+    /* Resolve the output columns once. */
+    emits = calloc((size_t)nprojs ? (size_t)nprojs : 1, sizeof(asof_emit_t));
+    if (!emits) { rc = TSDB_ERR_NOMEM; goto done; }
+    for (int i = 0; i < nprojs; i++) {
+        asof_emit_t *e = &emits[i];
+        if (projs[i].kind != PROJ_COL) { e->zero = 1; continue; }
+        if (!PROJ_IS_R(&projs[i])) {
+            e->col = projs[i].col;
+            e->w8  = (tsdb_type_width(ls->cols[e->col].type) == 8);
+        } else {
+            int rc2 = PROJ_RC(&projs[i]);
+            e->is_right = 1; e->col = rc2;
+            e->rsrc = rm.col_bufs[rc2];
+            e->w8   = (tsdb_type_width(rm.col_types[rc2]) == 8);
+            if (rm.col_types[rc2] == TSDB_TYPE_SYMBOL && rm.col_syms[rc2]) {
+                e->rsym = rm.col_syms[rc2];
+                e->osym = r->col_symtab[i];
+                e->symn = (uint32_t)tsdb_symtab_size(e->rsym);
+                e->symmap = malloc(((size_t)e->symn + 1) * sizeof(uint32_t));
+                if (!e->symmap) { rc = TSDB_ERR_NOMEM; goto done; }
+                memset(e->symmap, 0xFF, ((size_t)e->symn + 1) * sizeof(uint32_t));
+            }
+        }
+    }
+
+    /* Right rows a left row can never see: a dead key pair means no matches. */
+    size_t rn_scan = join_dead ? 0 : rm.nrows;
+    /* The one cursor into the right side. It only ever moves forward. */
     size_t rscan = 0;
 
     int need_lcol[TSDB_MAX_COLS]; memset(need_lcol, 0, sizeof(need_lcol));
@@ -2604,6 +3128,14 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
         if (!PROJ_IS_R(&projs[i]) && projs[i].col >= 0) need_lcol[projs[i].col] = 1;
     for (int k = 0; k < nkeys; k++) need_lcol[lcol_idx[k]] = 1;
     need_lcol[ls->ts_col_idx] = 1;
+
+    size_t max_src_rows = 0;
+    for (size_t si = 0; si < lplan.nsrcs; si++)
+        if (lplan.srcs[si].row_count > max_src_rows) max_src_rows = lplan.srcs[si].row_count;
+    if (max_src_rows) {
+        rpos = malloc(max_src_rows * sizeof(size_t));
+        if (!rpos) { rc = TSDB_ERR_NOMEM; goto done; }
+    }
 
     size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
 
@@ -2641,79 +3173,89 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
         }
 
         const int64_t *lts = (const int64_t *)lbufs[ls->ts_col_idx];
+        size_t emit_n = ln;
+        if (limit - r->nrows < emit_n) emit_n = limit - r->nrows;
 
-        for (size_t li = 0; li < ln && r->nrows < limit; li++) {
-            int64_t left_ts = lts[li];
-            uint64_t khash = (nkeys > 0)
-                ? asof_lkey_hash(ls, lbufs, li, lcol_idx, nkeys)
-                : 0xababababababababULL;
-
-            /* Advance global rscan pointer up to left_ts, updating per-key best match. */
-            while (rscan < rm.nrows && rm.ts_buf[rscan] <= left_ts) {
-                /* Grow before lookup, not after, to avoid stale pointer. */
-                if (cursor_n * 2 >= cursor_cap) {
-                    int grc = asof_grow(&cursor_map, &cursor_cap);
-                    if (grc != TSDB_OK) { rc = grc; goto free_lbufs; }
+        /* ---- Phase 1: the merge. One pass over each side, no backtracking.
+         * `rscan` walks the right table forward to left_ts, stamping each
+         * group's cursor with the newest right row it has passed; the left row
+         * then reads its own group's cursor. */
+        if (direct) {
+            const asof_key_t *K = &keys[0];
+            for (size_t li = 0; li < emit_n; li++) {
+                int64_t left_ts = lts[li];
+                while (rscan < rn_scan && rm.ts[rscan] <= left_ts) {
+                    best_arr[asof_rkey(K, &rm, rscan)] = rscan;
+                    rscan++;
                 }
-                /* Compute key hash for this right row. */
-                uint64_t rkhash = (nkeys > 0)
-                    ? asof_rkey_hash(&rm, rscan, rcol_idx, nkeys)
-                    : 0xababababababababULL;
-                asof_cursor_t *rslot = asof_slot(cursor_map, cursor_cap, rkhash);
-                if (!rslot->key) { rslot->key = rkhash; rslot->best = SIZE_MAX; cursor_n++; }
-                rslot->best = rscan;  /* always take the latest row (higher ts is better) */
-                rscan++;
+                size_t p = best_arr[asof_lkey(K, lbufs, li)];
+                rpos[li] = (p != ASOF_NOMATCH && rm.ts[p] <= left_ts) ? p : ASOF_NOMATCH;
             }
-
-            /* Look up cursor for this left row's key hash. */
-            if (cursor_n * 2 >= cursor_cap) {
-                int grc = asof_grow(&cursor_map, &cursor_cap);
-                if (grc != TSDB_OK) { rc = grc; goto free_lbufs; }
-            }
-            asof_cursor_t *slot = asof_slot(cursor_map, cursor_cap, khash);
-            if (!slot->key) { slot->key = khash; slot->best = SIZE_MAX; cursor_n++; }
-
-            size_t rpos = slot->best;
-            int have_match = (rpos != SIZE_MAX && rm.ts_buf[rpos] <= left_ts &&
-                ((nkeys == 0) ? 1 : asof_keys_eq(ls, lbufs, li, lcol_idx, &rm, rpos, rcol_idx, nkeys)));
-
-            rc = result_reserve_rows(r, r->nrows + 1);
-            if (rc != TSDB_OK) goto free_lbufs;
-
-            for (int pi = 0; pi < nprojs; pi++) {
-                proj_t *p = &projs[pi];
-                if (p->kind != PROJ_COL) { result_append_cell(r, pi, 0); continue; }
-                if (!PROJ_IS_R(p)) {
-                    int lc = p->col; size_t w = tsdb_type_width(ls->cols[lc].type);
-                    uint64_t bits = 0;
-                    if (w == 8) bits = ((const uint64_t *)lbufs[lc])[li];
-                    else if (w == 4) bits = ((const uint32_t *)lbufs[lc])[li];
-                    result_append_cell(r, pi, bits);
-                } else {
-                    if (!have_match) { result_append_cell(r, pi, 0); continue; }
-                    int rc2 = PROJ_RC(p); tsdb_type_t rt = rm.col_types[rc2]; size_t w = tsdb_type_width(rt);
-                    if (rt == TSDB_TYPE_SYMBOL && rm.col_syms[rc2]) {
-                        uint32_t rcode; memcpy(&rcode, (const uint8_t *)rm.col_bufs[rc2] + rpos * w, 4);
-                        const char *s = tsdb_symtab_str(rm.col_syms[rc2], rcode);
-                        uint32_t ocode = tsdb_symtab_intern(r->col_symtab[pi], s ? s : "");
-                        result_append_cell(r, pi, (uint64_t)ocode);
-                    } else {
-                        uint64_t bits = 0;
-                        if (w == 8) memcpy(&bits, (const uint8_t *)rm.col_bufs[rc2] + rpos * 8, 8);
-                        else if (w == 4) { uint32_t v; memcpy(&v, (const uint8_t *)rm.col_bufs[rc2] + rpos * 4, 4); bits = v; }
-                        result_append_cell(r, pi, bits);
-                    }
+        } else {
+            uint64_t kbuf[32];
+            for (size_t li = 0; li < emit_n; li++) {
+                int64_t left_ts = lts[li];
+                while (rscan < rn_scan && rm.ts[rscan] <= left_ts) {
+                    for (int k = 0; k < nkeys; k++) kbuf[k] = asof_rkey(&keys[k], &rm, rscan);
+                    asof_slot_t *s = asof_map_upsert(&cmap, kbuf, asof_khash(kbuf, nkeys));
+                    if (!s) { rc = TSDB_ERR_NOMEM; goto free_lbufs; }
+                    s->best = rscan;
+                    rscan++;
                 }
+                for (int k = 0; k < nkeys; k++) kbuf[k] = asof_lkey(&keys[k], lbufs, li);
+                size_t p = asof_map_best(&cmap, kbuf, asof_khash(kbuf, nkeys));
+                rpos[li] = (p != ASOF_NOMATCH && rm.ts[p] <= left_ts) ? p : ASOF_NOMATCH;
             }
-            r->nrows++;
         }
+
+        /* ---- Phase 2: emit, one output column at a time. */
+        rc = result_reserve_rows(r, r->nrows + emit_n);
+        if (rc != TSDB_OK) goto free_lbufs;
+        for (int pi = 0; pi < nprojs; pi++) {
+            asof_emit_t *e = &emits[pi];
+            uint64_t *out = (uint64_t *)r->col_data[pi] + r->nrows;
+            if (e->zero) {
+                memset(out, 0, emit_n * sizeof(uint64_t));
+            } else if (!e->is_right) {
+                const void *s = lbufs[e->col];
+                if (e->w8) { const uint64_t *v = s; for (size_t i = 0; i < emit_n; i++) out[i] = v[i]; }
+                else       { const uint32_t *v = s; for (size_t i = 0; i < emit_n; i++) out[i] = v[i]; }
+            } else if (e->symmap) {
+                const uint32_t *v = e->rsrc;
+                for (size_t i = 0; i < emit_n; i++) {
+                    size_t p = rpos[i];
+                    if (p == ASOF_NOMATCH) { out[i] = 0; continue; }
+                    uint32_t code = v[p];
+                    uint32_t oc = (code <= e->symn) ? e->symmap[code] : TSDB_SYMBOL_INVALID;
+                    if (oc == TSDB_SYMBOL_INVALID) {
+                        const char *s = (code < e->symn) ? tsdb_symtab_str(e->rsym, code) : NULL;
+                        oc = tsdb_symtab_intern(e->osym, s ? s : "");
+                        if (code <= e->symn) e->symmap[code] = oc;
+                    }
+                    out[i] = oc;
+                }
+            } else if (e->w8) {
+                const uint64_t *v = e->rsrc;
+                for (size_t i = 0; i < emit_n; i++)
+                    out[i] = (rpos[i] == ASOF_NOMATCH) ? 0 : v[rpos[i]];
+            } else {
+                const uint32_t *v = e->rsrc;
+                for (size_t i = 0; i < emit_n; i++)
+                    out[i] = (rpos[i] == ASOF_NOMATCH) ? 0 : v[rpos[i]];
+            }
+        }
+        r->nrows += emit_n;
 free_lbufs:
         for (int c = 0; c < ls->ncols; c++) if (!src->mem && lbufs[c]) free(lbufs[c]);
         free(lbufs);
         if (rc != TSDB_OK) goto done;
     }
 done:
-    free(cursor_map);
+    if (emits) { for (int i = 0; i < nprojs; i++) free(emits[i].symmap); free(emits); }
+    asof_keys_free(keys, nkeys);
+    asof_map_free(&cmap);
+    free(best_arr);
+    free(rpos);
     right_mat_free(&rm);
     scan_plan_free(&lplan);
     free(projs);
@@ -3049,8 +3591,13 @@ static void tsdb_gbpar_scan_task(void *arg) {
         gb_prof.enabled = (e && *e == '1');
     }
 
-    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(t->srcs, t->nsrcs));
+    size_t gb_max_rows = scan_max_block_rows(t->srcs, t->nsrcs);
+    void *agg_scratch = agg_scratch_alloc(gb_max_rows);
     if (!agg_scratch) { t->rc = TSDB_ERR_NOMEM; return; }
+    udf_agg_scratch_t usc;
+    if (udf_agg_scratch_init(&usc, t->master_projs, nprojs, gb_max_rows) != TSDB_OK) {
+        free(agg_scratch); t->rc = TSDB_ERR_NOMEM; return;
+    }
 
     for (size_t si = 0; si < t->nsrcs; si++) {
         scan_src_t *src = &t->srcs[si];
@@ -3140,8 +3687,29 @@ static void tsdb_gbpar_scan_task(void *arg) {
         const size_t sk_w  = single_key ? tsdb_type_width(s->cols[sk_col].type) : 0;
         const void  *sk_buf = single_key ? bufs[sk_col] : NULL;
 
+        /* agg(udf(...)): one UDF call for the whole block, before the row
+         * loop.  The output is compacted to the WHERE-selected rows, so a row
+         * that survives the bitmap is at dense index `udense`. */
+        size_t ucn = n, udense = 0;
+        {
+            const proj_t *ufail = NULL;
+            int urc = udf_agg_materialise(t->master_projs, nprojs, s,
+                                          bufs, n, bm, &usc, &ucn, &ufail);
+            if (urc != TSDB_OK) {
+                snprintf(t->err, sizeof(t->err), "UDF '%s' failed",
+                         ufail ? ufail->udf_name : "?");
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (owned[c]) free(owned[c]);
+                free(bufs); free(syms); free(owned);
+                t->rc = urc;
+                break;
+            }
+        }
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
+            size_t udf_row = udense++;
 
             int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
@@ -3191,6 +3759,15 @@ static void tsdb_gbpar_scan_task(void *arg) {
             for (int p = 0; p < nprojs; p++) {
                 proj_t *gp = &slot->state[p];
                 if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
+                if (gp->udf_agg && gp->kind != PROJ_AGG_COUNT) {
+                    const int64_t *tsp =
+                        (gp->kind >= PROJ_AGG_TS_KIND_FIRST && bufs[s->ts_col_idx])
+                        ? (const int64_t *)bufs[s->ts_col_idx] + row : NULL;
+                    agg_update_vals(gp, qcoltype((tsdb_type_t)gp->udf_ret_type),
+                                    udf_agg_out(&usc, gp->udf_slot) + udf_row * 8,
+                                    tsp, one_n, &one_bm, agg_scratch);
+                    continue;
+                }
                 int set_col = -1, set_tsc = -1;
                 if (gp->col >= 0) {
                     size_t w = tsdb_type_width(s->cols[gp->col].type);
@@ -3227,6 +3804,7 @@ static void tsdb_gbpar_scan_task(void *arg) {
         if (t->rc != TSDB_OK) break;
     }
     free(agg_scratch);
+    udf_agg_scratch_free(&usc);
 
     if (gb_prof.enabled && gb_prof.rows > 0) {
         int64_t total = gb_prof.ns_keygather + gb_prof.ns_hash + gb_prof.ns_upsert_agg;
@@ -3594,7 +4172,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         int need_col[TSDB_MAX_COLS];
         memset(need_col, 0, sizeof(need_col));
         for (int i = 0; i < q->ngroup_by; i++) need_col[gkey_cols[i]] = 1;
-        for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        for (int i = 0; i < nprojs; i++) proj_mark_cols(&projs[i], s, need_col);
         for (int i = 0; i < nprojs; i++)
             if (projs[i].kind >= PROJ_AGG_TS_KIND_FIRST &&
                 projs[i].kind <= PROJ_AGG_RANGE_END)
@@ -3731,9 +4309,14 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
     size_t nused = 0;
 
     /* SIMD gather scratch for agg updates. */
-    void *agg_scratch = agg_scratch_alloc(scan_max_block_rows(plan.srcs, plan.nsrcs));
+    size_t gb_max_rows = scan_max_block_rows(plan.srcs, plan.nsrcs);
+    void *agg_scratch = agg_scratch_alloc(gb_max_rows);
     if (!agg_scratch) {
         free(ht); scan_plan_free(&plan); return TSDB_ERR_NOMEM;
+    }
+    udf_agg_scratch_t gb_udf_scratch;
+    if (udf_agg_scratch_init(&gb_udf_scratch, projs, nprojs, gb_max_rows) != TSDB_OK) {
+        free(agg_scratch); free(ht); scan_plan_free(&plan); return TSDB_ERR_NOMEM;
     }
 
     size_t limit_rows = q->has_limit ? (size_t)q->limit : SIZE_MAX;
@@ -3751,8 +4334,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         int need_col[TSDB_MAX_COLS];
         memset(need_col, 0, sizeof(need_col));
         for (int i = 0; i < q->ngroup_by; i++) need_col[gkey_cols[i]] = 1;
-        for (int i = 0; i < nprojs; i++)
-            if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        for (int i = 0; i < nprojs; i++) proj_mark_cols(&projs[i], s, need_col);
         /* TS agg functions also need the ts column loaded. */
         for (int i = 0; i < nprojs; i++) {
             if (projs[i].kind >= PROJ_AGG_TS_KIND_FIRST &&
@@ -3847,8 +4429,27 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         const size_t sk_w  = single_key ? tsdb_type_width(s->cols[sk_col].type) : 0;
         const void  *sk_buf = single_key ? bufs[sk_col] : NULL;
 
+        /* agg(udf(...)): one UDF call for the whole block; see the parallel
+         * worker for the dense-index rule. */
+        size_t ucn = n, udense = 0;
+        {
+            const proj_t *ufail = NULL;
+            int urc = udf_agg_materialise(projs, nprojs, s, bufs, n, bm,
+                                          &gb_udf_scratch, &ucn, &ufail);
+            if (urc != TSDB_OK) {
+                eset(err, errcap, "UDF '%s' failed",
+                     ufail ? ufail->udf_name : "?");
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (owned[c]) free(owned[c]);
+                free(bufs); free(syms); free(owned);
+                rc = urc; goto out;
+            }
+        }
+
         for (size_t row = 0; row < n; row++) {
             if (!(bm[row / 64] & ((uint64_t)1 << (row % 64)))) continue;
+            size_t udf_row = udense++;
 
             int64_t t0 = gb_prof.enabled ? gb_prof_now_ns() : 0;
             uint64_t key_tuple[TSDB_MAX_COLS];
@@ -3897,6 +4498,15 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             for (int p = 0; p < nprojs; p++) {
                 proj_t *gp = &slot->state[p];
                 if (gp->kind == PROJ_COL || gp->kind == PROJ_TS_BUCKET) continue;
+                if (gp->udf_agg && gp->kind != PROJ_AGG_COUNT) {
+                    const int64_t *tsp =
+                        (gp->kind >= PROJ_AGG_TS_KIND_FIRST && bufs[s->ts_col_idx])
+                        ? (const int64_t *)bufs[s->ts_col_idx] + row : NULL;
+                    agg_update_vals(gp, qcoltype((tsdb_type_t)gp->udf_ret_type),
+                                    udf_agg_out(&gb_udf_scratch, gp->udf_slot) + udf_row * 8,
+                                    tsp, one_n, &one_bm, agg_scratch);
+                    continue;
+                }
                 int set_col = -1, set_tsc = -1;
                 if (gp->col >= 0) {
                     size_t w = tsdb_type_width(s->cols[gp->col].type);
@@ -3996,6 +4606,7 @@ out:
     }
     free(ht);
     free(agg_scratch);
+    udf_agg_scratch_free(&gb_udf_scratch);
     scan_plan_free(&plan);
     return rc;
 }
@@ -5756,6 +6367,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* Scratch declared up front so all goto-done paths can free it. */
     void *serial_agg_scratch = NULL;
+    udf_agg_scratch_t serial_udf_scratch;
+    memset(&serial_udf_scratch, 0, sizeof(serial_udf_scratch));
 
     /* ---- Parallel aggregate path --------------------------------------- */
     /* Conditions: agg query, no SAMPLE BY, more than 1 source, parallel enabled.
@@ -5781,7 +6394,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         /* Determine the columns needed (same logic as serial path). */
         int need_col[TSDB_MAX_COLS];
         memset(need_col, 0, sizeof(need_col));
-        for (int i = 0; i < nprojs; i++) if (projs[i].col >= 0) need_col[projs[i].col] = 1;
+        for (int i = 0; i < nprojs; i++) proj_mark_cols(&projs[i], s, need_col);
         {
             qast_expr_t *stk[128]; int tp = 0;
             if (q->where) stk[tp++] = q->where;
@@ -5988,8 +6601,36 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* SIMD gather scratch (64 KB), reused across blocks for the serial path. */
     if (has_agg) {
-        serial_agg_scratch = agg_scratch_alloc(scan_max_block_rows(plan.srcs, plan.nsrcs));
+        size_t smax = scan_max_block_rows(plan.srcs, plan.nsrcs);
+        serial_agg_scratch = agg_scratch_alloc(smax);
         if (!serial_agg_scratch) { rc = TSDB_ERR_NOMEM; goto done; }
+        rc = udf_agg_scratch_init(&serial_udf_scratch, projs, nprojs, smax);
+        if (rc != TSDB_OK) goto done;
+    }
+
+    /* Size the result once, up front, for a plain row projection.  Such a
+     * query emits at most one output row per scanned input row, and the scan
+     * plan already knows every source's row count — so the exact bound is
+     * free here, whereas letting the per-block reserve double its way up
+     * costs log2(rows) reallocs per column plus the memmove behind each one
+     * (measured: 4.4% of `SELECT volume FROM trades` at 1M rows).  A failure
+     * is not fatal: the per-block reserve below still runs and reports.
+     *
+     * Bounded by RESULT_PREALLOC_MAX_BYTES so a scan that aborts early (a
+     * per-query deadline, an error) cannot be made to commit the whole
+     * result buffer for rows it will never emit.  Past the bound we simply
+     * keep the incremental doubling, i.e. today's behaviour. */
+    if (!has_agg && !q->has_adv_window && nprojs > 0) {
+        size_t upper = 0;
+        for (size_t si = 0; si < plan.nsrcs; si++) {
+            upper += plan.srcs[si].row_count;
+            if (upper >= limit) { upper = limit; break; }
+        }
+        upper += r->nrows;   /* r may already carry rows (super-table child) */
+        size_t ncol = r->ncols > 0 ? (size_t)r->ncols : 1;
+        if (upper > r->cap_rows &&
+            upper <= RESULT_PREALLOC_MAX_BYTES / (8 * ncol))
+            (void)result_reserve_rows_exact(r, upper);
     }
 
     /* Iterate sources. */
@@ -6050,20 +6691,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         if (!syms) { free(bufs); rc = TSDB_ERR_NOMEM; goto done; }
 
         int need_col[TSDB_MAX_COLS] = {0};
-        /* Columns needed: from projections + from WHERE */
-        for (int i = 0; i < nprojs; i++) {
-            if (projs[i].col >= 0) need_col[projs[i].col] = 1;
-            /* Multi-arg UDFs reference columns beyond proj.col. */
-            if (projs[i].kind == PROJ_UDF_SCALAR) {
-                for (int ai = 0; ai < projs[i].udf_nargs; ai++) {
-                    int ci = projs[i].udf_arg_cols[ai];
-                    if (ci >= 0) need_col[ci] = 1;
-                }
-            }
-            /* Row scalar expressions reference an arbitrary set of columns. */
-            if (projs[i].kind == PROJ_SCALAR_ROW)
-                scalar_mark_cols(projs[i].scalar_expr, s, need_col);
-        }
+        /* Columns needed: from projections (incl. every UDF argument and
+         * row-scalar leaf) + from WHERE */
+        for (int i = 0; i < nprojs; i++) proj_mark_cols(&projs[i], s, need_col);
         /* Scan WHERE expression for idents */
         /* Simple: just load all referenced columns; recursion */
         /* For WHERE, we call a helper that marks column bits. */
@@ -6166,10 +6796,26 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
         /* Execute projections */
         if (has_agg && !has_sample && !q->has_adv_window) {
-            /* Single-row aggregate over all rows matching. */
+            /* Single-row aggregate over all rows matching.  agg(udf(...))
+             * inputs are produced once per block, then folded like any other
+             * decoded column. */
+            size_t ucn = n;
+            const proj_t *ufail = NULL;
+            int urc = udf_agg_materialise(projs, nprojs, s, bufs, n, bm,
+                                          &serial_udf_scratch, &ucn, &ufail);
+            if (urc != TSDB_OK) {
+                eset(err, errcap, "UDF '%s' failed",
+                     ufail ? ufail->udf_name : "?");
+                free(bm);
+                for (int c = 0; c < s->ncols; c++)
+                    if (!src->mem && bufs[c]) free(bufs[c]);
+                free(bufs); free(syms);
+                rc = urc; goto done;
+            }
             for (int pi = 0; pi < nprojs; pi++) {
                 if (projs[pi].kind >= PROJ_AGG_RANGE_BEGIN && projs[pi].kind <= PROJ_AGG_RANGE_END)
-                    agg_update(&projs[pi], s, bufs, n, bm, serial_agg_scratch);
+                    agg_update_blk(&projs[pi], s, bufs, n, bm,
+                                   serial_agg_scratch, &serial_udf_scratch, ucn);
             }
         } else if (has_agg && has_sample) {
             /* Streaming bucket aggregation: emit each bucket as soon as we
@@ -6518,27 +7164,50 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
             /* Fast path: all projections are 8-byte column reads (the
              * common shape for SELECT col1, col2, … FROM t WHERE …).
-             * Iterate the bitmap word-by-word; use CTZ to jump between
-             * set bits without per-position bit tests — big win at low
-             * selectivity, neutral at high. */
+             * The result is column-major and the block's decoded columns
+             * are column-major too, so a maximal RUN of consecutive set
+             * bits transfers as one memcpy per projection instead of one
+             * load+store per cell.  With no predicate (or a block every
+             * row of which passes) that is a single memcpy per column per
+             * block; at low selectivity the run walk degenerates to the
+             * old per-bit behaviour without ever testing a clear bit.
+             * Emission order — ascending row index — is unchanged. */
             if (all_simple_w8) {
                 size_t nwords = (n + 63) / 64;
-                for (size_t wi = 0; wi < nwords; wi++) {
-                    uint64_t m = bm[wi];
-                    while (m) {
-                        if (rows_emitted >= limit) goto limit_hit;
-                        int bit = __builtin_ctzll(m);
-                        m &= (m - 1);
-                        size_t i = wi * 64 + (size_t)bit;
-                        if (i >= n) break;
-                        size_t outrow = r->nrows;
-                        for (int pi = 0; pi < nprojs; pi++) {
-                            ((uint64_t *)r->col_data[pi])[outrow] =
-                                ((const uint64_t *)proj_src[pi])[i];
-                        }
-                        r->nrows = outrow + 1;
-                        rows_emitted++;
+                size_t i = 0;
+                while (i < n && rows_emitted < limit) {
+                    /* First set bit at or after i. */
+                    size_t w = i >> 6;
+                    uint64_t m = bm[w] & (~(uint64_t)0 << (i & 63));
+                    while (!m) {
+                        if (++w >= nwords) goto limit_hit;
+                        m = bm[w];
                     }
+                    size_t run_lo = (w << 6) + (size_t)__builtin_ctzll(m);
+                    if (run_lo >= n) break;   /* only tail padding left */
+
+                    /* First clear bit at or after run_lo. */
+                    size_t w2 = run_lo >> 6;
+                    uint64_t inv = (~bm[w2]) & (~(uint64_t)0 << (run_lo & 63));
+                    while (!inv) {
+                        if (++w2 >= nwords) break;
+                        inv = ~bm[w2];
+                    }
+                    size_t run_hi = inv ? ((w2 << 6) + (size_t)__builtin_ctzll(inv))
+                                        : nwords * 64;
+                    if (run_hi > n) run_hi = n;
+
+                    size_t run = run_hi - run_lo;
+                    if (run > limit - rows_emitted) run = limit - rows_emitted;
+
+                    size_t outrow = r->nrows;
+                    for (int pi = 0; pi < nprojs; pi++)
+                        memcpy((uint64_t *)r->col_data[pi] + outrow,
+                               (const uint64_t *)proj_src[pi] + run_lo,
+                               run * 8);
+                    r->nrows      = outrow + run;
+                    rows_emitted += run;
+                    i = run_lo + run;
                 }
             limit_hit:;
                 /* fast-path emitted; skip the generic loop below. */
@@ -6809,6 +7478,7 @@ post_scan:
     (void)cmp_u64;
 done:
     free(serial_agg_scratch);
+    udf_agg_scratch_free(&serial_udf_scratch);
     if (projs) {
         for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
         free(projs);
@@ -9093,4 +9763,17 @@ const char *tsdb_result_sym(tsdb_result_t *r, int col) {
 
 bool tsdb_result_is_null(tsdb_result_t *r, int col) {
     (void)r; (void)col; return false; /* Nulls not yet tracked */
+}
+
+/* Bulk (columnar) access — see the contract in include/tsdb.h.  Both are
+ * pure readers of the layout the scalar accessors already index into, so
+ * they cannot disagree with tsdb_result_next + tsdb_result_ts/_i64/_f64.
+ * Neither touches r->cur. */
+size_t tsdb_result_nrows(tsdb_result_t *r) {
+    return r ? r->nrows : 0;
+}
+
+const void *tsdb_result_col_ptr(tsdb_result_t *r, int col) {
+    if (!r || col < 0 || col >= r->ncols || !r->col_data) return NULL;
+    return r->col_data[col];
 }

@@ -13,6 +13,8 @@
  *   udf 3-arg       SELECT my_clamp(val,l,h) — three input columns
  *   udf + aggregate SELECT avg(my_double(val))  — no row materialisation
  *   native aggregate SELECT avg(val)         — the aggregate floor
+ *   client-side     SELECT my_double(val) drained and averaged by the caller,
+ *                   which is what the aggregate form replaces
  *
  * Reports ns/row and Mrows/s for each, plus the UDF/native ratio, so a
  * regression in the dispatch path is visible rather than buried in the scan.
@@ -167,15 +169,34 @@ int main(int argc, char **argv) {
     double nagg = timed(db, "SELECT avg(val) FROM u",                     iters, N, &seen);
     row("native  avg(val)", nagg, seen, 0);
 
-    /* A UDF nested inside an aggregate is rejected with TSDB_ERR_UNSUPPORTED
-     * (-9) rather than mis-evaluated — a capability gap, not a correctness bug.
-     * Report it as such instead of printing it as a failed benchmark. */
+    double uagg = timed(db, "SELECT avg(my_double(val)) FROM u",           iters, N, &seen);
+    row("udf     avg(my_double(val))", uagg, seen, nagg);
+    double uaggw = timed(db, "SELECT avg(my_double(val)) FROM u WHERE val > 0.0",
+                          iters, N, &seen);
+    row("udf     + WHERE filter", uaggw, seen, nagg);
+
+    /* What the aggregate form replaces: with no server-side composition the
+     * client has to pull every my_double(val) row and average it itself. */
     {
-        tsdb_result_t *r = NULL;
-        int rc = tsdb_query(db, "SELECT avg(my_double(val)) FROM u", &r);
-        if (r) tsdb_result_free(r);
-        printf("  %-26s %s (rc=%d %s)\n", "udf     avg(my_double(val))",
-               rc == TSDB_OK ? "supported" : "NOT SUPPORTED", rc, tsdb_errstr(rc));
+        double best = 1e30;
+        for (int it = 0; it < iters; it++) {
+            tsdb_result_t *r = NULL;
+            double t0 = now_s();
+            int rc = tsdb_query(db, "SELECT my_double(val) FROM u", &r);
+            double sum = 0; int64_t n = 0;
+            if (rc == TSDB_OK && r) {
+                while (tsdb_result_next(r) > 0) { sum += tsdb_result_f64(r, 0); n++; }
+            }
+            double dt = now_s() - t0;
+            if (r) tsdb_result_free(r);
+            if (rc != TSDB_OK) { n = -1; break; }
+            if (dt < best) best = dt;
+            seen = n;
+        }
+        row("  same, averaged client-side", best * 1e9 / (double)N, seen, nagg);
+        if (uagg > 0 && best > 0)
+            printf("\n  aggregating the UDF in the engine instead of at the client:"
+                   " %.2fx\n", (best * 1e9 / (double)N) / uagg);
     }
 
     if (proj > 0 && u1 > 0)

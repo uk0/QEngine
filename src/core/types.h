@@ -36,8 +36,16 @@ typedef enum {
     TSDB_CODEC_CHIMP128 = 8, /* Chimp128: Chimp + 128-elem ring buffer (VLDB 2022) */
     TSDB_CODEC_BP128   = 9, /* SIMD-BP128 bit-packing (Lemire & Boytsov) */
     TSDB_CODEC_PFOR    = 10,/* PFOR-Delta (patched frame of reference) */
-    TSDB_CODEC_F32     = 11 /* narrow double->float32: 4 bytes/value on disk,
+    TSDB_CODEC_F32     = 11,/* narrow double->float32: 4 bytes/value on disk,
                             * widened back to double on decode (FLOAT32 column) */
+    TSDB_CODEC_DEC     = 12 /* scaled decimal: round(v*10^s) int64 through
+                            * DoD/PFOR (src/compress/dec.c).  FORMAT CHANGE —
+                            * 12 was unassigned, so a binary that predates it
+                            * hits the default: arm of tsdb_codec_decode and
+                            * returns TSDB_ERR_UNSUPPORTED instead of
+                            * misreading the block.  Writers must stay off
+                            * until every reader in the cluster knows id 12;
+                            * see dec_enabled() in codec.c. */
 } tsdb_codec_t;
 
 /* Size in bytes of a physical value for a given type (fixed-width columns). */

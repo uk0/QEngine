@@ -4,6 +4,7 @@
 #include "gorilla.h"
 #include "chimp.h"
 #include "chimp128.h"
+#include "dec.h"
 #include "dict.h"
 #include "pfor.h"
 #include "lzlite.h"
@@ -311,6 +312,10 @@ int tsdb_codec_decode(tsdb_codec_t codec,
         return tsdb_chimp_decode(in, in_bytes, (double *)out, out_count);
     case TSDB_CODEC_CHIMP128:
         return tsdb_chimp128_decode(in, in_bytes, (double *)out, out_count);
+    case TSDB_CODEC_DEC:
+        /* Scaled decimal — always produces doubles, so it serves both FLOAT64
+         * and the (width-8) FLOAT32 column layout. */
+        return tsdb_dec_decode(in, in_bytes, out, out_count);
     case TSDB_CODEC_DICT:
         return tsdb_dict_decode(in, in_bytes, (uint32_t *)out, out_count);
     case TSDB_CODEC_PFOR:
@@ -395,6 +400,89 @@ static int lz_finalize(const uint8_t *dom, size_t dom_bytes,
 }
 
 /*
+ * TSDB_CODEC_DECIMAL=1 turns on the scaled-decimal FLOAT64 codec.  DEFAULT OFF,
+ * and it has to stay that way for at least one release, because unlike every
+ * other selection change in this file it is a FORMAT CHANGE: a block written
+ * with codec id 12 is unreadable by any binary that does not know id 12.
+ *
+ * ROLLOUT ORDER — READERS BEFORE WRITERS:
+ *   1. deploy the new binary everywhere with the flag unset.  It reads codec
+ *      12 and writes exactly what the old one wrote (byte-identical output;
+ *      dec_enabled() is the only thing gating the new path).
+ *   2. only once NO node in the cluster runs an older binary, set
+ *      TSDB_CODEC_DECIMAL=1 on the writers.
+ *
+ * Why the order is not merely advisable: src/cluster/rawblock.c ships the
+ * COMPRESSED block plus its codec byte to peers verbatim (serialize at :79,
+ * parse at :124) with no version negotiation, so a codec-12 block reaches an
+ * old peer, is stored, and fails at read time there.
+ *
+ * Compaction is a writer too (compaction.c:615 re-encodes aged blocks through
+ * this same function), so the flag does not only affect NEW rows.  Measured
+ * both ways on a 60,000-row 2-decimal column: one compaction pass with the
+ * flag on turned 8 pre-existing GORILLA/CHIMP blocks into 2 codec-12 blocks,
+ * and one pass with it off turned 8 codec-12 blocks back into 2 non-DEC
+ * blocks — bit-exact in both directions.  So there IS a downgrade path, but
+ * it only covers partitions compaction chooses to rewrite; turning the flag
+ * off does not by itself convert anything already on disk.
+ *
+ * Read on every call rather than cached once: it is one environ scan against
+ * a 10-150 us block encode, and keeping it live is what lets a single test
+ * process encode the same block both ways and diff the results.
+ */
+static int dec_enabled(void)
+{
+    const char *e = getenv("TSDB_CODEC_DECIMAL");
+    return (e && e[0] && e[0] != '0') ? 1 : 0;
+}
+
+/*
+ * Scaled-decimal FLOAT64 candidate, taken through the same outer-LZ stage as
+ * every other candidate.  Writes into `dst`; returns the final byte count and
+ * sets *dflags, or -1 when the block is not exactly representable at any
+ * scale (NaN, ±inf, -0.0, subnormals, >8 decimals, huge magnitudes) or the
+ * result does not fit.
+ *
+ * Both inner integer codecs are evaluated on FINAL size, for the same reason
+ * SYMBOL is: PFOR is smaller pre-LZ on jittery data but bit-packed, so lzlite
+ * finds nothing in it, while DoD's byte-aligned varints keep a repeating
+ * column's period visible.  Measured on a 100-value 2-decimal cycle at
+ * N=8192: choosing the inner codec pre-LZ gives 3,382 B, choosing it on final
+ * size gives 1,744 B.
+ */
+static int encode_decimal_final(const void *in, size_t in_count,
+                                uint8_t *dst, size_t dst_cap,
+                                uint16_t *dflags, int min_gain)
+{
+    size_t cap = in_count * 11 + 64;   /* DoD worst case + the 2-byte prefix */
+    int64_t *q    = malloc(in_count * sizeof(int64_t));
+    uint8_t *raw  = malloc(cap);
+    uint8_t *dfin = malloc(dst_cap ? dst_cap : 1);
+    int ret = -1;
+    if (!q || !raw || !dfin) goto done;
+
+    int scale = tsdb_dec_find_scale((const double *)in, in_count, q);
+    if (scale < 0) goto done;   /* not exactly representable — float path */
+
+    static const tsdb_codec_t inners[2] = { TSDB_CODEC_DOD, TSDB_CODEC_PFOR };
+    for (int i = 0; i < 2; i++) {
+        size_t nb = 0;
+        if (tsdb_dec_pack(q, in_count, scale, inners[i], raw, cap, &nb) != TSDB_OK)
+            continue;
+        uint16_t f = 0;
+        int fin = lz_finalize(raw, nb, dfin, dst_cap, min_gain, &f);
+        if (fin < 0 || (ret >= 0 && fin >= ret)) continue;
+        memcpy(dst, dfin, (size_t)fin);
+        *dflags = f;
+        ret = fin;
+    }
+
+done:
+    free(q); free(raw); free(dfin);
+    return ret;
+}
+
+/*
  * SYMBOL: choose DICT vs PFOR on FINAL size, i.e. after the outer LZ stage.
  *
  * tsdb_codec_encode picks between them on domain size alone, but the two
@@ -463,6 +551,32 @@ int tsdb_codec_encode_adaptive_ex(tsdb_type_t type,
                                     out_codec, out_flags, min_gain);
         if (n >= 0) return n;
         /* allocation failure — fall through to the ordinary path */
+    }
+
+    /* Step 0: scaled-decimal FLOAT64 (opt-in, format change — see
+     * dec_enabled()).  Quantized telemetry re-expressed as round(v*10^s)
+     * int64 lands at a fraction of what the XOR codecs produce, AND costs
+     * less to encode, because it replaces two XOR passes with one integer
+     * pass.  Taken only when it is at least 2x better than storing the
+     * doubles raw; below that bar the block is not really decimal data and
+     * the ordinary path (which is left byte-identical) decides.  Not folded
+     * into tsdb_codec_encode: legacy callers assert the XOR-codec choice
+     * there. */
+    if (type == TSDB_TYPE_FLOAT64 && in_count > 0 && dec_enabled()) {
+        uint8_t *dbuf = malloc(out_cap ? out_cap : 1);
+        if (dbuf) {
+            uint16_t dflags = 0;
+            int dfinal = encode_decimal_final(in, in_count, dbuf, out_cap,
+                                              &dflags, min_gain);
+            if (dfinal >= 0 && (size_t)dfinal * 2 <= in_count * 8) {
+                memcpy(out, dbuf, (size_t)dfinal);
+                free(dbuf);
+                *out_codec = TSDB_CODEC_DEC;
+                *out_flags = dflags;
+                return dfinal;
+            }
+            free(dbuf);
+        }
     }
 
     /* Step 1: domain-codec selection (existing logic). */

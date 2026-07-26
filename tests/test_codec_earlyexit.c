@@ -159,6 +159,11 @@ static void check(const char *label, const double *v, size_t n,
 
 int main(void) {
     printf("=== test_codec_earlyexit ===\n");
+    /* This test pins the DEFAULT float path, so it must not inherit the
+     * opt-in scaled-decimal codec from the environment — with that flag set,
+     * every quantized shape below is answered by codec 12 instead and the
+     * gate under test never runs.  tests/test_codec_decimal.c covers it. */
+    unsetenv("TSDB_CODEC_DECIMAL");
     const size_t N = 8192;
     double *v = malloc(N * sizeof(double));
     ASSERT(v);
