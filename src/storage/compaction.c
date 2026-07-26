@@ -238,10 +238,22 @@ static uint32_t live_idx_block_count(const char *part_dir, const char *col_name)
     return get_u32le(hdr + 4);
 }
 
+/*
+ * `ts_flat` / `ts_flat_n` are the partition's decoded timestamps, captured when
+ * the ts column was compacted (which is why compact_partition runs it first).
+ * A non-ts column derives each output block's ts range from them, so it stamps
+ * byte-identically to the ts column and stays pairable.  For the ts column
+ * itself they are NULL and `out_ts_flat` receives the decoded array, which the
+ * caller owns and frees.
+ */
 static int compact_column_file(const char *part_dir,
                                const char *col_name,
                                tsdb_type_t col_type,
                                int         threshold,
+                               const int64_t *ts_flat,
+                               size_t         ts_flat_n,
+                               int64_t  **out_ts_flat,
+                               size_t    *out_ts_flat_n,
                                uint64_t   *out_bytes_written,
                                uint64_t   *out_bytes_saved,
                                int        *out_produced,
@@ -534,24 +546,39 @@ static int compact_column_file(const char *part_dir,
                 if (ts_vals[k] < blk_ts_min) blk_ts_min = ts_vals[k];
                 if (ts_vals[k] > blk_ts_max) blk_ts_max = ts_vals[k];
             }
-        } else {
-            /* For non-timestamp columns, we borrow ts_min/ts_max from the
-             * corresponding source block(s).  Since we're concatenating in
-             * order, find which source block covers position `base`. */
-            size_t src_base = 0;
-            blk_ts_min = INT64_MAX;
-            blk_ts_max = INT64_MIN;
-            for (uint32_t b = 0; b < block_count; b++) {
-                size_t bcnt = (size_t)infos[b].count;
-                size_t src_end = src_base + bcnt;
-                /* Check if source block [src_base, src_end) overlaps [base, base+chunk). */
-                if (src_end > base && src_base < base + chunk) {
-                    if (infos[b].ts_min < blk_ts_min) blk_ts_min = infos[b].ts_min;
-                    if (infos[b].ts_max > blk_ts_max) blk_ts_max = infos[b].ts_max;
-                }
-                src_base = src_end;
+        } else if (ts_flat && base + chunk <= ts_flat_n) {
+            /* A non-ts column MUST stamp exactly the range the ts column stamps
+             * for the same output chunk: reads pair non-ts blocks to ts blocks
+             * by first-match on (ts_min,count) (exec.c:1978), so a value that
+             * merely overlaps is not good enough — it has to be identical.
+             *
+             * This used to borrow min/max across every SOURCE block overlapping
+             * [base, base+chunk).  Whenever the source block size did not tile
+             * COMPACT_BLOCK_POINTS, a source block straddled the output
+             * boundary and handed this column a ts_min strictly BELOW the ts
+             * column's, so the pairing missed and every non-ts read of the
+             * partition returned TSDB_ERR_CORRUPT — while count(*), which is
+             * served from the ts column, kept answering correctly, so nothing
+             * looked wrong.  Under flush-on-commit the flush block size is just
+             * the batch size, so any batch size that does not divide 32768 hit
+             * this on the partition's first compaction.
+             *
+             * ts_flat is the ts column's decoded values for this partition, so
+             * these are the same numbers, computed the same way. */
+            blk_ts_min = ts_flat[base];
+            blk_ts_max = ts_flat[base + chunk - 1];
+            for (size_t k = 1; k < chunk; k++) {
+                int64_t v = ts_flat[base + k];
+                if (v < blk_ts_min) blk_ts_min = v;
+                if (v > blk_ts_max) blk_ts_max = v;
             }
-            if (blk_ts_min == INT64_MAX) { blk_ts_min = 0; blk_ts_max = 0; }
+        } else {
+            /* No ts values available (ts column itself missing/short, or a row
+             * count that disagrees with it).  Refuse to invent a range: a wrong
+             * one silently unpairs the column.  Skipping leaves the partition
+             * uncompacted, which is always safe. */
+            free(comp_buf); free(idx_entries);
+            goto skip_col;
         }
 
         /* Encode at the L2 cold tier (lower outer-lzlite wrap threshold). */
@@ -652,6 +679,13 @@ static int compact_column_file(const char *part_dir,
     fclose(new_col); new_col = NULL;
     fclose(new_idx); new_idx = NULL;
 
+    /* Hand the ts column's decoded values to the caller: every other column of
+     * this partition derives its block ts ranges from them. */
+    if (out_ts_flat && col_type == TSDB_TYPE_TIMESTAMP) {
+        *out_ts_flat = (int64_t *)raw_buf;
+        if (out_ts_flat_n) *out_ts_flat_n = total_vals;
+        raw_buf = NULL;
+    }
     free(raw_buf);
     free(infos);
 
@@ -667,6 +701,18 @@ static int compact_column_file(const char *part_dir,
                                                   ? (old_bytes - col_offset) : 0;
     if (out_produced) *out_produced = 1;
     return TSDB_OK;
+
+skip_col:
+    /* No pairable ts range available for this column — leave the whole
+     * partition uncompacted.  Not compacting is always safe; stamping a range
+     * that disagrees with the ts column silently unpairs the column on read. */
+    if (new_col) fclose(new_col);
+    if (new_idx) fclose(new_idx);
+    remove(col_tmp);
+    remove(idx_tmp);
+    free(raw_buf);
+    free(infos);
+    return TSDB_OK;              /* *out_produced stays 0 */
 
 io_err:
     if (new_col) fclose(new_col);
@@ -712,14 +758,27 @@ static int compact_partition(tsdb_schema_t   *schema,
      * off the compact lock so readers are never blocked during it.  We record
      * the source block count each column was compacted from so phase 2 can
      * detect a concurrent flush that appended blocks in the meantime. */
-    for (int ci = 0; ci < schema->ncols; ci++) {
+    /* The ts column must go FIRST: every other column derives its output block
+     * ts ranges from ts's decoded values, so that all columns of the partition
+     * stamp identical (ts_min,count) pairs and stay pairable on read. */
+    int64_t *ts_flat = NULL;
+    size_t   ts_flat_n = 0;
+
+    for (int order = 0; order < schema->ncols; order++) {
+        int ci = (order == 0) ? schema->ts_col_idx
+               : (order <= schema->ts_col_idx) ? order - 1 : order;
         uint64_t bw = 0, bs = 0;
         int prod = 0;
         uint32_t srcb = 0;
+        int is_ts = (ci == schema->ts_col_idx);
         int rc = compact_column_file(part_dir,
                                      schema->cols[ci].name,
                                      schema->cols[ci].type,
                                      threshold,
+                                     is_ts ? NULL : ts_flat,
+                                     is_ts ? 0    : ts_flat_n,
+                                     is_ts ? &ts_flat : NULL,
+                                     is_ts ? &ts_flat_n : NULL,
                                      &bw, &bs, &prod, &srcb);
         if (rc == TSDB_OK && prod) {
             produced[ci]   = 1;
@@ -825,6 +884,7 @@ static int compact_partition(tsdb_schema_t   *schema,
 
     free(produced);
     free(src_blocks);
+    free(ts_flat);
     if (any_compacted && stats) {
         stats->parts_merged++;
     }
