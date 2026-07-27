@@ -99,6 +99,20 @@ TEST_SRCS += tests/test_codec_decimal.c
 # answers exactly, and everything that does fails naming the column and the ts
 # range — from every read site, including the stats fast path.
 TEST_SRCS += tests/test_short_column_read.c
+
+# Append-only .idx publish: kills a process at each step of the in-place
+# publish (TSDB_TEST_CRASH_IDX_APPEND) and reads the result back from a fresh
+# one — the sub-entry torn tail is what a mongrel-repairing reader mistakes for
+# a 40-vs-48 header and relocates the whole entry array over.
+TEST_SRCS += tests/test_idx_append_crash.c
+
+# The anti-entropy COLD gate's one input: a flush into an EXISTING partition
+# has to move that partition dir's mtime.  temp+rename got it for free from the
+# dirent churn; an in-place idx publish has to do it explicitly, and when it
+# stopped, the only guard keeping a partition under live local write out of
+# tsdb_cluster_backfill_partition_from_result() ("local-unique rows ... are
+# replaced by the peer copy") went ELIGIBLE after 60 s of writing.
+TEST_SRCS += tests/test_ae_cold_gate_mtime.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

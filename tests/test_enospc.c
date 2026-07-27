@@ -722,17 +722,38 @@ int main(void) {
     ASSERT(post == N1 + N2 + N3);
 
     /* ---- Phase 6: regression guard for the partial-flush .col rollback. ----
-     * Fail an APPEND into an EXISTING partition: blocking the partition dir
-     * lets col_writer_open's fopen("ab") on the existing .col succeed (and a
-     * block gets appended + fflush'd), but col_writer_close's idx temp+rename
-     * fails.  Pre-fix, the appended block stayed in the .col as an orphan with
-     * no idx entry — dead bytes that accumulate under sustained disk-full
-     * retries (consuming the very space that's scarce).  The col_writer_abort
-     * / failed-close rollback now truncate the .col back to its pre-flush
-     * length, so a FAILED flush leaves the partition byte-identical.
+     * Fail an APPEND into an EXISTING partition: col_writer_open's fopen("ab")
+     * on the existing .col succeeds (and a block gets appended + fflush'd), but
+     * col_writer_close's idx publish fails.  Pre-fix, the appended block stayed
+     * in the .col as an orphan with no idx entry — dead bytes that accumulate
+     * under sustained disk-full retries (consuming the very space that's
+     * scarce).  The col_writer_abort / failed-close rollback now truncate the
+     * .col back to its pre-flush length, so a FAILED flush leaves the partition
+     * byte-identical.
+     *
+     * The injection has to block the idx publish WHATEVER SHAPE it has, and the
+     * two shapes fail on different resources:
+     *   temp + rename   creates <col>.idx.tmp in the partition dir, so a 0500
+     *                   partition dir is what stops it; the mode bits on the
+     *                   live .idx are irrelevant (rename does not need write
+     *                   permission on its target).
+     *   append in place opens the live <col>.idx O_RDWR, which a 0500 partition
+     *                   dir does NOT stop — a directory's write bit gates
+     *                   creating and removing names, not writing through an
+     *                   existing one — so the .idx itself has to be read-only.
+     * Applying both stops the flush whichever publish the engine performs, with
+     * the same clean errno path an ENOSPC mid-flush takes.  Blocking only the
+     * directory would let an in-place publish SUCCEED and silently turn this
+     * phase into a no-op.  Note what a read-only .idx actually does to the
+     * in-place publish: open(O_RDWR) fails, so it DECLINES and the full rewrite
+     * is what fails on the 0500 dir.  That is the right injection for [6b] —
+     * the failure has to be survivable in either shape — but it does not enter
+     * the append publish's own rollback.  [6d] does that.
      *
      * Deterministic check: the v.col file size must be unchanged across the
-     * failed append. */
+     * failed append, and both .idx files must be byte-identical — an in-place
+     * publish mutates the live manifest, so "the failed flush changed nothing"
+     * now has to be asserted on the idx too, not just on the .col. */
     tsdb_table_t *t6 = NULL;
     OK(tsdb_open_table(db, "t", &t6));   /* ensure 20250101 exists on disk */
     char vcol[4096];
@@ -743,8 +764,20 @@ int main(void) {
 
     char p1_dir[4096];
     snprintf(p1_dir, sizeof(p1_dir), "%s/t/20250101", dir);
+    char p1_idx[2][4096];
+    snprintf(p1_idx[0], sizeof(p1_idx[0]), "%s/ts.idx", p1_dir);
+    snprintf(p1_idx[1], sizeof(p1_idx[1]), "%s/v.idx",  p1_dir);
+    uint64_t dg6[2];
+    for (int i = 0; i < 2; i++) {
+        dg6[i] = file_digest(p1_idx[i]);
+        if (file_size(p1_idx[i]) <= 0 || dg6[i] == 0)
+            FAIL("[6] %s missing/empty before the failed append", p1_idx[i]);
+    }
+
     const int64_t DAY1b = DAY1 + 5000;   /* same day as N1, distinct ts */
     const int N4 = 300;
+    for (int i = 0; i < 2; i++)
+        if (chmod(p1_idx[i], 0400) != 0) FAIL("chmod 0400 on %s failed", p1_idx[i]);
     if (chmod(p1_dir, 0500) != 0) FAIL("chmod 0500 on partition dir failed");
     int rc_app = try_insert(db, "t", N4, DAY1b, 90000);   /* append -> flush fails */
     if (g_deferred) {
@@ -757,11 +790,72 @@ int main(void) {
         rc_app = tsdb_db_flush_all(db);
     }
     if (chmod(p1_dir, 0700) != 0) FAIL("chmod 0700 on partition dir failed");
+    for (int i = 0; i < 2; i++)
+        if (chmod(p1_idx[i], 0600) != 0) FAIL("chmod 0600 on %s failed", p1_idx[i]);
     off_t sz_after = file_size(vcol);
     printf("[6b] failed append rc=%d (%s); v.col size after = %lld (expect == %lld)\n",
            rc_app, tsdb_errstr(rc_app), (long long)sz_after, (long long)sz_before);
     ASSERT(rc_app != TSDB_OK);            /* clean error */
     ASSERT(sz_after == sz_before);        /* FIX: failed flush left .col byte-identical */
+    for (int i = 0; i < 2; i++) {
+        if (file_digest(p1_idx[i]) != dg6[i])
+            FAIL("[6b] %s CHANGED by a failed flush — an idx publish that "
+                 "mutates the live manifest must roll it back byte-for-byte",
+                 p1_idx[i]);
+    }
+
+    /* ---- Phase 6d: the same contract, on the IN-PLACE publish's own rollback.
+     * Permissions cannot reach it (see [6b] above): they stop the append at
+     * open(O_RDWR) and the rewrite is what fails.  So let the publish run on a
+     * fully writable partition and tear its header write instead —
+     * TSDB_TEST_CRASH_IDX_APPEND=fail_header writes only the first 8 bytes of
+     * the new header (magic + the ADVANCED count) and then reports failure,
+     * which is what a short write followed by an error leaves behind.
+     *
+     * The rollback has to put the OLD header back before it shortens the file:
+     * shortening under a header that still names the new entries publishes a
+     * manifest longer than the file, i.e. blocks whose bytes are gone — the
+     * checkpoint-ahead-of-data direction, silent loss.  Asserted the only way
+     * that is observable from outside: the .idx is byte-identical again.
+     *
+     * These are the SAME rows [6b] failed to flush — no new data, so [6c]'s
+     * accounting below is unchanged: two failed attempts, one clean drain. */
+    /* The rollback must also bump the partition dir's mtime.  temp+rename did
+     * so even when it failed — it had already created <col>.idx.tmp before it
+     * could fail, and unlinked it after — and the anti-entropy COLD gate
+     * (db_cluster.c) keys "is this partition settled" on exactly that.  Without
+     * the bump, a partition whose publishes keep failing ages past the gate and
+     * becomes eligible for a backfill that replaces local-unique rows with a
+     * peer's copy.  Sleep so a 1-second-granularity mtime can actually move. */
+    struct stat pd_before, pd_after;
+    if (stat(p1_dir, &pd_before) != 0) FAIL("[6d] stat %s failed", p1_dir);
+    sleep(2);
+
+    setenv("TSDB_TEST_CRASH_IDX_APPEND", "fail_header:1", 1);
+    int rc_torn = tsdb_db_flush_all(db);
+    unsetenv("TSDB_TEST_CRASH_IDX_APPEND");
+
+    if (stat(p1_dir, &pd_after) != 0) FAIL("[6d] stat %s failed", p1_dir);
+    printf("[6d] partition dir mtime %lld -> %lld (must move: a partition whose "
+           "publishes are failing is under active write)\n",
+           (long long)pd_before.st_mtime, (long long)pd_after.st_mtime);
+    ASSERT(pd_after.st_mtime > pd_before.st_mtime);
+    off_t sz_torn = file_size(vcol);
+    printf("[6d] torn in-place idx publish rc=%d (%s); v.col size = %lld "
+           "(expect == %lld)\n", rc_torn, tsdb_errstr(rc_torn),
+           (long long)sz_torn, (long long)sz_before);
+    /* A publish that never entered the append path would have SUCCEEDED here:
+     * the partition is writable again and nothing else is injected. */
+    if (rc_torn == TSDB_OK)
+        FAIL("[6d] the flush succeeded — the in-place publish never ran, so "
+             "its rollback is untested (did the fast path decline?)");
+    ASSERT(sz_torn == sz_before);         /* .col rolled back as in [6b] */
+    for (int i = 0; i < 2; i++) {
+        if (file_digest(p1_idx[i]) != dg6[i])
+            FAIL("[6d] %s CHANGED by a torn in-place publish — the rollback "
+                 "must restore the old header and only then shorten the file",
+                 p1_idx[i]);
+    }
 
     /* The failed rows linger in the memtable; a graceful close flushes them
      * exactly once.  Verify no loss and no duplication after reopen. */

@@ -19,7 +19,6 @@
 #include <glob.h>        /* enumerate partition dirs without <dirent.h> (its DIR
                             type name collides with this file's DIR constant) */
 #include <sys/stat.h>
-#include <fcntl.h>       /* AT_FDCWD */
 #include <time.h>
 
 #define ASSERT(cond) do { if (!(cond)) { \
@@ -44,17 +43,23 @@ static uint64_t metric_counter(const char *name) {
     return val;
 }
 
-static void make_and_flush(tsdb_db_t *db, const char *name) {
-    tsdb_col_t cols[] = { {"ts", TSDB_TYPE_TIMESTAMP}, {"v", TSDB_TYPE_FLOAT64} };
-    OK(tsdb_create_table(db, name, cols, 2, "ts"));
+/* 100 rows at ts = (base+1..base+100) ms.  Every base used here keeps the rows
+ * inside the same UTC day, i.e. the same partition dir. */
+static void write_rows(tsdb_db_t *db, const char *name, int base) {
     tsdb_table_t *t = NULL; OK(tsdb_open_table(db, name, &t));
     tsdb_batch_t *b = NULL; OK(tsdb_batch_begin(t, &b));
     for (int i = 0; i < 100; i++) {
-        OK(tsdb_batch_row_ts(b, (tsdb_ts_t)(i + 1) * 1000000));
+        OK(tsdb_batch_row_ts(b, (tsdb_ts_t)(base + i + 1) * 1000000));
         OK(tsdb_batch_row_f64(b, 1, (double)i));
         OK(tsdb_batch_row_end(b));
     }
     OK(tsdb_batch_commit(b));
+}
+
+static void make_and_flush(tsdb_db_t *db, const char *name) {
+    tsdb_col_t cols[] = { {"ts", TSDB_TYPE_TIMESTAMP}, {"v", TSDB_TYPE_FLOAT64} };
+    OK(tsdb_create_table(db, name, cols, 2, "ts"));
+    write_rows(db, name, 0);
 }
 
 static void run_memo_enabled(void) {
@@ -125,32 +130,46 @@ static void run_memo_disabled(void) {
     printf("  [PASS] no memo skips when TSDB_COMPACTION_MEMO=0\n");
 }
 
-/* Push every partition subdir's mtime 100 s into the future WITHOUT touching the
- * table dir — mirrors a flush that appends into an EXISTING partition (bumps the
- * partition dir via the <col>.idx temp+rename, never the table dir).  Uses glob
- * to avoid <dirent.h>'s DIR type clashing with this file's DIR constant. */
-static void bump_partition_mtimes(const char *tbl_dir) {
-    char pat[512]; snprintf(pat, sizeof(pat), "%s/*", tbl_dir);
+/* First partition subdir under a table dir.  Uses glob to avoid <dirent.h>'s
+ * DIR type clashing with this file's DIR constant. */
+static int first_partition_dir(const char *tbl_dir, char *out, size_t outsz) {
+    char pat[600]; snprintf(pat, sizeof(pat), "%s/*", tbl_dir);
     glob_t g; memset(&g, 0, sizeof(g));
+    int found = 0;
     if (glob(pat, 0, NULL, &g) == 0) {
-        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
-        struct timespec future[2];
-        future[0].tv_sec = now.tv_sec + 100; future[0].tv_nsec = 0;
-        future[1].tv_sec = now.tv_sec + 100; future[1].tv_nsec = 0;
-        for (size_t i = 0; i < g.gl_pathc; i++) {
+        for (size_t i = 0; i < g.gl_pathc && !found; i++) {
             struct stat st;
-            if (stat(g.gl_pathv[i], &st) == 0 && S_ISDIR(st.st_mode))
-                utimensat(AT_FDCWD, g.gl_pathv[i], future, 0);
+            if (stat(g.gl_pathv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                snprintf(out, outsz, "%s", g.gl_pathv[i]);
+                found = 1;
+            }
         }
     }
     globfree(&g);
+    return found;
+}
+
+/* st_mtime is second-granular, so a second flush landing inside the same wall
+ * second as the first is indistinguishable from no flush at all.  Wait past it
+ * so "unchanged" can only mean "never bumped". */
+static void wait_past_second(time_t sec) {
+    struct timespec nap = { 0, 20 * 1000 * 1000 };   /* 20 ms */
+    while (time(NULL) <= sec) nanosleep(&nap, NULL);
 }
 
 /* Regression for the table-dir-mtime bug: a steadily-appended table must NOT be
  * memo-skipped.  Keying on max(partition mtime) re-checks tA after its partition
- * grows, while the untouched idle tB is still skipped. */
+ * grows, while the untouched idle tB is still skipped.
+ *
+ * The append here is a REAL flush into the partition tA already has — not a
+ * synthetic utimensat.  That distinction is the whole point of the test: the
+ * simulated version asserted the invariant while BYPASSING the code that has to
+ * uphold it, so it stayed green through a publish rewrite that stopped bumping
+ * the dir at all.  Driving the flush makes it fail unless
+ * col_idx_append_publish() still moves the partition dir's mtime — the same
+ * side effect db_cluster.c's anti-entropy COLD gate reads. */
 static void run_memo_detects_partition_append(void) {
-    printf("--- memo re-checks a table whose partition grew (partition-mtime key) ---\n");
+    printf("--- memo re-checks a table whose partition grew (REAL flush) ---\n");
     rm_tree(DIR);
     unsetenv("TSDB_COMPACTION_MEMO");
     tsdb_metrics_init();
@@ -169,18 +188,49 @@ static void run_memo_detects_partition_append(void) {
     uint64_t after1 = metric_counter("qengine_compaction_memo_skipped_total");
     ASSERT(after1 == before);
 
-    /* Append into tA's existing partition (bump its partition mtime, not the
-     * table dir).  Assert the table-dir mtime is unchanged — that is exactly the
-     * condition under which the OLD table-dir memo would wrongly skip tA. */
-    char ta_dir[512]; snprintf(ta_dir, sizeof(ta_dir), "%s/tA", DIR);
-    struct stat tbl_before; ASSERT(stat(ta_dir, &tbl_before) == 0);
-    bump_partition_mtimes(ta_dir);
-    struct stat tbl_after;  ASSERT(stat(ta_dir, &tbl_after) == 0);
-    ASSERT(tbl_after.st_mtime == tbl_before.st_mtime);   /* table dir untouched */
+    char ta_dir[512];  snprintf(ta_dir, sizeof(ta_dir), "%s/tA", DIR);
+    char ta_part[640]; ASSERT(first_partition_dir(ta_dir, ta_part, sizeof(ta_part)));
+    char ta_idx[700];  snprintf(ta_idx, sizeof(ta_idx), "%s/ts.idx", ta_part);
+
+    struct stat tbl_b, part_b, idx_b;
+    ASSERT(stat(ta_dir,  &tbl_b)  == 0);
+    ASSERT(stat(ta_part, &part_b) == 0);
+    ASSERT(stat(ta_idx,  &idx_b)  == 0);
+
+    wait_past_second(part_b.st_mtime);
+    time_t flush_at = time(NULL);
+
+    /* REAL flush of 100 more rows into that SAME partition. */
+    write_rows(db, "tA", 100);
+    OK(tsdb_db_flush_all(db));
+
+    struct stat tbl_a, part_a, idx_a;
+    ASSERT(stat(ta_dir,  &tbl_a)  == 0);
+    ASSERT(stat(ta_part, &part_a) == 0);
+    ASSERT(stat(ta_idx,  &idx_a)  == 0);
+
+    printf("  ts.idx %lld -> %lld bytes, inode %s;  partdir mtime %ld -> %ld"
+           " (flush at %ld);  tabledir mtime %ld -> %ld\n",
+           (long long)idx_b.st_size, (long long)idx_a.st_size,
+           idx_b.st_ino == idx_a.st_ino ? "SAME (in-place publish)"
+                                        : "CHANGED (temp+rename publish)",
+           (long)part_b.st_mtime, (long)part_a.st_mtime, (long)flush_at,
+           (long)tbl_b.st_mtime, (long)tbl_a.st_mtime);
+
+    ASSERT(idx_a.st_size > idx_b.st_size);            /* the append really landed */
+
+    /* The table dir does NOT move — which is why the memo key has to be
+     * max(partition mtime) and not the table dir's own mtime. */
+    ASSERT(tbl_a.st_mtime == tbl_b.st_mtime);
+
+    /* The partition dir DOES move.  temp+rename got this for free by creating
+     * and removing a dirent; an in-place publish has to do it explicitly. */
+    ASSERT(part_a.st_mtime >= flush_at);
+    ASSERT(part_a.st_mtime >  part_b.st_mtime);
 
     /* Cycle 2: tB idle → memo-skipped; tA's partition moved → re-checked, NOT
-     * skipped.  Counter advances by exactly 1 (with the old table-dir key it
-     * would be +2, wrongly skipping tA). */
+     * skipped.  Counter advances by exactly 1 (with a frozen partition mtime it
+     * would be +2, and compaction would never look at tA again). */
     OK(tsdb_compactor_run_once(cpt));
     uint64_t after2 = metric_counter("qengine_compaction_memo_skipped_total");
     printf("  cycle2 skipped=%llu (expect +1: tB idle skipped, tA re-checked)\n",
@@ -190,7 +240,7 @@ static void run_memo_detects_partition_append(void) {
     tsdb_compactor_stop(cpt);
     tsdb_close(db);
     rm_tree(DIR);
-    printf("  [PASS] partition-append busts the memo; idle table still skipped\n");
+    printf("  [PASS] a real partition append busts the memo; idle table still skipped\n");
 }
 
 int main(void) {

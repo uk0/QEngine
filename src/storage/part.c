@@ -1,5 +1,23 @@
 /* part.c — disk partition flush and read. */
 
+/* utimensat()/AT_FDCWD are POSIX.1-2008 and are what col_idx_append_publish
+ * uses to bump the partition dir's mtime.  glibc hides BOTH behind
+ * __USE_ATFILE, which the Makefile's default -std=c11 does NOT set (strict
+ * ANSI suppresses _DEFAULT_SOURCE), so on Linux AT_FDCWD is an undeclared
+ * identifier — a hard error — without this.  Measured: gcc 13 / glibc 2.36,
+ * `gcc -std=c11`, "error: 'AT_FDCWD' undeclared".  _DEFAULT_SOURCE and
+ * _DARWIN_C_SOURCE give back the BSD/Darwin namespace that naming a strict
+ * POSIX level would otherwise take away.  Same preamble as db_cluster.c. */
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE 1
+#endif
+#ifndef _DARWIN_C_SOURCE
+#  define _DARWIN_C_SOURCE 1
+#endif
+
 #include "part.h"
 #include "iopolicy.h"
 #include "io_async.h"
@@ -990,6 +1008,367 @@ static void col_writer_abort(col_writer_t *w) {
     w->idx_entries = NULL;
 }
 
+/* Write the whole buffer at `off`.  Returns 1 on success, 0 if any write
+ * failed or short-wrote — the case a full disk (ENOSPC) and an RLIMIT_FSIZE
+ * cap (EFBIG) both take, and the one the caller has to roll back.
+ * lseek+write rather than pwrite: pwrite sits behind __USE_UNIX98 in glibc's
+ * unistd.h and this tree compiles -std=c11, where the deployment gcc would
+ * reject it as an implicit declaration. */
+static int part_write_all_at(int fd, const void *buf, size_t n, off_t off) {
+    const uint8_t *p = (const uint8_t *)buf;
+    if (lseek(fd, off, SEEK_SET) != off) return 0;
+    while (n > 0) {
+        ssize_t k = write(fd, p, n);
+        if (k <= 0) {
+            if (k < 0 && errno == EINTR) continue;
+            return 0;
+        }
+        p += (size_t)k;
+        n -= (size_t)k;
+    }
+    return 1;
+}
+
+/* TEST-ONLY crash points inside the append publish below, in the order the
+ * publish reaches them.  IDX_FAIL_HEADER is not a kill — it tears the header
+ * write and returns failure, so the ROLLBACK runs (test_enospc [6d]). */
+#define IDX_CRASH_OFF        0
+#define IDX_CRASH_PRE_EXTEND 1
+#define IDX_CRASH_ENTRIES    2
+#define IDX_CRASH_HEADER_MID 3
+#define IDX_CRASH_HEADER     4
+#define IDX_FAIL_HEADER      5
+
+static int g_idx_crash_hits;   /* TEST-ONLY: only touched when the env is set */
+
+/*
+ * TEST-ONLY fault injection: TSDB_TEST_CRASH_IDX_APPEND=<step>[:<n>] kills
+ * this process with _exit() the n-th time (default 1st) the append publish
+ * reaches <step> — pre_extend | entries | header_mid | header — or, for
+ * fail_header, tears the header write and takes the rollback instead.  The
+ * point is that the states the publish can leave behind are produced by a REAL
+ * process death and then read back by a fresh process, instead of being argued
+ * from the code.  Deliberately NOT latched in a static: tests fork children
+ * from a parent that has already run publishes of its own, and a latched "off"
+ * would be inherited and silently disarm the injection.  Production cost is one
+ * getenv per column per flush, the same as TSDB_TEST_CRASH_BEFORE_TS below.
+ */
+static int idx_append_crash_cfg(int *out_nth) {
+    *out_nth = 1;
+    const char *e = getenv("TSDB_TEST_CRASH_IDX_APPEND");
+    if (!e) return IDX_CRASH_OFF;
+    const char *c = strchr(e, ':');
+    size_t len = c ? (size_t)(c - e) : strlen(e);
+    if (c && c[1]) {
+        int n = atoi(c + 1);
+        *out_nth = (n < 1) ? 1 : n;
+    }
+    if (len == 10 && !strncmp(e, "pre_extend", 10)) return IDX_CRASH_PRE_EXTEND;
+    if (len == 7  && !strncmp(e, "entries",     7)) return IDX_CRASH_ENTRIES;
+    if (len == 10 && !strncmp(e, "header_mid", 10)) return IDX_CRASH_HEADER_MID;
+    if (len == 6  && !strncmp(e, "header",      6)) return IDX_CRASH_HEADER;
+    if (len == 11 && !strncmp(e, "fail_header",11)) return IDX_FAIL_HEADER;
+    return IDX_CRASH_OFF;
+}
+
+static void idx_append_crash_point(int cfg, int nth, int step) {
+    if (cfg != step) return;                 /* production: always returns here */
+    if (++g_idx_crash_hits < nth) return;
+    _exit(70 + step);
+}
+
+/* TEST-ONLY: 1 when this publish should tear its header write and roll back. */
+static int idx_append_fail_header(int cfg, int nth) {
+    if (cfg != IDX_FAIL_HEADER) return 0;    /* production: always returns here */
+    return ++g_idx_crash_hits >= nth;
+}
+
+/*
+ * Append-only idx publish — fast path for col_writer_close.
+ * =========================================================
+ *
+ * The full-rewrite publish below re-reads every existing entry, writes them
+ * ALL back into <idx>.tmp, fsyncs and renames.  Per flush that is O(blocks) of
+ * index traffic to persist O(1) new blocks, so building a partition costs
+ * O(blocks^2): at 8M rows (977 blocks x 4 columns) it moves 168 MB in and
+ * 168 MB out, plus a rename and a directory fsync per column per flush.
+ *
+ * This path appends the new entries at the END of the entry array and then
+ * republishes the FIXED-SIZE header in place.  That is the same publish-last
+ * discipline the flush already uses for the ts column: the appended entries do
+ * not exist until the header's `count` names them.  Two fsyncs, same as the
+ * temp+rename path (idx + directory), but no rename, no directory fsync and no
+ * O(blocks) read/write.
+ *
+ * WHAT A CRASH LEAVES BEHIND
+ * --------------------------
+ * Steps, in order, on the live file:
+ *   [1] ftruncate to the FINAL length  hdr + (count+k)*88
+ *   [2] write the k new entries into that region, fsync
+ *   [3] republish the whole fixed-size header in ONE write; fsync
+ *   [4] bump the partition DIR's mtime — the side effect temp+rename had for
+ *       free, which two consumers key decisions on (see [4] in the body)
+ *
+ * Crash after [1], before or during [2]:
+ *   the header still says `count`, so a reader reads exactly the `count`
+ *   entries that were already durable and never looks past them — the new
+ *   blocks are invisible, as if the flush had never run.  Their .col bytes are
+ *   orphans, which is precisely what the temp+rename path leaves when it dies
+ *   before the rename.  No acked row is lost: flush-on-commit has not returned
+ *   yet, and under deferred flush the redo records are still live because
+ *   max_seq is published in [3], never before the entries.
+ *
+ * Crash after [2], before [3]:
+ *   indistinguishable from the above to a reader.  The entries are durable but
+ *   unnamed.  They are not overwritten by the next flush — the file is still
+ *   the length [1] set, hdr + (count+k)*88, so the exact-fit ELIGIBILITY gate
+ *   below fails against the surviving header's `count` and this fast path
+ *   DECLINES; the full rewrite then re-reads the `count` named entries, writes
+ *   a fresh temp and renames, dropping the unnamed ones.  Healed either way,
+ *   but by the rewrite, not by an overwrite in place.
+ *
+ * Crash after [3], before [4]:
+ *   fully published and correct; only the partition dir's mtime is missing.
+ *   See [4] in the body for who reads it and what a stale one costs.
+ *
+ * Crash during [3]:
+ *   the header is one write of <= 48 bytes at offset 0, so the only durable
+ *   states are the old header and the new one — see the next note, which is
+ *   the whole reason it is one write.
+ *
+ * COUNT AND MAX_SEQ ARE ONE WRITE
+ * ------------------------------
+ * The header carries two fields that MUST move together:
+ *   count    names the new entries, i.e. makes the new blocks visible;
+ *   max_seq  is the durable WAL redo checkpoint tsdb_part_max_seq reads off
+ *            ts.idx, i.e. retires the redo records for those same rows.
+ * Neither half-state is safe, and both are SILENT:
+ *   new count + old max_seq -> reopen replays records the partition already
+ *            holds, the re-flush appends a SECOND copy of the same blocks, and
+ *            every query counts those rows twice with TSDB_OK.  (Measured, with
+ *            a real kill between a separate count write and a separate max_seq
+ *            write: SELECT v = 600 for 500 durable rows, permanent across
+ *            reopens.  test_idx_append_crash's "header_mid" kill is that kill.)
+ *   old count + new max_seq -> replay is skipped for rows no entry names:
+ *            silent loss of acked rows.
+ * Writing them field-by-field makes both reachable — not only by a crash, but
+ * by any writeback in the window (jbd2 commit, dirty_expire, memory pressure,
+ * an unrelated sync) followed by a power loss.  Publishing the whole header in
+ * a single write at offset 0 leaves exactly two durable states, which is the
+ * atomicity temp+rename gave for free.  A process death cannot split it at all
+ * (write() has returned or it has not); a power loss cannot either unless a
+ * <= 48-byte overwrite inside sector 0 can tear, which is the same
+ * single-sector assumption a filesystem makes about its own journal — and it is
+ * strictly WEAKER than what the field-by-field version needed, since that
+ * needed per-field atomicity AND an ordering guarantee across three writes.
+ * This is the only place in the tree that overwrites a live header in place;
+ * everything else appends (wal.c) or publishes by rename, so the assumption is
+ * introduced here and stated here.  (Starting the write at offset 0 rather than
+ * at the first mutable field is deliberate: bytes 0..3 are the magic, byte-
+ * identical to what is already there — eligibility validated it — so the first
+ * four bytes of the write cannot change the file even if a short write stops
+ * inside them.)
+ *
+ * Fields other than those two are safe in either state on their own — a zone
+ * map wider than the blocks it covers only fails to prune, and an over-stated
+ * total_rows only over-states compaction sizing and anti-entropy — but they
+ * ride along in the same write, so no partial-header state exists to reason
+ * about.
+ *
+ * WHY [1] IS NOT OPTIONAL — the sub-entry torn tail
+ * -------------------------------------------------
+ * Without the pre-extension the entries would be a plain append and a crash
+ * could leave a PARTIAL entry: length hdr + count*88 + t for 0 < t < 88.
+ * idx_recover_header_size() reads exactly that shape as the V3/V4 header
+ * "mongrel" it exists to repair, and for t == 8 the alternate candidate
+ * (40 <-> 48) fits the length EXACTLY — so the reader relocates the whole
+ * entry array by 8 bytes and every block decodes from a garbage offset.  That
+ * is the failure mode that shredded 95% of rows when compaction read V4
+ * indexes as V3.  A sub-entry torn tail and a real mongrel are
+ * INDISTINGUISHABLE by file length, so the writer must never produce one.
+ * Pre-extending makes the length hdr + (count+j)*88 in every reachable state,
+ * and the alternate candidate can never fit that (it would need j*88 == +-8).
+ * ftruncate sets the final i_size up front, so no later write can publish an
+ * intermediate length either.
+ *
+ * ELIGIBILITY.  The fast path runs only when the append cannot change the
+ * SHAPE of the file:
+ *   - the idx exists and opens for update in place (no new file, no rename);
+ *   - its entries are 88 bytes wide (V3/V4) and it declares at least one;
+ *   - its length is an EXACT fit for the header size its VERSION implies —
+ *     which excludes both a mongrel and a torn tail left by an older writer,
+ *     handing them to the full rewrite that heals them permanently, and which
+ *     is also what makes the rollback below byte-exact;
+ *   - the header we are about to stamp is the same size as the one on disk
+ *     (a V3 -> V4 upgrade moves every entry by 8 bytes: a rewrite).
+ * Anything else falls through to the temp+rename path, unchanged.
+ *
+ * CONCURRENCY.  Callers hold tsdb_part_idx_lock, which is what serialises this
+ * against the raw-block writer of the same file.  No other process writes a
+ * data dir this engine owns.
+ *
+ * In-process readers are NOT uniformly serialised against the flush.  Three
+ * call sites open a partition lock-free, without t->compact_mtx:
+ * exec.c:9185 (the stats fast path), migrate.c:243 and migrate.c:729 (the
+ * export/measure walks).  They read the header, then the entries it names.
+ * Against this path that is the same race the temp+rename publish already had
+ * — a reader can observe the pre-publish header or the post-publish one — with
+ * one difference: temp+rename swapped an inode, so a reader holding the old fd
+ * kept a consistent old file, whereas here the bytes move under it.  Reading
+ * `count` from the old header and entries from the new file is still safe, as
+ * [1]/[2] only ever write BEYOND hdr + count*88 and the ftruncate only grows;
+ * the reverse (new `count`, old entries) cannot happen because [3] is ordered
+ * after [2]'s fsync.  A concurrent full REWRITE is a different matter, but
+ * that has always swapped the inode.
+ *
+ * Returns 1 when it owns the publish (*out_rc carries the result), 0 when the
+ * caller must fall back to the full rewrite.
+ */
+static int col_idx_append_publish(col_writer_t *w, int *out_rc)
+{
+    *out_rc = TSDB_OK;
+
+    int crash_nth = 1;
+    int crash_at  = idx_append_crash_cfg(&crash_nth);
+
+    int fd = open(w->idx_path, O_RDWR);
+    if (fd < 0) return 0;                    /* absent / not writable in place */
+
+    uint8_t     hdr[TSDB_IDX_HEADER_SIZE];
+    struct stat st;
+    ssize_t     hn = read(fd, hdr, TSDB_IDX_HEADER_SIZE);
+    if (hn != (ssize_t)TSDB_IDX_HEADER_SIZE || fstat(fd, &st) != 0) {
+        close(fd); return 0;
+    }
+
+    uint32_t cnt = 0, esz = 0;
+    uint16_t ver = 0;
+    uint64_t tot = 0, mseq = 0;
+    int64_t  fmn = 0, fmx = 0;
+    int hsz = read_idx_header_ex(hdr, (size_t)hn, &cnt, &ver, &tot,
+                                 &fmn, &fmx, &esz, &mseq);
+    if (hsz <= 0 || cnt == 0 || esz != TSDB_IDX_ENTRY_SIZE) { close(fd); return 0; }
+
+    /* Exact fit at the VERSION-derived header size.  Deliberately NOT
+     * idx_recover_header_size(): a file that needs recovering is a mongrel (or
+     * carries a torn tail), and appending onto one would open a window where a
+     * crash leaves a length that no longer matches EITHER candidate, taking the
+     * recovery away.  Those go to the full rewrite, which rewrites them into a
+     * single self-consistent format. */
+    uint64_t body    = (uint64_t)cnt * TSDB_IDX_ENTRY_SIZE;
+    uint64_t old_len = (uint64_t)st.st_size;
+    if (old_len != (uint64_t)hsz + body) { close(fd); return 0; }
+
+    /* Both were seeded at col_writer_open, before this lock was taken: never
+     * lower the durable checkpoint, and never NARROW the file zone map (a zone
+     * that does not cover a block prunes it out of every range query). */
+    if (mseq > w->max_seq)     w->max_seq     = mseq;
+    if (fmn  < w->file_ts_min) w->file_ts_min = fmn;
+    if (fmx  > w->file_ts_max) w->file_ts_max = fmx;
+
+    uint32_t new_count = cnt + (uint32_t)w->idx_n;
+    uint8_t  nhdr[TSDB_IDX_HEADER_SIZE];
+    /* Same encoder, same arguments as the full rewrite below — including
+     * w->ncols, the column-count stamp at header bytes [10..11] (part.h).  This
+     * publish REWRITES THE WHOLE HEADER, so the stamp has to be re-asserted
+     * here or an in-place publish would erase it, and erasing it makes the
+     * reader MORE permissive: part_col_absence_is_late_add() would fall back to
+     * the shape rule alone and zero-fill a column whose write was actually
+     * lost.  w->ncols is set by tsdb_part_flush_ex2 to s->ncols right after
+     * col_writer_open, and the flush is the ONLY writer part.h allows to assert
+     * the claim (it writes every schema column into every partition it
+     * touches); col_writer_close has no other caller.  The header this path
+     * stamps is therefore byte-identical to the one the full rewrite would
+     * stamp for the same state — that equivalence is the whole correctness
+     * argument, and it must include [10..11]. */
+    size_t   nhsz = write_idx_header(nhdr, new_count, w->total_rows,
+                                     w->has_zone ? w->file_ts_min : 0,
+                                     w->has_zone ? w->file_ts_max : 0,
+                                     w->max_seq, w->ncols);
+    if ((int)nhsz != hsz) { close(fd); return 0; }   /* V3 <-> V4 resize */
+
+    uint64_t new_len = (uint64_t)hsz + (uint64_t)new_count * TSDB_IDX_ENTRY_SIZE;
+    size_t   nbytes  = w->idx_n * TSDB_IDX_ENTRY_SIZE;
+
+    /* [1] Pre-extend to the final length.  Nothing is mutated yet if this
+     *     fails (ENOSPC / EFBIG / an fs without ftruncate), so hand the publish
+     *     back to the full rewrite rather than failing the flush here. */
+    if (ftruncate(fd, (off_t)new_len) != 0) { close(fd); return 0; }
+    idx_append_crash_point(crash_at, crash_nth, IDX_CRASH_PRE_EXTEND);
+
+    /* [2] The entries, durable before anything names them. */
+    if (!part_write_all_at(fd, w->idx_entries, nbytes, (off_t)(hsz + body)))
+        goto rollback;
+    if (tsdb_part_fsync_fd(fd) != 0) goto rollback;
+    idx_append_crash_point(crash_at, crash_nth, IDX_CRASH_ENTRIES);
+
+    /* [3] Publish the header — ONE write, the whole 40/48 bytes at offset 0.
+     *     `count` (which names the new entries) and `max_seq` (which retires
+     *     their redo records) are a PAIR: either durable state that carries one
+     *     without the other is a wrong answer, and both are silent.  See the
+     *     COUNT AND MAX_SEQ ARE ONE WRITE note above. */
+    if (idx_append_fail_header(crash_at, crash_nth)) {    /* TEST-ONLY */
+        (void)part_write_all_at(fd, nhdr, 8, 0);          /* tear it: new count */
+        goto rollback;
+    }
+    if (!part_write_all_at(fd, nhdr, nhsz, 0)) goto rollback;
+    idx_append_crash_point(crash_at, crash_nth, IDX_CRASH_HEADER_MID);
+    if (tsdb_part_fsync_fd(fd) != 0) goto rollback;
+    idx_append_crash_point(crash_at, crash_nth, IDX_CRASH_HEADER);
+
+    /* [4] temp+rename bumped <part_dir>'s mtime as a side effect of creating
+     *     and removing a dirent.  compaction.c table_max_part_mtime() (the
+     *     compaction memo key) and db_cluster.c's anti-entropy COLD gate both
+     *     depend on that.  An in-place publish changes no dirent, so bump it
+     *     explicitly.  The rollback path bumps it too — see the note there.
+     *     Best effort: the rows are already durable and named, so a failure
+     *     here must not turn a completed publish into a reported failure. */
+    (void)utimensat(AT_FDCWD, w->part_dir, NULL, 0);
+
+    close(fd);
+    return 1;
+
+rollback:
+    /* Eligibility required an exact fit, so every byte written before [3] lies
+     * beyond the original EOF: restoring the old header and truncating back
+     * leaves the file byte-identical — the guarantee test_enospc [6b] and [6d]
+     * pin, [6d] by tearing this very write.
+     *
+     * Header first, then shorten — and ONLY shorten if the header really went
+     * back.  The step that fails here can be the FSYNC, i.e. after the new
+     * header (count AND max_seq) is fully written; truncating under a header
+     * whose restore also failed then publishes a manifest naming entries the
+     * file no longer holds, with the checkpoint already past them.  Measured on
+     * that state built by hand: SELECT v = 400 for 500 acked rows, rc=TSDB_OK,
+     * permanent.  Leaving the file long instead is harmless: whichever header
+     * survives names entries that are all present, and the trailing bytes fail
+     * the exact-fit gate above so the next publish takes the full rewrite,
+     * which heals the length.
+     *
+     * The mtime IS bumped here too, matching [4].  A rolled-back publish leaves
+     * the partition byte-identical, so "unmodified" is the tempting reading —
+     * but temp+rename bumped the dir on its FAILURE path as well (it had already
+     * created the <col>.idx.tmp dirent before it could fail, and unlinked it
+     * after), and the anti-entropy COLD gate at db_cluster.c:1393 was tuned
+     * against that.  Skipping the bump here means a partition whose publishes
+     * keep failing — ENOSPC, EIO — ages past the 60 s gate and becomes eligible
+     * for tsdb_cluster_backfill_partition_from_result(), which by its own log
+     * line replaces local-unique rows with a fuller peer's copy.
+     *
+     * So the two readings differ only in what they cost when wrong: bumping
+     * costs the compaction memo one redundant re-scan, not bumping costs rows.
+     * And "hot" is the truthful signal anyway — a partition whose flush is
+     * failing is under active write, which is exactly when a peer's copy must
+     * not be allowed to overwrite it. */
+    if (part_write_all_at(fd, hdr, (size_t)hsz, 0))
+        (void)ftruncate(fd, (off_t)old_len);
+    (void)tsdb_part_fsync_fd(fd);
+    (void)utimensat(AT_FDCWD, w->part_dir, NULL, 0);
+    close(fd);
+    *out_rc = TSDB_ERR_IO;
+    return 1;
+}
+
 static int col_writer_close(col_writer_t *w) {
     int rc = TSDB_OK;
 
@@ -1015,6 +1394,16 @@ static int col_writer_close(col_writer_t *w) {
          * other's entries, and a dropped NON-ts entry under a surviving ts is
          * the multi-column hole.  Innermost lock — see part.h. */
         tsdb_part_idx_lock(w->part_dir);
+
+        /* Append-only publish when the file's shape allows it (see the
+         * contract on col_idx_append_publish); otherwise the full rewrite
+         * below, which is also what creates the idx in the first place and
+         * what heals a legacy / mongrel / torn-tail file. */
+        int append_rc = TSDB_OK;
+        if (col_idx_append_publish(w, &append_rc)) {
+            rc = append_rc;
+            goto idx_published;
+        }
 
         /* Read all existing entries from old idx (if any).  Handles v1 /
          * v2 (40-byte entries) and v3 (88-byte entries) transparently —
@@ -1173,6 +1562,7 @@ static int col_writer_close(col_writer_t *w) {
             }
             free(old_entries_v3);
         }
+idx_published:
         tsdb_part_idx_unlock(w->part_dir);
     }
 
