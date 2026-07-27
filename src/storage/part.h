@@ -23,8 +23,30 @@
  *   magic       u32  = 'IDX1' (0x31584449)
  *   count       u32  (number of BlockIndexEntry records)
  *   version     u16  = 1
- *   _pad        u16
+ *   ncols       u16  (was _pad; 0 == "not recorded" — see below)
  *   total_rows  u64
+ *
+ * bytes [10..11] — `ncols`, the column-count stamp.
+ *   Every writer before 2026-07 put a literal 0 here and no reader ever looked
+ *   at it, so the field is free in EVERY version (v1..v4) at a fixed offset:
+ *   recording it needs no version bump, no size change and no migration, and
+ *   an older binary keeps ignoring it.
+ *
+ *   Meaning: "when this idx was published, the schema had `ncols` columns AND
+ *   the writer wrote every one of them into this partition."  Only the FLUSH
+ *   may assert that (it loops over all s->ncols for each partition it touches
+ *   and is fail-stop).  Every other writer — raw-block replication, compaction,
+ *   the ts retraction — publishes ONE column at a time and therefore PRESERVES
+ *   whatever is already there instead of restating it.  0 means "no writer has
+ *   ever asserted it here" and the reader falls back to the shape rules alone.
+ *
+ *   Why it exists: a non-ts column with NO .idx in a partition is on-disk
+ *   IDENTICAL whether it was added by ALTER TABLE after those rows were written
+ *   (zero-fill is the CORRECT answer) or its write never landed (zero-fill is
+ *   FABRICATION).  Block counts cannot separate them — there is nothing to
+ *   count.  The stamp on the TS column's idx separates them: ts is published
+ *   LAST, so its stamp is the partition's "a complete K-column flush landed
+ *   here" marker, and a column with index < K was written here and is missing.
  *
  * IdxHeader v2 (36 bytes, current writer — 2026-04):
  *   ... v1 fields ...
@@ -172,16 +194,33 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
  */
 uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir);
 
+/* "no writer has recorded a column count in this idx header." */
+#define TSDB_IDX_NCOLS_UNKNOWN 0u
+
 /*
  * The ONE canonical idx-header encoder, shared by the flush path and the
  * raw-block replication path so both stamp byte-identical headers and select
  * V3 (max_seq==0, 40 bytes) vs V4 (max_seq>0, 48 bytes) the same way.  `buf`
  * must hold at least TSDB_IDX_HEADER_SIZE bytes.  Returns the header size.
+ *
+ * `ncols` is the column-count stamp documented at the top of this file.  Pass
+ * the schema's column count ONLY from a writer that writes every column of the
+ * partition (the flush); every other writer must pass the value it read back
+ * from the file it is republishing, so a one-column publish never invents the
+ * claim.  TSDB_IDX_NCOLS_UNKNOWN leaves the field unasserted.
  */
 size_t tsdb_part_write_idx_header(uint8_t *buf, uint32_t count,
                                   uint64_t total_rows,
                                   int64_t file_ts_min, int64_t file_ts_max,
-                                  uint64_t max_seq);
+                                  uint64_t max_seq, uint16_t ncols);
+
+/*
+ * Read just the column-count stamp out of an idx header.  Returns
+ * TSDB_IDX_NCOLS_UNKNOWN when the file is absent, short, corrupt, pre-V3 (only
+ * V3+ writers can have stamped it) or carries an out-of-range value.  Writers
+ * republishing someone else's idx use this to carry the stamp forward.
+ */
+uint16_t tsdb_part_idx_ncols(const char *idx_path);
 
 /*
  * Probe an existing idx file's header (version, entry size, zone map, total

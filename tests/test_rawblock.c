@@ -325,16 +325,35 @@ static void test_flush_apply(void) {
             ASSERT(smn == dmn); ASSERT(smx == dmx);
             /* Node-local: never inherited from the primary. */
             ASSERT_EQ(dseq, 0);
+
+            /* The SECOND node-local header field: the column-count stamp at
+             * bytes [10..11] (part.h).  It means "a FLUSH wrote every one of
+             * this schema's columns into this partition", which only the flush
+             * can assert — it loops over all of them and is fail-stop.  The
+             * applier lands ONE (column, block) per RPC and cannot know the
+             * rest are coming, so it PRESERVES the target's value instead of
+             * restating the primary's.  A replica-only partition therefore
+             * stays unstamped and is protected by its own commit test
+             * (tsdb_part_ts_publish_ready), not by an inherited claim.
+             * Inheriting it would let a single-column repair push assert that a
+             * partition holds columns it never held, turning a legitimately
+             * ALTER-added column into a permanent read error. */
+            ASSERT_EQ(tsdb_part_idx_ncols(src_col), 3);   /* ts, value, tag */
+            ASSERT_EQ(tsdb_part_idx_ncols(dst_col), TSDB_IDX_NCOLS_UNKNOWN);
+
             /* Replicated payload: entry array byte-for-byte. */
             ASSERT(sl > (size_t)shdr); ASSERT(dl > (size_t)dhdr);
             ASSERT_EQ(sl - (size_t)shdr, dl - (size_t)dhdr);
             ASSERT(memcmp(sb + shdr, db_b + dhdr, sl - (size_t)shdr) == 0);
             /* When the primary has no checkpoint to stamp either, the whole
-             * file must still match byte-for-byte — the original guarantee. */
+             * file must still match byte-for-byte APART from the two
+             * node-local stamp bytes — the original guarantee, minus exactly
+             * the field that is defined not to travel. */
             if (sseq == 0) {
                 ASSERT_EQ(shdr, dhdr);
                 ASSERT_EQ(sl, dl);
-                ASSERT(memcmp(sb, db_b, sl) == 0);
+                ASSERT(memcmp(sb, db_b, 10) == 0);
+                ASSERT(memcmp(sb + 12, db_b + 12, sl - 12) == 0);
             }
             printf("    idx=%s src=%zu dst=%zu bytes (v%u/v%u max_seq=%llu/%llu)"
                    " — entries match\n",

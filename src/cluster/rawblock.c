@@ -499,8 +499,15 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
      * byte-identical headers; preserving old_max_seq keeps a V4 partition V4
      * (and a fresh replica-only partition V3, since old_max_seq stays 0). */
     uint8_t ih[TSDB_IDX_HEADER_SIZE];
+    /* The column-count stamp (part.h) is PRESERVED, never asserted here: this
+     * applier lands ONE (column, block) per call and cannot know whether the
+     * rest of the schema's columns are coming, which is the whole reason the
+     * commit test above exists.  Restating it from schema->ncols would let a
+     * single-column repair push claim a partition holds columns it never held —
+     * turning a legitimate ALTER-added column into a permanent read error. */
     size_t  hdr_sz = tsdb_part_write_idx_header(ih, new_count, new_total,
-                                                new_fmn, new_fmx, old_max_seq);
+                                                new_fmn, new_fmx, old_max_seq,
+                                                tsdb_part_idx_ncols(idx_path));
 
     /* Atomic publish: write <idx>.rbtmp, fflush + fsync, then rename onto the
      * real path so a concurrent reader never observes a torn header (matches

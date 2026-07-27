@@ -259,10 +259,14 @@ static int read_block_header(const uint8_t *buf,
  */
 static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows,
                                int64_t file_ts_min, int64_t file_ts_max,
-                               uint64_t max_seq) {
+                               uint64_t max_seq, uint16_t ncols) {
     /* Emit v4 (48 bytes, carries max_seq) ONLY when a WAL redo checkpoint is
      * present.  With max_seq == 0 (the default flush-on-commit path) emit a
      * byte-identical v3 header, so default-mode partitions stay unchanged. */
+    /* Column-count stamp at [10..11] (see part.h).  Anything outside
+     * [1, TSDB_MAX_COLS] is written as "unknown" rather than propagated, so a
+     * garbage value can never make the reader STRICTER than it should be. */
+    if (ncols > (uint16_t)TSDB_MAX_COLS) ncols = TSDB_IDX_NCOLS_UNKNOWN;
     put_u32le(buf + 0,  TSDB_IDX_MAGIC);
     put_u32le(buf + 4,  count);
     put_u64le(buf + 12, total_rows);
@@ -272,11 +276,11 @@ static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows
     put_u16le(buf + 38, 0u);                              /* stats_variant */
     if (max_seq == 0) {
         put_u16le(buf + 8,  3);                           /* version = 3 */
-        put_u16le(buf + 10, 0);
+        put_u16le(buf + 10, ncols);
         return TSDB_IDX_HEADER_SIZE_V3;
     }
     put_u16le(buf + 8,  4);                               /* version = 4 */
-    put_u16le(buf + 10, 0);
+    put_u16le(buf + 10, ncols);
     put_u64le(buf + 40, max_seq);                         /* WAL redo checkpoint */
     return TSDB_IDX_HEADER_SIZE;
 }
@@ -291,10 +295,10 @@ static size_t write_idx_header(uint8_t *buf, uint32_t count, uint64_t total_rows
 size_t tsdb_part_write_idx_header(uint8_t *buf, uint32_t count,
                                   uint64_t total_rows,
                                   int64_t file_ts_min, int64_t file_ts_max,
-                                  uint64_t max_seq)
+                                  uint64_t max_seq, uint16_t ncols)
 {
     return write_idx_header(buf, count, total_rows,
-                            file_ts_min, file_ts_max, max_seq);
+                            file_ts_min, file_ts_max, max_seq, ncols);
 }
 
 /*
@@ -352,6 +356,42 @@ static int read_idx_header_ex(const uint8_t *buf, size_t avail,
         return (int)TSDB_IDX_HEADER_SIZE;
     }
     return -1;   /* unknown version */
+}
+
+/*
+ * The column-count stamp at bytes [10..11] of an already-read idx header.
+ *
+ * Honoured only for V3+ (write_idx_header is the only producer that has ever
+ * put a non-zero value there, and it has emitted V3/V4 since it existed) and
+ * only when the value is a plausible column count.  Anything else reads back as
+ * "unknown", which keeps the reader at its pre-stamp behaviour — a garbage
+ * value must never be able to make it STRICTER, only the absence of one makes
+ * it more permissive.
+ */
+static uint16_t idx_hdr_ncols(const uint8_t *buf, size_t avail, uint16_t version)
+{
+    if (version < 3 || avail < TSDB_IDX_HEADER_SIZE_V3)
+        return TSDB_IDX_NCOLS_UNKNOWN;
+    uint16_t n = get_u16le(buf + 10);
+    return (n <= (uint16_t)TSDB_MAX_COLS) ? n : TSDB_IDX_NCOLS_UNKNOWN;
+}
+
+uint16_t tsdb_part_idx_ncols(const char *idx_path)
+{
+    if (!idx_path) return TSDB_IDX_NCOLS_UNKNOWN;
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return TSDB_IDX_NCOLS_UNKNOWN;
+    uint8_t hdr[TSDB_IDX_HEADER_SIZE];
+    size_t  n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
+    fclose(f);
+
+    uint32_t cnt = 0, esz = 0;
+    uint16_t ver = 0;
+    uint64_t tot = 0, mseq = 0;
+    int64_t  fmn = 0, fmx = 0;
+    if (read_idx_header_ex(hdr, n, &cnt, &ver, &tot, &fmn, &fmx, &esz, &mseq) <= 0)
+        return TSDB_IDX_NCOLS_UNKNOWN;
+    return idx_hdr_ncols(hdr, n, ver);
 }
 
 /*
@@ -569,6 +609,13 @@ typedef struct {
      * then raised to the flush's hwm by tsdb_part_flush_ex2.  0 = leave as-is
      * (default/non-redo flush path). */
     uint64_t max_seq;
+
+    /* Column-count stamp for this column's idx header (part.h).  The flush is
+     * the ONLY writer allowed to assert it, because it is the only one that
+     * writes every schema column into every partition it touches; it sets this
+     * to s->ncols right after col_writer_open.  Left 0 (unknown) by the memset
+     * in col_writer_open, so any other user of col_writer_t stays unasserting. */
+    uint16_t ncols;
 
     char     idx_path[4096];
     char     col_path[4096];   /* for rollback-by-path on a failed close */
@@ -1069,7 +1116,7 @@ static int col_writer_close(col_writer_t *w) {
             int64_t  fmx = w->has_zone ? w->file_ts_max : 0;
             uint8_t  hdr[TSDB_IDX_HEADER_SIZE];
             size_t   hdr_sz = write_idx_header(hdr, total_count, w->total_rows,
-                                               fmn, fmx, w->max_seq);
+                                               fmn, fmx, w->max_seq, w->ncols);
             /* Every write MUST be checked.  This publish is a FULL REWRITE
              * (header + all OLD entries + this flush's new ones), so a short
              * write drops manifest entries for blocks that were ALREADY
@@ -1374,6 +1421,15 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
              * lower it — col_writer_open seeded it from the existing idx). */
             if (max_seq > w.max_seq) w.max_seq = max_seq;
 
+            /* Column-count stamp (part.h).  This loop runs over EVERY schema
+             * column of this partition and is fail-stop, so by the time the ts
+             * column (published last) carries the stamp, all s->ncols columns
+             * have published their idx here.  That is what lets the reader tell
+             * "column added by a later ALTER, zero-fill is correct" from
+             * "column index < stamp, its write is gone, zero-fill would be a
+             * fabrication".  Set AFTER col_writer_open, which memsets w. */
+            w.ncols = (uint16_t)s->ncols;
+
             /* Wire up raw-block hook if available.  Suppressed for the ts
              * column once a sibling column's push failed: ts is the peers'
              * visibility marker, so shipping it after a lost non-ts block is
@@ -1520,6 +1576,61 @@ uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir) {
  * identical (ts_min, count).  That is why no manifest is needed here.
  */
 
+/* ---- "no idx at all": late add, or a write that never landed? -------------
+ *
+ * A non-ts column with ZERO block-index entries in a partition ts HAS published
+ * into is the one shape block counts cannot classify, because there is nothing
+ * to count.  Two histories produce byte-identical directories:
+ *
+ *   (a) ALTER TABLE ADD COLUMN after those rows were flushed.  The rows really
+ *       have no value for it; zero-fill is the CORRECT answer and erroring
+ *       instead would break a shipped feature.
+ *   (b) the column's write never landed — an interrupted migrate import, a
+ *       partial file-level restore, a lost replication group, deleted files.
+ *       Zero-fill FABRICATES a value for every row: rc==0, the row count is
+ *       right, every cell is 0, and count(*)/max(ts) — hence anti-entropy —
+ *       report the partition healthy.
+ *
+ * So decide on evidence that is not a count.  Two independent facts exist:
+ *
+ *  1. SHAPE.  tsdb_schema_add_column only ever APPENDS (at index s->ncols), so
+ *     a column added later always sits to the RIGHT of every column that
+ *     predates it, and the columns present in a partition written by a flush
+ *     are always a PREFIX of the schema.  If any column to the right of `ci`
+ *     published blocks here, `ci` existed before that column did and cannot be
+ *     the late add.  Costs nothing, needs no new on-disk state, and therefore
+ *     also protects partitions written by older binaries.  (Note this makes
+ *     every column left of the ts column non-late by construction: ts exists
+ *     from CREATE TABLE.)
+ *
+ *  2. THE STAMP.  The ts column's idx records how many columns the schema had
+ *     when the flush that published it ran, and the flush writes EVERY schema
+ *     column into every partition it touches.  ci < that count therefore means
+ *     the column's data WAS written here.  Only the flush stamps it; everyone
+ *     else preserves, so the claim is never invented by a one-column publish.
+ *     0 == never stamped (a legacy partition, or one built purely by
+ *     replication / bulk import) and rule 1 stands alone.
+ *
+ * Returns 1 when nothing contradicts the late-add hypothesis (caller zero-fills,
+ * exactly as before), 0 when it is contradicted (caller must not fabricate).
+ * Both the reader (tsdb_part_open) and the writer's commit test
+ * (tsdb_part_ts_publish_ready) call THIS function, so the property part.h
+ * promises — a writer never publishes something the reader would refuse —
+ * holds by construction rather than by two copies agreeing.
+ */
+static int part_col_absence_is_late_add(const tsdb_schema_t *s, int ci,
+                                        const uint32_t *idx_block_count,
+                                        uint16_t ts_ncols)
+{
+    for (int cj = ci + 1; cj < s->ncols; cj++)
+        if (idx_block_count[cj] > 0) return 0;          /* rule 1: shape */
+
+    if (ts_ncols != TSDB_IDX_NCOLS_UNKNOWN &&
+        ci < (int)ts_ncols) return 0;                   /* rule 2: the stamp */
+
+    return 1;
+}
+
 /* Read entry `idx`'s pairing key out of an already-probed idx file. */
 static int part_idx_entry_key(FILE *f, int hsz, uint32_t esz, uint32_t idx,
                               int64_t *out_ts_min, uint32_t *out_count)
@@ -1558,33 +1669,51 @@ int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
     if (tsdb_part_idx_probe(idx_path, NULL, &ts_cnt, NULL, NULL,
                             NULL, NULL, NULL) < 0)
         return TSDB_ERR_IO;
+    uint16_t ts_ncols = tsdb_part_idx_ncols(idx_path);
+
+    /* One probe per column, up front, because the zero-block case below is
+     * classified from the shape of the WHOLE column set, not from this column
+     * alone (part_col_absence_is_late_add).  Same number of probes as before —
+     * the results are reused rather than re-read. */
+    uint32_t col_cnt[TSDB_MAX_COLS];
+    uint32_t col_esz[TSDB_MAX_COLS];
+    int      col_hsz[TSDB_MAX_COLS];
+    for (int ci = 0; ci < s->ncols; ci++) {
+        col_cnt[ci] = 0; col_esz[ci] = 0; col_hsz[ci] = 0;
+        if (ci == ts_ci) { col_cnt[ci] = ts_cnt; continue; }
+        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+                 part_dir, s->cols[ci].name);
+        col_hsz[ci] = tsdb_part_idx_probe(idx_path, NULL, &col_cnt[ci],
+                                          &col_esz[ci], NULL, NULL, NULL, NULL);
+        if (col_hsz[ci] < 0) return TSDB_ERR_IO;   /* corrupt — not ready */
+        if (col_hsz[ci] == 0 || col_esz[ci] == 0) col_cnt[ci] = 0;
+    }
 
     for (int ci = 0; ci < s->ncols; ci++) {
         if (ci == ts_ci) continue;
         snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
                  part_dir, s->cols[ci].name);
 
-        uint32_t cnt = 0, esz = 0;
-        int hsz = tsdb_part_idx_probe(idx_path, NULL, &cnt, &esz,
-                                      NULL, NULL, NULL, NULL);
-        if (hsz < 0) return TSDB_ERR_IO;           /* corrupt — not ready */
+        uint32_t cnt = col_cnt[ci], esz = col_esz[ci];
+        int      hsz = col_hsz[ci];
 
         if (hsz == 0 || cnt == 0 || esz == 0) {
             /* No blocks at all for this column here.
              *
-             * EXEMPT when ts has already published into this partition: the
-             * partition predates the column, which is ALTER TABLE ADD COLUMN
-             * and is exactly what tsdb_part_open zero-fills by design.
+             * EXEMPT only while nothing contradicts ALTER TABLE ADD COLUMN,
+             * which is exactly what tsdb_part_open zero-fills by design — the
+             * SAME test the reader applies, so this can never hand the reader a
+             * ts block it will then refuse to answer for.
              *
-             * REFUSED when ts has published nothing either: this is a FRESH
-             * partition whose first group is landing, and the flush writes
-             * every schema column for every partition it touches — so a
+             * REFUSED otherwise — including when ts has published nothing here
+             * either (a FRESH partition whose first group is landing: the flush
+             * writes every schema column for every partition it touches, so a
              * column with no block here means the whole column's push was
-             * lost.  Publishing ts anyway is the one case that reads back as
-             * fabricated ZEROS with rc=0 (tsdb_part_open cannot tell it from a
-             * late add), which is worse than an error: it poisons aggregates
-             * and hides the loss from anti-entropy. */
-            if (ts_cnt == 0) {
+             * lost).  Publishing ts anyway is the case that reads back as
+             * fabricated ZEROS with rc=0, which is worse than an error: it
+             * poisons aggregates and hides the loss from anti-entropy. */
+            if (ts_cnt == 0 ||
+                !part_col_absence_is_late_add(s, ci, col_cnt, ts_ncols)) {
                 if (out_missing_col && cap)
                     snprintf(out_missing_col, cap, "%s", s->cols[ci].name);
                 return TSDB_ERR_BUSY;
@@ -1720,7 +1849,12 @@ int tsdb_part_ts_retract_unpaired(tsdb_schema_t *s, const char *part_dir,
         if (!w) { rc = TSDB_ERR_IO; goto done; }
 
         uint8_t hdr[TSDB_IDX_HEADER_SIZE];
-        size_t  hsz = write_idx_header(hdr, keep, new_total, fmn, fmx, ts_mseq);
+        /* Republishing one column's idx: PRESERVE its column-count stamp
+         * (part.h) exactly as the version and max_seq are preserved.  A
+         * retraction knows nothing new about which columns this partition was
+         * written with, so it must neither assert nor erase the claim. */
+        size_t  hsz = write_idx_header(hdr, keep, new_total, fmn, fmx, ts_mseq,
+                                       tsdb_part_idx_ncols(ts_idx_path));
         int io_ok = (fwrite(hdr, 1, hsz, w) == hsz);
         if (io_ok && keep > 0) {
             size_t n = (size_t)keep * ts_esz;
@@ -1860,6 +1994,12 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
     uint32_t idx_decl_count[TSDB_MAX_COLS];
     for (int i = 0; i < s->ncols; i++) idx_decl_count[i] = 0;
 
+    /* Column-count stamp carried by the TS column's idx header (part.h): how
+     * many columns the schema had when the flush that published ts here ran.
+     * 0 for a partition no flush of this vintage ever wrote (legacy on-disk
+     * data, or one built purely by replication / bulk import). */
+    uint16_t ts_ncols_stamp = TSDB_IDX_NCOLS_UNKNOWN;
+
     /* Column read order must be the REVERSE of the write order (writers
      * publish ts LAST), or a reader racing a concurrent publish samples
      * val.idx at N and then ts.idx at N+1 and synthesises a HOLE for a block
@@ -1910,6 +2050,8 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         if (hdr_size < 0 || block_count == 0 || entry_size == 0) {
             fclose(idx_f); continue;
         }
+        if (ci == s->ts_col_idx)
+            ts_ncols_stamp = idx_hdr_ncols(idx_hdr, hdr_n, idx_version);
 
         /* Mixed-writer recovery: if the version-derived header size does not
          * match where the fixed-stride entries actually start (a V3/V4 header
@@ -2176,11 +2318,21 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                 }
             } else {
                 /* No readable blocks at all, so there is no content to check.
-                 * That is only credible as a late add when the idx declares
-                 * none either — a column whose idx declares blocks the .col
-                 * filter then dropped LOST them, and zero-filling the whole
-                 * column would fabricate every one of its values. */
-                alter_shaped = (idx_decl_count[ci] == 0);
+                 *
+                 * Necessary condition (KEEP): the idx must declare none either
+                 * — a column whose idx declares blocks the .col filter then
+                 * dropped LOST them, and zero-filling the whole column would
+                 * fabricate every one of its values.
+                 *
+                 * Not sufficient, and this is the case that shipped fabricated
+                 * zeros: with no idx AT ALL there is nothing to count, and a
+                 * genuinely ALTER-added column and a column whose write never
+                 * landed are byte-identical on disk.  Decide it on evidence
+                 * that is not a count — see part_col_absence_is_late_add. */
+                alter_shaped = (idx_decl_count[ci] == 0) &&
+                               part_col_absence_is_late_add(s, ci,
+                                                            idx_decl_count,
+                                                            ts_ncols_stamp);
             }
 
             tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
@@ -2208,7 +2360,15 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                 if (!alter_shaped) { merged[b].flags = TSDB_BLOCK_FLAG_HOLE; holes++; }
             }
 
-            if (holes)
+            if (holes && idx_decl_count[ci] == 0)
+                fprintf(stderr,
+                        "[part] %s: column %s has NO index here at all, but "
+                        "this partition was written with it (ts stamp=%u, "
+                        "column index=%d); its %zu block(s) of values are gone "
+                        "and now read as an error, not as zero\n",
+                        partition_dir, s->cols[ci].name,
+                        (unsigned)ts_ncols_stamp, ci, holes);
+            else if (holes)
                 fprintf(stderr,
                         "[part] %s: column %s declares %u blocks against ts's %u "
                         "and they are not a late-added suffix; %zu ts block(s) "

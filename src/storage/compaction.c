@@ -376,6 +376,15 @@ static int compact_column_file(const char *part_dir,
                          ? get_u64le(hdr_buf + 40)
                          : 0;
 
+    /* Same for the column-count stamp at [10..11] (part.h).  Compaction rewrites
+     * ONE column of the partition, so it must carry the claim forward untouched:
+     * erasing it would silently re-open the fabricated-zeros hole on a partition
+     * that had been protected, and restating it from the schema would let a
+     * single-column rewrite assert something only a full flush can know. */
+    uint16_t src_ncols = (idx_ver >= 3 && hdr_n >= IDX_HDR_SZ)
+                       ? get_u16le(hdr_buf + 10)
+                       : TSDB_IDX_NCOLS_UNKNOWN;
+
     /* ---- 3. Read all BlockIndexEntry records ------------------------------- */
 
     block_info_t *infos = malloc((size_t)block_count * sizeof(block_info_t));
@@ -690,7 +699,8 @@ static int compact_column_file(const char *part_dir,
          * paths, and it picks V3/V4 off max_seq exactly like out_hdr_sz did. */
         size_t hn = tsdb_part_write_idx_header(real_hdr, new_block_count,
                                                new_total_rows, file_ts_min,
-                                               file_ts_max, src_max_seq);
+                                               file_ts_max, src_max_seq,
+                                               src_ncols);
         if (hn != out_hdr_sz) goto io_err;
         if (safe_write(new_idx, real_hdr, hn) < 0) goto io_err;
     }
