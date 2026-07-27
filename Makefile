@@ -92,6 +92,13 @@ TEST_SRCS += tests/test_ae_candidates.c
 # selection, the -0.0 trap, a flag-off/flag-on differential, unknown-codec-id
 # rejection, and a partition-level round trip.
 TEST_SRCS += tests/test_codec_decimal.c
+
+# Graceful-degrade read path for a column that is SHORT for a partition (fewer
+# durable blocks than ts).  Builds the on-disk state by hand, then pins BOTH
+# halves of the contract: everything that does not need the missing cells still
+# answers exactly, and everything that does fails naming the column and the ts
+# range — from every read site, including the stats fast path.
+TEST_SRCS += tests/test_short_column_read.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

@@ -304,6 +304,41 @@ struct scan_src {
 };
 /* typedef scan_src_t was forward-declared above bloom_can_skip_block */
 
+/* ---- The one place that pairs a non-ts column's block to a ts block ------
+ *
+ * INVARIANT: non-ts is paired to ts by FIRST-MATCH on (ts_min,count).  Eight
+ * copies of this loop used to be open-coded across this file; they are all
+ * this function now, because "does this column have a readable block here"
+ * must have exactly ONE answer engine-wide.  When the copies disagreed, the
+ * engine answered the same query two ways — `SELECT count(c) FROM t` reported
+ * the column healthy off the stats fast path while the scan path reported
+ * TSDB_ERR_CORRUPT for the identical query.
+ *
+ * Returns the paired meta, or NULL when the column is SHORT here: the paired
+ * slot is a placeholder tsdb_part_open synthesised for a ts block this column
+ * lost (a dropped raw-block replication push, a half-finished migration).
+ *
+ * The `offset == UINT64_MAX` co-condition is not redundant and must not be
+ * dropped.  TSDB_BLOCK_FLAG_HOLE is bit 4 of the same u16 that carries the
+ * on-disk codec flags (OUTER_LZ/NOT_NULL/HAS_BLOOM/HAS_CRC occupy bits 0..3),
+ * and tsdb_part_open back-fills every REAL block's on-disk flags into
+ * meta.flags.  Testing the flag alone would turn the first on-disk use of bit
+ * 4 into a bogus "no stored value" error for every block carrying it — an
+ * availability regression against "old blocks stay readable".  This is
+ * byte-identical to the gate tsdb_part_read_block{,_ref} apply. */
+static tsdb_block_meta_t *col_block_pair(const scan_src_t *src,
+                                         tsdb_block_meta_t *metas, size_t nb)
+{
+    for (size_t b = 0; b < nb; b++) {
+        if (metas[b].ts_min != src->meta.ts_min ||
+            metas[b].count  != src->meta.count) continue;
+        if (metas[b].offset == UINT64_MAX &&
+            (metas[b].flags & TSDB_BLOCK_FLAG_HOLE)) break;   /* short column */
+        return &metas[b];
+    }
+    return NULL;
+}
+
 /*
  * Check whether a block can be skipped using Bloom filter constraints.
  *
@@ -330,13 +365,11 @@ static int bloom_can_skip_block(tsdb_part_t *part, tsdb_schema_t *s,
         int rc = tsdb_part_col_blocks(part, col, &metas, &nb);
         if (rc != TSDB_OK || !metas) continue;
 
-        tsdb_block_meta_t *hit = NULL;
-        for (size_t b = 0; b < nb; b++) {
-            if (metas[b].ts_min == src->meta.ts_min &&
-                metas[b].count  == src->meta.count) {
-                hit = &metas[b]; break;
-            }
-        }
+        /* A SHORT column yields NULL here, so `can_skip` stays 0 and the block
+         * is kept.  That is the only safe direction: skipping it would delete
+         * rows from the answer with rc=0, and keeping it means the scan reads
+         * the column and reports the damage by name. */
+        tsdb_block_meta_t *hit = col_block_pair(src, metas, nb);
         int can_skip = 0;
         if (hit && (hit->flags & TSDB_BF_HAS_BLOOM)) {
             if (!tsdb_bloom_test(hit->bloom, bc[i].code)) {
@@ -2200,12 +2233,15 @@ static int try_stats_fastpath(scan_src_t *src,
             ok = 0; break;
         }
         col_metas_arr[c] = metas;
-        for (size_t b = 0; b < nb; b++) {
-            if (metas[b].ts_min == src->meta.ts_min &&
-                metas[b].count  == src->meta.count) {
-                col_hits[c] = &metas[b]; break;
-            }
-        }
+        /* NULL when the column is SHORT for this block.  Declining here is
+         * what makes the fast path agree with the scan path: without it,
+         * `SELECT count(c) FROM t` took the `bits == 0` exit below and served
+         * src->meta.count — the ts block's row count — for a column that has
+         * no block at all, reporting a damaged column healthy with rc=0.  The
+         * scan path answers the same query TSDB_ERR_CORRUPT with the column
+         * name and ts range; only one of those can be right, and it is not
+         * the one that invents rows. */
+        col_hits[c] = col_block_pair(src, metas, nb);
         if (!col_hits[c]) { ok = 0; break; }
     }
     if (ok) {
@@ -2248,6 +2284,64 @@ static size_t scan_max_block_rows(const scan_src_t *srcs, size_t nsrcs) {
     return m;
 }
 
+/* ---- Reading a column that is SHORT for this partition -------------------
+ *
+ * tsdb_part_open aligns every column's block array 1:1 with the ts column, so a
+ * column with FEWER durable blocks than ts — a tear an older binary published,
+ * or a per-column raw-block apply that landed some columns and not others —
+ * still keeps a slot for every ts block, and the slots it has no data for carry
+ * TSDB_BLOCK_FLAG_HOLE.  That alignment is what confines the damage: count(*),
+ * SELECT ts, every healthy column, and any ts range that misses the hole all
+ * keep returning exactly the answer an intact partition returns.
+ *
+ * The HOLE itself has no truthful answer, and this is the one place that gets
+ * to decide what happens:
+ *   - Serving zero is out.  Zero is a value; it poisons every aggregate and
+ *     hides the loss from anti-entropy, which compares count/max(ts).
+ *   - Dropping the row is worse.  `SELECT c` would then disagree with
+ *     `count(*)` on row count with rc=0 on both — the exact signature of
+ *     silent loss, and unrepairable because nothing reports it.
+ *   - Marking the cell unavailable is not representable: result cells are raw
+ *     8-byte slots with no NULL bit, so any marker we invented would reach
+ *     every existing client (wire, JDBC, Influx, PromQL) as ordinary data.
+ * So the query fails.  That is correct — but failing BLIND is not.  A bare
+ * TSDB_ERR_CORRUPT names no column and no ts range, is indistinguishable from
+ * a CRC failure, and withholds precisely the two facts a caller needs to
+ * construct either of the retries that DO return complete, correct data: drop
+ * that column from the projection, or restrict the ts range away from the
+ * missing block.  Report both, from every read site, and count it so an
+ * operator can alert on a damaged partition being served.
+ *
+ * Pairing itself lives in col_block_pair(); this is the read site's wrapper
+ * that turns "no readable block here" into a named failure.  Match semantics
+ * are unchanged: first slot whose (ts_min,count) pairs wins; a HOLE in that
+ * slot is the miss it always was, just classified here instead of three
+ * frames down in tsdb_part_read_block.
+ *
+ * The two non-read users of col_block_pair() — the bloom skip test and the
+ * stats fast path — deliberately do NOT come through here.  Neither is
+ * reading a cell yet, so neither should name a failure; they decline, and the
+ * scan they hand back to arrives here and reports it once. */
+static int scan_find_col_block(const scan_src_t *src, int c,
+                               const tsdb_schema_t *s,
+                               tsdb_block_meta_t *metas, size_t nb,
+                               tsdb_block_meta_t **out_hit,
+                               char *err, size_t errcap)
+{
+    tsdb_block_meta_t *hit = col_block_pair(src, metas, nb);
+    if (hit) { *out_hit = hit; return TSDB_OK; }
+
+    tsdb_metric_inc("qengine_short_column_read_total");
+    const char *cn = (s && c >= 0 && c < s->ncols) ? s->cols[c].name : "?";
+    eset(err, errcap,
+         "column '%s' has no stored value for ts in [%lld,%lld] (%u rows): "
+         "the partition is short that column's block; re-sync it. Queries "
+         "without '%s', or outside that ts range, are complete.",
+         cn, (long long)src->meta.ts_min, (long long)src->meta.ts_max,
+         (unsigned)src->meta.count, cn);
+    return TSDB_ERR_CORRUPT;
+}
+
 /* Worker function: scan the assigned sources and accumulate into private projs[]. */
 /* 32-byte-aligned scratch sized for `rows` 8-byte lanes.  C11 aligned_alloc
  * requires size % alignment == 0 — glibc tolerates a violation but ASan
@@ -2271,18 +2365,16 @@ static void *agg_scratch_alloc(size_t rows) {
  * that must own or mutate a contiguous multi-block buffer (ASOF right-side
  * materialisation, row-emit scans) keep tsdb_part_read_block. */
 static int scan_load_col_block(scan_src_t *src, int c,
-                               void **out_buf, void **out_owned)
+                               const tsdb_schema_t *s,
+                               void **out_buf, void **out_owned,
+                               char *err, size_t errcap)
 {
     tsdb_block_meta_t *metas = NULL; size_t nb = 0;
     int rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
     if (rc != TSDB_OK) return rc;
     tsdb_block_meta_t *hit = NULL;
-    for (size_t b = 0; b < nb; b++)
-        if (metas[b].ts_min == src->meta.ts_min &&
-            metas[b].count  == src->meta.count) {
-            hit = &metas[b]; break;
-        }
-    if (!hit) { free(metas); return TSDB_ERR_CORRUPT; }
+    rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
+    if (rc != TSDB_OK) { free(metas); return rc; }
     const void *data = NULL;
     rc = tsdb_part_read_block_ref(src->part, c, hit, &data, out_owned);
     free(metas);
@@ -2377,7 +2469,9 @@ void tsdb_par_scan_task(void *arg) {
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                load_rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
+                load_rc = scan_load_col_block(src, c, t->schema,
+                                              &bufs[c], &owned[c],
+                                              t->err, sizeof(t->err));
                 if (load_rc != TSDB_OK) break;
             }
         }
@@ -2530,11 +2624,8 @@ static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
                 lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (lrc != TSDB_OK) break;
                 tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++)
-                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                if (!hit) { free(metas); lrc = TSDB_ERR_CORRUPT; break; }
+                lrc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
+                if (lrc != TSDB_OK) { free(metas); break; }
                 lrc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
                 free(metas);
                 if (lrc != TSDB_OK) break;
@@ -2671,7 +2762,8 @@ static void right_mat_free(right_mat_t *m) {
     m->col_bufs = NULL; m->col_types = NULL; m->col_syms = NULL; m->ts = NULL;
 }
 
-static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs, size_t off) {
+static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs,
+                              size_t off, char *err, size_t errcap) {
     size_t n = src->row_count;
     for (size_t c = 0; c < m->ncols; c++) {
         if (!m->col_bufs[c]) continue;          /* column pruned away */
@@ -2683,10 +2775,8 @@ static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs
             int rc = tsdb_part_col_blocks(src->part, (int)c, &metas, &nb);
             if (rc != TSDB_OK) return rc;
             tsdb_block_meta_t *hit = NULL;
-            for (size_t b = 0; b < nb; b++)
-                if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count)
-                    { hit = &metas[b]; break; }
-            if (!hit) { free(metas); return TSDB_ERR_CORRUPT; }
+            rc = scan_find_col_block(src, (int)c, rs, metas, nb, &hit, err, errcap);
+            if (rc != TSDB_OK) { free(metas); return rc; }
             rc = tsdb_part_read_block(src->part, (int)c, hit, (char *)m->col_bufs[c] + off * w);
             free(metas);
             if (rc != TSDB_OK) return rc;
@@ -2718,7 +2808,8 @@ static int right_mat_sort_idx(size_t *idx, size_t *tmp, const int64_t *ts, size_
 
 /* `need[c]` selects which right columns to decode. ts is always forced on. */
 static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m,
-                           const unsigned char *need) {
+                           const unsigned char *need,
+                           char *err, size_t errcap) {
     tsdb_schema_t *rs = tsdb_tbl_schema(rtbl);
     m->ncols = (size_t)rs->ncols; m->ts_col = rs->ts_col_idx;
     m->col_types = calloc(m->ncols, sizeof(tsdb_type_t));
@@ -2746,7 +2837,7 @@ static int right_mat_build(tsdb_table_internal_t *rtbl, right_mat_t *m,
     }
     size_t off = 0;
     for (size_t si = 0; si < rplan.nsrcs; si++) {
-        rc = right_mat_load_src(m, &rplan.srcs[si], rs, off);
+        rc = right_mat_load_src(m, &rplan.srcs[si], rs, off, err, errcap);
         if (rc != TSDB_OK) { scan_plan_free(&rplan); right_mat_free(m); return rc; }
         off += rplan.srcs[si].row_count;
     }
@@ -3061,7 +3152,7 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
     for (int k = 0; k < nkeys; k++) need_rcol[rcol_idx[k]] = 1;
 
     right_mat_t rm; memset(&rm, 0, sizeof(rm));
-    rc = right_mat_build(rtbl, &rm, need_rcol);
+    rc = right_mat_build(rtbl, &rm, need_rcol, err, errcap);
     if (rc != TSDB_OK) { free(projs); return rc; }
 
     scan_plan_t lplan; memset(&lplan, 0, sizeof(lplan));
@@ -3158,10 +3249,8 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
                 lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (lrc != TSDB_OK) break;
                 tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++)
-                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count)
-                        { hit = &metas[b]; break; }
-                if (!hit) { free(metas); lrc = TSDB_ERR_CORRUPT; break; }
+                lrc = scan_find_col_block(src, c, ls, metas, nb, &hit, err, errcap);
+                if (lrc != TSDB_OK) { free(metas); break; }
                 lrc = tsdb_part_read_block(src->part, c, hit, lbufs[c]);
                 free(metas);
                 if (lrc != TSDB_OK) break;
@@ -3621,7 +3710,9 @@ static void tsdb_gbpar_scan_task(void *arg) {
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                local_rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
+                local_rc = scan_load_col_block(src, c, s,
+                                               &bufs[c], &owned[c],
+                                               t->err, sizeof(t->err));
                 if (local_rc != TSDB_OK) break;
             }
         }
@@ -4231,8 +4322,12 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         for (int w = 0; w < nactive; w++) {
             if (tasks[w].rc != TSDB_OK && grc == TSDB_OK) {
                 grc = tasks[w].rc;
-                if (tasks[w].err[0] && err && errcap)
-                    snprintf(err, errcap, "%s", tasks[w].err);
+                /* eset, not snprintf: a worker's diagnostic lands in the
+                 * WORKER thread's g_last_err, which tsdb_last_error() on the
+                 * query thread never sees.  Re-set it here or the caller gets
+                 * a bare rc with no detail. */
+                if (tasks[w].err[0])
+                    eset(err, errcap, "%s", tasks[w].err);
             }
         }
 
@@ -4374,7 +4469,8 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
             if (src->mem) {
                 bufs[c] = src->mem_bufs[c];
             } else {
-                rc = scan_load_col_block(src, c, &bufs[c], &owned[c]);
+                rc = scan_load_col_block(src, c, s, &bufs[c], &owned[c],
+                                         err, errcap);
                 if (rc != TSDB_OK) break;
             }
         }
@@ -4721,11 +4817,8 @@ static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 src_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (src_rc != TSDB_OK) break;
                 tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++)
-                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                if (!hit) { free(metas); src_rc = TSDB_ERR_CORRUPT; break; }
+                src_rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
+                if (src_rc != TSDB_OK) { free(metas); break; }
                 src_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
                 free(metas);
                 if (src_rc != TSDB_OK) break;
@@ -6475,8 +6568,10 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         for (int w = 0; w < nactive; w++) {
             if (tasks[w].rc != TSDB_OK && rc == TSDB_OK) {
                 rc = tasks[w].rc;
-                if (tasks[w].err[0] && err && errcap)
-                    snprintf(err, errcap, "%s", tasks[w].err);
+                /* eset, not snprintf — see the same site in the GROUP BY
+                 * parallel path: worker g_last_err is thread-local. */
+                if (tasks[w].err[0])
+                    eset(err, errcap, "%s", tasks[w].err);
             }
         }
 
@@ -6751,12 +6846,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 if (rc != TSDB_OK) break;
                 /* match by ts_min == src->meta.ts_min */
                 tsdb_block_meta_t *hit = NULL;
-                for (size_t b = 0; b < nb; b++) {
-                    if (metas[b].ts_min == src->meta.ts_min && metas[b].count == src->meta.count) {
-                        hit = &metas[b]; break;
-                    }
-                }
-                if (!hit) { free(metas); rc = TSDB_ERR_CORRUPT; break; }
+                rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
+                if (rc != TSDB_OK) { free(metas); break; }
                 rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
                 free(metas);
                 if (rc != TSDB_OK) break;
