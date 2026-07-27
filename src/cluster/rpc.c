@@ -797,7 +797,14 @@ static void *connection_handler(void *arg) {
                 tsdb_rawblock_push_t rb;
                 int rc = tsdb_rawblock_parse(msg.payload, msg.payload_len, &rb);
                 if (rc == TSDB_OK) {
-                    rc = tsdb_rawblock_apply(db, &rb);
+                    /* VERIFY_TS: this is the only path where blocks arrive
+                     * from a sender whose pushes can fail independently, so it
+                     * is the only one that can be handed a ts block for a
+                     * group whose siblings never arrive.  A refusal (BUSY)
+                     * replies ERR and leaves this node BEHIND rather than
+                     * TORN — anti-entropy repairs behind, it cannot even see
+                     * torn (it compares count/max_ts, both served from ts). */
+                    rc = tsdb_rawblock_apply_ex(db, &rb, TSDB_RB_VERIFY_TS);
                 }
                 if (rc == TSDB_OK)
                     send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);

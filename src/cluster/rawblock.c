@@ -8,6 +8,7 @@
 #include "../storage/schema.h"
 #include "../storage/part.h"
 #include "../server/proto.h"  /* tsdb_crc32c — match flush-side trailer */
+#include "../server/metrics.h"
 #include "../../include/tsdb.h"
 
 #include <stdio.h>
@@ -204,7 +205,22 @@ static void rawblk_write_idx_entry(uint8_t *buf,
 
 /* ---- Apply on replica ------------------------------------------------------ */
 
+/* fsync the partition directory so the idx rename below is durable, not just
+ * atomic.  Without it a crash can lose the rename and resurrect the previous
+ * idx — for a NON-ts column that manufactures the exact short-column state
+ * this file is being fixed for, on a node that never lost a push. */
+static void rawblk_fsync_dir(const char *dir) {
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+}
+
 int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
+{
+    return tsdb_rawblock_apply_ex(db, r, 0);
+}
+
+int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
+                           uint32_t flags)
 {
     if (!db || !r) return TSDB_ERR_INVAL;
 
@@ -236,6 +252,64 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     snprintf(col_path, sizeof(col_path), "%s/%s.col", part_dir, col_name);
     snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col_name);
 
+    /* Declared before the first `goto out` so no jump skips an initialiser. */
+    int       rc            = TSDB_OK;
+    FILE     *col_fp        = NULL;
+    long      col_offset    = -1;   /* .col EOF before this append (rollback) */
+    int       appended      = 0;
+    uint8_t  *old_entries   = NULL;
+    uint32_t  old_count     = 0;
+    uint64_t  old_total     = 0;
+    int64_t   old_fmn       = INT64_MAX;
+    int64_t   old_fmx       = INT64_MIN;
+    int       have_old_zone = 0;
+    uint64_t  old_max_seq   = 0;   /* carried forward so a V4 partition stays V4 */
+
+    /* Serialise probe -> append -> idx read-modify-write -> rename against the
+     * other writers of this partition: a concurrent applier for the same
+     * column (rpc.c runs a thread per connection, and the flush hook fans out
+     * to every alive peer regardless of shard ownership, so one node receives
+     * pushes from several senders at once) and the local flush's
+     * col_writer_close.  Both do a FULL-FILE idx rewrite; unsynchronised they
+     * both read N and write N+1 and one entry is silently lost.  A lost NON-ts
+     * entry under a surviving ts is the multi-column hole. */
+    tsdb_part_idx_lock(part_dir);
+
+    /* --- Commit test -------------------------------------------------------
+     * Never advance the partition's visibility marker past a group this node
+     * has not fully received.  ts.idx is what exec.c enumerates blocks from
+     * and what count(*)/max(ts) — and therefore anti-entropy — are answered
+     * from, so a ts block published for a group some column is missing yields
+     * a partition that fails every query touching that column while still
+     * reporting the rows as present.  Nothing alerts.
+     *
+     * Ordering cannot fix this on the receiver: it sees one message at a time
+     * and cannot enforce a group property it has no way to name.  But the
+     * commit condition is locally checkable, because the join key is IN THE
+     * DATA — every column's block for the same rows carries the identical
+     * (ts_min, count), which is exactly the key the reader pairs on.  That is
+     * why this needs no manifest, no wire change and no format change, and why
+     * it holds against ANY sender, in any order, at any version.
+     *
+     * Nothing is written when it fails, so the caller may simply retry. */
+    if ((flags & TSDB_RB_VERIFY_TS) && (int)r->col_idx == schema->ts_col_idx) {
+        char missing[64];
+        int vrc = tsdb_part_ts_publish_ready(schema, part_dir,
+                                             r->ts_min, r->count,
+                                             missing, sizeof(missing));
+        if (vrc != TSDB_OK) {
+            tsdb_metric_inc("qengine_rawblock_ts_deferred_total");
+            fprintf(stderr,
+                    "[rawblock] %s/%s: refusing ts block (ts_min=%lld count=%u): "
+                    "column '%s' has no block for it here — the node stays "
+                    "BEHIND (repairable) instead of TORN (not)\n",
+                    r->table, day_str, (long long)r->ts_min, r->count,
+                    missing[0] ? missing : "?");
+            rc = vrc;
+            goto out;
+        }
+    }
+
     /* --- Idempotency: skip if last idx entry matches.  Use the storage
      * probe so the last-entry offset is correct even on a V3/V4-mongrel
      * header (a wrong header size here would mis-locate the last entry, miss
@@ -250,6 +324,7 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
             FILE *idx_r = fopen(idx_path, "rb");
             if (idx_r) {
                 long off = (long)((uint64_t)phsz + (uint64_t)(pcnt - 1) * pesz);
+                int  dup = 0;
                 if (fseek(idx_r, off, SEEK_SET) == 0) {
                     uint8_t ent[RAWBLK_IDX_ENT_SIZE];
                     if (fread(ent, 1, pesz, idx_r) == pesz) {
@@ -257,27 +332,26 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
                         uint32_t e_count = rb_get_u32(ent + 12);
                         int64_t  e_tmin  = rb_get_i64(ent + 16);
                         int64_t  e_tmax  = rb_get_i64(ent + 24);
-                        if (e_size == r->block_bytes_len &&
-                            e_count == r->count &&
-                            e_tmin  == r->ts_min &&
-                            e_tmax  == r->ts_max) {
-                            fclose(idx_r);
-                            return TSDB_OK; /* already applied */
-                        }
+                        dup = (e_size == r->block_bytes_len &&
+                               e_count == r->count &&
+                               e_tmin  == r->ts_min &&
+                               e_tmax  == r->ts_max);
                     }
                 }
                 fclose(idx_r);
+                if (dup) goto out;                 /* already applied, rc==OK */
             }
         }
     }
 
     /* --- Append to .col file --- */
-    FILE *col_fp = fopen(col_path, "ab");
-    if (!col_fp) return TSDB_ERR_IO;
+    col_fp = fopen(col_path, "ab");
+    if (!col_fp) { rc = TSDB_ERR_IO; goto out; }
 
     fseek(col_fp, 0, SEEK_END);
-    long col_offset = ftell(col_fp);
-    if (col_offset < 0) { fclose(col_fp); return TSDB_ERR_IO; }
+    col_offset = ftell(col_fp);
+    if (col_offset < 0) { rc = TSDB_ERR_IO; goto out; }
+    appended = 1;
 
     /* Write 32-byte BlockHeader. */
     uint8_t hdr[RAWBLK_HDR_SIZE];
@@ -285,11 +359,11 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
                         r->ts_min, r->ts_max, r->block_bytes_len);
 
     if (fwrite(hdr, 1, RAWBLK_HDR_SIZE, col_fp) != RAWBLK_HDR_SIZE) {
-        fclose(col_fp); return TSDB_ERR_IO;
+        rc = TSDB_ERR_IO; goto out;
     }
     if (r->block_bytes_len > 0 && r->block_bytes) {
         if (fwrite(r->block_bytes, 1, r->block_bytes_len, col_fp) != r->block_bytes_len) {
-            fclose(col_fp); return TSDB_ERR_IO;
+            rc = TSDB_ERR_IO; goto out;
         }
     }
 
@@ -310,11 +384,26 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
         trailer[3] = (uint8_t)(crc >> 24);
         if (fwrite(trailer, 1, TSDB_BLOCK_CRC_TRAILER_SIZE, col_fp)
             != TSDB_BLOCK_CRC_TRAILER_SIZE) {
-            fclose(col_fp); return TSDB_ERR_IO;
+            rc = TSDB_ERR_IO; goto out;
         }
     }
 
+    /* Durability ordering: the .col bytes MUST reach the device BEFORE the idx
+     * entry that points at them.  The flush path has done this since the
+     * max_seq checkpoint landed (col_writer_close fsyncs the .col before it
+     * fsyncs and renames the idx); this path did neither, so a plain power
+     * loss — with no dropped message at all — could leave a durable idx entry
+     * over never-written .col bytes.  On restart the per-block size filter in
+     * tsdb_part_open drops that block, leaving THIS column short while ts,
+     * whose own bytes happened to be flushed by the page cache, stays long:
+     * the multi-column hole, manufactured locally. */
+    if (fflush(col_fp) != 0) { rc = TSDB_ERR_IO; goto out; }
+    {
+        int cfd = fileno(col_fp);
+        if (cfd < 0 || fsync(cfd) != 0) { rc = TSDB_ERR_IO; goto out; }
+    }
     fclose(col_fp);
+    col_fp = NULL;
 
     /* --- Rewrite .idx --------------------------------------------------------
      * Read the existing idx (if any) via the storage layer's probe so we (a)
@@ -324,14 +413,6 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
      * to a V4 partition silently downgraded it to V3 (dropping the WAL redo
      * checkpoint) and — racing the flush writer — could leave a header size /
      * version / entry-offset mongrel that makes a SELECT read 0 rows. */
-    uint8_t *old_entries = NULL;
-    uint32_t old_count   = 0;
-    uint64_t old_total   = 0;
-    int64_t  old_fmn     = INT64_MAX;
-    int64_t  old_fmx     = INT64_MIN;
-    int      have_old_zone = 0;
-    uint64_t old_max_seq = 0;     /* carried forward so a V4 partition stays V4 */
-
     {
         uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
         uint64_t ptot = 0, pmseq = 0;
@@ -421,13 +502,19 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
     size_t  hdr_sz = tsdb_part_write_idx_header(ih, new_count, new_total,
                                                 new_fmn, new_fmx, old_max_seq);
 
-    /* Atomic publish: write <idx>.tmp, fflush + fsync, then rename onto the
+    /* Atomic publish: write <idx>.rbtmp, fflush + fsync, then rename onto the
      * real path so a concurrent reader never observes a torn header (matches
-     * the flush path's temp+fsync+rename in part.c col_writer_close). */
+     * the flush path's temp+fsync+rename in part.c col_writer_close).
+     *
+     * The suffix is deliberately NOT ".idx.tmp": part_compact_swap_recover
+     * renames <col>.idx.tmp -> <col>.idx for every column named in a surviving
+     * <part>/.compact_swap marker.  A crashed applier's PARTIAL temp sitting
+     * next to a crashed compaction's marker was therefore rolled FORWARD into
+     * the live index — a truncated manifest published as authoritative. */
     char tmp_path[4200];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", idx_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.rbtmp", idx_path);
     FILE *idx_w = fopen(tmp_path, "wb");
-    if (!idx_w) { free(old_entries); return TSDB_ERR_IO; }
+    if (!idx_w) { rc = TSDB_ERR_IO; goto out; }
 
     int io_ok = 1;
     if (fwrite(ih, 1, hdr_sz, idx_w) != hdr_sz) io_ok = 0;
@@ -438,15 +525,30 @@ int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r)
             != RAWBLK_IDX_ENT_SIZE) io_ok = 0;
     if (io_ok && fflush(idx_w) != 0) io_ok = 0;
     if (io_ok) {
+        /* Durable before rename, and CHECKED: publishing an idx whose bytes
+         * never reached the device is how a manifest ends up referencing
+         * blocks that are not there. */
         int fd = fileno(idx_w);
-        if (fd >= 0) (void)fsync(fd);   /* durable before rename */
+        if (fd < 0 || fsync(fd) != 0) io_ok = 0;
     }
-    fclose(idx_w);
-    free(old_entries);
+    if (fclose(idx_w) != 0) io_ok = 0;
 
-    if (!io_ok) { unlink(tmp_path); return TSDB_ERR_IO; }
-    if (rename(tmp_path, idx_path) != 0) { unlink(tmp_path); return TSDB_ERR_IO; }
-    return TSDB_OK;
+    if (!io_ok) { unlink(tmp_path); rc = TSDB_ERR_IO; goto out; }
+    if (rename(tmp_path, idx_path) != 0) { unlink(tmp_path); rc = TSDB_ERR_IO; goto out; }
+    rawblk_fsync_dir(part_dir);
+
+out:
+    if (col_fp) fclose(col_fp);
+    /* Roll the .col back to its pre-append length on ANY failure after the
+     * append, mirroring col_writer_abort on the flush path.  Without it every
+     * failed apply leaks a dead block into the .col; under a retry loop those
+     * orphans accumulate, and a retry that DOES succeed would otherwise index
+     * a second copy of the same bytes. */
+    if (rc != TSDB_OK && appended && col_offset >= 0)
+        (void)truncate(col_path, (off_t)col_offset);
+    tsdb_part_idx_unlock(part_dir);
+    free(old_entries);
+    return rc;
 }
 
 /* ---- Replicate (primary fan-out) ------------------------------------------ */

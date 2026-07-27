@@ -88,6 +88,33 @@ int tsdb_rawblock_replicate(tsdb_cluster_t *c,
  */
 int tsdb_rawblock_apply(tsdb_db_t *db, const tsdb_rawblock_push_t *r);
 
+/*
+ * Enforce tsdb_part_ts_publish_ready before publishing a TS block: refuse to
+ * advance the partition's visibility marker past a group whose other columns
+ * have not all landed here.
+ */
+#define TSDB_RB_VERIFY_TS  0x1u
+
+/*
+ * As tsdb_rawblock_apply, with control over that commit test.
+ *
+ * The RPC receiver (rpc.c, TSDB_RPC_RAW_BLOCK_PUSH) passes TSDB_RB_VERIFY_TS.
+ * That is the ONLY path where blocks arrive from an untrusted sender whose
+ * pushes can fail independently, and it is the only path that can be given a
+ * ts block for a group whose siblings will never arrive.
+ *
+ * tsdb_rawblock_apply (flags == 0) stays the raw primitive for LOCAL bulk
+ * callers — the migration importer and the tests — which deliberately land
+ * blocks in stream order (a v2 stream emits ts FIRST) and reconcile at the end
+ * of the run.  Enforcing the test inline there would reject every ts block of
+ * an existing stream file and break a documented feature.
+ *
+ * Returns TSDB_ERR_BUSY when the test defers a ts publish; NOTHING is written
+ * in that case, so the caller may simply retry once the sibling lands.
+ */
+int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
+                           uint32_t flags);
+
 #ifdef __cplusplus
 }
 #endif

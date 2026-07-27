@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 
 /* Thread-local io_async ring used by tsdb_part_fsync_fd — lazily created
  * on first use, destroyed at thread exit.  Each flush thread gets its own
@@ -48,6 +49,54 @@ static int tsdb_part_fsync_fd(int fd) {
     }
     if (tl_io_async && tsdb_io_async_fsync_sync(tl_io_async, fd) == 0) return 0;
     return fsync(fd);
+}
+
+/* ---- per-partition idx publish lock ---------------------------------------
+ *
+ * See the contract on tsdb_part_idx_lock in part.h.  Fixed stripe table, so
+ * there is nothing to allocate, nothing to free, and no per-partition state to
+ * garbage-collect.  pthread_once (not a repeated PTHREAD_MUTEX_INITIALIZER
+ * array initialiser, which gcc rejects as non-constant on some libcs). */
+#define PART_IDX_LOCK_STRIPES 64u
+static pthread_mutex_t g_part_idx_locks[PART_IDX_LOCK_STRIPES];
+static pthread_once_t  g_part_idx_locks_once = PTHREAD_ONCE_INIT;
+
+static void part_idx_locks_init(void) {
+    for (unsigned i = 0; i < PART_IDX_LOCK_STRIPES; i++)
+        pthread_mutex_init(&g_part_idx_locks[i], NULL);
+}
+
+static unsigned part_idx_stripe(const char *part_dir) {
+    uint32_t h = 2166136261u;                       /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)part_dir; *p; p++) {
+        h ^= (uint32_t)*p;
+        h *= 16777619u;
+    }
+    return (unsigned)(h % PART_IDX_LOCK_STRIPES);
+}
+
+void tsdb_part_idx_lock(const char *part_dir) {
+    if (!part_dir) return;
+    pthread_once(&g_part_idx_locks_once, part_idx_locks_init);
+    pthread_mutex_lock(&g_part_idx_locks[part_idx_stripe(part_dir)]);
+}
+
+void tsdb_part_idx_unlock(const char *part_dir) {
+    if (!part_dir) return;
+    pthread_once(&g_part_idx_locks_once, part_idx_locks_init);
+    pthread_mutex_unlock(&g_part_idx_locks[part_idx_stripe(part_dir)]);
+}
+
+/* fsync a directory so a rename inside it is durable.  POSIX makes rename
+ * ATOMIC but says nothing about its durability: without this a crash can lose
+ * the rename and resurrect the previous idx — which manufactures exactly the
+ * short-column state this file's alignment pass has to clean up, on a node
+ * that never lost a single network push.  Copies the compactor's pattern; a
+ * filesystem that rejects fsync on a directory fd just returns EINVAL and we
+ * are no worse off than before. */
+static void part_fsync_dir(const char *dir) {
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
 }
 
 /*
@@ -523,6 +572,14 @@ typedef struct {
 
     char     idx_path[4096];
     char     col_path[4096];   /* for rollback-by-path on a failed close */
+    char     part_dir[4096];   /* stripe key for the idx publish lock */
+
+    /* Set when the raw-block hook reported a failure for THIS column.  The
+     * local write still proceeds (a peer outage must never fail a local
+     * commit), but the caller uses it to suppress this partition's ts pushes
+     * so no peer is handed a visibility marker for a group it did not
+     * fully receive. */
+    int      raw_failed;
 
     /* Raw-block hook (optional, set by tsdb_part_flush_ex). */
     part_raw_block_fn_t  raw_block_fn;
@@ -538,8 +595,9 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
 {
     memset(w, 0, sizeof(*w));
 
-    snprintf(w->col_path, sizeof(w->col_path), "%s/%s.col", part_dir, col_name);
-    snprintf(w->idx_path, sizeof(w->idx_path), "%s/%s.idx", part_dir, col_name);
+    snprintf(w->col_path,  sizeof(w->col_path),  "%s/%s.col", part_dir, col_name);
+    snprintf(w->idx_path,  sizeof(w->idx_path),  "%s/%s.idx", part_dir, col_name);
+    snprintf(w->part_dir,  sizeof(w->part_dir),  "%s", part_dir);
 
     /* Open .col for appending. */
     w->col_fp = fopen(w->col_path, "ab");
@@ -807,11 +865,19 @@ static int col_writer_write_block(col_writer_t *w,
         meta.ts_max = ts_max;
         meta.codec  = (uint8_t)codec_used;
         meta.flags  = blk_flags;
-        w->raw_block_fn(w->raw_block_ud, w->raw_block_db,
-                        w->raw_block_table, w->raw_block_day,
-                        (uint16_t)w->col_idx, &meta,
-                        comp_buf, (size_t)comp_bytes);
-        /* Errors are intentionally ignored here — local write must proceed. */
+        int hrc = w->raw_block_fn(w->raw_block_ud, w->raw_block_db,
+                                  w->raw_block_table, w->raw_block_day,
+                                  (uint16_t)w->col_idx, &meta,
+                                  comp_buf, (size_t)comp_bytes);
+        /* The LOCAL write proceeds regardless — a peer outage must never fail
+         * a local commit, which is what the old "errors are intentionally
+         * ignored" comment was protecting.  What is NOT safe is throwing the
+         * result away entirely: publishing ts to a peer that NAK'd or timed
+         * out on THIS column's block hands it a visibility marker for a group
+         * it never received, and ts is what count(*)/max(ts) — and therefore
+         * anti-entropy — are answered from, so the loss is invisible.  Record
+         * it; tsdb_part_flush_ex2 suppresses this partition's ts pushes. */
+        if (hrc != TSDB_OK) w->raw_failed = 1;
     }
 
     free(comp_buf);
@@ -896,6 +962,13 @@ static int col_writer_close(col_writer_t *w) {
     }
 
     if (w->idx_n > 0 && rc == TSDB_OK) {
+        /* Serialise the whole read-modify-write against the OTHER writer of
+         * this same file, tsdb_rawblock_apply_ex.  Both read N entries and
+         * write N+k; unsynchronised, the later rename silently drops the
+         * other's entries, and a dropped NON-ts entry under a surviving ts is
+         * the multi-column hole.  Innermost lock — see part.h. */
+        tsdb_part_idx_lock(w->part_dir);
+
         /* Read all existing entries from old idx (if any).  Handles v1 /
          * v2 (40-byte entries) and v3 (88-byte entries) transparently —
          * we widen legacy entries to V3 on write-out so the resulting
@@ -1044,9 +1117,16 @@ static int col_writer_close(col_writer_t *w) {
             } else if (rename(tmp_path, w->idx_path) != 0) {
                 unlink(tmp_path);
                 rc = TSDB_ERR_IO;
+            } else {
+                /* POSIX gives the rename atomicity, not durability: without
+                 * this a crash can lose it and resurrect the previous idx —
+                 * silently rolling ts back, or (for a non-ts column) leaving
+                 * it short against a ts that did survive. */
+                part_fsync_dir(w->part_dir);
             }
             free(old_entries_v3);
         }
+        tsdb_part_idx_unlock(w->part_dir);
     }
 
     free(w->idx_entries);
@@ -1261,6 +1341,15 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
         }
         ci_iter[ci_count++] = ts_ci;  /* ts last */
 
+        /* Set when the raw-block hook failed for ANY non-ts column of THIS
+         * partition.  ts-last only makes the incompleteness of a group a
+         * SUFFIX when the writer is fail-stop on the first error; the flush is
+         * (a failed col_writer_close returns immediately), the raw-block
+         * fan-out was not.  Restoring fail-stop for the remote half turns an
+         * arbitrary-subset failure back into a suffix failure, which leaves
+         * the peer BEHIND (repairable) instead of TORN (not). */
+        int raw_poisoned = 0;
+
         for (int ix = 0; ix < ci_count; ix++) {
             int ci = ci_iter[ix];
             /* TEST-ONLY fault injection: simulate a crash AFTER every non-ts
@@ -1285,8 +1374,21 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
              * lower it — col_writer_open seeded it from the existing idx). */
             if (max_seq > w.max_seq) w.max_seq = max_seq;
 
-            /* Wire up raw-block hook if available. */
-            w.raw_block_fn    = raw_fn;
+            /* Wire up raw-block hook if available.  Suppressed for the ts
+             * column once a sibling column's push failed: ts is the peers'
+             * visibility marker, so shipping it after a lost non-ts block is
+             * precisely what hands a peer a partition it cannot read while
+             * count(*) still reports the rows present. */
+            if (ci == ts_ci && raw_poisoned && raw_fn) {
+                fprintf(stderr,
+                        "[part] %s/%s: a non-ts raw-block push failed; "
+                        "withholding this partition's ts blocks from peers "
+                        "(they stay behind, not torn)\n",
+                        table_name ? table_name : "?", part_name);
+                w.raw_block_fn = NULL;
+            } else {
+                w.raw_block_fn = raw_fn;
+            }
             w.raw_block_ud    = raw_ud;
             w.raw_block_db    = db;
             w.raw_block_table = table_name;
@@ -1344,6 +1446,7 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
 
             rc = col_writer_close(&w);
             if (rc != TSDB_OK) { free(row_idx); free(days); free(sorted_all); return rc; }
+            if (w.raw_failed && ci != ts_ci) raw_poisoned = 1;
         }
         free(row_idx);
         /* TEST-ONLY fault injection: after fully publishing this partition,
@@ -1392,6 +1495,260 @@ uint64_t tsdb_part_max_seq(tsdb_schema_t *s, const char *partition_dir) {
                            &fmn, &fmx, &esz, &mseq) > 0)
         return mseq;
     return 0;
+}
+
+/* ---- multi-column publish invariant ---------------------------------------
+ *
+ * The reader pairs a non-ts column's block to a ts block by (ts_min, count),
+ * and tsdb_part_open turns any ts block a column cannot answer for into a
+ * TSDB_BLOCK_FLAG_HOLE.  That keeps READS safe.  It does not stop the WRITE
+ * side manufacturing holes, and a partition full of holes fails every query
+ * touching that column while count(*) — served from ts alone — keeps saying
+ * the rows are there.
+ *
+ * ts-last ordering is what the flush relies on, and it is a PREFIX-commit
+ * protocol: sound only when the incompleteness of a group is always a suffix
+ * of one totally ordered sequence.  That holds for the flush (one writer,
+ * fixed order, fail-stop on the first error) and does NOT hold for the raw
+ * block path, where the unit of failure is one independent RPC — so the
+ * failure set is an arbitrary SUBSET, and no ordering of independent publishes
+ * makes an arbitrary-subset failure safe.
+ *
+ * The fix is not more ordering, it is testing the property the marker asserts
+ * before advancing it.  The commit condition is locally checkable because the
+ * join key is IN THE DATA: every column's block for the same rows carries the
+ * identical (ts_min, count).  That is why no manifest is needed here.
+ */
+
+/* Read entry `idx`'s pairing key out of an already-probed idx file. */
+static int part_idx_entry_key(FILE *f, int hsz, uint32_t esz, uint32_t idx,
+                              int64_t *out_ts_min, uint32_t *out_count)
+{
+    uint8_t e[TSDB_IDX_ENTRY_SIZE];
+    size_t want = (esz < sizeof(e)) ? (size_t)esz : sizeof(e);
+    if (want < 24) return 0;                       /* no key in this entry */
+    if (fseek(f, (long)((uint64_t)hsz + (uint64_t)idx * esz), SEEK_SET) != 0)
+        return 0;
+    if (fread(e, 1, want, f) != want) return 0;
+    *out_count  = get_u32le(e + 12);
+    *out_ts_min = get_i64le(e + 16);
+    return 1;
+}
+
+int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
+                               int64_t ts_min, uint32_t count,
+                               char *out_missing_col, size_t cap)
+{
+    if (out_missing_col && cap) out_missing_col[0] = '\0';
+    if (!s || !part_dir) return TSDB_ERR_INVAL;
+    int ts_ci = s->ts_col_idx;
+    if (ts_ci < 0 || ts_ci >= s->ncols) return TSDB_ERR_INVAL;
+    if (s->ncols <= 1) return TSDB_OK;
+
+    char idx_path[4096];
+
+    /* How many ts blocks this partition already publishes.  Both producers
+     * (the flush and the migration exporter) emit block i of every column in
+     * the same order, so the sibling entry is normally at exactly this index —
+     * probe it first, so the common case is one 88-byte read per column and
+     * not a scan. */
+    uint32_t ts_cnt = 0;
+    snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+             part_dir, s->cols[ts_ci].name);
+    if (tsdb_part_idx_probe(idx_path, NULL, &ts_cnt, NULL, NULL,
+                            NULL, NULL, NULL) < 0)
+        return TSDB_ERR_IO;
+
+    for (int ci = 0; ci < s->ncols; ci++) {
+        if (ci == ts_ci) continue;
+        snprintf(idx_path, sizeof(idx_path), "%s/%s.idx",
+                 part_dir, s->cols[ci].name);
+
+        uint32_t cnt = 0, esz = 0;
+        int hsz = tsdb_part_idx_probe(idx_path, NULL, &cnt, &esz,
+                                      NULL, NULL, NULL, NULL);
+        if (hsz < 0) return TSDB_ERR_IO;           /* corrupt — not ready */
+
+        if (hsz == 0 || cnt == 0 || esz == 0) {
+            /* No blocks at all for this column here.
+             *
+             * EXEMPT when ts has already published into this partition: the
+             * partition predates the column, which is ALTER TABLE ADD COLUMN
+             * and is exactly what tsdb_part_open zero-fills by design.
+             *
+             * REFUSED when ts has published nothing either: this is a FRESH
+             * partition whose first group is landing, and the flush writes
+             * every schema column for every partition it touches — so a
+             * column with no block here means the whole column's push was
+             * lost.  Publishing ts anyway is the one case that reads back as
+             * fabricated ZEROS with rc=0 (tsdb_part_open cannot tell it from a
+             * late add), which is worse than an error: it poisons aggregates
+             * and hides the loss from anti-entropy. */
+            if (ts_cnt == 0) {
+                if (out_missing_col && cap)
+                    snprintf(out_missing_col, cap, "%s", s->cols[ci].name);
+                return TSDB_ERR_BUSY;
+            }
+            continue;
+        }
+
+        FILE *f = fopen(idx_path, "rb");
+        if (!f) return TSDB_ERR_IO;
+
+        int      found = 0;
+        int64_t  emin  = 0;
+        uint32_t ecnt  = 0;
+        if (ts_cnt < cnt &&
+            part_idx_entry_key(f, hsz, esz, ts_cnt, &emin, &ecnt) &&
+            emin == ts_min && ecnt == count)
+            found = 1;
+        for (uint32_t b = 0; !found && b < cnt; b++) {
+            if (part_idx_entry_key(f, hsz, esz, b, &emin, &ecnt) &&
+                emin == ts_min && ecnt == count)
+                found = 1;
+        }
+        fclose(f);
+
+        if (!found) {
+            if (out_missing_col && cap)
+                snprintf(out_missing_col, cap, "%s", s->cols[ci].name);
+            return TSDB_ERR_BUSY;
+        }
+    }
+    return TSDB_OK;
+}
+
+int tsdb_part_ts_retract_unpaired(tsdb_schema_t *s, const char *part_dir,
+                                  uint32_t *out_retracted)
+{
+    if (out_retracted) *out_retracted = 0;
+    if (!s || !part_dir) return TSDB_ERR_INVAL;
+    int ts_ci = s->ts_col_idx;
+    if (ts_ci < 0 || ts_ci >= s->ncols) return TSDB_ERR_INVAL;
+
+    char ts_idx_path[4096];
+    snprintf(ts_idx_path, sizeof(ts_idx_path), "%s/%s.idx",
+             part_dir, s->cols[ts_ci].name);
+
+    int rc = TSDB_OK;
+    uint8_t *ts_entries = NULL;
+
+    tsdb_part_idx_lock(part_dir);
+
+    uint32_t ts_cnt = 0, ts_esz = 0;
+    uint64_t ts_mseq = 0;
+    int ts_hsz = tsdb_part_idx_probe(ts_idx_path, NULL, &ts_cnt, &ts_esz,
+                                     NULL, NULL, NULL, &ts_mseq);
+    /* write_idx_header always stamps entry_size = TSDB_IDX_ENTRY_SIZE, so the
+     * entries republished below must be that wide.  A legacy V1/V2 idx has
+     * 40-byte entries: widen them (zero stats tail == "absent", exactly what
+     * col_writer_close does).  Anything wider than we understand is left
+     * alone rather than rewritten into a shape we would be guessing at. */
+    if (ts_hsz <= 0 || ts_cnt == 0 || ts_esz == 0 ||
+        ts_esz > TSDB_IDX_ENTRY_SIZE) goto done;   /* nothing safe to do */
+
+    ts_entries = calloc((size_t)ts_cnt, TSDB_IDX_ENTRY_SIZE);
+    if (!ts_entries) { rc = TSDB_ERR_NOMEM; goto done; }
+    {
+        FILE *f = fopen(ts_idx_path, "rb");
+        if (!f) { rc = TSDB_ERR_IO; goto done; }
+        int ok = (fseek(f, (long)ts_hsz, SEEK_SET) == 0);
+        for (uint32_t b = 0; ok && b < ts_cnt; b++)
+            ok = (fread(ts_entries + (size_t)b * TSDB_IDX_ENTRY_SIZE,
+                        1, ts_esz, f) == ts_esz);
+        fclose(f);
+        if (!ok) { rc = TSDB_ERR_IO; goto done; }
+    }
+    ts_esz = TSDB_IDX_ENTRY_SIZE;                  /* in-memory stride from here */
+
+    /* Longest ts block PREFIX every column can pair with.  Blocks append in
+     * ts order, so the readable part of a torn partition is a prefix; keeping
+     * the prefix is what the torn-.col clamp already does on the read side. */
+    uint32_t keep = ts_cnt;
+    for (int ci = 0; ci < s->ncols && keep > 0; ci++) {
+        if (ci == ts_ci) continue;
+        char cpath[4096];
+        snprintf(cpath, sizeof(cpath), "%s/%s.idx", part_dir, s->cols[ci].name);
+        uint32_t ccnt = 0, cesz = 0;
+        int chsz = tsdb_part_idx_probe(cpath, NULL, &ccnt, &cesz,
+                                       NULL, NULL, NULL, NULL);
+        /* A column with NO entries here is an ALTER-added column as far as
+         * this partition can tell — the same call tsdb_part_open makes.  Never
+         * retract a whole partition on that evidence. */
+        if (chsz <= 0 || ccnt == 0 || cesz == 0) continue;
+
+        FILE *cf = fopen(cpath, "rb");
+        if (!cf) { rc = TSDB_ERR_IO; goto done; }
+        for (uint32_t b = 0; b < keep; b++) {
+            uint32_t want_cnt = get_u32le(ts_entries + (size_t)b * ts_esz + 12);
+            int64_t  want_min = get_i64le(ts_entries + (size_t)b * ts_esz + 16);
+            int      found = 0;
+            int64_t  emin = 0; uint32_t ecnt = 0;
+            if (b < ccnt && part_idx_entry_key(cf, chsz, cesz, b, &emin, &ecnt) &&
+                emin == want_min && ecnt == want_cnt)
+                found = 1;
+            for (uint32_t k = 0; !found && k < ccnt; k++) {
+                if (part_idx_entry_key(cf, chsz, cesz, k, &emin, &ecnt) &&
+                    emin == want_min && ecnt == want_cnt)
+                    found = 1;
+            }
+            if (!found) { keep = b; break; }
+        }
+        fclose(cf);
+    }
+
+    if (keep == ts_cnt) goto done;                 /* already paired — no-op */
+
+    /* Republish ts.idx at `keep` entries.  Version and max_seq are preserved
+     * (write_idx_header emits V4 exactly when max_seq > 0), the .col bytes and
+     * every non-ts entry are left alone, so a later push re-lands the missing
+     * block and the partition heals upward. */
+    {
+        uint64_t new_total = 0;
+        int64_t  fmn = 0, fmx = 0;
+        for (uint32_t b = 0; b < keep; b++) {
+            const uint8_t *e = ts_entries + (size_t)b * ts_esz;
+            new_total += get_u32le(e + 12);
+            int64_t emin = get_i64le(e + 16), emax = get_i64le(e + 24);
+            if (b == 0 || emin < fmn) fmn = emin;
+            if (b == 0 || emax > fmx) fmx = emax;
+        }
+
+        char tmp_path[4200];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.retract.tmp", ts_idx_path);
+        FILE *w = fopen(tmp_path, "wb");
+        if (!w) { rc = TSDB_ERR_IO; goto done; }
+
+        uint8_t hdr[TSDB_IDX_HEADER_SIZE];
+        size_t  hsz = write_idx_header(hdr, keep, new_total, fmn, fmx, ts_mseq);
+        int io_ok = (fwrite(hdr, 1, hsz, w) == hsz);
+        if (io_ok && keep > 0) {
+            size_t n = (size_t)keep * ts_esz;
+            io_ok = (fwrite(ts_entries, 1, n, w) == n);
+        }
+        if (io_ok && fflush(w) != 0) io_ok = 0;
+        if (io_ok && ferror(w))      io_ok = 0;
+        if (io_ok && tsdb_part_fsync_fd(fileno(w)) != 0) io_ok = 0;
+        if (fclose(w) != 0) io_ok = 0;
+        if (!io_ok || rename(tmp_path, ts_idx_path) != 0) {
+            unlink(tmp_path);
+            rc = TSDB_ERR_IO;
+            goto done;
+        }
+        part_fsync_dir(part_dir);
+
+        fprintf(stderr,
+                "[part] %s: retracted %u unpaired ts block(s) (%u -> %u); the "
+                "rows are no longer counted, so the gap is visible to "
+                "anti-entropy instead of reading as an error forever\n",
+                part_dir, ts_cnt - keep, ts_cnt, keep);
+        if (out_retracted) *out_retracted = ts_cnt - keep;
+    }
+
+done:
+    tsdb_part_idx_unlock(part_dir);
+    free(ts_entries);
+    return rc;
 }
 
 /* ---- tsdb_part_t (read side) ------------------------------------------- */
@@ -1503,7 +1860,24 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
     uint32_t idx_decl_count[TSDB_MAX_COLS];
     for (int i = 0; i < s->ncols; i++) idx_decl_count[i] = 0;
 
-    for (int ci = 0; ci < s->ncols; ci++) {
+    /* Column read order must be the REVERSE of the write order (writers
+     * publish ts LAST), or a reader racing a concurrent publish samples
+     * val.idx at N and then ts.idx at N+1 and synthesises a HOLE for a block
+     * that is not missing at all — a transient TSDB_ERR_CORRUPT on a healthy
+     * partition.  Reading ts FIRST can only ever see ts <= the other columns,
+     * which the alignment pass treats as "already aligned".  Today this holds
+     * only by the accident of ts_col_idx == 0; make it explicit. */
+    int open_iter[TSDB_MAX_COLS];
+    int open_n = 0;
+    {
+        int tsc = s->ts_col_idx;
+        if (tsc >= 0 && tsc < s->ncols) open_iter[open_n++] = tsc;
+        for (int i = 0; i < s->ncols; i++)
+            if (i != tsc) open_iter[open_n++] = i;
+    }
+
+    for (int ix = 0; ix < open_n; ix++) {
+        int ci = open_iter[ix];
         /* ── Parquet-footer open order ──────────────────────────────────
          * 1. Read idx fully into a scratch buffer (idx is the atomic
          *    manifest — published via rename by col_writer_close).

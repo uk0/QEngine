@@ -248,8 +248,22 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
         uint32_t day = (uint32_t)strtoul(parts[pi], NULL, 10);
         if (strlen(parts[pi]) == 10) day = (uint32_t)(strtoull(parts[pi], NULL, 10) / 100);
 
+        /* Emit the TS column LAST, exactly like the flush path (part.c) and
+         * for the same reason: ts.idx is the partition's visibility marker, so
+         * a stream truncated mid-partition must leave the target BEHIND, never
+         * TORN.  Iterating schema order put ts FIRST (ts_col_idx is
+         * conventionally 0), which made a truncated or interrupted import a
+         * DETERMINISTIC multi-column hole rather than a race. */
+        int ci_iter[TSDB_MAX_COLS];
+        int ci_count = 0;
+        for (int ci = 0; ci < s->ncols; ci++)
+            if (ci != s->ts_col_idx) ci_iter[ci_count++] = ci;
+        if (s->ts_col_idx >= 0 && s->ts_col_idx < s->ncols)
+            ci_iter[ci_count++] = s->ts_col_idx;
+
         char col_col_path[4400];
-        for (int ci = 0; ci < s->ncols && rc == TSDB_OK; ci++) {
+        for (int ix = 0; ix < ci_count && rc == TSDB_OK; ix++) {
+            int ci = ci_iter[ix];
             tsdb_block_meta_t *metas = NULL; size_t nb = 0;
             if (tsdb_part_col_blocks(p, ci, &metas, &nb) != TSDB_OK) continue;
 

@@ -197,6 +197,80 @@ int tsdb_part_idx_probe(const char *idx_path,
                         int64_t *out_file_ts_min, int64_t *out_file_ts_max,
                         uint64_t *out_max_seq);
 
+/*
+ * Serialise the read-modify-write publish of any <col>.idx inside ONE
+ * partition directory.  Striped by a hash of part_dir over a fixed mutex
+ * table, so different partitions never contend.
+ *
+ * Every <col>.idx publish is a full read-modify-write (read all old entries,
+ * append, rewrite via tmp+fsync+rename).  Two of them running concurrently on
+ * the same file both read N and both write N+1: one entry is silently lost.
+ * When the loser is a NON-ts column and ts survives, that is exactly the
+ * multi-column hole this lock exists to prevent.  Both writers of an idx take
+ * it: col_writer_close (flush/compaction) and tsdb_rawblock_apply_ex
+ * (replication/migration).
+ *
+ * LOCK ORDER: innermost.  Never acquire compact_mtx, db->lock or batch_mu
+ * while holding it.  It is deliberately NOT compact_mtx: the raw-block hook
+ * fires from inside tsdb_part_flush_ex2 while the SENDER holds its own
+ * compact_mtx across a blocking RPC, so making the RECEIVER's applier take
+ * compact_mtx would let two nodes that flush-and-push to each other stall for
+ * the full replication timeout and then drop the block — a self-inflicted
+ * version of the very failure being fixed.  The sender never holds this lock
+ * during the hook (it is taken only around the idx RMW), so no cycle exists.
+ */
+void tsdb_part_idx_lock(const char *part_dir);
+void tsdb_part_idx_unlock(const char *part_dir);
+
+/*
+ * Commit test for the partition's visibility marker.
+ *
+ * Answers: may a ts block with key (ts_min, count) be published into this
+ * partition without creating a block the reader cannot pair?  The key is
+ * exactly the one exec.c's block matcher uses, and the accept/reject rule is
+ * exactly the classification tsdb_part_open's alignment pass applies, so a
+ * writer can never publish something the reader would refuse.
+ *
+ *   TSDB_OK        every non-ts column already carries this key, or has no
+ *                  blocks here at all in a partition that ts has already
+ *                  published into (ALTER TABLE ADD COLUMN — tsdb_part_open
+ *                  zero-fills those by design).
+ *   TSDB_ERR_BUSY  at least one column HAS blocks here but not this one, or a
+ *                  column has NO blocks in a partition ts has not published
+ *                  into either (a whole column's group never arrived, which
+ *                  reads back as fabricated zeros).  The caller must not
+ *                  publish.  out_missing_col (may be NULL) names the column.
+ *   TSDB_ERR_IO    a probe failed; treat as not-ready.
+ *
+ * Caller MUST hold tsdb_part_idx_lock(part_dir).  Returns TSDB_OK immediately
+ * for a single-column schema.
+ */
+int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
+                               int64_t ts_min, uint32_t count,
+                               char *out_missing_col, size_t cap);
+
+/*
+ * Repair an ALREADY-torn partition: lower <ts>.idx to the longest block
+ * PREFIX every column can pair with, republished via tmp+fsync+rename with the
+ * idx version and max_seq preserved (never downgrades V4).
+ *
+ * Forward-only and idempotent: a second call retracts 0.  Deletes NOTHING —
+ * the .col bytes and the non-ts idx entries beyond the new count stay on disk,
+ * so a later push re-lands the missing block through the existing dedup and
+ * the partition heals upward.  Lowering the visibility marker is what makes
+ * the gap visible to anti-entropy, which compares (count, max_ts) and is
+ * otherwise structurally blind to a missing value column.
+ *
+ * A column with ZERO entries in this partition is treated as an ALTER-added
+ * column (the same call the reader makes) and never forces a retraction.
+ *
+ * NOT called from tsdb_part_open: reads must not mutate.  Call it from a
+ * restart-time repair sweep or an operator tool.  *out_retracted (may be NULL)
+ * receives the number of ts blocks dropped.
+ */
+int tsdb_part_ts_retract_unpaired(tsdb_schema_t *s, const char *part_dir,
+                                  uint32_t *out_retracted);
+
 /* Opaque partition handle (for reading). */
 typedef struct tsdb_part tsdb_part_t;
 
