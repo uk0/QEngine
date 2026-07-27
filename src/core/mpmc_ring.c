@@ -12,8 +12,9 @@
  *
  * No ABA: seq is 64-bit and monotonically increasing.  No lock on the
  * fast path.  Only the optional parking uses a mutex+cv to avoid
- * spinning when full or empty — and only awakened threads take the
- * mutex.
+ * spinning when full or empty — a waker takes the PEER direction's
+ * mutex, and never while holding its own (see the LOCK ORDER RULE
+ * below and in mpmc_ring.h).
  */
 
 #include "mpmc_ring.h"
@@ -58,7 +59,30 @@ void tsdb_mpmc_destroy(tsdb_mpmc_ring_t *r) {
     pthread_cond_destroy (&r->item_cv);
 }
 
-int tsdb_mpmc_push_nb(tsdb_mpmc_ring_t *r, void *item) {
+/* ---- claim / wake split ---------------------------------------------
+ *
+ * LOCK ORDER RULE: no thread may hold prod_mu while acquiring cons_mu,
+ * nor cons_mu while acquiring prod_mu.  The ring transaction and the
+ * peer wake-up are therefore two separate steps:
+ *
+ *   *_claim()   runs the whole lock-free ring transaction and takes NO
+ *               mutex, so a blocking waiter may call it while holding
+ *               its own mutex.  It reports through *wake whether a peer
+ *               was parked at the moment the item (or the freed slot)
+ *               was published.
+ *   wake_*()    takes the PEER's mutex to signal.  Every caller has
+ *               released its own mutex first, so no thread is ever
+ *               holding both — the AB-BA cycle cannot form.
+ *
+ * The earlier version signalled the peer from inside *_nb(), and the
+ * blocking forms called *_nb() from inside their parked loop while
+ * holding their own mutex.  A blocking pusher then held prod_mu and
+ * wanted cons_mu while a blocking popper held cons_mu and wanted
+ * prod_mu — a deadlock reachable with one producer and one consumer.
+ */
+
+static int push_claim(tsdb_mpmc_ring_t *r, void *item, int *wake) {
+    *wake = 0;
     if (!r) return 0;
     uint64_t pos = atomic_load_explicit(&r->enq_pos, memory_order_relaxed);
     for (;;) {
@@ -72,15 +96,11 @@ int tsdb_mpmc_push_nb(tsdb_mpmc_ring_t *r, void *item) {
                     memory_order_relaxed, memory_order_relaxed)) {
                 slot->data = item;
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
-                /* Wake one parked consumer, if any.  Consumer uses
-                 * cons_mu; producer path never holds cons_mu so no
-                 * recursive-lock hazard. */
-                if (atomic_load_explicit(&r->parked_consumers,
-                                         memory_order_relaxed) > 0) {
-                    pthread_mutex_lock(&r->cons_mu);
-                    pthread_cond_signal(&r->item_cv);
-                    pthread_mutex_unlock(&r->cons_mu);
-                }
+                /* The item is published before we read parked_consumers,
+                 * so a consumer that parks after this point re-checks the
+                 * ring under cons_mu and finds it. */
+                *wake = atomic_load_explicit(&r->parked_consumers,
+                                             memory_order_relaxed) > 0;
                 return 1;
             }
             /* CAS failed, another producer got here — pos already
@@ -95,7 +115,8 @@ int tsdb_mpmc_push_nb(tsdb_mpmc_ring_t *r, void *item) {
     }
 }
 
-int tsdb_mpmc_pop_nb(tsdb_mpmc_ring_t *r, void **out) {
+static int pop_claim(tsdb_mpmc_ring_t *r, void **out, int *wake) {
+    *wake = 0;
     if (!r) return 0;
     uint64_t pos = atomic_load_explicit(&r->deq_pos, memory_order_relaxed);
     for (;;) {
@@ -110,12 +131,8 @@ int tsdb_mpmc_pop_nb(tsdb_mpmc_ring_t *r, void **out) {
                 slot->data = NULL;
                 atomic_store_explicit(&slot->seq, pos + r->mask + 1,
                                       memory_order_release);
-                if (atomic_load_explicit(&r->parked_producers,
-                                         memory_order_relaxed) > 0) {
-                    pthread_mutex_lock(&r->prod_mu);
-                    pthread_cond_signal(&r->space_cv);
-                    pthread_mutex_unlock(&r->prod_mu);
-                }
+                *wake = atomic_load_explicit(&r->parked_producers,
+                                             memory_order_relaxed) > 0;
                 return 1;
             }
         } else if (diff < 0) {
@@ -124,6 +141,33 @@ int tsdb_mpmc_pop_nb(tsdb_mpmc_ring_t *r, void **out) {
             pos = atomic_load_explicit(&r->deq_pos, memory_order_relaxed);
         }
     }
+}
+
+/* Callers MUST hold neither prod_mu nor cons_mu. */
+static void wake_consumers(tsdb_mpmc_ring_t *r) {
+    pthread_mutex_lock(&r->cons_mu);
+    pthread_cond_signal(&r->item_cv);
+    pthread_mutex_unlock(&r->cons_mu);
+}
+
+static void wake_producers(tsdb_mpmc_ring_t *r) {
+    pthread_mutex_lock(&r->prod_mu);
+    pthread_cond_signal(&r->space_cv);
+    pthread_mutex_unlock(&r->prod_mu);
+}
+
+int tsdb_mpmc_push_nb(tsdb_mpmc_ring_t *r, void *item) {
+    int wake = 0;
+    if (!push_claim(r, item, &wake)) return 0;
+    if (wake) wake_consumers(r);   /* holds no mutex here */
+    return 1;
+}
+
+int tsdb_mpmc_pop_nb(tsdb_mpmc_ring_t *r, void **out) {
+    int wake = 0;
+    if (!pop_claim(r, out, &wake)) return 0;
+    if (wake) wake_producers(r);   /* holds no mutex here */
+    return 1;
 }
 
 /* Compute a pthread absolute deadline `ms` milliseconds into the future. */
@@ -148,10 +192,13 @@ int tsdb_mpmc_push(tsdb_mpmc_ring_t *r, void *item, int timeout_ms) {
     atomic_fetch_add_explicit(&r->parked_producers, 1, memory_order_relaxed);
     for (;;) {
         /* Re-check after taking the mutex — a consumer could have
-         * signalled between our non-blocking try and the mutex. */
-        if (tsdb_mpmc_push_nb(r, item)) {
+         * signalled between our non-blocking try and the mutex.  Claim
+         * only: taking cons_mu here, under prod_mu, is the AB-BA. */
+        int wake = 0;
+        if (push_claim(r, item, &wake)) {
             atomic_fetch_sub_explicit(&r->parked_producers, 1, memory_order_relaxed);
-            pthread_mutex_unlock(&r->prod_mu);
+            pthread_mutex_unlock(&r->prod_mu);   /* drop ours first ... */
+            if (wake) wake_consumers(r);         /* ... then take theirs */
             return 1;
         }
         int rc;
@@ -178,9 +225,12 @@ int tsdb_mpmc_pop(tsdb_mpmc_ring_t *r, void **out, int timeout_ms) {
     pthread_mutex_lock(&r->cons_mu);
     atomic_fetch_add_explicit(&r->parked_consumers, 1, memory_order_relaxed);
     for (;;) {
-        if (tsdb_mpmc_pop_nb(r, out)) {
+        /* Claim only — taking prod_mu here, under cons_mu, is the AB-BA. */
+        int wake = 0;
+        if (pop_claim(r, out, &wake)) {
             atomic_fetch_sub_explicit(&r->parked_consumers, 1, memory_order_relaxed);
-            pthread_mutex_unlock(&r->cons_mu);
+            pthread_mutex_unlock(&r->cons_mu);   /* drop ours first ... */
+            if (wake) wake_producers(r);         /* ... then take theirs */
             return 1;
         }
         int rc;

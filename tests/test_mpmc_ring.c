@@ -5,9 +5,22 @@
  *   - fill to capacity, 1 more push fails, pop frees a slot, push OK
  *   - spsc burst of 10k items
  *
+ * Deadlock:
+ *   - [4] hammers blocking push against blocking pop on a cap-2 ring so
+ *     both directions park constantly.  Before the claim/wake split the
+ *     blocking forms took prod_mu and cons_mu in opposite orders and
+ *     this wedged AB-BA (pusher holds prod_mu wants cons_mu, popper
+ *     holds cons_mu wants prod_mu).
+ *
  * Stress:
  *   - 4 producers × 4 consumers each do 50k ops on a 1024-slot ring;
  *     total produced = total consumed, sums agree.
+ *
+ * A hang in this file used to be INVISIBLE.  stdout is block-buffered
+ * when the suite redirects it to a log, so a deadlocked process sat until
+ * the 300 s suite timeout and was killed having written zero bytes — the
+ * failure log was empty.  The watchdog below turns any hang into a loud
+ * stderr failure within WATCHDOG_STALL_MS, naming the phase that wedged.
  */
 
 #include "../src/core/mpmc_ring.h"
@@ -19,11 +32,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-#define PASS(msg) printf("PASS: %s\n", msg)
+#define PASS(msg) do { printf("PASS: %s\n", msg); fflush(stdout); } while (0)
+
+/* ---- Watchdog -------------------------------------------------------- */
+
+#define WATCHDOG_STALL_MS 20000  /* no progress this long == hung */
+#define WATCHDOG_TICK_MS  100
+#define HB_SLOTS          128    /* slots are spaced 8 apart == 1 per line */
+
+/* Per-thread heartbeat counters.  Threads only ever touch their own slot,
+ * so liveness reporting adds no contention to what is being measured. */
+static _Atomic unsigned long g_hb[HB_SLOTS];
+static _Atomic int           g_phase;
+static _Atomic int           g_wd_stop;
+
+static const char *const g_phase_name[] = {
+    "[0] startup",
+    "[1] basic push/pop",
+    "[2] invalid capacity",
+    "[3] blocking spsc",
+    "[4] AB-BA blocking push/pop hammer",
+    "[5] mpmc stress",
+    "[6] done",
+};
+
+#define HB(slot) atomic_fetch_add_explicit(&g_hb[(slot) & (HB_SLOTS - 1)], \
+                                           1UL, memory_order_relaxed)
+
+static unsigned long hb_sum(void) {
+    unsigned long s = 0;
+    for (int i = 0; i < HB_SLOTS; i++)
+        s += atomic_load_explicit(&g_hb[i], memory_order_relaxed);
+    return s;
+}
+
+static void set_phase(int p) {
+    atomic_store(&g_phase, p);
+    HB(0);              /* entering a phase counts as progress */
+    fflush(stdout);     /* so a redirected log is never empty */
+}
+
+static void *watchdog_main(void *arg) {
+    (void)arg;
+    unsigned long last = hb_sum();
+    int quiet_ms = 0;
+    while (!atomic_load(&g_wd_stop)) {
+        struct timespec tick = { 0, WATCHDOG_TICK_MS * 1000L * 1000L };
+        nanosleep(&tick, NULL);
+        unsigned long now = hb_sum();
+        if (now != last) { last = now; quiet_ms = 0; continue; }
+        quiet_ms += WATCHDOG_TICK_MS;
+        if (quiet_ms < WATCHDOG_STALL_MS) continue;
+
+        const char *phase = g_phase_name[atomic_load(&g_phase)];
+        /* stderr is unbuffered — this reaches the log even though the
+         * process is about to be torn down mid-flight. */
+        fprintf(stderr,
+                "\n*** WATCHDOG: no thread made progress for %d ms in phase "
+                "%s (heartbeat frozen at %lu).\n"
+                "*** This is a HANG, almost certainly the prod_mu/cons_mu "
+                "AB-BA deadlock.  Inspect with:\n"
+                "***     gdb -p %ld -batch -ex 'thread apply all bt'\n"
+                "FAIL: test_mpmc_ring hung in %s\n",
+                quiet_ms, phase, now, (long)getpid(), phase);
+        fflush(stderr);
+        fflush(stdout);
+        _exit(9);
+    }
+    return NULL;
+}
 
 static void t_basic(void) {
     printf("\n[1] basic push/pop\n");
+    set_phase(1);
     tsdb_mpmc_ring_t r;
     assert(tsdb_mpmc_init(&r, 4) == 0);
 
@@ -50,6 +134,7 @@ static void t_basic(void) {
 
 static void t_invalid_cap(void) {
     printf("\n[2] invalid capacity rejected\n");
+    set_phase(2);
     tsdb_mpmc_ring_t r;
     assert(tsdb_mpmc_init(&r, 0) == -1);
     assert(tsdb_mpmc_init(&r, 1) == -1);    /* too small */
@@ -82,6 +167,7 @@ static void *producer(void *arg) {
             sched_yield();
         }
         local_sum += v;
+        if ((i & 63) == 0) HB(1);
     }
     atomic_fetch_add(&g_produced_sum, local_sum);
     atomic_fetch_add(&g_producers_done, 1);
@@ -92,8 +178,10 @@ static void *consumer(void *arg) {
     (void)arg;
     uint64_t local_sum = 0;
     uint64_t local_count = 0;
+    uint64_t spins = 0;
     for (;;) {
         void *v = NULL;
+        if ((++spins & 63) == 0) HB(2);
         if (tsdb_mpmc_pop_nb(&g_ring, &v)) {
             local_sum   += (uint64_t)(uintptr_t)v;
             local_count += 1;
@@ -118,8 +206,9 @@ static void *consumer(void *arg) {
 }
 
 static void t_stress(void) {
-    printf("\n[3] stress: %d producers × %d consumers × %d ops\n",
+    printf("\n[5] stress: %d producers × %d consumers × %d ops\n",
            STRESS_PRODUCERS, STRESS_CONSUMERS, STRESS_PER_PROD);
+    set_phase(5);
     assert(tsdb_mpmc_init(&g_ring, STRESS_RING_CAP) == 0);
     atomic_store(&g_produced_sum, 0);
     atomic_store(&g_consumed_sum, 0);
@@ -162,12 +251,14 @@ static void *block_producer(void *arg) {
             fprintf(stderr, "block push timed out at %d\n", i);
             abort();
         }
+        if ((i & 63) == 0) HB(8);
     }
     return NULL;
 }
 
 static void t_blocking(void) {
-    printf("\n[4] blocking push/pop keeps pace without timeouts\n");
+    printf("\n[3] blocking push/pop keeps pace without timeouts\n");
+    set_phase(3);
     assert(tsdb_mpmc_init(&g_block_ring, 64) == 0);
 
     pthread_t tid;
@@ -181,17 +272,152 @@ static void t_blocking(void) {
         assert(ok);
         assert((uintptr_t)v == (uintptr_t)i);
         expected += (uint64_t)i;
+        if ((i & 63) == 0) HB(16);
     }
     pthread_join(tid, NULL);
     tsdb_mpmc_destroy(&g_block_ring);
     PASS("blocking spsc keeps FIFO order");
 }
 
+/* ---- [4] AB-BA hammer ------------------------------------------------
+ *
+ * Regression guard for the lock-order inversion between the two blocking
+ * directions.  A cap-2 ring with several threads pushing and several
+ * popping keeps BOTH sides parked essentially all the time, which is the
+ * only way the cycle closes: a parked pusher must wake, claim a slot and
+ * try to signal a consumer at the same moment a parked popper wakes,
+ * claims an item and tries to signal a producer.
+ *
+ * The per-call timeout does NOT mask a deadlock — a deadlocked thread is
+ * blocked in pthread_mutex_lock, which has no timeout.  It DOES mask a lost
+ * wakeup: a thread nobody signalled just wakes 250 ms later and carries on,
+ * so "the phase finished" is not by itself evidence that the wake half of
+ * the claim/wake split is present.  The timeout counters are that evidence,
+ * and ABBA_MAX_TIMEOUTS below is what turns them into a guard.
+ *
+ * Measured here, deleting or misdirecting only the wake:
+ *
+ *                    push+pop timeouts        wall time
+ *   correct          5, on 15 of 15 runs      4.3-4.7 s
+ *   wake deleted     17..37, 8 runs           4.3-4.7 s  <- INVISIBLE in time
+ *   wrong condvar    ~2500                     60-80 s
+ *
+ * The bound has to catch a mutant that costs no wall time at all, so wall
+ * time cannot be the guard.  The counter can be, because the two rows scale
+ * differently: the correct build's 5 is STRUCTURAL — ABBA_CONS-1 consumers
+ * each park once on the drained ring at the end — and does not grow with
+ * ABBA_PER_PROD, while a missing wake costs one timeout per park and grows
+ * linearly with it.  At 20k/producer the rows overlapped (correct 5, mutant
+ * 11-18, and one mutant run slipped under a bound of 10); at 100k they are
+ * 5 against 17..37, which is what pays for the extra ~3 s this phase costs.
+ *
+ * So: if a loaded machine ever trips this, re-measure all three rows before
+ * loosening the bound — the row that matters is the middle one, and raising
+ * ABBA_PER_PROD widens the gap where raising the bound only hides it. */
+
+#define ABBA_CAP      2
+#define ABBA_PROD     6
+#define ABBA_CONS     6
+#define ABBA_PER_PROD 100000
+#define ABBA_TIMEOUT  250       /* ms */
+#define ABBA_MAX_TIMEOUTS (ABBA_CONS + 4)   /* see the measurement table above */
+#define ABBA_TOTAL    ((uint64_t)ABBA_PROD * ABBA_PER_PROD)
+
+static tsdb_mpmc_ring_t g_abba_ring;
+static _Atomic uint64_t g_abba_sum;
+static _Atomic uint64_t g_abba_consumed;
+static _Atomic uint64_t g_abba_push_timeouts;
+static _Atomic uint64_t g_abba_pop_timeouts;
+
+static void *abba_producer(void *arg) {
+    int id = (int)(uintptr_t)arg;
+    int slot = 24 + 8 * id;
+    for (int i = 0; i < ABBA_PER_PROD; i++) {
+        /* Values are globally unique and cover 1..ABBA_TOTAL exactly. */
+        uint64_t v = (uint64_t)id * ABBA_PER_PROD + (uint64_t)i + 1;
+        while (!tsdb_mpmc_push(&g_abba_ring, (void *)(uintptr_t)v,
+                               ABBA_TIMEOUT)) {
+            atomic_fetch_add(&g_abba_push_timeouts, 1);
+            HB(slot);
+        }
+        HB(slot);
+    }
+    return NULL;
+}
+
+static void *abba_consumer(void *arg) {
+    int id = (int)(uintptr_t)arg;
+    int slot = 72 + 8 * id;
+    uint64_t sum = 0;
+    while (atomic_load(&g_abba_consumed) < ABBA_TOTAL) {
+        void *v = NULL;
+        if (tsdb_mpmc_pop(&g_abba_ring, &v, ABBA_TIMEOUT)) {
+            sum += (uint64_t)(uintptr_t)v;
+            atomic_fetch_add(&g_abba_consumed, 1);
+        } else {
+            atomic_fetch_add(&g_abba_pop_timeouts, 1);
+        }
+        HB(slot);
+    }
+    atomic_fetch_add(&g_abba_sum, sum);
+    return NULL;
+}
+
+static void t_abba(void) {
+    printf("\n[4] AB-BA: %d blocking producers × %d blocking consumers "
+           "× %d ops on a cap-%d ring\n",
+           ABBA_PROD, ABBA_CONS, ABBA_PER_PROD, ABBA_CAP);
+    set_phase(4);
+    assert(tsdb_mpmc_init(&g_abba_ring, ABBA_CAP) == 0);
+    atomic_store(&g_abba_sum, 0);
+    atomic_store(&g_abba_consumed, 0);
+    atomic_store(&g_abba_push_timeouts, 0);
+    atomic_store(&g_abba_pop_timeouts, 0);
+
+    pthread_t ptids[ABBA_PROD], ctids[ABBA_CONS];
+    for (uintptr_t i = 0; i < ABBA_PROD; i++)
+        pthread_create(&ptids[i], NULL, abba_producer, (void *)i);
+    for (uintptr_t i = 0; i < ABBA_CONS; i++)
+        pthread_create(&ctids[i], NULL, abba_consumer, (void *)i);
+
+    for (int i = 0; i < ABBA_PROD; i++) pthread_join(ptids[i], NULL);
+    for (int i = 0; i < ABBA_CONS; i++) pthread_join(ctids[i], NULL);
+
+    uint64_t got      = atomic_load(&g_abba_sum);
+    uint64_t consumed = atomic_load(&g_abba_consumed);
+    uint64_t want     = ABBA_TOTAL * (ABBA_TOTAL + 1) / 2;
+    printf("  consumed=%llu (expected %llu) sum=%llu (expected %llu) "
+           "push_timeouts=%llu pop_timeouts=%llu\n",
+           (unsigned long long)consumed, (unsigned long long)ABBA_TOTAL,
+           (unsigned long long)got, (unsigned long long)want,
+           (unsigned long long)atomic_load(&g_abba_push_timeouts),
+           (unsigned long long)atomic_load(&g_abba_pop_timeouts));
+    assert(consumed == ABBA_TOTAL);
+    assert(got == want);
+    /* Every parked thread must have been woken by a signal, not by its own
+     * timeout.  Without this the phase passes with the wake deleted. */
+    assert(atomic_load(&g_abba_push_timeouts) +
+           atomic_load(&g_abba_pop_timeouts) <= ABBA_MAX_TIMEOUTS);
+    tsdb_mpmc_destroy(&g_abba_ring);
+    PASS("blocking push and blocking pop interleave without deadlocking, "
+         "and each parked side is woken by a signal rather than a timeout");
+}
+
 int main(void) {
+    pthread_t wd;
+    set_phase(0);
+    pthread_create(&wd, NULL, watchdog_main, NULL);
+
     t_basic();
     t_invalid_cap();
     t_blocking();
+    t_abba();
     t_stress();
+
+    set_phase(6);
+    atomic_store(&g_wd_stop, 1);
+    pthread_join(wd, NULL);
     printf("\n=== all mpmc_ring tests passed ===\n");
+    fflush(stdout);
     return 0;
 }

@@ -52,10 +52,21 @@ typedef struct {
     uint64_t          mask;
     uint64_t          cap;
 
-    /* Optional parking — each direction uses its OWN mutex so a
-     * blocking popper's signal-to-producer path can't deadlock
-     * against itself.  parked_* counters are the only cross-mutex
-     * hand-off and are atomic. */
+    /* Optional parking — each direction has its own mutex + condvar.
+     *
+     * LOCK ORDER RULE: no thread may hold one of these mutexes while
+     * acquiring the other.  Per-direction mutexes on their own only
+     * rule out RECURSIVE self-locking; they do NOT rule out two threads
+     * taking the pair in opposite orders.  An earlier version signalled
+     * the peer from inside its own critical section and did exactly
+     * that: a blocking pusher held prod_mu and wanted cons_mu while a
+     * blocking popper held cons_mu and wanted prod_mu — AB-BA, and it
+     * hung with a single producer and a single consumer.  The ring
+     * transaction and the peer signal are now split so a waker always
+     * releases its own mutex before taking the peer's.
+     *
+     * parked_* counters are the only cross-mutex hand-off and are
+     * atomic. */
     pthread_mutex_t   prod_mu;    /* producers park here when full */
     pthread_cond_t    space_cv;
     pthread_mutex_t   cons_mu;    /* consumers park here when empty */
@@ -81,10 +92,23 @@ int  tsdb_mpmc_push_nb(tsdb_mpmc_ring_t *r, void *item);
 int  tsdb_mpmc_pop_nb (tsdb_mpmc_ring_t *r, void **out);
 
 /* Blocking push.  Parks on space_cv when full.  Returns 1 on success,
- * 0 on timeout (timeout_ms < 0 → wait forever, 0 → return-fast). */
+ * 0 on timeout (timeout_ms < 0 → wait forever, 0 → return-fast).
+ *
+ * USE A FINITE TIMEOUT.  The parked/wake hand-off is a Dekker pattern —
+ * one side publishes a slot then loads parked_*, the other increments
+ * parked_* then re-checks the ring — and it carries no fence between the
+ * two, so on a weakly-ordered machine the two loads can both miss.  With
+ * a finite timeout that costs one late wakeup; with timeout_ms < 0 the
+ * thread parks forever.  Measured on arm64: 3 runs in 10, on this code
+ * and on the version before the AB-BA fix alike, so the fix neither
+ * caused it nor cures it.  Closing it properly needs a seq_cst fence
+ * between the seq publish and the parked_* load, which would put an
+ * mfence on the _nb hot path that the reactor actually uses — not worth
+ * it while nothing in the tree calls the blocking forms.  Anyone wiring
+ * the reactor onto these: fix this first. */
 int  tsdb_mpmc_push   (tsdb_mpmc_ring_t *r, void *item, int timeout_ms);
 
-/* Blocking pop.  Parks on item_cv when empty. */
+/* Blocking pop.  Parks on item_cv when empty.  Same timeout caveat. */
 int  tsdb_mpmc_pop    (tsdb_mpmc_ring_t *r, void **out, int timeout_ms);
 
 /* Approximate count (for metrics / backpressure).  Not atomic-coherent
