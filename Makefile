@@ -113,6 +113,79 @@ TEST_SRCS += tests/test_idx_append_crash.c
 # tsdb_cluster_backfill_partition_from_result() ("local-unique rows ... are
 # replaced by the peer copy") went ELIGIBLE after 60 s of writing.
 TEST_SRCS += tests/test_ae_cold_gate_mtime.c
+
+# Backup set -> restore round trip, by VALUE, plus the two properties a
+# count(*) check cannot see: no block is duplicated on a replay, and a restore
+# killed mid-flight leaves the .tsdb_restore marker behind.  test_restore_crash
+# forks and _exit()s inside the restore, so it is a real process death.
+TEST_SRCS += tests/test_restore.c tests/test_restore_crash.c
+
+# The two rc=0-and-the-data-is-gone paths the restore reviewer reproduced: a
+# striped (TSDB_DATA_DIRS) database backing up / restoring through data dir 0
+# only, and the WAL-checkpoint stamp re-heading a legacy 40-byte-entry idx as
+# an 88-byte-entry one.  Both must be refused loudly, never answered wrongly.
+TEST_SRCS += tests/test_restore_multidir.c
+
+# The two rc=0-and-the-data-is-wrong paths found in the round-2 restore work.
+# test_restore_adv: a table nobody in this process opened still holds its acked
+# rows in the redo log under TSDB_WAL_ONLY_COMMIT, and tsdb_backup_create used
+# to flush only the OPENED tables — so it wrote complete=1 over rows=0.  It
+# forks and _exit()s without closing, so the crash is a real process death.
+# test_restore_adv2: a re-run of a finished restore after the DEFAULT compactor
+# rewrote the partition's block boundaries used to land every block a second
+# time; it drives tsdb_compactor_run_once with stock options, no test tuning.
+TEST_SRCS += tests/test_restore_adv.c tests/test_restore_adv2.c
+
+# tsdb_restore_verify against a database that is NOT a frozen copy of the set.
+# A source that kept ingesting used to be certified TSDB_ERR_CORRUPT (an intact
+# set, rows_backup=2000 vs rows_target=2700); the force-drain that made that
+# fire also published TARGET-side block boundaries — arming the re-run gate's
+# refusal on a later restore — and fired the cluster replication hook, so the
+# check shipped rows.  The third case pins the drain that must still happen:
+# a node whose acked rows are all in its redo log digests 0 against a manifest
+# of 2000, and the drain that answers it MUST replicate (a memtable flushes
+# exactly once).
+TEST_SRCS += tests/test_restore_verify_live.c
+
+# The fcacea4 zero-fill protection, asserted against a RESTORED data dir.  Every
+# partition tsdb_restore_run creates used to come out with ncols == 0 in its idx
+# header, so rule 2 of part_col_absence_is_late_add was gone and a trailing
+# column whose blocks the source had already lost read back as fabricated zeros
+# with rc=0 — where the source it was copied from answered TSDB_ERR_CORRUPT.
+# The two availability guards ride along: an ALTER-added column must still
+# zero-fill on the restored copy, and a claim the stream carries no blocks for
+# must not be stamped.
+TEST_SRCS += tests/test_restore_ncols.c
+
+# tsdb_restore_verify against a target the ENGINE refuses to read.
+# tsdb_migrate_digest counts `rows` over the ts column ONLY and `blocks` over
+# EVERY column, so a target that loses one value column's blocks keeps its rows
+# and drops blocks — bit for bit the signature the classification hands to
+# REENCODED ("nothing is missing").  The index level passed it and the deep
+# level DECLINED on that classification, so a database whose SELECT ts, val
+# answers TSDB_ERR_CORRUPT verified clean at BOTH levels.  The control cases
+# ride along: a purely re-encoded target must still verify clean (the false
+# alarm REENCODED exists to prevent), one compacted partition must not switch
+# off the per-block check for the partitions beside it, a deep level that
+# measured nothing must not answer clean, and a .seq sidecar claiming more
+# columns than the schema has must not be stamped.
+TEST_SRCS += tests/test_restore_verify_hole.c
+
+# The two ways tsdb_restore_verify still certified a database that had lost a
+# block.  (ts_min, count) is not a unique block identity — equal timestamps are
+# kept in insertion order and a flush splits on block_points — so the DEEP
+# level's UNCONSUMED first-match let one surviving block satisfy two stream
+# records: checked=4 missing=0 unresolved=0, a fully-resolved clean answer for
+# a column reading back half fabricated zeros.  And the hole axis was only
+# consulted on a block DEFICIT, which a target that kept ingesting can never
+# show, so the index level certified the same whole-column loss [H1] catches on
+# a quiesced node.  Two controls ride along: a faithful copy of an already-torn
+# SOURCE that out-grew its set is containment and must not be called corrupt,
+# and a byte rot on a partition the compactor never touched must not be
+# swallowed by a table-wide re-encode hypothesis.
+TEST_SRCS += tests/test_restore_verify_dup.c
+TEST_SRCS += tests/test_restore_verify_rot.c
+TEST_SRCS += tests/test_restore_verify_mult.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

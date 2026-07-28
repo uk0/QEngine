@@ -18,6 +18,20 @@
 # read against the same node.  Full restore-into-empty-dir is a follow-
 # up: needs an ephemeral docker node to swap data_dirs without touching
 # the prod cluster.
+#
+# TWO THINGS THIS SCRIPT USED TO GET WRONG, both fixed below:
+#
+#   - A table whose response did not parse was counted as SKIPPED and the
+#     phase passed on "no mismatches".  A restore where every single table
+#     errored therefore exited 0 — the check that was supposed to catch a
+#     bad restore was structurally incapable of failing on the worst one.
+#     Unqueryable is now an ERROR, and a phase that compared zero tables,
+#     or fewer than the manifest lists, fails too.
+#
+#   - Everything was count(*).  count(*) is answered from <ts>.idx alone,
+#     so a partition whose value columns did not survive still counts every
+#     row and reads them back as fabricated zeros.  Phase 8 compares the
+#     VALUES (sum/min/max) as well.
 
 set -u
 SSH=${SSH:-ssh root@10.88.51.102}
@@ -104,12 +118,26 @@ trunc=$(python3 -c "import json; print(json.load(open('$manifest'))['truncated']
 say "phase 5: compare manifest counts vs live counts (per table)"
 mismatches=0
 total=0
+errors=0
 while IFS=$'\t' read -r tbl mcount; do
   total=$((total+1))
   live=$(curl -s -b $CK -X POST "$BASE/sql" \
          -H 'Content-Type: application/json' \
          --data-binary "{\"q\":\"SELECT count(*) FROM $tbl\"}" \
-         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("rows",[[0]])[0][0])' 2>/dev/null)
+         | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get("rows",[[None]])[0][0])
+except Exception:
+    print("PARSE_ERR")
+' 2>/dev/null)
+  # A response that does not parse is a FAILED table, not a skipped one.
+  if [[ -z "$live" || "$live" == "None" || "$live" == "PARSE_ERR" ]]; then
+    errors=$((errors+1))
+    echo "    ✗ $tbl: live query returned nothing parseable"
+    continue
+  fi
   if [[ "$live" != "$mcount" ]]; then
     mismatches=$((mismatches+1))
     echo "    ✗ $tbl: manifest=$mcount  live=$live"
@@ -121,10 +149,12 @@ for t in m['tables']:
     if t.get('ok'):
         print(f\"{t['name']}\t{t['count']}\")")
 
-if (( mismatches == 0 )); then
+if (( total == 0 )); then
+  bad "phase 5 compared 0 tables — the manifest listed none as ok"
+elif (( mismatches == 0 && errors == 0 )); then
   ok "all $total tables: manifest count == live count"
 else
-  bad "$mismatches / $total tables diverged manifest vs live"
+  bad "$mismatches diverged, $errors unqueryable, out of $total tables (live)"
 fi
 
 # Specifically check our seeded table's bookkeeping survived round-trip.
@@ -232,10 +262,21 @@ ok "sidecar healthy on http://127.0.0.1:$HOST_PORT_HTTP"
 # misses: catalog rows that exist on the source but reference partition
 # files that didn't make it into the tar; WAL records the standalone
 # can't replay; schema mismatches across versions.
+#
+# A table whose response does not parse used to be counted as `side_skipped`
+# and the phase passed on side_mismatches == 0 alone — so a restore in which
+# EVERY table errored (a sidecar that boots but cannot read a single
+# partition) exited 0.  An unqueryable table IS the failure this phase exists
+# to catch: it is now side_errors, it fails the phase, and the phase also
+# fails if it compared nothing or lost a table on the way.
 say "phase 7: compare manifest counts vs restored sidecar counts"
 side_mismatches=0
 side_total=0
-side_skipped=0
+side_errors=0
+side_expected=$(python3 -c "
+import json
+m = json.load(open('$manifest'))
+print(sum(1 for t in m['tables'] if t.get('ok')))")
 while IFS=$'\t' read -r tbl mcount; do
   side_total=$((side_total+1))
   # ssh -n: detach stdin so the remote curl doesn't gobble the rest of
@@ -252,8 +293,9 @@ try:
 except Exception:
     print("PARSE_ERR")
 ' 2>/dev/null)
-  if [[ "$side_count" == "None" || "$side_count" == "PARSE_ERR" ]]; then
-    side_skipped=$((side_skipped+1))
+  if [[ -z "$side_count" || "$side_count" == "None" || "$side_count" == "PARSE_ERR" ]]; then
+    side_errors=$((side_errors+1))
+    echo "    ✗ $tbl: restored sidecar returned nothing parseable"
     continue
   fi
   if [[ "$side_count" != "$mcount" ]]; then
@@ -267,10 +309,14 @@ for t in m['tables']:
     if t.get('ok'):
         print(f\"{t['name']}\t{t['count']}\")")
 
-if (( side_mismatches == 0 )); then
-  ok "restored sidecar matches manifest: $side_total tables (skipped=$side_skipped)"
+if (( side_total == 0 )); then
+  bad "phase 7 compared 0 tables — nothing was actually verified"
+elif [[ "$side_total" != "$side_expected" ]]; then
+  bad "phase 7 compared $side_total tables, manifest lists $side_expected"
+elif (( side_mismatches == 0 && side_errors == 0 )); then
+  ok "restored sidecar matches manifest on all $side_total tables"
 else
-  bad "$side_mismatches / $side_total tables diverged on restored sidecar"
+  bad "$side_mismatches diverged, $side_errors unqueryable, out of $side_total tables (restored)"
 fi
 
 # Specifically: the seeded table came back via the ephemeral restore.
@@ -282,6 +328,44 @@ if [[ "$side_demo" == "100" ]]; then
   ok "bk_rt_demo restored count = 100"
 else
   bad "bk_rt_demo restored count got=$side_demo want=100"
+fi
+
+# ── Phase 8: the VALUES, not just the count ────────────────────
+# count(*) is answered from <ts>.idx alone.  A partition whose value columns
+# did not survive the tar still counts every row and reads them back as
+# fabricated zeros, so a count-only check passes on exactly the corruption
+# that matters most.  sum/min/max touch the value column itself.
+say "phase 8: compare bk_rt_demo VALUES (sum/min/max of v) live vs restored"
+VQ='{"q":"SELECT count(*), sum(v), min(v), max(v) FROM bk_rt_demo"}'
+agg_of() {  # $1 = curl prefix producing the JSON on stdout
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    r = d["rows"][0]
+    print("%s|%s|%s|%s" % (r[0], r[1], r[2], r[3]))
+except Exception:
+    print("PARSE_ERR")
+' 2>/dev/null
+}
+live_agg=$(curl -s -b $CK -X POST "$BASE/sql" \
+           -H 'Content-Type: application/json' --data-binary "$VQ" | agg_of)
+side_agg=$($SSH "curl -s -X POST http://127.0.0.1:$HOST_PORT_HTTP/sql \
+                 -H 'Content-Type: application/json' --data-binary '$VQ'" | agg_of)
+echo "    live=$live_agg"
+echo "    restored=$side_agg"
+# v was seeded as 1..100, so the aggregate is known independently of the source.
+want_agg="100|5050|1|100"
+if [[ "$live_agg" == "PARSE_ERR" || -z "$live_agg" ]]; then
+  bad "live value aggregate did not parse"
+elif [[ "$side_agg" == "PARSE_ERR" || -z "$side_agg" ]]; then
+  bad "restored value aggregate did not parse — the sidecar cannot read the values"
+elif [[ "$side_agg" != "$live_agg" ]]; then
+  bad "restored VALUES differ from live: $side_agg != $live_agg"
+elif [[ "$side_agg" != "$want_agg" ]]; then
+  bad "restored VALUES differ from the seed: $side_agg != $want_agg"
+else
+  ok "bk_rt_demo values survived the round trip ($side_agg)"
 fi
 
 # ── Cleanup ────────────────────────────────────────────────────

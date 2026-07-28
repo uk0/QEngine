@@ -38,6 +38,7 @@ const char *tsdb_errstr(int err) {
     case TSDB_ERR_PERMISSION:  return "permission denied";
     case TSDB_ERR_BUSY:        return "busy — prior op still pending";
     case TSDB_ERR_TIMEOUT:     return "query deadline elapsed";
+    case TSDB_ERR_INDETERMINATE: return "outcome unknown — not proven either way";
     default:                   return "unknown";
     }
 }

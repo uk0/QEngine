@@ -2513,6 +2513,17 @@ int tsdb_db_wal_only_commit(tsdb_db_t *db) {
     return db->wal_only_commit;
 }
 
+int tsdb_db_raise_commit_seq(tsdb_db_t *db, const char *table, uint64_t seq) {
+    if (!db || !table) return TSDB_ERR_INVAL;
+    tsdb_table_internal_t *t = tsdb_db_find_table(db, table);
+    if (!t) return TSDB_ERR_NOTFOUND;
+    /* Same lock redo_recover_table takes to publish the recovered value. */
+    pthread_mutex_lock(&t->compact_mtx);
+    if (seq > t->commit_seq) t->commit_seq = seq;
+    pthread_mutex_unlock(&t->compact_mtx);
+    return TSDB_OK;
+}
+
 /* Public wrapper: serialises concurrent batch_commit calls on the same
  * table by wrapping the full flush body (replicate + part_flush + clear)
  * in compact_mtx.  Without this, two callers both pass the rows>0 check,

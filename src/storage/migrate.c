@@ -28,6 +28,7 @@
 #include "db.h"
 #include "part.h"
 #include "schema.h"
+#include "migrate_internal.h"
 #include "../cluster/rawblock.h"
 #include "../core/symbol.h"
 
@@ -455,7 +456,7 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
  * under a reader: exec.c snapshots that pointer for the life of a query, and
  * the old code freed it.
  */
-static int mig_sym_adopt(tsdb_schema_t *s, int ci, const uint8_t *b, size_t len)
+int tsdb_migrate_symtab_adopt(tsdb_schema_t *s, int ci, const uint8_t *b, size_t len)
 {
     /* Wire bytes are a .sym file — see core/symbol.h for the layout. */
     uint32_t magic = 0, cnt = 0, hsz = 0;
@@ -634,7 +635,7 @@ sym_fail:
             tgt_schema->cols[ci].type != TSDB_TYPE_SYMBOL) continue;
         if (!sym_len[k]) continue;
 
-        rc = mig_sym_adopt(tgt_schema, ci, sym_buf[k], sym_len[k]);
+        rc = tsdb_migrate_symtab_adopt(tgt_schema, ci, sym_buf[k], sym_len[k]);
     }
     for (uint32_t k = 0; k < nsym; k++) free(sym_buf[k]);
     free(sym_col); free(sym_buf); free(sym_len);
@@ -735,6 +736,15 @@ int tsdb_migrate_digest(tsdb_db_t *db, const char *table, tsdb_mig_stats_t *out)
             tsdb_block_meta_t *metas = NULL; size_t nb = 0;
             if (tsdb_part_col_blocks(p, ci, &metas, &nb) != TSDB_OK) continue;
             for (size_t bi = 0; bi < nb; bi++) {
+                /* A HOLE is a ts block this column has no value for, and
+                 * tsdb_part_open has already ruled out the ALTER-added
+                 * explanation for it — tsdb_part_read_block answers
+                 * TSDB_ERR_CORRUPT here.  It has size 0, so `blocks` skips it
+                 * below and a lost column reads out of these counters as
+                 * "fewer blocks, same rows" — indistinguishable from a
+                 * compactor merge.  Count it on its own axis so the caller can
+                 * tell those two apart. */
+                if (metas[bi].flags & TSDB_BLOCK_FLAG_HOLE) st.holes++;
                 if (metas[bi].size == 0) continue;
                 st.blocks++;
                 if (ci == s->ts_col_idx) st.rows += metas[bi].count;

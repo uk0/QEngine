@@ -66,6 +66,13 @@ typedef struct {
     uint64_t rows;         /* summed block row counts                        */
     uint64_t payload_bytes;/* compressed block bytes, excluding framing      */
     uint64_t digest;       /* order-independent checksum, see below          */
+    /* DIGEST ONLY.  Block slots the reader refuses: a ts block for which some
+     * other column has no value and whose absence tsdb_part_open judged NOT to
+     * be an ALTER-added column (TSDB_BLOCK_FLAG_HOLE).  `blocks` cannot carry
+     * this — it counts a hole as simply not there, exactly like a block the
+     * compactor merged away, and those two are opposite answers.  See the
+     * classification in tsdb_restore_verify. */
+    uint64_t holes;
 } tsdb_mig_stats_t;
 
 /*

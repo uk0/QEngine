@@ -152,6 +152,19 @@ tsdb_iopolicy_t        tsdb_db_iopolicy(tsdb_db_t *db);
  * disk-level assertion — must tsdb_db_flush_all() first, and check it. */
 int                    tsdb_db_wal_only_commit(tsdb_db_t *db);
 
+/* Raise a table's redo commit sequence so no FUTURE record can be handed a seq
+ * a partition on disk already claims as durable.  Monotonic — never lowers.
+ *
+ * Needed by the restore path (storage/restore.c), which stamps a restored
+ * partition's idx with the checkpoint the SOURCE recorded.  Those numbers come
+ * from another table's counter, so a target that starts writing afterwards
+ * would give its first commits seqs at or below the stamp, and the next open's
+ * redo_recover_table would SKIP exactly those records for that partition —
+ * acked rows dropped, silently.  Defined in db.c. */
+int                    tsdb_db_raise_commit_seq(tsdb_db_t *db,
+                                                const char *table,
+                                                uint64_t seq);
+
 /* Monotonic flush counter — bumped once per successful memtable→disk
  * flush in flush_and_clear_locked.  Used by the compactor's adaptive
  * pause to back off while writes are hot.  Relaxed atomic; only the
