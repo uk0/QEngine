@@ -298,28 +298,40 @@ static void t_blocking(void) {
  * Measured here, deleting or misdirecting only the wake:
  *
  *                    push+pop timeouts        wall time
- *   correct          5, on 15 of 15 runs      4.3-4.7 s
- *   wake deleted     17..37, 8 runs           4.3-4.7 s  <- INVISIBLE in time
- *   wrong condvar    ~2500                     60-80 s
+ *   correct          5, every run             ~5 s
+ *   wake deleted     14..30                   ~5 s   <- INVISIBLE in wall time
+ *   wrong condvar    ~2500                    60-80 s
  *
  * The bound has to catch a mutant that costs no wall time at all, so wall
  * time cannot be the guard.  The counter can be, because the two rows scale
  * differently: the correct build's 5 is STRUCTURAL — ABBA_CONS-1 consumers
  * each park once on the drained ring at the end — and does not grow with
- * ABBA_PER_PROD, while a missing wake costs one timeout per park and grows
- * linearly with it.  At 20k/producer the rows overlapped (correct 5, mutant
- * 11-18, and one mutant run slipped under a bound of 10); at 100k they are
- * 5 against 17..37, which is what pays for the extra ~3 s this phase costs.
+ * ABBA_PER_PROD, while a missing wake costs one timeout per park and does.
+ * At 20k/producer the rows overlapped (correct 5, mutant 11-18, and one
+ * mutant run slipped under a bound of 10); at 100k they separate.
  *
- * So: if a loaded machine ever trips this, re-measure all three rows before
- * loosening the bound — the row that matters is the middle one, and raising
- * ABBA_PER_PROD widens the gap where raising the bound only hides it. */
+ * The third input is ABBA_TIMEOUT, and it is what makes the correct row hold
+ * under LOAD rather than merely at idle — see the note on it below.  At 250 ms
+ * a loaded machine produced 12 on a correct build, over the bound; at 1000 ms
+ * the same machine under 14 spinning hogs produced 5 on every run while the
+ * mutant stayed at 14..30.
+ *
+ * So if this ever trips, re-measure all three rows — idle AND loaded — before
+ * loosening the bound.  The row that matters is the middle one; raising
+ * ABBA_PER_PROD or ABBA_TIMEOUT widens the gap, raising the bound only hides it. */
 
 #define ABBA_CAP      2
 #define ABBA_PROD     6
 #define ABBA_CONS     6
 #define ABBA_PER_PROD 100000
-#define ABBA_TIMEOUT  250       /* ms */
+/* Long enough that a scheduler delay does not read as a lost wakeup.  At 250 ms
+ * a loaded machine produced push=1 pop=11 on a CORRECT build — over the bound —
+ * because a woken thread that is not scheduled within the timeout counts one
+ * just like a thread nobody signalled.  Lengthening the timeout suppresses that
+ * noise without touching the signal: a genuinely missing wake still costs the
+ * whole timeout, so the mutant's count is unchanged while the correct build's
+ * stays at its structural floor.  The cost is about a second of tail, once. */
+#define ABBA_TIMEOUT  1000      /* ms */
 #define ABBA_MAX_TIMEOUTS (ABBA_CONS + 4)   /* see the measurement table above */
 #define ABBA_TOTAL    ((uint64_t)ABBA_PROD * ABBA_PER_PROD)
 
