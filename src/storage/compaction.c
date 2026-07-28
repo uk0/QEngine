@@ -147,7 +147,8 @@ static void write_idx_entry(uint8_t *buf,
                             uint64_t offset, uint32_t size,
                             uint32_t count,
                             int64_t ts_min, int64_t ts_max,
-                            const tsdb_block_meta_t *stats)
+                            const tsdb_block_meta_t *stats,
+                            uint32_t ordinal)
 {
     memset(buf, 0, IDX_ENTRY_SZ);
     put_u64le(buf + 0,  offset);
@@ -164,6 +165,18 @@ static void write_idx_entry(uint8_t *buf,
         put_i64le(buf + 72, stats->stats_last);
         put_u16le(buf + 80, stats->stats_flags);
     }
+    /* Durable partition-local ordinal (part.h).  Compaction rewrites EVERY
+     * column of the partition over the same row space, so output block j of
+     * every column gets the same ordinal.  Stamping it is what keeps the re-cut
+     * blocks pairable: compaction does not disambiguate a duplicate-timestamp
+     * run, it re-creates the ambiguity at a coarser grain (64 x 1024 identical
+     * keys become 2 x 32768 identical keys).
+     *
+     * The caller passes ord_base + j, NOT j: the partition's ordinal space must
+     * never go BACKWARDS, or the next flush re-issues numbers a replica still
+     * holds for other rows.  See compact_partition. */
+    put_u32le(buf + 82, ordinal);
+    put_u16le(buf + 86, TSDB_IDX_ORD_MARK);
 }
 
 /*
@@ -245,6 +258,25 @@ static uint32_t live_idx_block_count(const char *part_dir, const char *col_name)
  * byte-identically to the ts column and stays pairable.  For the ts column
  * itself they are NULL and `out_ts_flat` receives the decoded array, which the
  * caller owns and frees.
+ *
+ * `pad_rows` is the number of leading rows of the partition this column has no
+ * value for — an ALTER-added column's pre-add rows, VERIFIED by
+ * compact_partition to be exactly that (a contiguous ordinal prefix) and
+ * nothing else.  Those rows read as the type's zero today (the zero-fill
+ * sentinel), so materialising them keeps the column's answer identical while
+ * putting it back on the partition's shared block grid.  Without it the
+ * re-cut is the B-case defect: the column's own row zero gets stamped with the
+ * PARTITION's first ts values and every read of it turns to CORRUPT.
+ *
+ * `force` compacts a column that is below the block threshold or already at the
+ * compacted block count.  compact_partition sets it once the ts column has
+ * produced: a partition has ONE block layout, so a column left on the old cut
+ * while ts is re-cut is unreadable, which is the other half of the B case.
+ *
+ * `ord_base` is the partition's next free durable ordinal; output block j is
+ * stamped ord_base + j.  Every column of one compaction gets the SAME base, so
+ * the re-cut blocks stay pairable, and the base is above everything the
+ * partition has issued, so the space never renumbers downward.
  */
 static int compact_column_file(const char *part_dir,
                                const char *col_name,
@@ -258,7 +290,10 @@ static int compact_column_file(const char *part_dir,
                                uint64_t   *out_bytes_saved,
                                int        *out_produced,
                                int        *out_eligible,
-                               uint32_t   *out_src_blocks)
+                               uint32_t   *out_src_blocks,
+                               size_t      pad_rows,
+                               int         force,
+                               uint32_t    ord_base)
 {
     char col_path[4096], idx_path[4096];
     char col_tmp[4096],  idx_tmp[4096];
@@ -321,7 +356,7 @@ static int compact_column_file(const char *part_dir,
     uint64_t total_rows  = get_u64le(hdr_buf + 12);
 
     /* Not enough blocks to bother compacting. */
-    if ((int)block_count < threshold) {
+    if (!force && (int)block_count < threshold) {
         fclose(idx_f);
         munmap(col_map, map_len);
         return TSDB_OK;
@@ -333,7 +368,7 @@ static int compact_column_file(const char *part_dir,
      * an infinite re-compaction loop (observed burning a core and churning
      * files on a steady-state cluster).  ceil(total_rows / COMPACT_BLOCK_POINTS)
      * is the post-compaction block count; skip once we are already there. */
-    if (total_rows > 0) {
+    if (!force && total_rows > 0) {
         uint64_t expected = (total_rows + COMPACT_BLOCK_POINTS - 1)
                             / (uint64_t)COMPACT_BLOCK_POINTS;
         if ((uint64_t)block_count <= expected) {
@@ -464,16 +499,18 @@ static int compact_column_file(const char *part_dir,
     /* ---- 4. Decode all blocks into a flat buffer -------------------------- */
 
     size_t val_width = tsdb_type_width(col_type);
-    size_t total_vals = (size_t)total_rows;
+    size_t total_vals = (size_t)total_rows + pad_rows;
 
-    uint8_t *raw_buf = malloc(total_vals * val_width);
+    /* calloc, not malloc: the leading `pad_rows` values are the zeros the
+     * pre-ALTER rows already read as, and they must BE zeros. */
+    uint8_t *raw_buf = calloc(total_vals ? total_vals : 1, val_width);
     if (!raw_buf) {
         free(infos);
         munmap(col_map, map_len);
         return TSDB_ERR_NOMEM;
     }
 
-    size_t out_pos = 0;
+    size_t out_pos = pad_rows;
     for (uint32_t b = 0; b < block_count; b++) {
         uint64_t off     = infos[b].offset;
         uint32_t data_sz = infos[b].data_sz;
@@ -668,7 +705,8 @@ static int compact_column_file(const char *part_dir,
         tsdb_block_meta_t bstats;
         tsdb_part_compute_block_stats(col_type, chunk_ptr, chunk, &bstats);
         write_idx_entry(ep, col_offset, (uint32_t)comp_bytes,
-                        (uint32_t)chunk, blk_ts_min, blk_ts_max, &bstats);
+                        (uint32_t)chunk, blk_ts_min, blk_ts_max, &bstats,
+                        ord_base + new_block_count);
         new_block_count++;
 
         col_offset    += BLK_HDR_SZ + (uint64_t)comp_bytes
@@ -788,6 +826,77 @@ nomem_err:
     return TSDB_ERR_NOMEM;
 }
 
+/* ---- Pre-pass: is every column on the partition's shared row prefix? -------
+ *
+ * A partition has ONE block layout shared by every column, and compaction
+ * re-cuts it.  Re-cutting is only meaningful if compaction knows WHICH rows of
+ * the partition each column holds — and (ts_min, count) cannot tell it, because
+ * on a duplicate-timestamp run every block of the run carries the same one.
+ * The durable ordinal can.
+ *
+ * Two shapes are safe to rewrite, and nothing else is:
+ *   FULL      the column's ordinals are ts's, one for one.
+ *   LATE ADD  the column's ordinals are a contiguous SUFFIX of ts's (ALTER
+ *             TABLE ADD COLUMN).  Its pre-add rows read as the type's zero
+ *             today, so compaction materialises exactly those zeros
+ *             (`pad_rows`) and the column lands back on the shared grid.
+ * Anything else — an interior loss, a reordered raw partition, a legacy column
+ * with no ordinal that is short — is VETOED: the partition stays uncompacted,
+ * which is always safe, instead of being rewritten around a guess.
+ */
+typedef struct {
+    uint32_t *ord;         /* effective ordinal per entry (position if legacy) */
+    uint32_t *cnt;         /* rows per entry                                   */
+    uint32_t  n;
+    uint64_t  rows;        /* sum of cnt                                       */
+    int       present;     /* the idx exists and declares entries              */
+} col_manifest_t;
+
+static void manifest_free(col_manifest_t *m) {
+    free(m->ord); free(m->cnt); memset(m, 0, sizeof(*m));
+}
+
+/* 1 on success (n == 0 when the column has no idx here), 0 on a read error. */
+static int read_col_manifest(const char *part_dir, const char *col,
+                             col_manifest_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    char idx_path[4200];
+    snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, col);
+
+    uint32_t cnt = 0, esz = 0;
+    int hsz = tsdb_part_idx_probe(idx_path, NULL, &cnt, &esz,
+                                  NULL, NULL, NULL, NULL);
+    if (hsz < 0) return 0;                 /* corrupt — do not guess */
+    if (hsz == 0 || cnt == 0 || esz == 0) return 1;   /* absent: n stays 0 */
+
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return 0;
+    out->ord = malloc((size_t)cnt * sizeof(uint32_t));
+    out->cnt = malloc((size_t)cnt * sizeof(uint32_t));
+    if (!out->ord || !out->cnt) { fclose(f); manifest_free(out); return 0; }
+
+    uint8_t e[TSDB_IDX_ENTRY_SIZE];
+    size_t want = (esz < sizeof(e)) ? (size_t)esz : sizeof(e);
+    int ok = 1;
+    for (uint32_t i = 0; i < cnt && ok; i++) {
+        if (fseek(f, (long)((uint64_t)hsz + (uint64_t)i * esz), SEEK_SET) != 0 ||
+            fread(e, 1, want, f) != want) { ok = 0; break; }
+        uint32_t o = i;                                  /* LEGACY: position */
+        if (want >= TSDB_IDX_ENTRY_SIZE && get_u16le(e + 86) == TSDB_IDX_ORD_MARK)
+            o = get_u32le(e + 82);
+        out->ord[i] = o;
+        out->cnt[i] = get_u32le(e + 12);
+        out->rows  += out->cnt[i];
+    }
+    fclose(f);
+    if (!ok) { manifest_free(out); return 0; }
+    out->n = cnt;
+    out->present = 1;
+    return 1;
+}
+
 /* ---- compact_partition ---------------------------------------------------- */
 
 /*
@@ -806,7 +915,108 @@ static int compact_partition(tsdb_schema_t   *schema,
 
     int *produced = calloc((size_t)schema->ncols, sizeof(int));
     uint32_t *src_blocks = calloc((size_t)schema->ncols, sizeof(uint32_t));
-    if (!produced || !src_blocks) { free(produced); free(src_blocks); return TSDB_ERR_NOMEM; }
+    size_t *pad_rows = calloc((size_t)schema->ncols, sizeof(size_t));
+    if (!produced || !src_blocks || !pad_rows) {
+        free(produced); free(src_blocks); free(pad_rows); return TSDB_ERR_NOMEM;
+    }
+
+    /* The partition's NEXT FREE ordinal, computed below from the manifests the
+     * pre-pass already reads.  Compaction re-cuts N blocks into fewer, larger
+     * ones; stamping the output index with 0..k renumbered the space DOWNWARD,
+     * so the next local flush re-issued numbers this partition had already
+     * bound to other rows and the reader paired the wrong blocks.  Continuing
+     * past everything the partition has issued keeps it monotone.
+     *
+     * That is now the WHOLE requirement, and it is a purely LOCAL one.  It used
+     * to have to be a cross-node one as well — and could not be, because
+     * compaction is node-local and is never replicated, so whichever direction
+     * this renumbered in collided with the other node's space.  Ingest
+     * translates instead (tsdb_part_ord_translate): no number issued here ever
+     * reaches another node's index, and none of theirs reaches this one. */
+    uint32_t ord_base = 0;
+
+    /* ---- Pre-pass: classify every column against the ts column's ordinals --
+     * See the note above read_col_manifest.  A partition that fails this is
+     * left alone entirely; that costs space, whereas rewriting it around a
+     * guess costs values. */
+    {
+        int ts_ci = schema->ts_col_idx;
+        col_manifest_t tsm;
+        int ok = (ts_ci >= 0 && ts_ci < schema->ncols) &&
+                 read_col_manifest(part_dir, schema->cols[ts_ci].name, &tsm);
+        if (!ok || tsm.n == 0) {
+            /* No readable ts manifest — nothing here defines the row space, so
+             * nothing may be re-cut against it. */
+            if (ok) manifest_free(&tsm);
+            free(produced); free(src_blocks); free(pad_rows);
+            return TSDB_OK;
+        }
+        /* Floor at the ts block count: read_col_manifest already reports a
+         * legacy unmarked entry's POSITION as its ordinal, so this is
+         * max(effective ordinal) + 1 over the whole partition. */
+        ord_base = tsm.n;
+        for (uint32_t i = 0; i < tsm.n; i++)
+            if (tsm.ord[i] + 1u > ord_base) ord_base = tsm.ord[i] + 1u;
+
+        int veto = 0;
+        for (int ci = 0; ci < schema->ncols && !veto; ci++) {
+            if (ci == ts_ci) continue;
+            col_manifest_t cm;
+            if (!read_col_manifest(part_dir, schema->cols[ci].name, &cm)) {
+                veto = 1; break;
+            }
+            if (cm.n == 0) { manifest_free(&cm); continue; }   /* absent */
+
+            /* A non-ts column can legitimately sit ABOVE ts's highest ordinal —
+             * a flush that published it and then crashed before ts leaves
+             * exactly that.  Re-issuing those ordinals would collide. */
+            for (uint32_t i = 0; i < cm.n; i++)
+                if (cm.ord[i] + 1u > ord_base) ord_base = cm.ord[i] + 1u;
+
+            int full = (cm.n == tsm.n);
+            for (uint32_t i = 0; full && i < cm.n; i++)
+                if (cm.ord[i] != tsm.ord[i] || cm.cnt[i] != tsm.cnt[i]) full = 0;
+
+            if (!full) {
+                int suffix = (cm.n < tsm.n);
+                uint32_t nmiss = suffix ? (tsm.n - cm.n) : 0;
+                for (uint32_t k = 0; suffix && k < cm.n; k++)
+                    if (cm.ord[k] != tsm.ord[nmiss + k] ||
+                        cm.cnt[k] != tsm.cnt[nmiss + k]) suffix = 0;
+                if (suffix) {
+                    uint64_t pad = 0;
+                    for (uint32_t k = 0; k < nmiss; k++) pad += tsm.cnt[k];
+                    pad_rows[ci] = (size_t)pad;
+                } else {
+                    fprintf(stderr,
+                            "[compact] %s: column %s does not sit on the "
+                            "partition's shared row prefix (%u blocks against "
+                            "ts's %u); leaving the partition uncompacted rather "
+                            "than re-cutting it around a guess\n",
+                            part_dir, schema->cols[ci].name, cm.n, tsm.n);
+                    veto = 1;
+                }
+            }
+            manifest_free(&cm);
+        }
+        manifest_free(&tsm);
+        if (veto) { free(produced); free(src_blocks); free(pad_rows); return TSDB_OK; }
+
+        /* And never below the one allocator every other writer of this
+         * partition uses, which also accounts for ordinals reserved by a
+         * received block group whose ts has not been published yet — those are
+         * durable in the map but not yet visible in any manifest.
+         *
+         * NO TEST COVERS THIS FLOOR, and it is kept anyway.  The pre-pass above
+         * already maxes over every column's recorded ordinals, so the only value
+         * this can ADD is the ordmap high-water — an ordinal recorded and then
+         * lost to a crash before its block landed, which no fixture produces.
+         * What it buys is that all three allocators (flush, compaction, the
+         * applier) go through ONE function, which is the invariant; a second
+         * hand-rolled max is a second thing to keep in step. */
+        uint32_t nx = tsdb_part_next_ordinal(schema, part_dir);
+        if (nx > ord_base) ord_base = nx;
+    }
 
     /* Phase 1 — re-encode each eligible column to .col.tmp/.idx.tmp.  No lock:
      * this only reads the live files and writes new .tmp files.  This is the
@@ -827,6 +1037,11 @@ static int compact_partition(tsdb_schema_t   *schema,
         int prod = 0, elig = 0;
         uint32_t srcb = 0;
         int is_ts = (ci == schema->ts_col_idx);
+        /* ts decides for the partition.  If it did not produce, the layout is
+         * not changing and no sibling may change either — a column re-cut
+         * against a ts that stayed put is unreadable.  Once it HAS produced,
+         * every present sibling must follow, threshold or not. */
+        if (!is_ts && !produced[schema->ts_col_idx]) break;
         int rc = compact_column_file(part_dir,
                                      schema->cols[ci].name,
                                      schema->cols[ci].type,
@@ -835,7 +1050,10 @@ static int compact_partition(tsdb_schema_t   *schema,
                                      is_ts ? 0    : ts_flat_n,
                                      is_ts ? &ts_flat : NULL,
                                      is_ts ? &ts_flat_n : NULL,
-                                     &bw, &bs, &prod, &elig, &srcb);
+                                     &bw, &bs, &prod, &elig, &srcb,
+                                     is_ts ? 0 : pad_rows[ci],
+                                     is_ts ? 0 : 1,
+                                     ord_base);
         if (rc == TSDB_OK && prod) {
             produced[ci]   = 1;
             src_blocks[ci] = srcb;
@@ -954,6 +1172,7 @@ static int compact_partition(tsdb_schema_t   *schema,
 
     free(produced);
     free(src_blocks);
+    free(pad_rows);
     free(ts_flat);
     if (any_compacted && stats) {
         stats->parts_merged++;

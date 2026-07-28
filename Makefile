@@ -186,6 +186,93 @@ TEST_SRCS += tests/test_restore_verify_hole.c
 TEST_SRCS += tests/test_restore_verify_dup.c
 TEST_SRCS += tests/test_restore_verify_rot.c
 TEST_SRCS += tests/test_restore_verify_mult.c
+
+# Duplicate-timestamp block identity.  (ts_min, ts_max, count) is NOT a unique
+# key: equal timestamps are kept in insertion order and a flush cuts a
+# partition into independent block_points chunks, so two full chunks of one
+# repeated timestamp are genuinely distinct blocks with an identical key.
+# Every path that paired or deduplicated by that content key mispaired or
+# silently dropped data; these four cover the scan/stats/bloom read paths, the
+# replication applier, the migrate importer and the compactor.
+TEST_SRCS += tests/test_dup_ts_block_pair.c
+TEST_SRCS += tests/test_dup_ts_readpaths.c
+TEST_SRCS += tests/test_dup_ts_rawblock.c
+TEST_SRCS += tests/test_dup_ts_compaction.c
+
+# Where the ordinal comes from and who may believe it — the failures that do
+# NOT involve duplicate timestamps: compaction renumbering the space downward
+# (which then stalls replication permanently), a replica trusting a remote
+# ordinal as proof of re-delivery, a legacy entry being handed its physical
+# position as its ordinal (which breaks the repair push it exists for), a legacy
+# ts prefix disabling ordinal pairing forever — making an ALTER performed by
+# THIS binary unreadable — plus [O8] an ordinal carried without its ISSUER (two
+# shards of one synchronised ingest write the same timestamp grid, both number
+# from 0, and their ts blocks are byte-identical, so the second sender's group
+# was ACKed and destroyed) and [O9] a repeated content key on the COLUMN side
+# being treated as ambiguity, which made the whole column unreadable forever.
+TEST_SRCS += tests/test_block_ordinal_space.c
+
+# The anti-entropy backfill is the one writer that renumbers a partition's
+# ordinal space DOWNWARD: it rebuilds from a peer's row set in an empty scratch
+# dir, so the new blocks are stamped 0..k-1, and only the .col/.idx pairs are
+# swapped.  A surviving <part>/.ordmap then maps every sender's group onto the
+# OLD numbering, where local ordinal N now names different rows, and the next
+# delivery of that group overwrites a just-restored block with the sender's
+# values at rc=0.
+TEST_SRCS += tests/test_backfill_ordmap.c
+
+# Compaction on ONE side of a replication pair — the direction neither [O1] nor
+# [O2] covers, and the one that decided round 3.  Every node runs a compactor
+# unconditionally and nothing marks a partition as replicated, so a REPLICA
+# compacts a replicated partition while the primary keeps flushing into it.  Both
+# cross-node numbering rules failed here in opposite directions; ingest
+# translation is what makes the two ordinal spaces independent.  Production
+# threshold (min_blocks_to_compact = 0 -> 16), no test tuning.
+TEST_SRCS += tests/test_replica_compact.c
+
+# tsdb_part_ts_retract_unpaired against a LEGACY unmarked index whose column is
+# SHORT — which is what an ALTER-added column always looks like.  On an unmarked
+# index the effective ordinal IS the position, so an ordinal-only pairing test
+# collapses to "same position" and the repair truncated a perfectly whole
+# partition: measured count(*) 5120 -> 2048 with repeating timestamps and
+# 5120 -> 0 with unique ones, permanently, because no push is coming for a
+# locally added column.
+TEST_SRCS += tests/test_retract_short_column.c
+
+# The documented repair path on a partition an OLDER binary wrote — i.e. every
+# partition in an existing fleet.  One value column's files are lost and an
+# upgraded sender re-syncs THAT COLUMN block by block, which is the applier's
+# only repair granularity and literally what the engine's own error message
+# tells the operator to do.  With no <part>/.ordmap the translation allocates
+# FRESH local ordinals, whose legacy floor is ts.idx's ENTRY COUNT, so the
+# repaired column is numbered disjointly from ts's invented positions: every
+# push returns TSDB_OK, anti-entropy sees a healthy partition, and the column
+# reads TSDB_ERR_CORRUPT forever.  Written to compile and behave natively on
+# 9dab5a2 too (everything new is behind TSDB_IDX_ORD_MARK), so the two trees
+# can be compared directly.
+TEST_SRCS += tests/test_adv_repair_portable.c
+
+# ts_max is only evidence on an entry that carries the durable ordinal.  A
+# LEGACY value entry can be a tick wider than its ts partner — the range borrow
+# in the compaction this same change fixes — and demanding ts_max on bytes
+# written before the marker turns a column pristine answers CORRECTLY into a
+# permanent TSDB_ERR_CORRUPT that nothing can re-stamp.  [B1] the borrow where
+# the writer left it, [B2] the same after a reorder so the positional fast path
+# cannot fire and the content rule has to place it, [B3] the guard that relaxing
+# it does NOT resurrect first-match on an all-equal-timestamp run.  Portable to
+# 9dab5a2, where B1/B2 pass and B3 is the original bug.
+TEST_SRCS += tests/test_legacy_range_borrow.c
+
+# The repair, run against a partition whose placement is NOT recoverable: legacy
+# on both sides, repeating ts keys, short column.  Unavailable is the right
+# answer and there is no healing path — the information does not exist.  What
+# the re-sync must not do is make it worse: its pushes APPEND marked entries
+# beside the unmarked survivors, and a purely positional pairing then served a
+# re-delivered copy of block 0 as ts block 2's answer — rc=0 rows=3072
+# sum=2622976 against an intact 4720128, a refusal turned into a silent wrong
+# answer by the repair the error message asks for.
+TEST_SRCS += tests/test_repair_into_ambiguous.c
+TEST_SRCS += tests/test_ordmap_torn.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

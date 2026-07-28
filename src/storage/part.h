@@ -109,6 +109,20 @@ extern "C" {
  *                TSDB_ERR_CORRUPT rather than fabricating one. */
 #define TSDB_BLOCK_FLAG_HOLE      (1u << 4)
 
+/* IN-MEMORY ONLY, same rules as HOLE above.  The third kind of "this column has
+ * no usable block here": the slot's ORDINAL paired with the ts block's, but the
+ * entry it named describes different rows (count/ts_min/ts_max disagree).  That
+ * is structural corruption of the block index, not a missing block, and a
+ * caller acts on it differently — a HOLE is repaired by re-syncing the column,
+ * a mismatch says the two indexes disagree about what the partition contains.
+ * Kept apart so the read path can name it (COLPAIR_MISMATCH in query/exec.c)
+ * instead of describing it as a short column. */
+#define TSDB_BLOCK_FLAG_MISMATCH  (1u << 5)
+
+/* Both of the above mean "offset == UINT64_MAX carries no value to serve", as
+ * opposed to the ALTER zero-fill sentinel which does. */
+#define TSDB_BLOCK_FLAG_NO_VALUE  (TSDB_BLOCK_FLAG_HOLE | TSDB_BLOCK_FLAG_MISMATCH)
+
 /* Index header sizes.
  *   V1 = legacy (no zone map)
  *   V2 = adds file-level ts zone map
@@ -128,6 +142,42 @@ extern "C" {
 /* Stats payload (bytes 40..87 of a V3 BlockIndexEntry) — see comment at
  * the top of part.c for full layout. */
 #define TSDB_IDX_STATS_BYTES  48u
+
+/* ---- Durable block ordinal (entry bytes [82..87]) --------------------------
+ *
+ * A block's CONTENT — (ts_min, ts_max, count) — is not a key.  Equal timestamps
+ * are kept in insertion order and a flush cuts a partition into independent
+ * block_points chunks, so two full chunks of one repeated timestamp are
+ * genuinely different blocks with a byte-identical key.  Every path that paired
+ * or deduplicated on that key therefore mispaired or silently dropped data.
+ *
+ * The identity is now DURABLE: each entry records the block's PARTITION-LOCAL
+ * ordinal — its position in the partition's ts block sequence, shared by every
+ * column of the same rows — in the six bytes the V3 entry already reserved:
+ *
+ *   [82..85]  ordinal u32
+ *   [86..87]  marker  u16 == TSDB_IDX_ORD_MARK when [82..85] is meaningful
+ *
+ * No entry-size change and no idx version bump: the bytes were reserved and
+ * written as zero by every previous writer, and a marker of 0 is exactly the
+ * "this entry predates the ordinal" state.  Note the marker lives in the ENTRY;
+ * the column-count stamp (below) lives in the HEADER at [10..11] — different
+ * fields, different writers, neither disturbs the other.  An OLD binary never
+ * reads [82..87], so it ignores the ordinal entirely and keeps behaving exactly
+ * as it does today. */
+#define TSDB_IDX_ORD_MARK  0x4F52u   /* 'R','O' little-endian — "ordinal recorded" */
+
+/* One block's durable ordinal.  `mark == TSDB_IDX_ORD_MARK` means `v` is
+ * meaningful; mark == 0 (the all-zero / memset default) means UNKNOWN — a
+ * legacy entry, or a sender that predates the field.  Kept as a struct so a
+ * copy between a meta and a wire push is a single assignment that cannot
+ * forget half of the pair. */
+typedef struct {
+    uint32_t v;
+    uint16_t mark;
+} tsdb_block_ord_t;
+
+#define TSDB_ORD_KNOWN(o)  ((o).mark == TSDB_IDX_ORD_MARK)
 
 /* Column-stats flag bits (bytes 80..81 of a V3 entry, little-endian u16). */
 #define TSDB_STATS_HAS_MIN_MAX    0x0001u
@@ -161,6 +211,14 @@ typedef struct {
     int64_t  stats_first;
     int64_t  stats_last;
     uint16_t stats_flags;
+
+    /* Durable partition-local ordinal (entry bytes [82..87], see above).
+     * tsdb_part_open leaves this UNKNOWN for a legacy entry.  After the
+     * alignment pass every column's array is 1:1 with the ts column's, so the
+     * reader addresses a sibling by ARRAY POSITION and only validates the
+     * content — the ordinal itself is what tsdb_part_open aligned with, and
+     * what the replication / migration paths carry over the wire. */
+    tsdb_block_ord_t ord;
 } tsdb_block_meta_t;
 
 /*
@@ -287,6 +345,95 @@ void tsdb_part_idx_unlock(const char *part_dir);
 int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
                                int64_t ts_min, uint32_t count,
                                char *out_missing_col, size_t cap);
+
+/*
+ * The partition's NEXT FREE ordinal in THIS NODE's space: max(effective
+ * ordinal) + 1 over every column's idx, and over the remote-ordinal map's
+ * durable high-water.  0 for a partition that holds nothing.
+ *
+ * Every allocator of an ordinal — the flush, compaction, the replication
+ * applier — goes through this one function, so the space stays monotone and
+ * collision-free for the partition's LIFETIME.  Monotone locally is all it has
+ * to be; see tsdb_part_ord_translate.
+ *
+ * Reads files without locking.  Callers that need it exclusive hold
+ * tsdb_part_idx_lock(part_dir); the flush does not, exactly as it did not
+ * before, so a flush racing an applier for the same partition can still land on
+ * one number twice (last entry wins on the read side, no rows lost).
+ */
+uint32_t tsdb_part_next_ordinal(const tsdb_schema_t *s, const char *part_dir);
+
+/*
+ * Map a SENDER's partition-local block ordinal into THIS node's ordinal space.
+ *
+ * The ordinal names a block group inside ONE partition on ONE node.  It is not,
+ * and cannot be made into, a cross-node identity: every node compacts
+ * independently and never replicates the result, and the receiver's own flush
+ * allocates out of the same range, so a number issued elsewhere means nothing
+ * here.  Believing one is how a replica-side compaction came to consume exactly
+ * the ordinals the primary was about to issue.
+ *
+ * The mapping is keyed on (ISSUER, remote ordinal, ts_min, ts_max, count).  The
+ * last four are the fields every column of one flush block carries identically,
+ * so every column of a group translates to the SAME local ordinal and the group
+ * stays pairable.  `issuer` scopes them to the node that issued the ordinal:
+ * without it, two senders flushing the same timestamp grid into one table+day
+ * both start at ordinal 0, their groups collapse onto one local ordinal, and the
+ * second sender's ts block — byte-identical to the first — is ACKed and
+ * discarded as a re-delivery while its value block silently overwrites the
+ * first's.  Pass the sending node's id; 0 means "this node's own stream" (the
+ * migration importer and the restore replay, which have exactly one source).
+ *
+ * It is durable (<part>/.ordmap) and is recorded BEFORE the block is written,
+ * so a crash costs a skipped ordinal, never a second identity for one group.
+ *
+ * `remote.mark == 0` (a sender predating the field) yields an unknown local
+ * ordinal and records nothing: there is no identity to translate.
+ *
+ * Caller MUST hold tsdb_part_idx_lock(part_dir).
+ * Returns TSDB_ERR_CORRUPT if a map exists here that this build cannot read,
+ * and TSDB_ERR_IO if the record could not be made durable — in both cases the
+ * caller must write nothing and let the sender retry.
+ */
+int tsdb_part_ord_translate(const tsdb_schema_t *s, const char *part_dir,
+                            uint64_t issuer, tsdb_block_ord_t remote,
+                            int64_t ts_min, int64_t ts_max, uint32_t count,
+                            tsdb_block_ord_t *out_local);
+
+/*
+ * Drop this partition's remote-ordinal map.
+ *
+ * For the ONE writer that does not extend the partition's ordinal space but
+ * REPLACES it: tsdb_cluster_backfill_partition_from_result rebuilds a partition
+ * from a peer's row set in an empty scratch dir, so the rebuilt blocks are
+ * stamped 0..k-1 and every previously-issued local ordinal now names rows that
+ * are no longer there.  A mapping onto the old numbering does not survive that
+ * in any meaningful form — the rows behind local ordinal N are simply not the
+ * rows the sender's group N holds any more — so the map is removed rather than
+ * rewritten, and the next delivery of each group allocates a fresh ordinal and
+ * lands as a new group.
+ *
+ * Removing it can only cost a re-delivered group a second local ordinal (an
+ * over-count anti-entropy can see); keeping it costs the sender's rows.
+ */
+void tsdb_part_ord_reset(const char *part_dir);
+
+/*
+ * As tsdb_part_ts_publish_ready, but tested on the block's DURABLE ORDINAL.
+ *
+ * (ts_min, count) is not a key: on a duplicate-timestamp run every block of the
+ * run carries the same one, so "some sibling block matches" is satisfied by the
+ * WRONG sibling and the ts block publishes over a group that column has not
+ * received.  When `ord` is known this requires the sibling with that exact
+ * ordinal, and still requires its (ts_min, count) to agree.
+ *
+ * `ord.mark == 0` (unknown — a sender predating the field) falls back to the
+ * key test, which is what tsdb_part_ts_publish_ready passes.
+ */
+int tsdb_part_ts_publish_ready_ord(tsdb_schema_t *s, const char *part_dir,
+                                   tsdb_block_ord_t ord,
+                                   int64_t ts_min, uint32_t count,
+                                   char *out_missing_col, size_t cap);
 
 /*
  * Repair an ALREADY-torn partition: lower <ts>.idx to the longest block

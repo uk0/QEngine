@@ -302,6 +302,7 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
                 r.stats_first     = m->stats_first;
                 r.stats_last      = m->stats_last;
                 r.stats_flags     = m->stats_flags;
+                r.ord             = m->ord;
                 r.block_bytes_len = m->size;
                 r.block_bytes     = payload;
 
@@ -352,32 +353,70 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
  * The stream is emitted partition-major then column-major, so one cached
  * signature list per (day, column) covers the whole run.
  */
-typedef struct { uint32_t day; uint16_t col; int64_t ts_min; uint32_t count; } mig_sig_t;
+/* The resume key, and why it is CONTENT and not the block's durable ordinal.
+ *
+ * The ordinal is partition-local to the node that ISSUED it.  This list is
+ * primed from the TARGET's index while the incoming block carries the SOURCE's
+ * numbering, so ordinal N of the stream and ordinal N of the target name
+ * unrelated rows — matching on it dropped live blocks at a brand-new site, and
+ * because this is a PRE-FILTER it did so without the applier ever seeing them.
+ * (tsdb_rawblock_apply translates the stream's ordinal into the target's space;
+ * that translation is the only place a remote ordinal means anything.)
+ *
+ * So: content, widened from (ts_min, count) to include ts_max and the block's
+ * byte size — the same four fields the applier's own idempotency test compares.
+ *
+ * NO TEST COVERS THE WIDENING, and it is kept anyway: no fixture builds two
+ * blocks of one (day, col) that agree on (ts_min, count) and differ in ts_max
+ * or size, so nothing goes red without it.  What it buys is that this
+ * PRE-FILTER cannot be coarser than the applier it filters for.  A coarser key
+ * skips a block the applier would have kept, and a skip here is silent — the
+ * applier never sees the block at all.
+ *
+ * And it is CONSUMED, not just matched.  One token per block the target already
+ * holds: a duplicate-timestamp run of three blocks against a target holding one
+ * of them skips one and lands two, where a plain "is this key present" test
+ * skipped all three.  A repeat inside one run needs no token — the applier's
+ * translated-ordinal test absorbs it exactly. */
+typedef struct {
+    uint32_t day; uint16_t col; int64_t ts_min; int64_t ts_max;
+    uint32_t count; uint32_t size;
+    int      taken;
+} mig_sig_t;
 
 typedef struct {
-    mig_sig_t *v; size_t n, cap;        /* signatures known to be present   */
+    mig_sig_t *v; size_t n, cap;        /* blocks the TARGET already holds   */
     uint64_t  *loaded; size_t ln, lcap; /* (day,col) pairs already scanned  */
 } mig_seen_t;
 
 static void mig_seen_free(mig_seen_t *sn) { free(sn->v); free(sn->loaded); memset(sn, 0, sizeof(*sn)); }
 
 static int mig_seen_add(mig_seen_t *sn, uint32_t day, uint16_t col,
-                        int64_t ts_min, uint32_t count) {
+                        int64_t ts_min, int64_t ts_max,
+                        uint32_t count, uint32_t size) {
     if (sn->n == sn->cap) {
         size_t nc = sn->cap ? sn->cap * 2 : 256;
         mig_sig_t *nv = realloc(sn->v, nc * sizeof(*nv));
         if (!nv) return TSDB_ERR_NOMEM;
         sn->v = nv; sn->cap = nc;
     }
-    sn->v[sn->n++] = (mig_sig_t){ day, col, ts_min, count };
+    sn->v[sn->n++] = (mig_sig_t){ day, col, ts_min, ts_max, count, size, 0 };
     return TSDB_OK;
 }
 
-static int mig_seen_has(const mig_seen_t *sn, uint32_t day, uint16_t col,
-                        int64_t ts_min, uint32_t count) {
-    for (size_t i = 0; i < sn->n; i++)
-        if (sn->v[i].day == day && sn->v[i].col == col &&
-            sn->v[i].ts_min == ts_min && sn->v[i].count == count) return 1;
+/* Consume one token for this block if the target has an unconsumed copy of it.
+ * 1 == "already present, skip"; 0 == "hand it to the applier". */
+static int mig_seen_take(mig_seen_t *sn, uint32_t day, uint16_t col,
+                         int64_t ts_min, int64_t ts_max,
+                         uint32_t count, uint32_t size) {
+    for (size_t i = 0; i < sn->n; i++) {
+        if (sn->v[i].taken) continue;
+        if (sn->v[i].day != day || sn->v[i].col != col) continue;
+        if (sn->v[i].ts_min != ts_min || sn->v[i].ts_max != ts_max) continue;
+        if (sn->v[i].count != count || sn->v[i].size != size) continue;
+        sn->v[i].taken = 1;
+        return 1;
+    }
     return 0;
 }
 
@@ -412,7 +451,7 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
     uint16_t ver = 0; uint32_t cnt = 0, esz = 0;
     uint64_t tot = 0, mseq = 0; int64_t fmn = 0, fmx = 0;
     int hsz = tsdb_part_idx_probe(idx_path, &ver, &cnt, &esz, &tot, &fmn, &fmx, &mseq);
-    if (hsz <= 0 || cnt == 0 || esz < 24) return;
+    if (hsz <= 0 || cnt == 0 || esz < 32) return;   /* need ts_max at [24..31] */
 
     FILE *f = fopen(idx_path, "rb");
     if (!f) return;
@@ -421,11 +460,15 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
         for (uint32_t i = 0; i < cnt; i++) {
             if (fseeko(f, (off_t)hsz + (off_t)i * esz, SEEK_SET) != 0) break;
             if (fread(e, 1, esz, f) != esz) break;
+            uint32_t bsize  = (uint32_t)e[8]  | ((uint32_t)e[9]  << 8)
+                            | ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
             uint32_t bcount = (uint32_t)e[12] | ((uint32_t)e[13] << 8)
                             | ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
-            uint64_t tmin = 0;
+            uint64_t tmin = 0, tmax = 0;
             for (int k = 7; k >= 0; k--) tmin = (tmin << 8) | e[16 + k];
-            mig_seen_add(sn, day, col, (int64_t)tmin, bcount);
+            for (int k = 7; k >= 0; k--) tmax = (tmax << 8) | e[24 + k];
+            mig_seen_add(sn, day, col, (int64_t)tmin, (int64_t)tmax,
+                         bcount, bsize);
         }
         free(e);
     }
@@ -670,10 +713,15 @@ sym_fail:
         if (tgt_schema)
             mig_seen_prime(&seen, db, tname, tgt_schema, r.part_day, r.col_idx);
 
-        if (!mig_seen_has(&seen, r.part_day, r.col_idx, r.ts_min, r.count)) {
+        if (!mig_seen_take(&seen, r.part_day, r.col_idx, r.ts_min, r.ts_max,
+                           r.count, r.block_bytes_len)) {
+            /* No token: the target does not already hold this block.  The
+             * applier is the authority from here — it translates the stream's
+             * ordinal into the target's space and absorbs a genuine repeat
+             * there, which is where a repeat can be told apart from a second
+             * block of a duplicate-timestamp run. */
             int arc = tsdb_rawblock_apply(db, &r);
             if (arc != TSDB_OK) { rc = arc; break; }
-            mig_seen_add(&seen, r.part_day, r.col_idx, r.ts_min, r.count);
             st.blocks_landed++;
         }
 

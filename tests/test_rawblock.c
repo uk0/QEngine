@@ -249,6 +249,7 @@ static void test_flush_apply(void) {
         r.stats_first     = ctx.blocks[i].meta.stats_first;
         r.stats_last      = ctx.blocks[i].meta.stats_last;
         r.stats_flags     = ctx.blocks[i].meta.stats_flags;
+        r.ord             = ctx.blocks[i].meta.ord;
         r.block_bytes_len = (uint32_t)ctx.blocks[i].bytes_len;
         r.block_bytes     = ctx.blocks[i].bytes;
 
@@ -407,6 +408,7 @@ static void test_flush_apply(void) {
         orig.ts_max          = cb->meta.ts_max;
         orig.block_bytes_len = (uint32_t)cb->bytes_len;
         orig.block_bytes     = cb->bytes;
+        orig.issuer          = 0x0123456789ABCDEFULL;
 
         uint8_t *buf = NULL; size_t blen = 0;
         ASSERT(tsdb_rawblock_serialize(&orig, &buf, &blen) == TSDB_OK);
@@ -423,8 +425,25 @@ static void test_flush_apply(void) {
         ASSERT(orig.ts_max == parsed.ts_max);
         ASSERT_EQ(orig.block_bytes_len, parsed.block_bytes_len);
         ASSERT(memcmp(orig.block_bytes, parsed.block_bytes, orig.block_bytes_len) == 0);
+        ASSERT(orig.issuer == parsed.issuer);
+
+        /* Rolling upgrade, both directions.  The issuer sits AFTER the block
+         * bytes, so a payload from a peer that predates it is exactly this
+         * buffer minus its last 8 — every field before it keeps its offset and
+         * the missing one reads as 0, the "unknown issuer" state.  (The other
+         * direction needs no assertion here: the parser has never required the
+         * payload to end where it stops reading, which is what lets an older
+         * receiver ignore the tail this build appends.) */
+        tsdb_rawblock_push_t old_style;
+        ASSERT(tsdb_rawblock_parse(buf, blen - 8, &old_style) == TSDB_OK);
+        ASSERT(old_style.issuer == 0);
+        ASSERT_EQ(orig.count,           old_style.count);
+        ASSERT_EQ(orig.block_bytes_len, old_style.block_bytes_len);
+        ASSERT(memcmp(orig.block_bytes, old_style.block_bytes,
+                      orig.block_bytes_len) == 0);
         free(buf);
-        printf("    serialize/parse round-trip passed\n");
+        printf("    serialize/parse round-trip passed (issuer tail, and a "
+               "payload without one)\n");
     }
 
     capture_ctx_free(&ctx);
@@ -663,6 +682,7 @@ static void test_benchmark(void) {
         r.stats_first     = ctx.blocks[i].meta.stats_first;
         r.stats_last      = ctx.blocks[i].meta.stats_last;
         r.stats_flags     = ctx.blocks[i].meta.stats_flags;
+        r.ord             = ctx.blocks[i].meta.ord;
         r.block_bytes_len = (uint32_t)ctx.blocks[i].bytes_len;
         r.block_bytes     = ctx.blocks[i].bytes;
         ASSERT(tsdb_rawblock_apply(rdb, &r) == TSDB_OK);

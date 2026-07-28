@@ -13,6 +13,7 @@
  *   [codec u8] [flags u16]
  *   [count u32] [ts_min i64] [ts_max i64]
  *   [block_bytes_len u32] [block_bytes]   -- compressed data only, NO BlockHeader
+ *   [issuer u64]                          -- OPTIONAL tail, see tsdb_rawblock_push_t
  */
 #ifndef TSDB_CLUSTER_RAWBLOCK_H
 #define TSDB_CLUSTER_RAWBLOCK_H
@@ -49,8 +50,34 @@ typedef struct {
     int64_t   stats_first;
     int64_t   stats_last;
     uint16_t  stats_flags;
+    /* The block's PARTITION-LOCAL ordinal, carried in the six padding bytes the
+     * stats area already had (wire [42..47] == idx entry [82..87] — the areas
+     * are byte-for-byte the same layout, so this needs no wire-length change).
+     *
+     * It is the identity: (size, count, ts_min, ts_max) is NOT unique — a run of
+     * rows carrying one timestamp yields several distinct blocks whose ts
+     * payloads are byte-identical — so the applier could neither tell a retried
+     * push from a genuinely different block nor place an out-of-order one.
+     *
+     * mark == 0 (the memset default) means the sender predates the field; the
+     * applier then falls back to its historical append + tail-compare. */
+    tsdb_block_ord_t ord;
     uint32_t  block_bytes_len;
     uint8_t  *block_bytes;       /* caller-owned; NOT freed by parse/serialize */
+    /* WHO issued `ord`.  An ordinal names a block group inside the partition
+     * that issued it, so it means nothing without the issuer: two nodes flushing
+     * the same timestamp grid into one table+day both start at ordinal 0 and
+     * their ts blocks are byte-identical, so a receiver keying its translation
+     * on the ordinal alone collapses the two groups onto one local ordinal —
+     * ACKing and discarding the second sender's ts block, and answering the
+     * survivor with the second sender's values.
+     *
+     * Carried as 8 trailing bytes AFTER block_bytes, which is additive in both
+     * directions: tsdb_rawblock_parse has always ignored trailing bytes, so an
+     * older receiver skips it, and a payload without it parses as issuer 0.
+     * 0 means "unknown / this node's own stream" — what the migration importer,
+     * the restore replay and the tests produce. */
+    uint64_t  issuer;
 } tsdb_rawblock_push_t;
 
 /*

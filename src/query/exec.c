@@ -299,44 +299,107 @@ struct scan_src {
     int               mem_nbufs;       /* schema->ncols at snapshot time */
     tsdb_part_t      *part;            /* NULL if from memtable */
     tsdb_block_meta_t meta;            /* only valid when part != NULL */
+    size_t            blk_ord;         /* this ts block's PARTITION-LOCAL
+                                          ordinal — its index in the partition's
+                                          ts block array.  tsdb_part_open aligns
+                                          every column's array to that array (by
+                                          the DURABLE ordinal stored in the idx
+                                          entry), so this index addresses the
+                                          sibling block directly.  Only
+                                          meaningful when part != NULL. */
     size_t            row_count;       /* rows in this source segment */
     int64_t           ts_min, ts_max;
 };
 /* typedef scan_src_t was forward-declared above bloom_can_skip_block */
 
-/* ---- The one place that pairs a non-ts column's block to a ts block ------
+/* Why a sibling block could not be resolved.  The three are NOT interchangeable
+ * — see the failure-scoping note on scan_find_col_block. */
+enum {
+    COLPAIR_OK = 0,
+    COLPAIR_SHORT,      /* no slot at all: the array is shorter than ts's      */
+    COLPAIR_HOLE,       /* slot is a HOLE: the column lost that block          */
+    COLPAIR_MISMATCH    /* slot exists but describes different rows: corrupt   */
+};
+
+/* ---- The one place that resolves a non-ts column's block for a ts block ----
  *
- * INVARIANT: non-ts is paired to ts by FIRST-MATCH on (ts_min,count).  Eight
- * copies of this loop used to be open-coded across this file; they are all
- * this function now, because "does this column have a readable block here"
- * must have exactly ONE answer engine-wide.  When the copies disagreed, the
- * engine answered the same query two ways — `SELECT count(c) FROM t` reported
- * the column healthy off the stats fast path while the scan path reported
- * TSDB_ERR_CORRUPT for the identical query.
+ * INVARIANT: the sibling is addressed by ORDINAL — src->blk_ord, the ts block's
+ * position in the partition — and the content is then VERIFIED.
  *
- * Returns the paired meta, or NULL when the column is SHORT here: the paired
- * slot is a placeholder tsdb_part_open synthesised for a ts block this column
- * lost (a dropped raw-block replication push, a half-finished migration).
+ * It used to be a FIRST-MATCH scan for an entry with the same (ts_min, count).
+ * That identity is not unique: equal timestamps are kept in insertion order and
+ * a flush cuts a partition into independent block_points chunks, so a run of
+ * rows carrying one timestamp yields several genuinely different blocks with a
+ * byte-identical key.  The scan returned whichever came first, so `SELECT v`
+ * over three such blocks answered with block zero's values three times — right
+ * row count, every value wrong, rc=0.  Compaction does not disambiguate it
+ * either; it re-creates the same ambiguity at a coarser grain.
+ *
+ * There is no fallback to a content scan when the ordinal does not resolve, and
+ * adding one would reintroduce exactly this bug.  count and ts_min must agree;
+ * anything else is corruption and is reported as such.
+ *
+ * ts_max joins them only when BOTH blocks carry a durable ordinal, which is the
+ * same scoping part_meta_agrees applies and for the same reason: pristine
+ * identified a block by (ts_min, count), a legacy entry can carry a ts_max a
+ * tick wider than its ts partner's (the range borrow in the compaction this
+ * change fixes), and demanding it on bytes written before the marker turns a
+ * column that reads correctly today into a permanent TSDB_ERR_CORRUPT.  One
+ * marker is not enough, because a comparison has two operands: a re-synced
+ * value entry is marked while the LEGACY ts entry it is measured against is
+ * not, and that ts_max was written by a binary that could produce the borrow.
+ * Where both are marked, both were written by this binary, ts_max is exact and
+ * a disagreement is real corruption that used to be served as an answer.
+ *
+ * Returns the paired meta, or NULL with *out_why set.  The ALTER-added column's
+ * zero-fill sentinel IS returned: tsdb_part_open stamps it with the ts block's
+ * own count/ts_min/ts_max, so it verifies, and tsdb_part_read_block turns it
+ * into the zeros those rows legitimately have.
  *
  * The `offset == UINT64_MAX` co-condition is not redundant and must not be
- * dropped.  TSDB_BLOCK_FLAG_HOLE is bit 4 of the same u16 that carries the
- * on-disk codec flags (OUTER_LZ/NOT_NULL/HAS_BLOOM/HAS_CRC occupy bits 0..3),
- * and tsdb_part_open back-fills every REAL block's on-disk flags into
- * meta.flags.  Testing the flag alone would turn the first on-disk use of bit
- * 4 into a bogus "no stored value" error for every block carrying it — an
- * availability regression against "old blocks stay readable".  This is
- * byte-identical to the gate tsdb_part_read_block{,_ref} apply. */
+ * dropped.  TSDB_BLOCK_FLAG_HOLE and TSDB_BLOCK_FLAG_MISMATCH are bits 4 and 5
+ * of the same u16 that carries the on-disk codec flags (OUTER_LZ/NOT_NULL/
+ * HAS_BLOOM/HAS_CRC occupy bits 0..3), and tsdb_part_open back-fills every REAL
+ * block's on-disk flags into meta.flags.  Testing a flag alone would turn the
+ * first on-disk use of that bit into a bogus "no stored value" error for every
+ * block carrying it — an availability regression against "old blocks stay
+ * readable".  This is byte-identical to the gate tsdb_part_read_block{,_ref}
+ * apply. */
+static tsdb_block_meta_t *col_block_pair_ex(const scan_src_t *src,
+                                            tsdb_block_meta_t *metas, size_t nb,
+                                            int *out_why)
+{
+    int why = COLPAIR_OK;
+    tsdb_block_meta_t *hit = NULL;
+
+    if (src->blk_ord >= nb) {
+        why = COLPAIR_SHORT;
+    } else {
+        tsdb_block_meta_t *m = &metas[src->blk_ord];
+        if (m->offset == UINT64_MAX && (m->flags & TSDB_BLOCK_FLAG_MISMATCH)) {
+            /* tsdb_part_open found an entry at this ordinal and it described
+             * different rows.  It is NOT a short column and must not be
+             * reported as one — the two indexes contradict each other. */
+            why = COLPAIR_MISMATCH;
+        } else if (m->offset == UINT64_MAX && (m->flags & TSDB_BLOCK_FLAG_HOLE)) {
+            why = COLPAIR_HOLE;
+        } else if (m->count  != src->meta.count  ||
+                   m->ts_min != src->meta.ts_min ||
+                   (TSDB_ORD_KNOWN(m->ord) && TSDB_ORD_KNOWN(src->meta.ord) &&
+                    m->ts_max != src->meta.ts_max)) {
+            why = COLPAIR_MISMATCH;
+        } else {
+            hit = m;
+        }
+    }
+    if (out_why) *out_why = why;
+    return hit;
+}
+
 static tsdb_block_meta_t *col_block_pair(const scan_src_t *src,
                                          tsdb_block_meta_t *metas, size_t nb)
 {
-    for (size_t b = 0; b < nb; b++) {
-        if (metas[b].ts_min != src->meta.ts_min ||
-            metas[b].count  != src->meta.count) continue;
-        if (metas[b].offset == UINT64_MAX &&
-            (metas[b].flags & TSDB_BLOCK_FLAG_HOLE)) break;   /* short column */
-        return &metas[b];
-    }
-    return NULL;
+    return col_block_pair_ex(src, metas, nb, NULL);
 }
 
 /*
@@ -522,6 +585,11 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
             scan_src_t sc = {0};
             sc.part = part;
             sc.meta = metas[b];
+            /* The partition-local ordinal every non-ts column is addressed by.
+             * tsdb_part_open has already aligned each column's array to this
+             * one using the DURABLE ordinal in the idx entry, so the position
+             * is the identity — not the block's content, which repeats. */
+            sc.blk_ord = b;
             sc.row_count = metas[b].count;
             sc.ts_min = metas[b].ts_min;
             sc.ts_max = metas[b].ts_max;
@@ -2312,11 +2380,19 @@ static size_t scan_max_block_rows(const scan_src_t *srcs, size_t nsrcs) {
  * missing block.  Report both, from every read site, and count it so an
  * operator can alert on a damaged partition being served.
  *
- * Pairing itself lives in col_block_pair(); this is the read site's wrapper
- * that turns "no readable block here" into a named failure.  Match semantics
- * are unchanged: first slot whose (ts_min,count) pairs wins; a HOLE in that
- * slot is the miss it always was, just classified here instead of three
- * frames down in tsdb_part_read_block.
+ * Pairing itself lives in col_block_pair_ex(); this is the read site's wrapper
+ * that turns "no readable block here" into a named failure.  The three ways
+ * that can happen are kept APART, because they are different facts about the
+ * partition and a caller acts on them differently:
+ *
+ *   SHORT / HOLE  the column has no block for this ts block — unavailable,
+ *                 exactly the case above, repaired by re-syncing the column.
+ *   MISMATCH      the slot at this ordinal describes DIFFERENT rows.  That is
+ *                 structural corruption, not a missing block, and it must not
+ *                 be described as one: the old code fell back to scanning for
+ *                 any entry with a matching key, which on a duplicate-timestamp
+ *                 run silently returned another group's values.  There is no
+ *                 content scan here by design.
  *
  * The two non-read users of col_block_pair() — the bloom skip test and the
  * stats fast path — deliberately do NOT come through here.  Neither is
@@ -2328,11 +2404,25 @@ static int scan_find_col_block(const scan_src_t *src, int c,
                                tsdb_block_meta_t **out_hit,
                                char *err, size_t errcap)
 {
-    tsdb_block_meta_t *hit = col_block_pair(src, metas, nb);
+    int why = COLPAIR_OK;
+    tsdb_block_meta_t *hit = col_block_pair_ex(src, metas, nb, &why);
     if (hit) { *out_hit = hit; return TSDB_OK; }
 
-    tsdb_metric_inc("qengine_short_column_read_total");
     const char *cn = (s && c >= 0 && c < s->ncols) ? s->cols[c].name : "?";
+    if (why == COLPAIR_MISMATCH) {
+        tsdb_metric_inc("qengine_block_ordinal_mismatch_total");
+        eset(err, errcap,
+             "column '%s' block %zu does not describe the rows ts block %zu "
+             "holds (ts [%lld,%lld], %u rows): the partition's block ordinals "
+             "disagree, so this column cannot be paired here. Queries without "
+             "'%s', or outside that ts range, are complete.",
+             cn, src->blk_ord, src->blk_ord,
+             (long long)src->meta.ts_min, (long long)src->meta.ts_max,
+             (unsigned)src->meta.count, cn);
+        return TSDB_ERR_CORRUPT;
+    }
+
+    tsdb_metric_inc("qengine_short_column_read_total");
     eset(err, errcap,
          "column '%s' has no stored value for ts in [%lld,%lld] (%u rows): "
          "the partition is short that column's block; re-sync it. Queries "

@@ -44,6 +44,8 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>    /* open() — fsync the partition dir after the backfill swap */
+#include <unistd.h>
 
 /* ---- Cluster registry ---------------------------------------------------- */
 
@@ -1215,6 +1217,23 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
 
         (void)tsdb_mkdir_p(live_part);   /* no-op when already present */
 
+        /* THE ONE WRITER THAT RENUMBERS THE PARTITION'S ORDINAL SPACE DOWNWARD.
+         *
+         * Phase 1 flushed into an EMPTY scratch dir, so part_ord_base started at
+         * 0 and the rebuilt blocks are stamped 0..k-1 — numbers this partition
+         * has already bound to other rows.  Everything else that allocates an
+         * ordinal (the flush, compaction, the replication applier) goes through
+         * tsdb_part_next_ordinal precisely so the space stays monotone for the
+         * partition's LIFETIME; this path replaces the rows instead of extending
+         * them, and only the .col/.idx pairs are swapped.
+         *
+         * The remote-ordinal map is not rebuilt by that swap and would keep
+         * mapping every sender's group onto the OLD numbering, where local
+         * ordinal N now names a different peer's rows.  Drop it: the next
+         * delivery of each group then allocates a fresh ordinal and lands as a
+         * new group, which is what this path did before ordinals existed. */
+        tsdb_part_ord_reset(live_part);
+
         /* Rename every column pair, ts LAST — same visibility order as the
          * flush path (readers enumerate blocks via ts.idx).  Failures are
          * logged and skipped like compaction's renames; the torn-column
@@ -1235,6 +1254,13 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
                     fprintf(stderr, "[anti-entropy] %s: backfill rename %s failed\n",
                             table_name, from);
             }
+        }
+        /* Make the directory entries the swap just rewrote — the renames AND the
+         * .ordmap removal — durable together.  A crash that kept the renames but
+         * lost the unlink would resurrect a map onto the pre-rebuild numbering. */
+        {
+            int dfd = open(live_part, O_RDONLY);
+            if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
         }
         pthread_mutex_unlock(cmtx);
     }

@@ -129,6 +129,24 @@ static metric_t g_metrics[] = {
     { "qengine_rawblock_pushes_total",
       "Total raw-block replication pushes sent", MT_COUNTER, { .c = { 0 } } },
 
+    /* The registry is a FIXED table and tsdb_metric_inc() on an unlisted name is
+     * a silent no-op, so a counter that is not here can never increment however
+     * often it is bumped.  These three are the "damaged partition served" and
+     * "colliding block refused" signals; the read path keeps the first two APART
+     * on purpose (a missing block and an index that disagrees about the rows are
+     * different facts), which is only observable if both are real counters. */
+    { "qengine_short_column_read_total",
+      "Reads that hit a ts block the column has no stored value for",
+      MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_block_ordinal_mismatch_total",
+      "Reads where a column's block ordinal paired but described different rows",
+      MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_rawblock_ordinal_collision_total",
+      "Raw-block pushes refused because the ordinal is held by a different block",
+      MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_sent_total",
       "Total per-peer WRITE_BATCH RPCs fanned out from this node", MT_COUNTER, { .c = { 0 } } },
 

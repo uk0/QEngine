@@ -1561,6 +1561,100 @@ const char *tsdb_restore_target_rel_name(tsdb_restore_target_rel_t rel) {
     return "?";
 }
 
+/* Which of ONE (partition, column)'s target blocks a stream record has already
+ * claimed, and that column's own block table.
+ *
+ * (ts_min, count) IS NOT A UNIQUE BLOCK IDENTITY, and the containment answer
+ * fell apart on exactly that.  Equal timestamps are accepted and kept in
+ * insertion order and a flush splits on block_points, so one partition can hold
+ * two blocks with identical (ts_min, ts_max, count) — and when the target has
+ * lost one of them, an UNCONSUMED first-match let the single survivor satisfy
+ * BOTH stream records.  Identical payload bytes, so both compared equal, and
+ * DEEP reported blocks_checked=4 blocks_missing=0 blocks_unresolved=0: a
+ * positively clean, fully-resolved containment answer for a database whose
+ * value column reads back half fabricated zeros with rc=0.  (It also disarmed
+ * the blocks_checked == 0 => INDETERMINATE guard, which cannot fire against a
+ * count of 4.)
+ *
+ * The landing path already counts occurrences for the same reason (rst_seen_t:
+ * "a source that legitimately holds two blocks with the same (ts_min, count)
+ * must come back with two").  The check has to count them too. */
+typedef struct {
+    uint8_t           *bits;    /* one flag per target block of this column   */
+    size_t             n;
+    tsdb_block_meta_t *metas;   /* that column's OWN entries — see below      */
+    size_t             nmeta;
+    int                loaded;  /* metas attempted (an empty column loads 0)  */
+} rst_claim_t;
+
+/* ---- The column's OWN block table -----------------------------------------
+ *
+ * DEEP asks about a COLUMN; tsdb_part_col_blocks answers about the READER.
+ *
+ * THIS IS A COMPENSATING CHANGE, not a repair of something 9dab5a2 had lost.
+ * State it that way because the alternative reading is false: on 9dab5a2 the
+ * reader's pairing was a first-match content scan, so a desynced column's
+ * blocks still came back as blocks, and DEEP could see them.  What blinds it is
+ * THIS series' own rewrite of part_align_column: a slot the new rule cannot
+ * prove becomes a HOLE rather than a wrong answer — right for a query, and it
+ * empties exactly the array DEEP was reading.  On a DESYNCED partition (ts
+ * swapped by compaction, the value column not — the shape [D5] is about) not
+ * one of the column's blocks pairs, so every one of them vanishes and DEEP can
+ * no longer see, let alone attribute, a rot inside them.  It falls back to
+ * reporting the whole partition unresolved: safe, and blind, on exactly the
+ * partition an operator most needs it to name a bad block.  Measured with this
+ * function reverted and the rest of the change in place: [D5] mismatched=0
+ * unresolved=40 — the rot unnamed — and the test red in both modes.
+ *
+ * So read the column's index directly, the way rst_seen_switch already does for
+ * the landing path and for the same reason.  Only (offset, size, count, ts_min,
+ * ts_max) are needed: tsdb_part_read_block takes codec and flags from the block
+ * header in the .col, and rejects an entry whose header disagrees with it — an
+ * entry pointing outside its own .col comes back as the rot it is.
+ *
+ * Loaded once per (partition, column) and dropped with the claim bits when the
+ * partition changes, so the per-record cost stays what it was. */
+static void rst_col_raw_load(tsdb_schema_t *s, const char *part_dir,
+                             int col, rst_claim_t *cl)
+{
+    if (!cl || cl->loaded) return;
+    cl->loaded = 1;
+    if (!s || col < 0 || col >= s->ncols) return;
+
+    char idx_path[4500];
+    snprintf(idx_path, sizeof(idx_path), "%s/%s.idx", part_dir, s->cols[col].name);
+
+    uint32_t cnt = 0, esz = 0;
+    int hsz = tsdb_part_idx_probe(idx_path, NULL, &cnt, &esz,
+                                  NULL, NULL, NULL, NULL);
+    if (hsz <= 0 || cnt == 0 || esz < 32) return;
+
+    FILE *f = fopen(idx_path, "rb");
+    if (!f) return;
+    tsdb_block_meta_t *m = (tsdb_block_meta_t *)calloc(cnt, sizeof(*m));
+    uint8_t *e = (uint8_t *)malloc(esz);
+    size_t n = 0;
+    if (m && e) {
+        for (uint32_t i = 0; i < cnt; i++) {
+            if (fseeko(f, (off_t)hsz + (off_t)i * esz, SEEK_SET) != 0) break;
+            if (fread(e, 1, esz, f) != esz) break;
+            uint64_t off = 0, tmn = 0, tmx = 0;
+            for (int k = 7; k >= 0; k--) off = (off << 8) | e[0  + k];
+            for (int k = 7; k >= 0; k--) tmn = (tmn << 8) | e[16 + k];
+            for (int k = 7; k >= 0; k--) tmx = (tmx << 8) | e[24 + k];
+            m[n].offset = off;
+            m[n].size   = rst_get_u32(e + 8);
+            m[n].count  = rst_get_u32(e + 12);
+            m[n].ts_min = (int64_t)tmn;
+            m[n].ts_max = (int64_t)tmx;
+            n++;
+        }
+    }
+    free(e);
+    fclose(f);
+    if (m && n) { cl->metas = m; cl->nmeta = n; } else { free(m); }
+}
+
 /* How many real blocks of `col` carry this (ts_min, count)?
  *
  * THE ONE QUESTION THAT SEPARATES A MERGE FROM A LOSS.  Every column of a
@@ -1585,17 +1679,17 @@ const char *tsdb_restore_target_rel_name(tsdb_restore_target_rel_t rel) {
  *     ts=1 val=1   ->  not >  ->  UNRESOLVED  (a merge collapsed the key)
  *     ts=1 val=0   ->  1 > 0  ->  LOSS        (the whole column's block is gone)
  */
-static size_t rst_key_multiplicity(tsdb_part_t *p, int col,
+static size_t rst_key_multiplicity(tsdb_schema_t *s, const char *part_dir,
+                                   rst_claim_t *cl, int col,
                                    int64_t ts_min, uint32_t count)
 {
-    tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-    if (tsdb_part_col_blocks(p, col, &metas, &nb) != TSDB_OK) return 0;
+    if (!cl) return 0;
+    rst_col_raw_load(s, part_dir, col, cl);
     size_t n = 0;
-    for (size_t i = 0; i < nb; i++) {
-        if (metas[i].ts_min == ts_min && metas[i].count == count &&
-            metas[i].offset != UINT64_MAX && metas[i].size != 0) n++;
+    for (size_t i = 0; i < cl->nmeta; i++) {
+        if (cl->metas[i].ts_min == ts_min && cl->metas[i].count == count &&
+            cl->metas[i].offset != UINT64_MAX && cl->metas[i].size != 0) n++;
     }
-    free(metas);
     return n;
 }
 
@@ -1651,29 +1745,6 @@ static int rst_deep_compare_one(tsdb_schema_t *s, const char *part_dir,
     return differs ? 2 : 0;
 }
 
-/* Which of ONE (partition, column)'s target blocks a stream record has already
- * claimed.
- *
- * (ts_min, count) IS NOT A UNIQUE BLOCK IDENTITY, and the containment answer
- * fell apart on exactly that.  Equal timestamps are accepted and kept in
- * insertion order and a flush splits on block_points, so one partition can hold
- * two blocks with identical (ts_min, ts_max, count) — and when the target has
- * lost one of them, an UNCONSUMED first-match let the single survivor satisfy
- * BOTH stream records.  Identical payload bytes, so both compared equal, and
- * DEEP reported blocks_checked=4 blocks_missing=0 blocks_unresolved=0: a
- * positively clean, fully-resolved containment answer for a database whose
- * value column reads back half fabricated zeros with rc=0.  (It also disarmed
- * the blocks_checked == 0 => INDETERMINATE guard, which cannot fire against a
- * count of 4.)
- *
- * The landing path already counts occurrences for the same reason (rst_seen_t:
- * "a source that legitimately holds two blocks with the same (ts_min, count)
- * must come back with two").  The check has to count them too. */
-typedef struct {
-    uint8_t *bits;      /* one flag per target block of this column          */
-    size_t   n;
-} rst_claim_t;
-
 /* Locate the target block matching a stream record, claim it, and compare it.
  * Returns 0 = match, 1 = missing, 2 = present with different but decodable
  * bytes, 3 = present and unreadable. */
@@ -1681,11 +1752,13 @@ static int rst_deep_check_block(tsdb_schema_t *s, const char *part_dir,
                                 tsdb_part_t *p, const tsdb_rawblock_push_t *r,
                                 rst_claim_t *cl)
 {
-    tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-    if (tsdb_part_col_blocks(p, (int)r->col_idx, &metas, &nb) != TSDB_OK)
-        return 1;
+    if (!cl) return 1;
+    rst_col_raw_load(s, part_dir, (int)r->col_idx, cl);
+    const tsdb_block_meta_t *metas = cl->metas;
+    size_t nb = cl->nmeta;
+    if (!metas) return 1;
 
-    if (cl && !cl->bits && nb) {
+    if (!cl->bits && nb) {
         cl->bits = (uint8_t *)calloc(nb, 1);
         cl->n    = cl->bits ? nb : 0;
     }
@@ -1717,14 +1790,13 @@ static int rst_deep_check_block(tsdb_schema_t *s, const char *part_dir,
     for (size_t i = 0; i < nb; i++) {
         if (metas[i].ts_min != r->ts_min || metas[i].count != r->count) continue;
         if (metas[i].offset == UINT64_MAX || metas[i].size == 0) continue;
-        if (cl && i < cl->n && cl->bits[i]) continue;
+        if (i < cl->n && cl->bits[i]) continue;
         v = rst_deep_compare_one(s, part_dir, p, r, &metas[i]);
         take = i; have = 1;
         break;
     }
-    if (have && cl && take < cl->n) cl->bits[take] = 1;
+    if (have && take < cl->n) cl->bits[take] = 1;
 
-    free(metas);
     return have ? v : 1;
 }
 
@@ -1782,7 +1854,9 @@ static int rst_verify_deep_table(tsdb_db_t *db, const char *backup_dir,
         if (!p || r.part_day != open_day) {
             if (p) { tsdb_part_close(p); p = NULL; }
             for (int c = 0; c < tgt->ncols; c++) {
-                free(claim[c].bits); claim[c].bits = NULL; claim[c].n = 0;
+                free(claim[c].bits);  claim[c].bits  = NULL; claim[c].n     = 0;
+                free(claim[c].metas); claim[c].metas = NULL; claim[c].nmeta = 0;
+                claim[c].loaded = 0;
             }
             open_day = r.part_day;
             snprintf(part_dir, sizeof(part_dir), "%s/%s/%08u",
@@ -1834,8 +1908,10 @@ static int rst_verify_deep_table(tsdb_db_t *db, const char *backup_dir,
          * on.  v == 3 never reaches here — see above. */
         if (reenc_shape &&
             (v == 2 ||
-             rst_key_multiplicity(p, h.ts_idx, r.ts_min, r.count) <=
-             rst_key_multiplicity(p, (int)r.col_idx, r.ts_min, r.count))) {
+             rst_key_multiplicity(tgt, part_dir, &claim[h.ts_idx], h.ts_idx,
+                                  r.ts_min, r.count) <=
+             rst_key_multiplicity(tgt, part_dir, &claim[r.col_idx],
+                                  (int)r.col_idx, r.ts_min, r.count))) {
             vt->blocks_unresolved++;
             continue;
         }
@@ -1843,7 +1919,7 @@ static int rst_verify_deep_table(tsdb_db_t *db, const char *backup_dir,
         else        vt->blocks_mismatched++;
     }
     if (p) tsdb_part_close(p);
-    for (int c = 0; c < tgt->ncols; c++) free(claim[c].bits);
+    for (int c = 0; c < tgt->ncols; c++) { free(claim[c].bits); free(claim[c].metas); }
     free(claim);
     free(buf);
     close(fd);

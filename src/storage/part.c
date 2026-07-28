@@ -561,17 +561,24 @@ int tsdb_part_idx_probe(const char *idx_path,
  *   [64..71]  stats_first  i64 bits  (block is ts-ordered on flush)
  *   [72..79]  stats_last   i64 bits
  *   [80..81]  stats_flags  u16       (see TSDB_STATS_HAS_* in part.h)
- *   [82..87]  _pad         6 bytes   (reserved)
+ *   [82..85]  ordinal      u32       partition-local block ordinal
+ *   [86..87]  ord_mark     u16       TSDB_IDX_ORD_MARK, or 0 == "unknown"
  *
  * The stats payload is written unconditionally at V3 so the layout is
  * uniform; for SYMBOL columns stats_flags == 0 and the fields are 0 —
  * those columns are served from the existing bloom filter instead.
+ *
+ * [82..87] were reserved and written as zero by every previous writer, which is
+ * exactly the "ordinal unknown" encoding — so recording the ordinal there needs
+ * no entry-size change and no version bump.  See part.h for why the ordinal has
+ * to be durable rather than inferred from position.
  */
 static size_t write_idx_entry(uint8_t *buf,
                               uint64_t offset, uint32_t size, uint32_t count,
                               int64_t ts_min, int64_t ts_max,
                               uint64_t bloom,
-                              const tsdb_block_meta_t *stats)
+                              const tsdb_block_meta_t *stats,
+                              tsdb_block_ord_t ord)
 {
     put_u64le(buf + 0,  offset);
     put_u32le(buf + 8,  size);
@@ -592,7 +599,350 @@ static size_t write_idx_entry(uint8_t *buf,
         put_i64le(buf + 72, stats->stats_last);
         put_u16le(buf + 80, stats->stats_flags);
     }
+    if (TSDB_ORD_KNOWN(ord)) {
+        put_u32le(buf + 82, ord.v);
+        put_u16le(buf + 86, ord.mark);
+    }
     return TSDB_IDX_ENTRY_SIZE;
+}
+
+/* Read the ordinal back out of an on-disk entry.  `esz` is the file's entry
+ * size: a V1/V2 40-byte entry has no room for one, so it is UNKNOWN. */
+static tsdb_block_ord_t read_idx_entry_ord(const uint8_t *entry, uint32_t esz)
+{
+    tsdb_block_ord_t o = { 0, 0 };
+    if (esz < TSDB_IDX_ENTRY_SIZE) return o;
+    uint16_t mark = get_u16le(entry + 86);
+    if (mark != TSDB_IDX_ORD_MARK) return o;
+    o.v    = get_u32le(entry + 82);
+    o.mark = mark;
+    return o;
+}
+
+/* The ordinal to use for an entry at physical position `pos`.
+ *
+ * LEGACY RULE (part.h): an entry with no marker gets its PHYSICAL position.
+ * That is sound only where the arrays are equal length and agree
+ * position-by-position, which every caller of this helper checks separately —
+ * it never stands in for that check. */
+static uint32_t idx_eff_ord(tsdb_block_ord_t o, uint32_t pos)
+{
+    return TSDB_ORD_KNOWN(o) ? o.v : pos;
+}
+
+/* The NEXT FREE ordinal of ONE column index, i.e. max(effective ordinal) + 1,
+ * floored at the entry count.  0 when the index is absent.
+ *
+ * It is deliberately NOT the entry count.  A partition's ordinal space has to
+ * stay monotone for the partition's whole LIFETIME: compaction re-cuts the
+ * local blocks into fewer, larger ones, so seeding the next flush from the
+ * local block count would re-issue numbers this partition has already bound to
+ * other rows.  Monotonicity is a LOCAL requirement — see the note above
+ * tsdb_part_ord_translate for why it is only ever a local one.
+ *
+ * The entry-count floor is the legacy rule idx_eff_ord() encodes: an unmarked
+ * entry's ordinal IS its position, so the first free ordinal after N unmarked
+ * entries is N. */
+static uint32_t part_idx_next_ord(const char *idx_path)
+{
+    uint32_t cnt = 0, esz = 0;
+    int hsz = tsdb_part_idx_probe(idx_path, NULL, &cnt, &esz,
+                                  NULL, NULL, NULL, NULL);
+    if (hsz <= 0 || cnt == 0 || esz == 0) return 0;
+
+    uint32_t next = cnt;                  /* legacy floor: position == ordinal */
+    if (esz >= TSDB_IDX_ENTRY_SIZE) {
+        FILE *f = fopen(idx_path, "rb");
+        if (f) {
+            uint8_t e[TSDB_IDX_ENTRY_SIZE];
+            for (uint32_t i = 0; i < cnt; i++) {
+                if (fseek(f, (long)((uint64_t)hsz + (uint64_t)i * esz),
+                          SEEK_SET) != 0 ||
+                    fread(e, 1, sizeof(e), f) != sizeof(e)) break;
+                tsdb_block_ord_t o = read_idx_entry_ord(e, TSDB_IDX_ENTRY_SIZE);
+                if (TSDB_ORD_KNOWN(o) && o.v + 1u > next) next = o.v + 1u;
+            }
+            fclose(f);
+        }
+    }
+    return next;
+}
+
+/* ---- Cross-node ordinal translation (<part>/.ordmap) ----------------------
+ *
+ * THE ORDINAL IS A PARTITION-LOCAL IDENTITY, ISSUED BY ONE NODE.  It answers
+ * exactly one question — "which ts block group does this column block belong
+ * to, HERE" — and it answers it only inside the partition that issued it.  For
+ * that, all it must satisfy is: every column of one block group carries the
+ * same value, and no two distinct groups in one partition collide.  Absolute
+ * values need not agree across nodes at all.
+ *
+ * A block arriving over the wire carries the SENDER's number.  Believing it
+ * turns a node-local counter into a cluster-wide one, and nothing keeps the two
+ * spaces apart: every node runs its own compactor unconditionally, compaction
+ * is node-local and is never replicated, and the receiver's own flush allocates
+ * out of the same range.  Both directions have been measured to lose data —
+ * renumbering DOWN re-issues numbers a replica still holds, renumbering UP
+ * consumes the ones the primary is about to hand out — and any further variation
+ * on "make compaction number differently" fails the same way, because the
+ * number is still being asked a question it cannot answer.
+ *
+ * So the receiver TRANSLATES.  Each incoming block-group ordinal is mapped,
+ * ONCE, to a free ordinal in the RECEIVER's own space, and that mapping is
+ * durable and shared by every column of the group — the same invariant
+ * `part_ord_base` maintains for a local flush.  The sender's numbers never
+ * enter the receiver's space, so a replica-side compaction cannot alias
+ * anything the primary is about to issue, and vice versa.
+ *
+ * The group key is (ISSUER, sender ordinal, ts_min, ts_max, count).  Every
+ * column of one flush block carries the last four identically (the flush derives
+ * one block's ts_min/ts_max from the same rows for every column), and the
+ * sender's ordinal is what separates the two blocks of a duplicate-timestamp run
+ * that agree on the other three.
+ *
+ * THE ISSUER IS NOT OPTIONAL, and leaving it out was silent destruction of acked
+ * rows.  An ordinal names a group inside the partition that ISSUED it, so
+ * "ordinal 0" is a different group on every node — and two nodes flushing the
+ * same timestamp grid into the same table+day both start at 0 with byte-equal ts
+ * blocks, which is what any synchronised ingest (a metric scrape, a sharded
+ * loader) produces by construction.  Without an issuer the two groups collapse
+ * onto ONE local ordinal: the second sender's ts block matches at that ordinal,
+ * is declared a re-delivery and is dropped with rc == TSDB_OK — ACKed and
+ * thrown away — while its value block, whose bytes differ, lands as a second
+ * claimant of the same ordinal and the surviving ts block is then answered with
+ * the WRONG sender's values.  Scoping the key to the issuer is what keeps two
+ * senders' spaces apart, exactly as translation keeps sender and receiver apart.
+ *
+ *   header 16 B: magic u32 | version u16 | entry_size u16 | next_local u32 | pad
+ *   entry  40 B: issuer u64 | remote u32 | local u32 | count u32 | pad u32
+ *                | ts_min i64 | ts_max i64
+ *
+ * `next_local` is a HIGH-WATER MARK and is never lowered: an allocation that is
+ * recorded and then lost to a crash before its block lands must not be handed
+ * out a second time, or the retry lands on top of another group's rows.  The
+ * record is therefore written BEFORE the block; a mapping with no block behind
+ * it costs one skipped ordinal and nothing else.
+ *
+ * An absent file means "this partition has never received a remote block",
+ * which is every partition of every single-node database, so nothing is
+ * created until the first push arrives.
+ */
+#define ORDMAP_NAME     ".ordmap"
+#define ORDMAP_MAGIC    0x4D44524Fu     /* 'O','R','D','M', little-endian */
+#define ORDMAP_VERSION  2u              /* v1 had no issuer — see above */
+#define ORDMAP_HDR_SZ   16u
+#define ORDMAP_ENT_SZ   40u
+
+static void ordmap_path(char *dst, size_t cap, const char *part_dir) {
+    snprintf(dst, cap, "%s/%s", part_dir, ORDMAP_NAME);
+}
+
+static int ordmap_hdr_ok(const uint8_t *h) {
+    return get_u32le(h) == ORDMAP_MAGIC &&
+           get_u16le(h + 4) == (uint16_t)ORDMAP_VERSION &&
+           get_u16le(h + 6) == (uint16_t)ORDMAP_ENT_SZ;
+}
+
+/* The map's high-water, or 0 when there is no readable map here. */
+static uint32_t ordmap_next_local(const char *part_dir)
+{
+    char p[4200];
+    ordmap_path(p, sizeof(p), part_dir);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    uint8_t h[ORDMAP_HDR_SZ];
+    uint32_t nx = 0;
+    if (fread(h, 1, sizeof(h), f) == sizeof(h) && ordmap_hdr_ok(h))
+        nx = get_u32le(h + 8);
+    fclose(f);
+    return nx;
+}
+
+uint32_t tsdb_part_next_ordinal(const tsdb_schema_t *s, const char *part_dir)
+{
+    if (!s || !part_dir) return 0;
+
+    /* Over EVERY column, not just ts.  A non-ts column can legitimately sit
+     * above ts's highest ordinal: a flush that published its value columns and
+     * died before ts leaves exactly that, and so does a received group whose ts
+     * block the commit test is still holding back. */
+    uint32_t next = ordmap_next_local(part_dir);
+    for (int ci = 0; ci < s->ncols; ci++) {
+        char p[4200];
+        snprintf(p, sizeof(p), "%s/%s.idx", part_dir, s->cols[ci].name);
+        uint32_t n = part_idx_next_ord(p);
+        if (n > next) next = n;
+    }
+    return next;
+}
+
+void tsdb_part_ord_reset(const char *part_dir)
+{
+    if (!part_dir) return;
+    char p[4200];
+    ordmap_path(p, sizeof(p), part_dir);
+    (void)unlink(p);
+}
+
+int tsdb_part_ord_translate(const tsdb_schema_t *s, const char *part_dir,
+                            uint64_t issuer, tsdb_block_ord_t remote,
+                            int64_t ts_min, int64_t ts_max, uint32_t count,
+                            tsdb_block_ord_t *out_local)
+{
+    if (!s || !part_dir || !out_local) return TSDB_ERR_INVAL;
+
+    tsdb_block_ord_t none = { 0, 0 };
+    *out_local = none;
+    /* A sender that predates the field has no ordinal to translate.  Nothing is
+     * recorded and the caller keeps its historical content-only behaviour. */
+    if (!TSDB_ORD_KNOWN(remote)) return TSDB_OK;
+
+    char p[4200];
+    ordmap_path(p, sizeof(p), part_dir);
+
+    uint32_t hw = 0;
+    int      have_map = 0;
+    off_t    aligned_end = (off_t)ORDMAP_HDR_SZ;
+
+    FILE *f = fopen(p, "rb");
+    if (f) {
+        uint8_t h[ORDMAP_HDR_SZ];
+        if (fread(h, 1, sizeof(h), f) == sizeof(h) && ordmap_hdr_ok(h)) {
+            have_map = 1;
+            hw = get_u32le(h + 8);
+            uint8_t e[ORDMAP_ENT_SZ];
+            while (fread(e, 1, sizeof(e), f) == sizeof(e)) {
+                aligned_end += (off_t)ORDMAP_ENT_SZ;
+                if (get_u64le(e + 0)  != issuer)   continue;
+                if (get_u32le(e + 8)  != remote.v) continue;
+                if (get_u32le(e + 16) != count)    continue;
+                if (get_i64le(e + 24) != ts_min)   continue;
+                if (get_i64le(e + 32) != ts_max)   continue;
+                out_local->v    = get_u32le(e + 12);
+                out_local->mark = TSDB_IDX_ORD_MARK;
+                fclose(f);
+                return TSDB_OK;
+            }
+        }
+        long flen = (fseek(f, 0, SEEK_END) == 0) ? ftell(f) : -1;
+        fclose(f);
+        if (!have_map) {
+            /* SHORTER THAN A HEADER IS ABSENT, NOT CORRUPT.  A file with fewer
+             * bytes than the header carries no mapping at all, so it is
+             * indistinguishable from no file, and refusing buys nothing: there
+             * is nothing to translate against either way.  It matters because
+             * the create path used to publish a 0-byte file the instant it
+             * opened, so an ENOSPC or a process death on the FIRST remote push
+             * into a partition left one behind — and the refusal below is NOT
+             * retryable, it is sticky for the life of the partition.  The
+             * create path is atomic now (see below) so this state should no
+             * longer arise, but a map written by a build that predates that fix
+             * still has to be recoverable.
+             *
+             * A FULL HEADER THAT IS NOT OURS is different and still refuses:
+             * that is a foreign file or a version this build cannot read, and
+             * translating against a map we cannot interpret would cost values.
+             * `tsdb_part_ord_reset` is the operator escape, and the anti-entropy
+             * backfill already calls it. */
+            if (flen >= 0 && flen < (long)ORDMAP_HDR_SZ) {
+                (void)unlink(p);
+            } else {
+                fprintf(stderr,
+                        "[part] %s: %s carries a header this build cannot read; "
+                        "refusing to translate a remote block ordinal against "
+                        "it.  This does NOT clear itself — reset the map "
+                        "(tsdb_part_ord_reset) or let anti-entropy rebuild the "
+                        "partition\n", part_dir, ORDMAP_NAME);
+                return TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+
+    /* A group this node has not seen.  Allocate out of OUR space. */
+    uint32_t local = tsdb_part_next_ordinal(s, part_dir);
+    if (local < hw) local = hw;
+
+    uint8_t h[ORDMAP_HDR_SZ];
+    memset(h, 0, sizeof(h));
+    put_u32le(h + 0, ORDMAP_MAGIC);
+    put_u16le(h + 4, (uint16_t)ORDMAP_VERSION);
+    put_u16le(h + 6, (uint16_t)ORDMAP_ENT_SZ);
+    put_u32le(h + 8, local + 1u);
+
+    uint8_t e[ORDMAP_ENT_SZ];
+    memset(e, 0, sizeof(e));
+    put_u64le(e + 0,  issuer);
+    put_u32le(e + 8,  remote.v);
+    put_u32le(e + 12, local);
+    put_u32le(e + 16, count);
+    put_i64le(e + 24, ts_min);
+    put_i64le(e + 32, ts_max);
+
+    /* THE MAP IS DURABLE STATE, SO IT IS PUBLISHED LIKE DURABLE STATE.  Two
+     * different disciplines, because the two paths fail differently and a
+     * whole-file rewrite is not affordable on the hot one.
+     *
+     * CREATE: temp + rename, the pattern 5d75238 established for the idx
+     * header.  The old code's `fopen(p, "w+b")` published a 0-byte file the
+     * instant it opened, and every failure path left it there — so an ENOSPC or
+     * a process death on the first remote push into a partition permanently
+     * refused all later replication into it.  Now a crash leaves either no map
+     * or a complete one.  The image is one header plus one entry, 56 bytes.
+     *
+     * APPEND: header FIRST, then the entry.  Rewriting the whole file would be
+     * O(entries^2) over a partition's life — one entry per received block
+     * group, so thousands on a busy day — and it is not needed, because the two
+     * orders fail in opposite directions.  Entry-then-header (what this used to
+     * do) can leave an entry the high-water does not cover, and a LATER group
+     * then gets the SAME local ordinal; on a duplicate-timestamp run the two
+     * groups' ts blocks are byte-identical, the applier calls the second a
+     * re-delivery, and it is dropped at rc == TSDB_OK.  Silent loss of acked
+     * rows.  Header-then-entry can only leave a high-water ahead of the entries
+     * — the group is simply re-allocated the next ordinal on retry, costing one
+     * skipped number and nothing else.  Too-high never aliases; too-low does.
+     *
+     * The header is 16 bytes at offset 0, inside sector 0, so it lands whole or
+     * not at all — the same assumption the idx header publish already documents
+     * and relies on. */
+    int ok = 1;
+    if (have_map) {
+        FILE *w = fopen(p, "r+b");
+        if (!w) return TSDB_ERR_IO;
+        /* Drop any short tail first, so the entry lands on the record grid. */
+        if (ftruncate(fileno(w), aligned_end) != 0) ok = 0;
+        if (ok && (fseek(w, 0, SEEK_SET) != 0 ||
+                   fwrite(h, 1, sizeof(h), w) != sizeof(h))) ok = 0;
+        if (ok && fflush(w) != 0) ok = 0;
+        if (ok && tsdb_part_fsync_fd(fileno(w)) != 0) ok = 0;   /* [1] high-water */
+        /* TEST-ONLY: die exactly between the two writes, which is the whole
+         * point of their order.  Production always falls straight through. */
+        if (ok && getenv("TSDB_TEST_CRASH_ORDMAP_MID")) { fflush(NULL); _exit(71); }
+        if (ok && fseek(w, (long)aligned_end, SEEK_SET) != 0) ok = 0;
+        if (ok && fwrite(e, 1, sizeof(e), w) != sizeof(e)) ok = 0;
+        if (ok && fflush(w) != 0) ok = 0;
+        if (ok && ferror(w))      ok = 0;
+        if (ok && tsdb_part_fsync_fd(fileno(w)) != 0) ok = 0;   /* [2] the entry */
+        if (fclose(w) != 0) ok = 0;
+        if (!ok) return TSDB_ERR_IO;
+    } else {
+        char tmp[4300];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", p);
+        FILE *w = fopen(tmp, "wb");
+        if (!w) return TSDB_ERR_IO;
+        if (fwrite(h, 1, sizeof(h), w) != sizeof(h)) ok = 0;
+        if (ok && fwrite(e, 1, sizeof(e), w) != sizeof(e)) ok = 0;
+        if (ok && fflush(w) != 0) ok = 0;
+        if (ok && ferror(w))      ok = 0;
+        if (ok && tsdb_part_fsync_fd(fileno(w)) != 0) ok = 0;
+        if (fclose(w) != 0) ok = 0;
+        if (ok && rename(tmp, p) != 0) ok = 0;
+        if (!ok) { (void)unlink(tmp); return TSDB_ERR_IO; }
+        part_fsync_dir(part_dir);
+    }
+
+    out_local->v    = local;
+    out_local->mark = TSDB_IDX_ORD_MARK;
+    return TSDB_OK;
 }
 
 /* ---- Per-partition, per-column writer ----------------------------------- */
@@ -634,6 +984,14 @@ typedef struct {
      * to s->ncols right after col_writer_open.  Left 0 (unknown) by the memset
      * in col_writer_open, so any other user of col_writer_t stays unasserting. */
     uint16_t ncols;
+
+    /* Partition-local ordinal of the FIRST block this session writes.  It is
+     * the ts column's pre-flush block count for this partition — the SHARED
+     * number, not this column's own physical entry count.  The two differ
+     * exactly when the column is short or ALTER-added, which is the case the
+     * ordinal exists for: an ALTER-added column's first block belongs to ts
+     * block N, not to ts block 0.  Set by tsdb_part_flush_ex2. */
+    uint32_t part_ord_base;
 
     char     idx_path[4096];
     char     col_path[4096];   /* for rollback-by-path on a failed close */
@@ -920,9 +1278,17 @@ static int col_writer_write_block(col_writer_t *w,
     tsdb_block_meta_t stats;
     compute_block_stats(type, raw_vals, count, &stats);
 
+    /* This block's partition-local ordinal.  idx_n counts the blocks THIS
+     * session has written, so base + idx_n is the shared ordinal every column
+     * of the same rows stamps. */
+    tsdb_block_ord_t ord;
+    ord.v    = w->part_ord_base + (uint32_t)w->idx_n;
+    ord.mark = TSDB_IDX_ORD_MARK;
+
     /* Raw-block replication hook: fire BEFORE freeing comp_buf. */
     if (w->raw_block_fn) {
         tsdb_block_meta_t meta = stats;        /* carry stats to peers */
+        meta.ord    = ord;                     /* ... and the ordinal */
         meta.offset = w->col_offset;
         meta.size   = (uint32_t)comp_bytes;
         meta.count  = (uint32_t)count;
@@ -957,7 +1323,7 @@ static int col_writer_write_block(col_writer_t *w,
     }
     uint8_t *entry = w->idx_entries + w->idx_n * TSDB_IDX_ENTRY_SIZE;
     write_idx_entry(entry, w->col_offset, (uint32_t)comp_bytes,
-                    (uint32_t)count, ts_min, ts_max, bloom, &stats);
+                    (uint32_t)count, ts_min, ts_max, bloom, &stats, ord);
     w->idx_n++;
     w->col_offset  += TSDB_BLOCK_HEADER_SIZE
                       + (uint64_t)comp_bytes
@@ -1778,6 +2144,23 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
         }
         ci_iter[ci_count++] = ts_ci;  /* ts last */
 
+        /* The partition's SHARED ordinal base: its NEXT FREE ordinal.  Every
+         * column of this flush stamps base+j on its j-th block, so an
+         * ALTER-added column's first block records the ts block it actually
+         * belongs to instead of 0.
+         *
+         * Using the block count here was a data bug, not a cosmetic one:
+         * compaction re-cuts this partition into FEWER blocks, so the count
+         * collapses while the ordinals already handed out do not, and the next
+         * flush re-issued numbers this partition had bound to other rows.
+         *
+         * It is the max over EVERY column and over the remote-ordinal map's
+         * high-water, not over ts.idx alone: a received group whose ts block
+         * the commit test is still holding back has already consumed an
+         * ordinal, and so has a flush that published its value columns and died
+         * before ts.  Computed ONCE, before any column is touched. */
+        uint32_t part_ord_base = tsdb_part_next_ordinal(s, part_dir);
+
         /* Set when the raw-block hook failed for ANY non-ts column of THIS
          * partition.  ts-last only makes the incompleteness of a group a
          * SUFFIX when the writer is fail-stop on the first error; the flush is
@@ -1819,6 +2202,7 @@ int tsdb_part_flush_ex2(tsdb_schema_t *s, tsdb_memtable_t *m,
              * "column index < stamp, its write is gone, zero-fill would be a
              * fabrication".  Set AFTER col_writer_open, which memsets w. */
             w.ncols = (uint16_t)s->ncols;
+            w.part_ord_base = part_ord_base;
 
             /* Wire up raw-block hook if available.  Suppressed for the ts
              * column once a sibling column's push failed: ts is the peers'
@@ -2021,9 +2405,11 @@ static int part_col_absence_is_late_add(const tsdb_schema_t *s, int ci,
     return 1;
 }
 
-/* Read entry `idx`'s pairing key out of an already-probed idx file. */
+/* Read entry `idx`'s pairing key out of an already-probed idx file, together
+ * with its durable ordinal (UNKNOWN on a V1/V2 entry or a pre-ordinal writer). */
 static int part_idx_entry_key(FILE *f, int hsz, uint32_t esz, uint32_t idx,
-                              int64_t *out_ts_min, uint32_t *out_count)
+                              int64_t *out_ts_min, uint32_t *out_count,
+                              tsdb_block_ord_t *out_ord)
 {
     uint8_t e[TSDB_IDX_ENTRY_SIZE];
     size_t want = (esz < sizeof(e)) ? (size_t)esz : sizeof(e);
@@ -2033,12 +2419,23 @@ static int part_idx_entry_key(FILE *f, int hsz, uint32_t esz, uint32_t idx,
     if (fread(e, 1, want, f) != want) return 0;
     *out_count  = get_u32le(e + 12);
     *out_ts_min = get_i64le(e + 16);
+    if (out_ord) *out_ord = read_idx_entry_ord(e, (uint32_t)want);
     return 1;
 }
 
 int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
                                int64_t ts_min, uint32_t count,
                                char *out_missing_col, size_t cap)
+{
+    tsdb_block_ord_t none = { 0, 0 };
+    return tsdb_part_ts_publish_ready_ord(s, part_dir, none, ts_min, count,
+                                          out_missing_col, cap);
+}
+
+int tsdb_part_ts_publish_ready_ord(tsdb_schema_t *s, const char *part_dir,
+                                   tsdb_block_ord_t ord,
+                                   int64_t ts_min, uint32_t count,
+                                   char *out_missing_col, size_t cap)
 {
     if (out_missing_col && cap) out_missing_col[0] = '\0';
     if (!s || !part_dir) return TSDB_ERR_INVAL;
@@ -2117,14 +2514,34 @@ int tsdb_part_ts_publish_ready(tsdb_schema_t *s, const char *part_dir,
         int      found = 0;
         int64_t  emin  = 0;
         uint32_t ecnt  = 0;
-        if (ts_cnt < cnt &&
-            part_idx_entry_key(f, hsz, esz, ts_cnt, &emin, &ecnt) &&
-            emin == ts_min && ecnt == count)
-            found = 1;
-        for (uint32_t b = 0; !found && b < cnt; b++) {
-            if (part_idx_entry_key(f, hsz, esz, b, &emin, &ecnt) &&
+        tsdb_block_ord_t eord = { 0, 0 };
+
+        if (TSDB_ORD_KNOWN(ord)) {
+            /* The ordinal is the identity.  "Some block with a matching key"
+             * is NOT good enough: on a duplicate-timestamp run every block of
+             * the run carries the same (ts_min, count), so the test passes on
+             * the WRONG sibling and publishes a ts block over a group this node
+             * never received — the partition then answers that column with
+             * another group's values, rc=0.  A legacy entry with no marker
+             * keeps its physical position as its ordinal, which is the writers'
+             * ordering contract and what the reader assumes for it too. */
+            for (uint32_t b = 0; !found && b < cnt; b++) {
+                if (!part_idx_entry_key(f, hsz, esz, b, &emin, &ecnt, &eord))
+                    continue;
+                if (idx_eff_ord(eord, b) == ord.v &&
+                    emin == ts_min && ecnt == count)
+                    found = 1;
+            }
+        } else {
+            if (ts_cnt < cnt &&
+                part_idx_entry_key(f, hsz, esz, ts_cnt, &emin, &ecnt, NULL) &&
                 emin == ts_min && ecnt == count)
                 found = 1;
+            for (uint32_t b = 0; !found && b < cnt; b++) {
+                if (part_idx_entry_key(f, hsz, esz, b, &emin, &ecnt, NULL) &&
+                    emin == ts_min && ecnt == count)
+                    found = 1;
+            }
         }
         fclose(f);
 
@@ -2198,18 +2615,102 @@ int tsdb_part_ts_retract_unpaired(tsdb_schema_t *s, const char *part_dir,
 
         FILE *cf = fopen(cpath, "rb");
         if (!cf) { rc = TSDB_ERR_IO; goto done; }
+
+        /* May this column's ordinals be believed?  Only if EVERY entry records
+         * one — exactly part_align_column's `ord_mode`, and for the same reason:
+         * a column holding even one unmarked entry is on the legacy content
+         * rule, and its OTHER entries can carry ordinals from a space the
+         * unmarked ts prefix knows nothing about (a repair push translated into
+         * this node's own numbering, for one).  Comparing those against a ts
+         * entry's positional effective ordinal is a category error, and it
+         * rejects a block that is demonstrably there.
+         *
+         * It is a property of the COLUMN's entries alone, so it is only half the
+         * question: each comparison below ALSO needs the ts entry it is made
+         * against to carry a marker, or the ordinal rule runs with nothing real
+         * on the other side.  A whole column re-synced into a legacy partition
+         * is exactly that — every entry of the column stamped, every entry of ts
+         * not — and tsdb_part_next_ordinal's legacy floor guarantees the
+         * re-synced numbers start at ts.idx's ENTRY COUNT, so they can never
+         * equal one of ts's invented positions.  The ordinal rule then pairs
+         * NOTHING, and this function concludes the partition is torn from block
+         * 0 and republishes ts.idx at zero entries — deleting every row of a
+         * partition tsdb_part_open reads back whole (test_adv_repair_portable
+         * certifies rc=0 rows=3072 sum=4720128 on those bytes).  A repair
+         * primitive must not delete rows the reader can serve. */
+        int col_ord_mode = 1;
+        for (uint32_t k = 0; k < ccnt; k++) {
+            int64_t emin = 0; uint32_t ecnt = 0;
+            tsdb_block_ord_t eord = { 0, 0 };
+            if (!part_idx_entry_key(cf, chsz, cesz, k, &emin, &ecnt, &eord) ||
+                !TSDB_ORD_KNOWN(eord)) { col_ord_mode = 0; break; }
+        }
+
+        /* ...and neither is a column whose entries are a contiguous SUFFIX of
+         * ts's blocks.  That is the ALTER shape at every non-zero length, and
+         * it is precisely what tsdb_part_open's alignment pass classifies as a
+         * late add and answers with the zeros those rows legitimately hold —
+         * `idx_decl_count[ci] >= idx_decl_count[ts_ci]` is the same gate on the
+         * read side.  Retracting it deletes rows that read perfectly, and since
+         * no push is ever coming for a locally ALTER-added column, the deletion
+         * is permanent.  Measured on this shape with the ordinal-only rule
+         * below: count(*) 5120 -> 2048 with repeating timestamps and 5120 -> 0
+         * with unique ones, where HEAD retracted nothing. */
+        if (ccnt < ts_cnt) {
+            uint32_t nmiss = ts_cnt - ccnt;
+            int      suffix = 1;
+            for (uint32_t k = 0; suffix && k < ccnt; k++) {
+                const uint8_t *te = ts_entries + (size_t)(nmiss + k) * ts_esz;
+                int64_t emin = 0; uint32_t ecnt = 0;
+                tsdb_block_ord_t eord = { 0, 0 };
+                if (!part_idx_entry_key(cf, chsz, cesz, k, &emin, &ecnt, &eord) ||
+                    emin != get_i64le(te + 16) || ecnt != get_u32le(te + 12) ||
+                    (col_ord_mode &&
+                     TSDB_ORD_KNOWN(read_idx_entry_ord(te, ts_esz)) &&
+                     eord.v != idx_eff_ord(read_idx_entry_ord(te, ts_esz),
+                                           nmiss + k)))
+                    suffix = 0;
+            }
+            if (suffix) { fclose(cf); continue; }
+        }
+
         for (uint32_t b = 0; b < keep; b++) {
-            uint32_t want_cnt = get_u32le(ts_entries + (size_t)b * ts_esz + 12);
-            int64_t  want_min = get_i64le(ts_entries + (size_t)b * ts_esz + 16);
+            const uint8_t *te = ts_entries + (size_t)b * ts_esz;
+            uint32_t want_cnt = get_u32le(te + 12);
+            int64_t  want_min = get_i64le(te + 16);
+            uint32_t want_ord = idx_eff_ord(read_idx_entry_ord(te, ts_esz), b);
             int      found = 0;
             int64_t  emin = 0; uint32_t ecnt = 0;
-            if (b < ccnt && part_idx_entry_key(cf, chsz, cesz, b, &emin, &ecnt) &&
-                emin == want_min && ecnt == want_cnt)
+            tsdb_block_ord_t eord = { 0, 0 };
+
+            /* The positional probe first: both writers emit block b of every
+             * column in the same order, so this is the overwhelmingly common
+             * case and it stays a pure check. */
+            if (b < ccnt && part_idx_entry_key(cf, chsz, cesz, b, &emin, &ecnt, &eord) &&
+                emin == want_min && ecnt == want_cnt &&
+                (!(col_ord_mode &&
+                   TSDB_ORD_KNOWN(read_idx_entry_ord(te, ts_esz))) ||
+                 eord.v == want_ord))
                 found = 1;
+
+            /* Otherwise scan.  Where this column's ordinals may be believed
+             * the ordinal decides, because on a duplicate-timestamp run every
+             * block of the run carries the same content key and a key match
+             * cannot tell the column that holds THIS group from one holding
+             * another.  Where they may not, the key is all there is: an unmarked
+             * entry's position is NOT its ordinal (a lost push closes the
+             * survivors up over the gap), so demanding
+             * `idx_eff_ord(eord, k) == want_ord` would collapse the scan to
+             * `k == b` and make it dead code — which is how this repair came to
+             * truncate whole readable partitions. */
             for (uint32_t k = 0; !found && k < ccnt; k++) {
-                if (part_idx_entry_key(cf, chsz, cesz, k, &emin, &ecnt) &&
-                    emin == want_min && ecnt == want_cnt)
-                    found = 1;
+                if (!part_idx_entry_key(cf, chsz, cesz, k, &emin, &ecnt, &eord))
+                    continue;
+                if (emin != want_min || ecnt != want_cnt) continue;
+                if (col_ord_mode &&
+                    TSDB_ORD_KNOWN(read_idx_entry_ord(te, ts_esz)) &&
+                    eord.v != want_ord) continue;
+                found = 1;
             }
             if (!found) { keep = b; break; }
         }
@@ -2349,6 +2850,527 @@ static void part_compact_swap_recover(const char *part_dir) {
     unlink(marker);
     int dfd = open(part_dir, O_RDONLY);
     if (dfd >= 0) { fsync(dfd); close(dfd); }
+}
+
+/* ---- Aligning a non-ts column's block array to the ts column's -------------
+ *
+ * exec.c addresses a sibling block by the ts block's POSITION.  This pass is
+ * where that position is established, and the durable ordinal is what
+ * establishes it — never a content scan.  (ts_min, ts_max, count) is not a key:
+ * a run of rows carrying one timestamp produces several genuinely different
+ * blocks whose keys are byte-identical, so a first-match scan returns whichever
+ * one happens to come first and the query answers with another group's values,
+ * rc=0.  The content is still CHECKED, it is just no longer what selects.
+ */
+
+/* Does a column block describe the same rows as a ts block?
+ *
+ * ts_max is only EVIDENCE when the column entry carries a durable ordinal.
+ *
+ * The pristine reader identified a block by (ts_min, count) and never looked at
+ * ts_max.  Requiring it unconditionally reaches backwards onto bytes this change
+ * cannot re-stamp, and there is a producer: the range borrow in the compaction
+ * this same change fixes could leave output chunk 0's value entry a tick wider
+ * than ts's.  On such a partition the strict rule pairs nothing for that block,
+ * so a column pristine answers correctly —
+ *
+ *     pristine 9dab5a2   SELECT v rc=0 rows=3072 sum=4720128
+ *
+ * — becomes a permanent TSDB_ERR_CORRUPT with no self-heal path.  That is the
+ * same defect class as the repair-push regression ord_retry_legacy exists to
+ * close, and it gets the same answer: a rule introduced with the marker applies
+ * to entries that carry the marker.
+ *
+ * BOTH sides have to carry it, and one marker was not enough.  A comparison has
+ * two operands: a marked COLUMN entry says the sender ran the fixed compaction,
+ * but the ts entry it is measured against can still be a legacy one whose
+ * ts_max a binary that COULD borrow wrote — and the legacy partition is exactly
+ * where a re-synced column lands, because that is what the repair path is for.
+ * Measured on that shape (a legacy partition whose value column an upgraded
+ * sender re-synced whole, one entry carrying the borrow): the column pairs by
+ * content, the strict rule then rejects the pairing, and
+ *
+ *     SELECT v rc=0 rows=3072 sum=4720128   ->   TSDB_ERR_CORRUPT, forever
+ *
+ * with rc=0 on every push — the repair the error message asks for making the
+ * partition permanently worse.
+ *
+ * Where BOTH entries are marked, both were written by a binary with the fixed
+ * compaction, ts_max is exact, and a disagreement is real corruption that used
+ * to be served as an answer.  The ordinal branch below is therefore strict
+ * exactly there — ord_mode requires every column entry to be marked, and this
+ * adds the other operand. */
+static int part_meta_agrees(const tsdb_block_meta_t *c, const tsdb_block_meta_t *t) {
+    if (c->count != t->count || c->ts_min != t->ts_min) return 0;
+    return !TSDB_ORD_KNOWN(c->ord) || !TSDB_ORD_KNOWN(t->ord) ||
+           c->ts_max == t->ts_max;
+}
+
+static int part_all_ord_known(const tsdb_block_meta_t *m, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (!TSDB_ORD_KNOWN(m[i].ord)) return 0;
+    return 1;
+}
+
+/* (ordinal, position) pairs sorted by ordinal, for an O(log n) lookup. */
+typedef struct { uint32_t ord; uint32_t pos; } part_ordref_t;
+
+static int part_ordref_cmp(const void *a, const void *b) {
+    uint32_t x = ((const part_ordref_t *)a)->ord;
+    uint32_t y = ((const part_ordref_t *)b)->ord;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/* Position of the entry with ordinal `want`, or -1 if there is none.
+ *
+ * Two entries CAN claim one ordinal, and it is not corruption: a flush that
+ * crashed after publishing a non-ts column but before ts leaves that column an
+ * orphan entry, and the re-flush of the same rows (replayed from the WAL) then
+ * stamps the same ordinal again.  The idx is append-ordered, so the LAST such
+ * entry is the one the surviving ts block was published with; the earlier one
+ * is the dead prefix.  Take the last. */
+static long part_ordref_find(const part_ordref_t *v, size_t n, uint32_t want) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (v[mid].ord <= want) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0 || v[lo - 1].ord != want) return -1;
+    /* qsort is not stable, so scan the equal run for the highest position. */
+    uint32_t best = v[lo - 1].pos;
+    for (size_t i = lo - 1; i > 0 && v[i - 1].ord == want; i--)
+        if (v[i - 1].pos > best) best = v[i - 1].pos;
+    return (long)best;
+}
+
+/* Content key, used ONLY on the legacy path below and ONLY when unique.
+ *
+ * Two keys, deliberately.  FULL is (ts_min, ts_max, count); REL drops ts_max and
+ * is the identity the pristine reader used.  A legacy entry's ts_max can be a
+ * tick wider than its ts partner's (see part_meta_agrees), so the full key can
+ * fail to place a block that is not missing at all — while the full key is what
+ * separates two blocks of one duplicate-timestamp run that differ only there.
+ * Neither alone is right; the pairing below runs FULL first and lets REL fill
+ * only what FULL left empty, each gated on TS-side uniqueness under its own key
+ * so that both remain forced placements rather than guesses. */
+typedef struct { int64_t mn, mx; uint32_t cnt, pos; } part_keyref_t;
+
+static int part_keyref_cmp(const void *a, const void *b) {
+    const part_keyref_t *x = (const part_keyref_t *)a;
+    const part_keyref_t *y = (const part_keyref_t *)b;
+    if (x->mn  != y->mn)  return x->mn  < y->mn  ? -1 : 1;
+    if (x->mx  != y->mx)  return x->mx  < y->mx  ? -1 : 1;
+    if (x->cnt != y->cnt) return x->cnt < y->cnt ? -1 : 1;
+    return 0;
+}
+
+static int part_keyref_cmp_rel(const void *a, const void *b) {
+    const part_keyref_t *x = (const part_keyref_t *)a;
+    const part_keyref_t *y = (const part_keyref_t *)b;
+    if (x->mn  != y->mn)  return x->mn  < y->mn  ? -1 : 1;
+    if (x->cnt != y->cnt) return x->cnt < y->cnt ? -1 : 1;
+    return 0;
+}
+
+/* Fill `out` sorted by key; return 1 iff every key is pairwise DISTINCT.
+ *
+ * UNIQUENESS IS LOAD-BEARING ON THE TS SIDE ONLY.  A repeated key among the ts
+ * blocks means the correspondence is a guess — nothing left on disk says which
+ * ts block a column block belongs to.  A repeated key among the COLUMN's blocks
+ * says something else entirely: two entries describe the SAME rows, so either
+ * answers the ts block that asks for them.  Treating that as ambiguity turned
+ * every ts block into a HOLE and the whole column into a permanent
+ * TSDB_ERR_CORRUPT — for a shape part_ordref_find explicitly calls *not*
+ * corruption (a flush that published a non-ts column and died before ts, then
+ * re-flushed the same rows from the WAL). */
+static int part_keyref_build(const tsdb_block_meta_t *m, size_t n,
+                             part_keyref_t *out, int rel) {
+    int (*cmp)(const void *, const void *) =
+        rel ? part_keyref_cmp_rel : part_keyref_cmp;
+    for (size_t i = 0; i < n; i++) {
+        out[i].mn = m[i].ts_min; out[i].mx = m[i].ts_max;
+        out[i].cnt = m[i].count; out[i].pos = (uint32_t)i;
+    }
+    if (n > 1) qsort(out, n, sizeof(*out), cmp);
+    for (size_t i = 1; i < n; i++)
+        if (cmp(&out[i - 1], &out[i]) == 0) return 0;
+    return 1;
+}
+
+/* Position of the column entry answering ts block `t`, or -1.
+ *
+ * Resolves a repeated key the way part_ordref_find resolves a repeated ordinal,
+ * and for the same reason: the idx is append-ordered, so the LAST claimant is
+ * the one the surviving ts block was published with and the earlier one is the
+ * dead prefix.  (Upper bound, then walk the equal run back for its highest
+ * position — qsort is not stable, so the run's order is not the file's.) */
+static long part_keyref_find(const part_keyref_t *v, size_t n,
+                             const tsdb_block_meta_t *t, int rel) {
+    int (*cmp)(const void *, const void *) =
+        rel ? part_keyref_cmp_rel : part_keyref_cmp;
+    part_keyref_t probe;
+    probe.mn = t->ts_min; probe.mx = t->ts_max; probe.cnt = t->count; probe.pos = 0;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cmp(&v[mid], &probe) <= 0) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0 || cmp(&v[lo - 1], &probe) != 0) return -1;
+    uint32_t best = v[lo - 1].pos;
+    for (size_t i = lo - 1; i > 0 && cmp(&v[i - 1], &probe) == 0; i--)
+        if (v[i - 1].pos > best) best = v[i - 1].pos;
+    return (long)best;
+}
+
+/* The legacy content rule, in one place: fill `pick` by key, twice.
+ *
+ * Returns 1 when a placement was made (or provably none exists), 0 when the TS
+ * keys repeat and any alignment would be a guess — the caller reports that as
+ * ambiguity and the slots read as an error rather than as another block's
+ * values.  -1 is out of memory.
+ *
+ * The REL pass touches ONLY slots the FULL pass left empty and cannot steal a
+ * block the FULL pass placed: REL-uniqueness on the TS side means no two ts
+ * slots share a REL key, and a column entry has exactly one, so at most one slot
+ * can ever claim it. */
+static int part_legacy_pair(const tsdb_block_meta_t *ts_m, size_t nb_ts,
+                            const tsdb_block_meta_t *cm, size_t nb_col,
+                            long *pick)
+{
+    part_keyref_t *kt = malloc(nb_ts  * sizeof(*kt));
+    part_keyref_t *kc = malloc(nb_col * sizeof(*kc));
+    if (!kt || !kc) { free(kt); free(kc); return -1; }
+
+    int ok = part_keyref_build(ts_m, nb_ts, kt, 0);
+    (void)part_keyref_build(cm, nb_col, kc, 0);    /* sorts; uniqueness moot */
+    if (ok) {
+        size_t unplaced = 0;
+        for (size_t b = 0; b < nb_ts; b++) {
+            pick[b] = part_keyref_find(kc, nb_col, &ts_m[b], 0);
+            if (pick[b] < 0) unplaced++;
+        }
+        if (unplaced && part_keyref_build(ts_m, nb_ts, kt, 1)) {
+            (void)part_keyref_build(cm, nb_col, kc, 1);
+            for (size_t b = 0; b < nb_ts; b++)
+                if (pick[b] < 0)
+                    pick[b] = part_keyref_find(kc, nb_col, &ts_m[b], 1);
+        }
+    }
+    free(kt); free(kc);
+    return ok;
+}
+
+/*
+ * Build the nb_ts-long array that answers for column `ci`.
+ *
+ * *out_merged == NULL means "already exactly aligned, keep the column's own
+ * array".  Otherwise the caller takes ownership.  Every slot is one of:
+ *   - a real block                (paired by ordinal, metadata verified)
+ *   - an ALTER zero-fill sentinel (offset UINT64_MAX, no NO_VALUE flag)
+ *   - a HOLE                      (offset UINT64_MAX | TSDB_BLOCK_FLAG_HOLE)
+ *   - a MISMATCH                  (offset UINT64_MAX | TSDB_BLOCK_FLAG_MISMATCH)
+ * and keeping those four apart is the whole job: a sentinel reads as the zeros
+ * it legitimately is, a HOLE and a MISMATCH each read as their own named error,
+ * and none of them is ever another's values.
+ */
+static int part_align_column(const tsdb_schema_t *s, int ci,
+                             const char *partition_dir,
+                             const tsdb_block_meta_t *ts_m, size_t nb_ts,
+                             const tsdb_block_meta_t *cm, size_t nb_col,
+                             const uint32_t *idx_decl_count,
+                             uint16_t ts_ncols_stamp,
+                             tsdb_block_meta_t **out_merged)
+{
+    *out_merged = NULL;
+
+    /* Ordinal pairing is gated on the COLUMN's ordinals, not on both arrays.
+     *
+     * Gating on ts as well made the fix unreachable on any partition an
+     * unpatched binary ever wrote: a flush only APPENDS to ts.idx, so its
+     * unmarked legacy prefix survives forever and no amount of subsequent
+     * patched writing ever removes it.  The partition would stay on the legacy
+     * content rule permanently — and on a duplicate-timestamp table that rule
+     * declares the placement ambiguous, so a column this binary wrote itself
+     * (an ALTER TABLE ADD COLUMN, say) became unreadable for good.
+     *
+     * The ts column does not need its own marker to be usable here, because ts
+     * is the partition's spine: entries are only ever appended to it and
+     * part_idx_next_ord() seeds the first stamped ordinal at the pre-existing
+     * entry count, so on an unmarked ts prefix position IS ordinal by
+     * construction — exactly what idx_eff_ord() encodes.  A short COLUMN gets
+     * no such guarantee, which is why its ordinals must all be recorded before
+     * they are believed; without that the legacy content reasoning below (which
+     * can still place a legacy ALTER-added suffix correctly) has to stand. */
+    const int ord_mode = nb_col > 0 && part_all_ord_known(cm, nb_col);
+
+    /* Already aligned?  The overwhelmingly common case — both writers emit
+     * block i of every column in the same order — and it stays a pure check.
+     * The metadata is verified either way: an ordinal that pairs over rows the
+     * two indexes describe differently is corruption, and taking the fast exit
+     * on it would serve it instead of naming it. */
+    if (nb_col >= nb_ts) {
+        int exact = 1;
+        for (size_t b = 0; b < nb_ts && exact; b++) {
+            if (ord_mode && cm[b].ord.v != idx_eff_ord(ts_m[b].ord, (uint32_t)b))
+                exact = 0;
+            /* A MARKED column entry sitting against an UNMARKED ts entry is
+             * numbering in a space that does not meet ts's invented positions —
+             * tsdb_part_next_ordinal's legacy floor is ts.idx's entry count, so
+             * the two are disjoint by construction — and its position therefore
+             * says nothing about which ts block it answers.
+             *
+             * Reached when only SOME of the column's entries are marked, so
+             * ord_mode is off and the loop would otherwise fall through to a
+             * pure content check.  That is the state the documented repair
+             * leaves behind: a legacy partition whose column is short is
+             * re-synced block by block, the pushes APPEND marked entries beside
+             * the unmarked survivors, and on a duplicate-timestamp table every
+             * key is identical — so position alone accepted a re-delivered copy
+             * of block 0 as the answer for ts block 2.  Measured without this:
+             * SELECT v rc=0 rows=3072 sum=2622976 against an intact 4720128 —
+             * a refusal turning into a silent wrong answer under the repair the
+             * error message asks for.
+             *
+             * A partition being flushed concurrently is untouched: a writer
+             * appends to ts and to the column in lockstep, so their marked
+             * prefixes begin at the same position and a marked column entry
+             * never lines up with an unmarked ts entry. */
+            else if (TSDB_ORD_KNOWN(cm[b].ord) && !TSDB_ORD_KNOWN(ts_m[b].ord))
+                exact = 0;
+            else if (!part_meta_agrees(&cm[b], &ts_m[b]))
+                exact = 0;
+        }
+        if (exact) return TSDB_OK;
+    }
+
+    /* pick[b]: >= 0 the column entry that answers ts block b
+     *          PICK_NONE      nothing pairs (sentinel or HOLE, per alter_shaped)
+     *          PICK_MISMATCH  an ordinal paired but its metadata disagreed */
+    enum { PICK_NONE = -1, PICK_MISMATCH = -2 };
+
+    long *pick = malloc(nb_ts * sizeof(*pick));
+    if (!pick) return TSDB_ERR_NOMEM;
+    for (size_t b = 0; b < nb_ts; b++) pick[b] = PICK_NONE;
+
+    int alter_shaped = 0;
+    int mismatched   = 0;      /* an ordinal paired but the content disagreed */
+    int ambiguous    = 0;      /* legacy + duplicate keys: nothing is provable */
+
+    /* Set when the ordinal branch paired NOTHING: the two sides are numbering
+     * in disjoint spaces, not describing different rows, so the legacy content
+     * rule below has to decide instead.  See the long comment at the end of the
+     * ordinal branch. */
+    int ord_retry_legacy = 0;
+
+    if (nb_col == 0) {
+        /* Nothing to pair against.  Unchanged rule: only a shape/stamp argument
+         * (part_col_absence_is_late_add) may license the zero-fill. */
+        alter_shaped = (idx_decl_count[ci] == 0) &&
+                       part_col_absence_is_late_add(s, ci, idx_decl_count,
+                                                    ts_ncols_stamp);
+    } else if (ord_mode) {
+        part_ordref_t *ov = malloc(nb_col * sizeof(*ov));
+        if (!ov) { free(pick); return TSDB_ERR_NOMEM; }
+        for (size_t k = 0; k < nb_col; k++) {
+            ov[k].ord = cm[k].ord.v; ov[k].pos = (uint32_t)k;
+        }
+        if (nb_col > 1) qsort(ov, nb_col, sizeof(*ov), part_ordref_cmp);
+
+        size_t matched = 0;
+        for (size_t b = 0; b < nb_ts; b++) {
+            long k = part_ordref_find(ov, nb_col, idx_eff_ord(ts_m[b].ord,
+                                                              (uint32_t)b));
+            if (k < 0) continue;
+            if (!part_meta_agrees(&cm[k], &ts_m[b])) {
+                /* The ordinal paired and the rows disagree.  That is its own
+                 * fact — the two indexes contradict each other about what this
+                 * partition holds — and it is kept apart from a missing block
+                 * all the way to the read site, which reports it under its own
+                 * name and metric instead of calling it a short column. */
+                mismatched = 1;
+                pick[b] = PICK_MISMATCH;
+                continue;
+            }
+            pick[b] = k; matched++;
+        }
+        free(ov);
+
+        /* A genuine late add owns a contiguous SUFFIX of the ts ordinals, and
+         * nothing else.  Verified on the ordinal, so a duplicate-key run can no
+         * longer satisfy it by accident — which is how an interior loss used to
+         * be misread as an ALTER and answered with fabricated zeros.
+         *
+         * matched > 0 is required: a column that has blocks but matches NO ts
+         * ordinal is corruption, and zero-filling it whole would fabricate
+         * every one of its values.  (The genuinely blockless case is the
+         * nb_col == 0 branch above, which is decided on the stamp.) */
+        if (!mismatched && matched > 0) {
+            size_t nmiss = nb_ts - matched;
+            alter_shaped = 1;
+            for (size_t b = 0; b < nb_ts; b++) {
+                int want = (b >= nmiss);
+                if ((pick[b] >= 0) != want) { alter_shaped = 0; break; }
+            }
+        }
+
+        /* Paired NOTHING.
+         *
+         * A column whose blocks match NONE of ts's ordinals has not been shown
+         * to be short — the two sides may simply be numbering in DISJOINT
+         * spaces, which tsdb_part_next_ordinal() guarantees by construction.
+         * It never re-issues a number this partition has already bound, so a
+         * column re-delivered block by block is stamped out of the FREE range
+         * above everything ts already owns.  Nothing overlaps, ever, and that
+         * holds whether or not ts carries markers of its own:
+         *
+         *   - legacy ts: its "ordinals" are the positions idx_eff_ord() invents,
+         *     0..nb_ts-1, and the re-sync is stamped nb_ts, nb_ts+1, ...
+         *   - ts THIS BINARY WROTE: it owns marked 0..nb_ts-1 for real, and the
+         *     re-sync is stamped nb_ts, nb_ts+1, ... for exactly the same
+         *     reason — those are the ordinals that are free.
+         *
+         * Gating this escape on "ts is not fully marked" therefore closed the
+         * repair for the FIRST shape and left it open for the second, which is
+         * backwards: every partition becomes the second shape once the fleet has
+         * upgraded and written, so the gate turned a rollout-window bug into a
+         * permanent one.
+         *
+         * That is not a hypothetical: it is the documented repair path.  The
+         * engine's own error message tells the operator to re-sync a lost
+         * column — which the applier can only do one (column, block) push at a
+         * time.  Falling through here with matched == 0 HOLEs every slot, so the
+         * repair is accepted at rc=TSDB_OK, anti-entropy sees a healthy
+         * partition, and the column reads TSDB_ERR_CORRUPT forever with nothing
+         * left to self-heal it — round 1 of the repair writes <part>/.ordmap, so
+         * rounds 2 and 3 translate onto the same local ordinals and land
+         * idempotently on the same wrong answer.  The state is self-locking.
+         *
+         * So hand the decision to the legacy content rule the function already
+         * has.  It is not weaker: it still refuses (ambiguous) when the ts keys
+         * repeat, which is the only case where the placement would be a guess.
+         *
+         * `matched == 0` is the whole trigger.  A PARTIAL match is real evidence
+         * — the spaces provably overlap — and keeps its meaning: the unmatched
+         * slots are genuinely missing blocks. */
+        if (!mismatched && matched == 0) {
+            ord_retry_legacy = 1;
+            for (size_t b = 0; b < nb_ts; b++) pick[b] = PICK_NONE;
+        }
+    }
+
+    /* The legacy content rule: reached either because this column carries no
+     * durable ordinal on every entry, or because the ordinal branch just handed
+     * the decision back. */
+    const int use_legacy = ord_retry_legacy || (!ord_mode && nb_col > 0);
+
+    if (use_legacy && nb_col < nb_ts) {
+        /* LEGACY, short.  A late add is a contiguous positional run of ts, and
+         * that is what used to be tested — at the ONE offset a late add would
+         * sit at.  On an all-equal-key run every offset satisfies it, so an
+         * interior loss was accepted as an ALTER and answered with a zero block
+         * plus every surviving block shifted one slot.  Count the offsets that
+         * fit instead: exactly one is a forced placement, two or more means the
+         * keys repeat and the alignment would be a guess. */
+        size_t nmiss = nb_ts - nb_col;
+        size_t fits = 0, fit_d = 0;
+        for (size_t d = 0; d + nb_col <= nb_ts && fits < 2; d++) {
+            int ok = 1;
+            for (size_t k = 0; k < nb_col && ok; k++)
+                if (!part_meta_agrees(&cm[k], &ts_m[d + k])) ok = 0;
+            if (ok) { fits++; fit_d = d; }
+        }
+        if (fits == 1) {
+            for (size_t k = 0; k < nb_col; k++) pick[fit_d + k] = (long)k;
+            /* Only a run sitting at the END is the late add whose missing
+             * blocks are legitimately zero; anywhere else the gap is loss. */
+            alter_shaped = (fit_d == nmiss);
+        } else if (fits >= 2) {
+            ambiguous = 1;
+        } else {
+            /* Not a suffix.  Pair by key ONLY where the TS keys are pairwise
+             * distinct, which makes the correspondence forced rather than
+             * guessed; a duplicate ts key is information-theoretically ambiguous
+             * (no remaining field says which ordinal is missing) and is marked
+             * unavailable instead.  A duplicate COLUMN key is not ambiguity —
+             * both entries describe the same rows — and part_keyref_find takes
+             * the last of the run, as the ordinal path does. */
+            int lr = part_legacy_pair(ts_m, nb_ts, cm, nb_col, pick);
+            if (lr < 0) { free(pick); return TSDB_ERR_NOMEM; }
+            if (!lr) ambiguous = 1;
+        }
+    } else if (use_legacy) {
+        /* LEGACY, equal or longer, but the positional check above disagreed.
+         * Same rule: forced by TS uniqueness or unavailable, never first-match. */
+        int lr = part_legacy_pair(ts_m, nb_ts, cm, nb_col, pick);
+        if (lr < 0) { free(pick); return TSDB_ERR_NOMEM; }
+        if (!lr) ambiguous = 1;
+    }
+
+    tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
+    if (!merged) { free(pick); return TSDB_ERR_NOMEM; }
+
+    size_t holes = 0, mismatches = 0;
+    for (size_t b = 0; b < nb_ts; b++) {
+        if (pick[b] >= 0) { merged[b] = cm[pick[b]]; continue; }
+        memset(&merged[b], 0, sizeof(merged[b]));
+        merged[b].offset = UINT64_MAX;                  /* sentinel */
+        merged[b].count  = ts_m[b].count;
+        merged[b].ts_min = ts_m[b].ts_min;
+        merged[b].ts_max = ts_m[b].ts_max;
+        merged[b].codec  = TSDB_CODEC_NONE;
+        merged[b].ord    = ts_m[b].ord;
+        if (pick[b] == PICK_MISMATCH) {
+            merged[b].flags = TSDB_BLOCK_FLAG_MISMATCH; mismatches++;
+        } else if (!alter_shaped) {
+            merged[b].flags = TSDB_BLOCK_FLAG_HOLE; holes++;
+        }
+    }
+    free(pick);
+
+    if (holes && idx_decl_count[ci] == 0)
+        fprintf(stderr,
+                "[part] %s: column %s has NO index here at all, but this "
+                "partition was written with it (ts stamp=%u, column index=%d); "
+                "its %zu block(s) of values are gone and now read as an error, "
+                "not as zero\n",
+                partition_dir, s->cols[ci].name,
+                (unsigned)ts_ncols_stamp, ci, holes);
+    else if (holes && ambiguous)
+        /* `ambiguous` is only ever reached on the legacy content rule, which is
+         * either "at least one entry of THIS column has no marker" or "both
+         * sides are marked in spaces that do not meet" (ord_retry_legacy).  Do
+         * not name a cause that may not be this partition's: say what actually
+         * decided, which is that the keys repeat. */
+        fprintf(stderr,
+                "[part] %s: column %s declares %u blocks against ts's %u and "
+                "the two cannot be paired by durable block ordinal (%s); the "
+                "keys repeat, so which block is missing is not recoverable — "
+                "%zu ts block(s) now read as an error, not as another block's "
+                "values\n",
+                partition_dir, s->cols[ci].name,
+                idx_decl_count[ci], idx_decl_count[s->ts_col_idx],
+                ord_retry_legacy ? "this column is stamped in a space that does "
+                                   "not meet ts's"
+                                 : "not every entry of this column is stamped",
+                holes);
+    else if (holes)
+        fprintf(stderr,
+                "[part] %s: column %s declares %u blocks against ts's %u and "
+                "they are not a late-added suffix; %zu ts block(s) have no "
+                "value for it and now read as an error, not as zero\n",
+                partition_dir, s->cols[ci].name,
+                idx_decl_count[ci], idx_decl_count[s->ts_col_idx], holes);
+
+    if (mismatches)
+        fprintf(stderr,
+                "[part] %s: column %s pairs %zu ts block(s) by ordinal but its "
+                "entries describe different rows; the two indexes disagree "
+                "about what this partition holds, so those block(s) now read "
+                "as an error, not as another block's values\n",
+                partition_dir, s->cols[ci].name, mismatches);
+
+    *out_merged = merged;
+    return TSDB_OK;
 }
 
 int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out) {
@@ -2568,6 +3590,11 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                 m->stats_last  = get_i64le(entry + 72);
                 m->stats_flags = get_u16le(entry + 80);
             }
+            /* The durable ordinal, when this writer recorded one.  NOTE `i`,
+             * not `slot`: the ordinal describes the ENTRY, and the size filter
+             * above can drop entries, so the surviving array's positions are
+             * not the file's positions. */
+            m->ord = read_idx_entry_ord(entry, entry_size);
             p->col_meta_n[ci]++;
         }
         free(entries);
@@ -2683,90 +3710,15 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         size_t nb_ts = p->col_meta_n[ts_ci];
         const tsdb_block_meta_t *ts_m = p->col_metas[ts_ci];
         for (int ci = 0; ci < s->ncols; ci++) {
-            if (ci == ts_ci)                  continue;
-            size_t nb_col = p->col_meta_n[ci];
-            if (nb_col >= nb_ts)              continue;   /* already aligned */
-            /* Skip a torn (not late-added) column: its idx is as long as ts's,
-             * so the shortfall is a tail tear, not missing leading blocks.
-             * The clamp above already bounded the partition to the prefix
-             * these blocks live in. */
-            if (idx_decl_count[ci] >= idx_decl_count[ts_ci]) continue;
-
-            size_t nmiss = nb_ts - nb_col;
-            const tsdb_block_meta_t *cm = p->col_metas[ci];
-
-            /* Is the shortfall shaped like a late add?  Compare against ts on
-             * the reader's own key. */
-            int alter_shaped;
-            if (nb_col > 0) {
-                alter_shaped = 1;
-                for (size_t b = 0; b < nb_col; b++) {
-                    if (cm[b].ts_min != ts_m[nmiss + b].ts_min ||
-                        cm[b].count  != ts_m[nmiss + b].count) {
-                        alter_shaped = 0; break;
-                    }
-                }
-            } else {
-                /* No readable blocks at all, so there is no content to check.
-                 *
-                 * Necessary condition (KEEP): the idx must declare none either
-                 * — a column whose idx declares blocks the .col filter then
-                 * dropped LOST them, and zero-filling the whole column would
-                 * fabricate every one of its values.
-                 *
-                 * Not sufficient, and this is the case that shipped fabricated
-                 * zeros: with no idx AT ALL there is nothing to count, and a
-                 * genuinely ALTER-added column and a column whose write never
-                 * landed are byte-identical on disk.  Decide it on evidence
-                 * that is not a count — see part_col_absence_is_late_add. */
-                alter_shaped = (idx_decl_count[ci] == 0) &&
-                               part_col_absence_is_late_add(s, ci,
-                                                            idx_decl_count,
-                                                            ts_ncols_stamp);
-            }
-
-            tsdb_block_meta_t *merged = malloc(nb_ts * sizeof(*merged));
-            if (!merged) { tsdb_part_close(p); return TSDB_ERR_NOMEM; }
-
-            size_t holes = 0;
-            for (size_t b = 0; b < nb_ts; b++) {
-                const tsdb_block_meta_t *use = NULL;
-                if (alter_shaped) {
-                    if (b >= nmiss) use = &cm[b - nmiss];
-                } else {
-                    /* Exactly the first-match the readers do, so this pass can
-                     * never place a block the reader would fail to find. */
-                    for (size_t k = 0; k < nb_col; k++)
-                        if (cm[k].ts_min == ts_m[b].ts_min &&
-                            cm[k].count  == ts_m[b].count) { use = &cm[k]; break; }
-                }
-                if (use) { merged[b] = *use; continue; }
-                memset(&merged[b], 0, sizeof(merged[b]));
-                merged[b].offset = UINT64_MAX;                /* sentinel */
-                merged[b].count  = ts_m[b].count;
-                merged[b].ts_min = ts_m[b].ts_min;
-                merged[b].ts_max = ts_m[b].ts_max;
-                merged[b].codec  = TSDB_CODEC_NONE;
-                if (!alter_shaped) { merged[b].flags = TSDB_BLOCK_FLAG_HOLE; holes++; }
-            }
-
-            if (holes && idx_decl_count[ci] == 0)
-                fprintf(stderr,
-                        "[part] %s: column %s has NO index here at all, but "
-                        "this partition was written with it (ts stamp=%u, "
-                        "column index=%d); its %zu block(s) of values are gone "
-                        "and now read as an error, not as zero\n",
-                        partition_dir, s->cols[ci].name,
-                        (unsigned)ts_ncols_stamp, ci, holes);
-            else if (holes)
-                fprintf(stderr,
-                        "[part] %s: column %s declares %u blocks against ts's %u "
-                        "and they are not a late-added suffix; %zu ts block(s) "
-                        "have no value for it and now read as an error, not as "
-                        "zero\n",
-                        partition_dir, s->cols[ci].name,
-                        idx_decl_count[ci], idx_decl_count[ts_ci], holes);
-
+            if (ci == ts_ci) continue;
+            tsdb_block_meta_t *merged = NULL;
+            int arc = part_align_column(s, ci, partition_dir,
+                                        ts_m, nb_ts,
+                                        p->col_metas[ci], p->col_meta_n[ci],
+                                        idx_decl_count, ts_ncols_stamp,
+                                        &merged);
+            if (arc != TSDB_OK) { tsdb_part_close(p); return arc; }
+            if (!merged) continue;                 /* already exactly aligned */
             free(p->col_metas[ci]);
             p->col_metas[ci]  = merged;
             p->col_meta_n[ci] = nb_ts;
@@ -2880,11 +3832,13 @@ int tsdb_part_read_block(tsdb_part_t *p, int col_idx,
      * that pre-dates the column's creation — zero-fill with the type's
      * default value. Works whether the column file is mapped or not.
      *
-     * The HOLE flag marks the other producer of a missing block: the column
-     * DID exist for these rows, it just lost the block (see tsdb_part_open).
-     * The value is unknown, so refuse rather than invent one. */
+     * The HOLE and MISMATCH flags mark the other two producers of a missing
+     * block: the column DID exist for these rows, it either lost the block or
+     * its index disagrees about which rows the block holds (see
+     * tsdb_part_open).  The value is unknown, so refuse rather than invent
+     * one. */
     if (meta->offset == UINT64_MAX) {
-        if (meta->flags & TSDB_BLOCK_FLAG_HOLE) return TSDB_ERR_CORRUPT;
+        if (meta->flags & TSDB_BLOCK_FLAG_NO_VALUE) return TSDB_ERR_CORRUPT;
         tsdb_type_t type = p->schema->cols[col_idx].type;
         size_t w = tsdb_type_width(type);
         memset(out_buf, 0, (size_t)meta->count * w);
@@ -2923,9 +3877,10 @@ int tsdb_part_read_block_ref(tsdb_part_t *p, int col_idx,
 
     /* ALTER ADD COLUMN sentinel: there are no on-disk bytes to point at —
      * materialise the zero-fill into an owned buffer.  A HOLE is a lost
-     * block, not a pre-dating one: it has no value to serve. */
+     * block and a MISMATCH is an index that disagrees about the rows, not a
+     * pre-dating one: neither has a value to serve. */
     if (meta->offset == UINT64_MAX) {
-        if (meta->flags & TSDB_BLOCK_FLAG_HOLE) return TSDB_ERR_CORRUPT;
+        if (meta->flags & TSDB_BLOCK_FLAG_NO_VALUE) return TSDB_ERR_CORRUPT;
         void *buf = calloc(1, need ? need : 1);
         if (!buf) return TSDB_ERR_NOMEM;
         *out_owned = buf;

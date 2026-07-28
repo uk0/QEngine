@@ -56,8 +56,14 @@ static inline int64_t  rb_get_i64(const uint8_t *p) {
 
 /* Stats block on the wire: 5 × i64 + u16 + 6 bytes pad = 48 bytes,
  * matching the V3 index entry tail byte-for-byte so the replica can
- * memcpy the payload straight into its idx file. */
+ * memcpy the payload straight into its idx file.
+ *
+ * The 6 pad bytes at [42..47] are the durable block ordinal + marker — the same
+ * fields, at the same relative offsets, as idx entry bytes [82..87].  Every
+ * previous sender wrote them as zero, which is exactly "ordinal unknown", so no
+ * wire length or version changes. */
 #define RAWBLK_WIRE_STATS_SIZE 48u
+#define RAWBLK_WIRE_ORD_OFF    42u
 
 int tsdb_rawblock_serialize(const tsdb_rawblock_push_t *r,
                              uint8_t **buf, size_t *len)
@@ -65,9 +71,13 @@ int tsdb_rawblock_serialize(const tsdb_rawblock_push_t *r,
     if (!r || !buf || !len) return TSDB_ERR_INVAL;
 
     uint8_t tlen = (uint8_t)strnlen(r->table, 63);
-    /* 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8 + 48 stats + 4 + block_bytes_len */
+    /* 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8 + 48 stats + 4 + block_bytes_len
+     * + 8 issuer.  The issuer sits AFTER the block bytes on purpose: every
+     * field before it keeps its offset, and tsdb_rawblock_parse has never
+     * required the payload to end where it stops reading, so an older receiver
+     * ignores the tail and a payload written without one parses as issuer 0. */
     size_t total = 1 + tlen + 4 + 2 + 1 + 2 + 4 + 8 + 8
-                   + RAWBLK_WIRE_STATS_SIZE + 4 + r->block_bytes_len;
+                   + RAWBLK_WIRE_STATS_SIZE + 4 + r->block_bytes_len + 8;
 
     uint8_t *p = malloc(total);
     if (!p) return TSDB_ERR_NOMEM;
@@ -91,11 +101,17 @@ int tsdb_rawblock_serialize(const tsdb_rawblock_push_t *r,
     rb_put_i64(w + 24, r->stats_first);
     rb_put_i64(w + 32, r->stats_last);
     rb_put_u16(w + 40, r->stats_flags);
+    if (TSDB_ORD_KNOWN(r->ord)) {
+        rb_put_u32(w + RAWBLK_WIRE_ORD_OFF,     r->ord.v);
+        rb_put_u16(w + RAWBLK_WIRE_ORD_OFF + 4, r->ord.mark);
+    }
     w += RAWBLK_WIRE_STATS_SIZE;
 
     rb_put_u32(w, r->block_bytes_len); w += 4;
     if (r->block_bytes_len > 0 && r->block_bytes)
         memcpy(w, r->block_bytes, r->block_bytes_len);
+    w += r->block_bytes_len;
+    rb_put_i64(w, (int64_t)r->issuer);
 
     *buf = p;
     *len = total;
@@ -135,11 +151,21 @@ int tsdb_rawblock_parse(const uint8_t *buf, size_t len,
     out->stats_first = rb_get_i64(p + 24);
     out->stats_last  = rb_get_i64(p + 32);
     out->stats_flags = (uint16_t)p[40] | ((uint16_t)p[41] << 8);
+    {
+        uint16_t mk = rb_get_u16(p + RAWBLK_WIRE_ORD_OFF + 4);
+        out->ord.mark = (mk == TSDB_IDX_ORD_MARK) ? mk : 0;
+        out->ord.v    = out->ord.mark ? rb_get_u32(p + RAWBLK_WIRE_ORD_OFF) : 0;
+    }
     p += RAWBLK_WIRE_STATS_SIZE;
 
     RB_NEED(4); out->block_bytes_len = rb_get_u32(p); p += 4;
     RB_NEED(out->block_bytes_len);
     out->block_bytes = (uint8_t *)p; /* points into caller's buf */
+    p += out->block_bytes_len;
+
+    /* Optional issuer tail.  A sender that predates it stops here, and 0 is
+     * exactly the "unknown issuer" state the applier falls back on. */
+    out->issuer = (p + 8 <= end) ? (uint64_t)rb_get_i64(p) : 0;
 
 #undef RB_NEED
     return TSDB_OK;
@@ -183,7 +209,8 @@ static void rawblk_write_header(uint8_t *hdr,
 static void rawblk_write_idx_entry(uint8_t *buf,
                                    uint64_t offset, uint32_t size, uint32_t count,
                                    int64_t ts_min, int64_t ts_max,
-                                   const tsdb_block_meta_t *stats_src)
+                                   const tsdb_block_meta_t *stats_src,
+                                   tsdb_block_ord_t ord)
 {
     memset(buf, 0, RAWBLK_IDX_ENT_SIZE);
     for (int i = 0; i < 8; i++) buf[0+i] = (uint8_t)(((uint64_t)offset >> (i*8)) & 0xFF);
@@ -201,6 +228,75 @@ static void rawblk_write_idx_entry(uint8_t *buf,
         rb_put_i64(buf + 72, stats_src->stats_last);
         rb_put_u16(buf + 80, stats_src->stats_flags);
     }
+    /* [82..87] the durable ordinal, in THIS node's space (the applier has
+     * already translated the sender's).  A sender that predates the field
+     * leaves the marker 0, which is the entry's "unknown" state. */
+    if (TSDB_ORD_KNOWN(ord)) {
+        rb_put_u32(buf + 82, ord.v);
+        rb_put_u16(buf + 86, ord.mark);
+    }
+}
+
+/* The RECORDED ordinal of an entry in an idx image of 88-byte entries.
+ * Returns 1 and fills `*out` when the entry carries one, 0 when it does not.
+ *
+ * It deliberately does NOT fall back to the physical position.  Position ==
+ * ordinal is precisely false in the state a repair push exists to fix: once a
+ * push has been lost, the surviving entries have closed up over the gap, so the
+ * n-th entry is no longer ordinal n.  Handing an unmarked entry an invented
+ * ordinal made the repair collide with the WRONG entry and be discarded as a
+ * re-delivery — turning a repairable gap into a column that reads
+ * TSDB_ERR_CORRUPT forever, on exactly the rolling-upgrade path (upgraded
+ * sender, not-yet-upgraded index) this field was supposed to help. */
+static int rawblk_entry_ord(const uint8_t *ent, uint32_t *out) {
+    if (rb_get_u16(ent + 86) != TSDB_IDX_ORD_MARK) return 0;
+    *out = rb_get_u32(ent + 82);
+    return 1;
+}
+
+/* Does an existing entry describe the same block as the incoming push? */
+static int rawblk_entry_agrees(const uint8_t *ent,
+                               const tsdb_rawblock_push_t *r) {
+    return rb_get_u32(ent + 8)  == r->block_bytes_len &&
+           rb_get_u32(ent + 12) == r->count &&
+           rb_get_i64(ent + 16) == r->ts_min &&
+           rb_get_i64(ent + 24) == r->ts_max;
+}
+
+/* Is an existing entry THE SAME BLOCK as the incoming push — bytes included?
+ *
+ * ABSORBING A PUSH IS DISCARDING IT, so the metadata compare above is not
+ * enough to license it.  (size, count, ts_min, ts_max) is a description, not a
+ * checksum: two different value blocks of one column routinely encode to the
+ * same length under the same codec, and the whole point of this file's rework is
+ * that content keys repeat.  A push absorbed on that alone is ACKed and thrown
+ * away — the sender counts a durable replica for rows this node does not hold.
+ *
+ * So read the bytes the entry points at and compare them.  Anything that stops
+ * the comparison from PROVING equality — a .col shorter than its own index, a
+ * failed open, OOM — answers "not the same block", which routes the push through
+ * the keep-both path: a duplicate is an over-count anti-entropy can see and
+ * repair, where the drop is silent and permanent. */
+static int rawblk_entry_is_same_block(const char *col_path, const uint8_t *ent,
+                                      const tsdb_rawblock_push_t *r) {
+    if (!rawblk_entry_agrees(ent, r)) return 0;
+    uint32_t n = r->block_bytes_len;
+    if (n == 0) return 1;                 /* nothing to compare */
+    if (!r->block_bytes) return 0;
+
+    uint64_t off = (uint64_t)rb_get_i64(ent + 0);
+    FILE *f = fopen(col_path, "rb");
+    if (!f) return 0;
+    uint8_t *have = malloc(n);
+    int same = 0;
+    if (have) {
+        if (fseeko(f, (off_t)(off + RAWBLK_HDR_SIZE), SEEK_SET) == 0 &&
+            fread(have, 1, n, f) == n)
+            same = (memcmp(have, r->block_bytes, n) == 0);
+        free(have);
+    }
+    fclose(f);
+    return same;
 }
 
 /* ---- Apply on replica ------------------------------------------------------ */
@@ -264,6 +360,7 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
     int64_t   old_fmx       = INT64_MIN;
     int       have_old_zone = 0;
     uint64_t  old_max_seq   = 0;   /* carried forward so a V4 partition stays V4 */
+    uint32_t  insert_at     = 0;   /* entry position this block belongs at */
 
     /* Serialise probe -> append -> idx read-modify-write -> rename against the
      * other writers of this partition: a concurrent applier for the same
@@ -274,6 +371,34 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
      * both read N and write N+1 and one entry is silently lost.  A lost NON-ts
      * entry under a surviving ts is the multi-column hole. */
     tsdb_part_idx_lock(part_dir);
+
+    /* --- Translate the sender's ordinal into OUR space ----------------------
+     *
+     * A block on the wire carries the SENDER's partition-local number.  This
+     * node's space is its own: it compacts on its own schedule (every node runs
+     * a compactor, and compaction is never replicated), and its own flush
+     * allocates out of the same range.  Two rounds of trusting a remote ordinal
+     * lost data in both directions — a primary that renumbered re-issued
+     * numbers the replica held for other rows, and a replica-side compaction
+     * consumed exactly the numbers the primary was about to issue.
+     *
+     * tsdb_part_ord_translate maps the incoming block GROUP — keyed on the
+     * ISSUER plus the four fields every column of one flush block shares — to
+     * one free ordinal here, durably, so every column of the group lands on the
+     * same number and the group stays pairable.  Nothing the sender numbered
+     * ever enters this node's space, which is what makes the two compactors
+     * independent again; and the issuer is what keeps TWO senders' spaces apart
+     * from each other, which matters because they both start at ordinal 0 over
+     * the same timestamps and their ts blocks are then byte-identical.
+     *
+     * It runs before the commit test because that test is answered against THIS
+     * index, so it has to be asked about THIS node's ordinal. */
+    tsdb_block_ord_t lord = { 0, 0 };
+    {
+        int trc = tsdb_part_ord_translate(schema, part_dir, r->issuer, r->ord,
+                                          r->ts_min, r->ts_max, r->count, &lord);
+        if (trc != TSDB_OK) { rc = trc; goto out; }
+    }
 
     /* --- Commit test -------------------------------------------------------
      * Never advance the partition's visibility marker past a group this node
@@ -294,9 +419,13 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
      * Nothing is written when it fails, so the caller may simply retry. */
     if ((flags & TSDB_RB_VERIFY_TS) && (int)r->col_idx == schema->ts_col_idx) {
         char missing[64];
-        int vrc = tsdb_part_ts_publish_ready(schema, part_dir,
-                                             r->ts_min, r->count,
-                                             missing, sizeof(missing));
+        /* By ORDINAL when the sender carries one.  "Some sibling block with a
+         * matching key" is satisfied by the WRONG sibling on a duplicate-
+         * timestamp run — the replica then publishes ts for a group it has not
+         * received and answers that column with another group's values. */
+        int vrc = tsdb_part_ts_publish_ready_ord(schema, part_dir, lord,
+                                                 r->ts_min, r->count,
+                                                 missing, sizeof(missing));
         if (vrc != TSDB_OK) {
             tsdb_metric_inc("qengine_rawblock_ts_deferred_total");
             fprintf(stderr,
@@ -310,38 +439,181 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
         }
     }
 
-    /* --- Idempotency: skip if last idx entry matches.  Use the storage
-     * probe so the last-entry offset is correct even on a V3/V4-mongrel
-     * header (a wrong header size here would mis-locate the last entry, miss
-     * the match, and double-append the block). */
+    /* --- Read the existing idx -----------------------------------------------
+     * Read via the storage layer's probe so we (a) locate old entries at the
+     * right offset even on a V3/V4-mongrel header, and (b) PRESERVE the
+     * partition's idx version + carry its max_seq forward.  Pre-fix this path
+     * hardcoded a V3 40-byte header, so applying a raw block to a V4 partition
+     * silently downgraded it to V3 (dropping the WAL redo checkpoint) and —
+     * racing the flush writer — could leave a header size / version /
+     * entry-offset mongrel that makes a SELECT read 0 rows.
+     *
+     * This runs BEFORE the .col append because the placement decision below
+     * needs the whole entry array, not just its tail. */
     {
         uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
         uint64_t ptot = 0, pmseq = 0;
-        int64_t  pfmn = 0, pfmx = 0;
+        int64_t  pfmn = INT64_MAX, pfmx = INT64_MIN;
+        /* probe returns >0 only when the magic + version are valid, so a
+         * missing/short/corrupt-magic idx falls through to a fresh write. */
         int phsz = tsdb_part_idx_probe(idx_path, &pver, &pcnt, &pesz,
                                        &ptot, &pfmn, &pfmx, &pmseq);
-        if (phsz > 0 && pesz > 0 && pcnt > 0) {
-            FILE *idx_r = fopen(idx_path, "rb");
-            if (idx_r) {
-                long off = (long)((uint64_t)phsz + (uint64_t)(pcnt - 1) * pesz);
-                int  dup = 0;
-                if (fseek(idx_r, off, SEEK_SET) == 0) {
-                    uint8_t ent[RAWBLK_IDX_ENT_SIZE];
-                    if (fread(ent, 1, pesz, idx_r) == pesz) {
-                        uint32_t e_size  = rb_get_u32(ent + 8);
-                        uint32_t e_count = rb_get_u32(ent + 12);
-                        int64_t  e_tmin  = rb_get_i64(ent + 16);
-                        int64_t  e_tmax  = rb_get_i64(ent + 24);
-                        dup = (e_size == r->block_bytes_len &&
-                               e_count == r->count &&
-                               e_tmin  == r->ts_min &&
-                               e_tmax  == r->ts_max);
+        if (phsz > 0 && pesz > 0) {
+            old_count   = pcnt;
+            old_total   = ptot;
+            old_max_seq = pmseq;          /* 0 for V3, the checkpoint for V4 */
+            if (pver >= 2 && pcnt > 0) {
+                old_fmn = pfmn;
+                old_fmx = pfmx;
+                have_old_zone = 1;
+            }
+            if (old_count > 0) {
+                FILE *idx_r = fopen(idx_path, "rb");
+                if (idx_r && fseek(idx_r, (long)phsz, SEEK_SET) == 0) {
+                    /* Read old entries at their native size then widen to V3
+                     * so the resulting file is uniform 88-byte entries.  The
+                     * widen zero-fills [82..87] for a legacy 40-byte entry,
+                     * which is exactly "ordinal unknown". */
+                    size_t raw_sz = (size_t)old_count * pesz;
+                    uint8_t *raw = malloc(raw_sz);
+                    if (raw && fread(raw, 1, raw_sz, idx_r) == raw_sz) {
+                        old_entries = calloc((size_t)old_count, RAWBLK_IDX_ENT_SIZE);
+                        if (old_entries) {
+                            size_t copy_prefix = (pesz < RAWBLK_IDX_ENT_SIZE)
+                                                 ? pesz : RAWBLK_IDX_ENT_SIZE;
+                            for (uint32_t b = 0; b < old_count; b++) {
+                                memcpy(old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE,
+                                       raw + (size_t)b * pesz,
+                                       copy_prefix);
+                            }
+                            if (!have_old_zone) {
+                                for (uint32_t b = 0; b < old_count; b++) {
+                                    uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
+                                    int64_t mn = rb_get_i64(e + 16);
+                                    int64_t mx = rb_get_i64(e + 24);
+                                    if (mn < old_fmn) old_fmn = mn;
+                                    if (mx > old_fmx) old_fmx = mx;
+                                }
+                                have_old_zone = 1;
+                            }
+                        }
                     }
+                    free(raw);
                 }
-                fclose(idx_r);
-                if (dup) goto out;                 /* already applied, rc==OK */
+                if (idx_r) fclose(idx_r);
             }
         }
+    }
+
+    /* Everything below reads `old_entries` and then copies it back out, so a
+     * declared-but-unreadable entry array is fatal, not something to route
+     * around.  A failed fopen/fseek/malloc/fread above leaves old_count > 0
+     * with old_entries == NULL; the placement scan would dereference NULL, and
+     * pretending old_count == 0 instead would publish a header claiming one
+     * entry over an index whose other entries were silently dropped.  Fail the
+     * apply and let the sender retry — nothing has been written yet. */
+    if (old_count > 0 && !old_entries) { rc = TSDB_ERR_IO; goto out; }
+
+    /* --- Placement + idempotency -------------------------------------------
+     *
+     * The old rule compared the incoming block against the index TAIL on
+     * (size, count, ts_min, ts_max).  Neither half of that works:
+     *
+     *   - it DISCARDED real data.  A run of rows carrying one timestamp
+     *     produces several genuinely different blocks whose keys — and whose ts
+     *     payloads, since ts_min == ts_max means one repeated value — are
+     *     identical.  Block 1 of the run therefore looked like a re-delivery of
+     *     block 0 and was dropped, silently: count(*) reported one block's rows
+     *     for the whole run.
+     *   - it could not absorb a repeat that was no longer the last entry, so a
+     *     resync or a re-sent batch appended the whole stream a second time.
+     *
+     * The TRANSLATED ordinal decides both: it is a number in this node's own
+     * space, so an entry already carrying it describes a group we have already
+     * been given, and a new one is INSERTED at its place rather than appended,
+     * so blocks that arrive out of order still land in order.  The scan below
+     * reads every entry, not just the tail, so the absorb no longer depends on
+     * the repeat still being the last thing written.
+     *
+     * WHAT IT DOES NOT SPAN IS A RENUMBERING OF THIS PARTITION.  A local
+     * compaction re-cuts the partition and stamps its output above the ordinal
+     * high-water, so the mapping a sender's group was absorbed under names
+     * nothing that is still on disk, the scan finds no match, and a resync
+     * appends the whole group a second time.  Measured on a 24-block partition:
+     * replicate, compact locally, resync the same 48 blocks -> every push
+     * ACCEPTED, count(*) 24576 -> 49152, rc=0.
+     *
+     * That is NOT something the ordinal introduced.  9dab5a2 compares the
+     * incoming block against the index TAIL and fails for the same reason — the
+     * blocks the sender is re-delivering no longer exist here in any form a
+     * comparison can recognise — and measures identically: count(*) 24576 ->
+     * 49152, rc=0.  Closing it needs the applier to reason about ROW RANGES
+     * already covered rather than about block identity, which neither rule
+     * does; it is recorded as a known gap, not papered over here.
+     *
+     * TWO things this must NOT do:
+     *
+     *   - drop on the ordinal ALONE.  The mapping is a local bookkeeping fact,
+     *     not evidence about the bytes; the CONTENT still has to agree before a
+     *     block is discarded as a re-delivery.  Nor may a disagreement be
+     *     refused: round 2 answered it with TSDB_ERR_CORRUPT and a replica-side
+     *     compaction then made every subsequent push permanently unacceptable.
+     *     Keep both entries — the read side takes the last claimant of an
+     *     ordinal — and count it, because losing acked rows is the worse of the
+     *     two failures by a wide margin.
+     *   - invent an ordinal for an unmarked entry.  Position == ordinal is
+     *     precisely false in the state a repair push exists to fix (see
+     *     rawblk_entry_ord), so an unmarked entry can never satisfy the drop
+     *     test.  A push against an index that still has unmarked entries falls
+     *     back to the historical tail compare — and only when the TAIL ITSELF is
+     *     unmarked, so a duplicate-timestamp run of marked blocks is never
+     *     collapsed by it. */
+    if (TSDB_ORD_KNOWN(lord) && old_count > 0) {
+        int saw_unmarked = 0;
+        for (uint32_t b = 0; b < old_count; b++) {
+            uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
+            uint32_t eo = 0;
+            if (!rawblk_entry_ord(e, &eo)) {
+                /* Ordinal unknown: predates the field, so it sorts before
+                 * anything a marked writer issues, and it proves nothing. */
+                saw_unmarked = 1;
+                insert_at = b + 1;
+                continue;
+            }
+            if (eo == lord.v) {
+                /* Re-delivery only if the BYTES match too — see
+                 * rawblk_entry_is_same_block. */
+                if (rawblk_entry_is_same_block(col_path, e, r)) goto out;
+                tsdb_metric_inc("qengine_rawblock_ordinal_collision_total");
+                fprintf(stderr,
+                        "[rawblock] %s/%s: column '%s' already holds DIFFERENT "
+                        "bytes at local ordinal %u (have size=%u count=%u "
+                        "ts=[%lld,%lld], got size=%u count=%u ts=[%lld,%lld]); "
+                        "keeping both rather than dropping acked rows\n",
+                        r->table, day_str, col_name, lord.v,
+                        rb_get_u32(e + 8), rb_get_u32(e + 12),
+                        (long long)rb_get_i64(e + 16),
+                        (long long)rb_get_i64(e + 24),
+                        r->block_bytes_len, r->count,
+                        (long long)r->ts_min, (long long)r->ts_max);
+                insert_at = b + 1;
+                continue;
+            }
+            if (eo < lord.v) insert_at = b + 1;
+        }
+        if (saw_unmarked) {
+            uint8_t *tail = old_entries +
+                            (size_t)(old_count - 1) * RAWBLK_IDX_ENT_SIZE;
+            uint32_t dummy = 0;
+            if (!rawblk_entry_ord(tail, &dummy) &&
+                rawblk_entry_is_same_block(col_path, tail, r))
+                goto out;                          /* already applied, rc==OK */
+        }
+    } else if (!TSDB_ORD_KNOWN(lord) && old_count > 0) {
+        uint8_t *e = old_entries + (size_t)(old_count - 1) * RAWBLK_IDX_ENT_SIZE;
+        if (rawblk_entry_is_same_block(col_path, e, r))
+            goto out;                              /* already applied, rc==OK */
+        insert_at = old_count;
     }
 
     /* --- Append to .col file --- */
@@ -405,71 +677,6 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
     fclose(col_fp);
     col_fp = NULL;
 
-    /* --- Rewrite .idx --------------------------------------------------------
-     * Read the existing idx (if any) via the storage layer's probe so we (a)
-     * locate old entries at the right offset even on a V3/V4-mongrel header,
-     * and (b) PRESERVE the partition's idx version + carry its max_seq forward.
-     * Pre-fix this path hardcoded a V3 40-byte header, so applying a raw block
-     * to a V4 partition silently downgraded it to V3 (dropping the WAL redo
-     * checkpoint) and — racing the flush writer — could leave a header size /
-     * version / entry-offset mongrel that makes a SELECT read 0 rows. */
-    {
-        uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
-        uint64_t ptot = 0, pmseq = 0;
-        int64_t  pfmn = INT64_MAX, pfmx = INT64_MIN;
-        /* probe returns >0 only when the magic + version are valid, so a
-         * missing/short/corrupt-magic idx falls through to a fresh write. */
-        int phsz = tsdb_part_idx_probe(idx_path, &pver, &pcnt, &pesz,
-                                       &ptot, &pfmn, &pfmx, &pmseq);
-        if (phsz > 0 && pesz > 0) {
-            old_count   = pcnt;
-            old_total   = ptot;
-            old_max_seq = pmseq;          /* 0 for V3, the checkpoint for V4 */
-            if (pver >= 2 && pcnt > 0) {
-                old_fmn = pfmn;
-                old_fmx = pfmx;
-                have_old_zone = 1;
-            }
-            if (old_count > 0) {
-                FILE *idx_r = fopen(idx_path, "rb");
-                if (idx_r && fseek(idx_r, (long)phsz, SEEK_SET) == 0) {
-                    /* Read old entries at their native size then widen to V3
-                     * so the resulting file is uniform 88-byte entries. */
-                    size_t raw_sz = (size_t)old_count * pesz;
-                    uint8_t *raw = malloc(raw_sz);
-                    if (raw && fread(raw, 1, raw_sz, idx_r) == raw_sz) {
-                        old_entries = calloc((size_t)old_count, RAWBLK_IDX_ENT_SIZE);
-                        if (old_entries) {
-                            size_t copy_prefix = (pesz < RAWBLK_IDX_ENT_SIZE)
-                                                 ? pesz : RAWBLK_IDX_ENT_SIZE;
-                            for (uint32_t b = 0; b < old_count; b++) {
-                                memcpy(old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE,
-                                       raw + (size_t)b * pesz,
-                                       copy_prefix);
-                            }
-                            if (!have_old_zone) {
-                                for (uint32_t b = 0; b < old_count; b++) {
-                                    uint8_t *e = old_entries + (size_t)b * RAWBLK_IDX_ENT_SIZE;
-                                    int64_t mn = rb_get_i64(e + 16);
-                                    int64_t mx = rb_get_i64(e + 24);
-                                    if (mn < old_fmn) old_fmn = mn;
-                                    if (mx > old_fmx) old_fmx = mx;
-                                }
-                                have_old_zone = 1;
-                            }
-                        } else {
-                            old_count = 0;
-                        }
-                    } else {
-                        old_count = 0;
-                    }
-                    free(raw);
-                }
-                if (idx_r) fclose(idx_r);
-            }
-        }
-    }
-
     uint32_t new_count = old_count + 1;
     uint64_t new_total = old_total + r->count;
 
@@ -490,10 +697,12 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
     stats.stats_last  = r->stats_last;
     stats.stats_flags = r->stats_flags;
 
+    /* Stamp the LOCAL ordinal.  The sender's number is never written here: it
+     * would only be meaningful on the sender. */
     uint8_t ent[RAWBLK_IDX_ENT_SIZE];
     rawblk_write_idx_entry(ent, (uint64_t)col_offset,
                            r->block_bytes_len, r->count,
-                           r->ts_min, r->ts_max, &stats);
+                           r->ts_min, r->ts_max, &stats, lord);
 
     /* Header via the SHARED storage writer so flush + replication stamp
      * byte-identical headers; preserving old_max_seq keeps a V4 partition V4
@@ -523,13 +732,20 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
     FILE *idx_w = fopen(tmp_path, "wb");
     if (!idx_w) { rc = TSDB_ERR_IO; goto out; }
 
+    /* Entries stay in ORDINAL order: [0, insert_at) then the new block then the
+     * rest.  insert_at == old_count is the historical append. */
+    if (insert_at > old_count) insert_at = old_count;
+    size_t head_n = (size_t)insert_at * RAWBLK_IDX_ENT_SIZE;
+    size_t tail_n = (size_t)(old_count - insert_at) * RAWBLK_IDX_ENT_SIZE;
+
     int io_ok = 1;
     if (fwrite(ih, 1, hdr_sz, idx_w) != hdr_sz) io_ok = 0;
-    if (io_ok && old_count > 0 && old_entries &&
-        fwrite(old_entries, 1, (size_t)old_count * RAWBLK_IDX_ENT_SIZE, idx_w)
-            != (size_t)old_count * RAWBLK_IDX_ENT_SIZE) io_ok = 0;
+    if (io_ok && head_n > 0 && old_entries &&
+        fwrite(old_entries, 1, head_n, idx_w) != head_n) io_ok = 0;
     if (io_ok && fwrite(ent, 1, RAWBLK_IDX_ENT_SIZE, idx_w)
             != RAWBLK_IDX_ENT_SIZE) io_ok = 0;
+    if (io_ok && tail_n > 0 && old_entries &&
+        fwrite(old_entries + head_n, 1, tail_n, idx_w) != tail_n) io_ok = 0;
     if (io_ok && fflush(idx_w) != 0) io_ok = 0;
     if (io_ok) {
         /* Durable before rename, and CHECKED: publishing an idx whose bytes
@@ -630,8 +846,14 @@ int tsdb_rawblock_replicate(tsdb_cluster_t *c,
     r.stats_first     = meta->stats_first;
     r.stats_last      = meta->stats_last;
     r.stats_flags     = meta->stats_flags;
+    r.ord             = meta->ord;
     r.block_bytes_len = (uint32_t)block_len;
     r.block_bytes     = (uint8_t *)block_bytes;
+    /* `ord` is OUR partition-local number, so it only means anything paired with
+     * who we are: two nodes flushing the same timestamps into one table+day both
+     * issue ordinal 0 for byte-identical ts blocks, and a receiver that cannot
+     * tell the two apart collapses them onto one group. */
+    r.issuer          = (uint64_t)tsdb_cluster_local_id(c);
 
     /* Serialize once. */
     uint8_t *payload = NULL;
