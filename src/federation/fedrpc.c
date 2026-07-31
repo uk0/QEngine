@@ -341,21 +341,30 @@ static int fedrpc_query_type(tsdb_rpc_conn_t *conn, int rpc_type,
     uint8_t *resp = malloc(FED_MAX_RESULT_BUF);
     if (!resp) { free(payload); return TSDB_ERR_NOMEM; }
 
-    uint32_t resp_len = 0;
+    uint32_t resp_len = 0; int resp_trunc = 0;
     int rc = hard_timeout
-        ? tsdb_rpc_call_recv_to(conn, (tsdb_rpc_type_t)rpc_type,
+        ? tsdb_rpc_call_recv_to_ex(conn, (tsdb_rpc_type_t)rpc_type,
+                                   payload, (uint32_t)payload_len,
+                                   resp, (uint32_t)FED_MAX_RESULT_BUF,
+                                   &resp_len, &resp_trunc, timeout_ms)
+        : tsdb_rpc_call_recv_ex(conn, (tsdb_rpc_type_t)rpc_type,
                                 payload, (uint32_t)payload_len,
                                 resp, (uint32_t)FED_MAX_RESULT_BUF,
-                                &resp_len, timeout_ms)
-        : tsdb_rpc_call_recv(conn, (tsdb_rpc_type_t)rpc_type,
-                             payload, (uint32_t)payload_len,
-                             resp, (uint32_t)FED_MAX_RESULT_BUF,
-                             &resp_len);
+                                &resp_len, &resp_trunc);
     free(payload);
 
     if (rc != TSDB_OK) {
         free(resp);
         return rc;
+    }
+
+    /* A result frame larger than FED_MAX_RESULT_BUF gives us only a prefix;
+     * decoding it would return a SHORT result set as if it were the whole
+     * answer — a wrong answer with no error, which the scatter coordinator
+     * would then sum.  Fail loudly instead. */
+    if (resp_trunc) {
+        free(resp);
+        return TSDB_ERR_IO;
     }
 
     /* Decode result. */

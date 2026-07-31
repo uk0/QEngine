@@ -27,6 +27,7 @@
 #include "../catalog/database.h"
 #include "../catalog/group.h"
 #include "../catalog/stable.h"
+#include "../server/metrics.h"
 #include "../../include/tsdb.h"
 
 #include <stdio.h>
@@ -375,9 +376,20 @@ int tsdb_catalog_reconcile_from_peers(tsdb_db_t *db) {
         if (snap[i].state != TSDB_NODE_ALIVE) continue;
         tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, snap[i].id);
         if (!conn) continue;
-        uint32_t rlen = 0;
-        int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_CATALOG_DUMP,
-                                     NULL, 0, reply, (uint32_t)cap, &rlen);
+        uint32_t rlen = 0; int rtrunc = 0;
+        int rc = tsdb_rpc_call_recv_ex(conn, TSDB_RPC_CATALOG_DUMP,
+                                       NULL, 0, reply, (uint32_t)cap, &rlen, &rtrunc);
+        if (rc == TSDB_OK && rtrunc) {
+            /* rlen is only a PREFIX of a dump that overran our 32 MB buffer, so
+             * its tail record is cut mid-way.  Applying it would parse a
+             * partial record into the catalog — skip this peer and surface the
+             * short read instead of corrupting the merge. */
+            tsdb_metric_inc("qengine_catalog_dump_truncated_total");
+            fprintf(stderr, "[catalog-reconcile] peer %llu dump exceeded %zu-byte "
+                    "buffer — skipped (truncated)\n",
+                    (unsigned long long)snap[i].id, cap);
+            continue;
+        }
         if (rc == TSDB_OK && rlen > 0)
             total += tsdb_catalog_dump_apply_filtered(tsdb_db_data_dir(db), reply, rlen);
     }
@@ -500,13 +512,25 @@ int tsdb_catalog_pull_from_master(tsdb_db_t *db) {
     size_t reply_cap = 32 * 1024 * 1024;
     uint8_t *reply = (uint8_t *)malloc(reply_cap);
     if (!reply) return TSDB_ERR_NOMEM;
-    uint32_t reply_len = 0;
-    int rc = tsdb_rpc_call_recv(conn, TSDB_RPC_CATALOG_DUMP,
-                                 NULL, 0, reply, (uint32_t)reply_cap, &reply_len);
+    uint32_t reply_len = 0; int reply_trunc = 0;
+    int rc = tsdb_rpc_call_recv_ex(conn, TSDB_RPC_CATALOG_DUMP,
+                                    NULL, 0, reply, (uint32_t)reply_cap, &reply_len,
+                                    &reply_trunc);
     if (rc != TSDB_OK) {
         fprintf(stderr, "[catalog-sync] rpc rc=%d\n", rc);
         free(reply);
         return rc;
+    }
+    if (reply_trunc) {
+        /* The master's dump overran our buffer; reply_len bytes are a prefix
+         * whose last record is cut.  Applying it would publish a half-parsed
+         * catalog — fail the pull so the caller retries rather than install a
+         * partial record. */
+        tsdb_metric_inc("qengine_catalog_dump_truncated_total");
+        fprintf(stderr, "[catalog-sync] master dump exceeded %zu-byte buffer — "
+                "aborting (truncated)\n", reply_cap);
+        free(reply);
+        return TSDB_ERR_IO;
     }
 
     int applied = tsdb_catalog_dump_apply(tsdb_db_data_dir(db), reply, reply_len);

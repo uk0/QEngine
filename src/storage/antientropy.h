@@ -110,6 +110,46 @@ int tsdb_antientropy_run_candidates(const tsdb_ae_cand_t *cands, int ncand,
                                     const tsdb_ae_driver_t *drv,
                                     tsdb_ae_run_t *out);
 
+/* ---- Periodic-sweep hardening seams (db_cluster.c) ----------------------- *
+ *
+ * Small pieces of the periodic anti-entropy sweep pulled out so the parts that
+ * guard against silent data loss are unit-testable without a live cluster.
+ * Reached only from the single sweep thread, so their state needs no locking.
+ */
+
+struct tsdb_db;
+
+/* Defect 1 — FULL_PULL truncate-race guard.  A FULL_PULL truncates then
+ * re-pulls, gated on a local_stats snapshot taken microseconds earlier: a
+ * WRITE_BATCH committing in that window is destroyed by the truncate and NOT
+ * replaced by the pull (the peer never had those rows).  This re-measures THIS
+ * node immediately before the truncate; if a row landed since the empty
+ * measurement it ABORTS.  Returns 1 = truncated (safe to pull), 0 = aborted
+ * (a row landed — caller must not pull), -1 = error. */
+int  tsdb_ae_full_pull_truncate_guarded_for_test(struct tsdb_db *db,
+                                                 const char *table);
+
+/* Install a hook fired inside the guard EXACTLY in the race window (after the
+ * empty measurement that gated FULL_PULL, before the re-measure + truncate).
+ * NULL in production; a test lands a deterministic write in the window with it.
+ * Not thread-safe — single-threaded tests only. */
+void tsdb_ae_set_test_prewrite_hook(void (*fn)(void *), void *arg);
+
+/* Defect 2 — middle-gap log throttle.  The counter fires every occurrence (it
+ * is the scrapeable signal); the human stderr line must not.  Returns 1 to
+ * EMIT the line for `table` this sweep: on the TRANSITION into middle-gap and
+ * then at most once per `every` sweeps while it persists.  `sweep_no` is the
+ * monotonic sweep counter. */
+int  tsdb_ae_midgap_should_log(const char *table, long sweep_no, long every);
+
+/* Defect 4 — over-count persistence tracker.  Records this sweep's observation
+ * for `table` (suspect != 0 = local holds more rows than every peer at an equal
+ * newest-ts horizon) and returns the resulting consecutive-suspect streak.  A
+ * legitimately-ahead async replica clears within a sweep or two (the streak
+ * resets on the first non-suspect sweep); a real duplicate over-count persists
+ * and the streak climbs. */
+long tsdb_ae_overcount_note(const char *table, int suspect);
+
 #ifdef __cplusplus
 }
 #endif

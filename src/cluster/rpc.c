@@ -1510,13 +1510,16 @@ int tsdb_rpc_call(tsdb_rpc_conn_t *conn,
 }
 
 /* Lock-free request/response body shared by tsdb_rpc_call_recv and
- * tsdb_rpc_call_recv_to.  Caller holds conn->lock. */
+ * tsdb_rpc_call_recv_to.  Caller holds conn->lock.  `truncated` (may be NULL)
+ * is set to 1 when the reply frame carried more bytes than fit in resp_buf. */
 static int call_recv_locked(tsdb_rpc_conn_t *conn,
                             tsdb_rpc_type_t type,
                             const uint8_t *payload, uint32_t payload_len,
                             uint8_t *resp_buf, uint32_t resp_cap,
-                            uint32_t *resp_len)
+                            uint32_t *resp_len, int *truncated)
 {
+    if (truncated) *truncated = 0;
+
     /* Never put another request onto a stream whose offset is unknown: the
      * reply would be paired with the wrong one. */
     if (conn->desynced) return TSDB_ERR_IO;
@@ -1604,11 +1607,19 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
         return TSDB_ERR_CORRUPT;
     }
 
-    if (resp_len) *resp_len = resp.payload_len;
-    if (resp_buf && resp_cap > 0 && resp.payload_len > 0) {
-        uint32_t copy = resp.payload_len < resp_cap ? resp.payload_len : resp_cap;
-        memcpy(resp_buf, resp.payload, copy);
-    }
+    /* Report the bytes actually COPIED, never the wire payload_len.  Only
+     * min(payload_len, resp_cap) landed in resp_buf; a caller that trusted the
+     * wire length read the uninitialised buffer tail past what was written —
+     * catalog_sync's 32 MB CATALOG_DUMP, fedrpc's result buffer, and the
+     * fixed-size raft reply buffers all consume this length as data.
+     * `*truncated` is the distinct short-changed signal: *resp_len alone
+     * cannot tell an exact fit (copied == cap) from a clamp. */
+    uint32_t copied = 0;
+    if (resp_buf && resp_cap > 0 && resp.payload_len > 0)
+        copied = resp.payload_len < resp_cap ? resp.payload_len : resp_cap;
+    if (copied > 0) memcpy(resp_buf, resp.payload, copied);
+    if (resp_len)  *resp_len  = copied;
+    if (truncated) *truncated = (resp.payload_len > copied);
 
     /* ERR_UNSUPPORTED is kept apart from ERR on purpose: a caller with a
      * legacy fallback (tsdb_rpc_local_table_stats) has to know the difference
@@ -1622,19 +1633,29 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
     return result;
 }
 
+int tsdb_rpc_call_recv_ex(tsdb_rpc_conn_t *conn,
+                          tsdb_rpc_type_t type,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint8_t *resp_buf, uint32_t resp_cap,
+                          uint32_t *resp_len, int *truncated)
+{
+    if (!conn) return TSDB_ERR_INVAL;
+
+    pthread_mutex_lock(&conn->lock);
+    int rc = call_recv_locked(conn, type, payload, payload_len,
+                              resp_buf, resp_cap, resp_len, truncated);
+    pthread_mutex_unlock(&conn->lock);
+    return rc;
+}
+
 int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
                        tsdb_rpc_type_t type,
                        const uint8_t *payload, uint32_t payload_len,
                        uint8_t *resp_buf, uint32_t resp_cap,
                        uint32_t *resp_len)
 {
-    if (!conn) return TSDB_ERR_INVAL;
-
-    pthread_mutex_lock(&conn->lock);
-    int rc = call_recv_locked(conn, type, payload, payload_len,
-                              resp_buf, resp_cap, resp_len);
-    pthread_mutex_unlock(&conn->lock);
-    return rc;
+    return tsdb_rpc_call_recv_ex(conn, type, payload, payload_len,
+                                 resp_buf, resp_cap, resp_len, NULL);
 }
 
 /* Arm (timeout_ms > 0) or clear (timeout_ms == 0) the socket I/O deadline. */
@@ -1704,18 +1725,18 @@ static int conn_lock_deadline(pthread_mutex_t *m, int timeout_ms) {
  * stopped — no election ever fired.  The deadline is armed and cleared
  * under conn->lock so a concurrent data-path call never runs with our
  * timeout in effect. */
-int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
-                          tsdb_rpc_type_t type,
-                          const uint8_t *payload, uint32_t payload_len,
-                          uint8_t *resp_buf, uint32_t resp_cap,
-                          uint32_t *resp_len, int timeout_ms)
+int tsdb_rpc_call_recv_to_ex(tsdb_rpc_conn_t *conn,
+                             tsdb_rpc_type_t type,
+                             const uint8_t *payload, uint32_t payload_len,
+                             uint8_t *resp_buf, uint32_t resp_cap,
+                             uint32_t *resp_len, int *truncated, int timeout_ms)
 {
     if (!conn) return TSDB_ERR_INVAL;
 
     if (conn_lock_deadline(&conn->lock, timeout_ms) != 0) return TSDB_ERR_IO;
     conn_set_io_timeout(conn->fd, timeout_ms);
     int rc = call_recv_locked(conn, type, payload, payload_len,
-                              resp_buf, resp_cap, resp_len);
+                              resp_buf, resp_cap, resp_len, truncated);
     /* Put back what tsdb_rpc_connect installed, not 0.  Restoring 0 means
      * "block forever", which deleted the connect-time 30 s guard from the
      * shared pooled socket for every later plain tsdb_rpc_call_recv on it —
@@ -1724,6 +1745,17 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
     conn_set_io_timeout(conn->fd, conn->io_timeout_ms);
     pthread_mutex_unlock(&conn->lock);
     return rc;
+}
+
+int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
+                          tsdb_rpc_type_t type,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint8_t *resp_buf, uint32_t resp_cap,
+                          uint32_t *resp_len, int timeout_ms)
+{
+    return tsdb_rpc_call_recv_to_ex(conn, type, payload, payload_len,
+                                    resp_buf, resp_cap, resp_len, NULL,
+                                    timeout_ms);
 }
 
 /* ---- Anti-entropy peer probe (client side) ------------------------------- */

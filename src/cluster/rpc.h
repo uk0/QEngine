@@ -233,6 +233,20 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
                        uint32_t *resp_len);
 
 /*
+ * Like tsdb_rpc_call_recv, but reports whether the reply frame was larger than
+ * resp_buf.  *resp_len is always the number of bytes actually copied
+ * (min(payload_len, resp_cap)); *truncated (may be NULL) is set to 1 iff the
+ * frame carried more than that — the distinct signal a caller that needed the
+ * WHOLE frame (CATALOG_DUMP, a federated result) uses to reject a short read
+ * instead of parsing an uninitialised buffer tail as data.
+ */
+int tsdb_rpc_call_recv_ex(tsdb_rpc_conn_t *conn,
+                          tsdb_rpc_type_t type,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint8_t *resp_buf, uint32_t resp_cap,
+                          uint32_t *resp_len, int *truncated);
+
+/*
  * Same as tsdb_rpc_call_recv but with a hard per-call socket deadline
  * (SO_RCVTIMEO/SO_SNDTIMEO armed for the duration of the exchange,
  * cleared after).  Used by the raft senders so a silently-dead peer
@@ -244,6 +258,14 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
                           const uint8_t *payload, uint32_t payload_len,
                           uint8_t *resp_buf, uint32_t resp_cap,
                           uint32_t *resp_len, int timeout_ms);
+
+/* tsdb_rpc_call_recv_to with the same *truncated short-changed signal as
+ * tsdb_rpc_call_recv_ex (see there).  *resp_len is the bytes copied. */
+int tsdb_rpc_call_recv_to_ex(tsdb_rpc_conn_t *conn,
+                             tsdb_rpc_type_t type,
+                             const uint8_t *payload, uint32_t payload_len,
+                             uint8_t *resp_buf, uint32_t resp_cap,
+                             uint32_t *resp_len, int *truncated, int timeout_ms);
 
 /* Bound for the write-replication sends (WRITE_BATCH fanout + RAW_BLOCK_PUSH).
  * These hold the single per-peer pooled conn->lock (CONNS_PER_PEER=1) for a

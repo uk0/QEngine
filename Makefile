@@ -326,6 +326,29 @@ TEST_SRCS += tests/test_fanout_backpressure.c
 # discarded it with a (void) cast and the /backup route streamed a tar of a
 # data dir whose rows were still in RAM.
 TEST_SRCS += tests/test_backup_flush_rc.c
+
+# Periodic anti-entropy turned a one-shot truncate race into a recurring one: a
+# WRITE_BATCH committing between the empty measurement that gates a FULL_PULL and
+# the truncate is wiped and not restored by the pull.  Pins that the guard
+# aborts the truncate when a row lands in the window (deterministic injection).
+TEST_SRCS += tests/test_ae_truncate_race.c
+
+# The middle-gap stderr line was logged once per divergent peer per table per
+# sweep, forever (~8,600 lines/day/table).  Pins that the human line is
+# throttled to the transition + once per N sweeps while the counter still fires
+# every occurrence.
+TEST_SRCS += tests/test_ae_midgap_throttle.c
+
+# Anti-entropy could not see an over-counted replica (best_count <= local_count
+# -> UP_TO_DATE).  A duplicate must not be truncated (an async-ahead replica is
+# indistinguishable by count alone); pins the persistence tracker that makes a
+# real over-count visible while a transient ahead-state resolves.
+TEST_SRCS += tests/test_ae_overcount.c
+
+# *resp_len reported the wire payload_len, not the bytes copied, so a caller
+# with a smaller buffer over-read the uninitialised tail.  Pins that *resp_len
+# is the copied length and that _ex raises a distinct truncation signal.
+TEST_SRCS += tests/test_rpc_resp_len_copied.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

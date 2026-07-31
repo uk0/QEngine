@@ -1741,6 +1741,134 @@ static int ae_local_stats_cb(void *vctx, uint64_t *count, int64_t *max_ts) {
 
 static long ae_now_ms_cb(void *vctx) { (void)vctx; return mono_ms(); }
 
+/* ---- Periodic-sweep hardening ------------------------------------------- *
+ *
+ * Reached only from the single anti-entropy sweep thread
+ * (tsdb_resync_startup_thread -> resync_all_tables -> resync_table -> here),
+ * so the per-table registries below need no locking.  Each is bounded and
+ * fails OPEN (logs rather than suppresses) when full — a first occurrence is
+ * never lost.
+ */
+
+/* Monotonic sweep counter, bumped once per full sweep in
+ * tsdb_cluster_resync_all_tables.  Read by the middle-gap throttle. */
+static long g_ae_sweep_no = 0;
+
+/* Defect 1 — deterministic race-window injection seam (NULL in production). */
+static void (*g_ae_prewrite_hook)(void *) = NULL;
+static void  *g_ae_prewrite_arg = NULL;
+
+void tsdb_ae_set_test_prewrite_hook(void (*fn)(void *), void *arg) {
+    g_ae_prewrite_hook = fn;
+    g_ae_prewrite_arg  = arg;
+}
+
+/* Defect 1 — the destructive half of FULL_PULL, isolated so the truncate-race
+ * guard is testable without a live peer.  See antientropy.h. */
+static int ae_full_pull_truncate_guarded(tsdb_db_t *db, const char *table)
+{
+    /* Test seam: fire a racing write EXACTLY where the production race exposes
+     * one — after FULL_PULL was decided on an empty measurement, before the
+     * truncate.  No-op in production. */
+    if (g_ae_prewrite_hook) g_ae_prewrite_hook(g_ae_prewrite_arg);
+
+    /* Truncate ONLY if the table is still empty when checked under the table
+     * lock.  FULL_PULL was handed out for a table that measured EMPTY outside
+     * any lock; if a WRITE_BATCH has committed since, truncating would destroy
+     * rows no peer holds and the pull (sized to the peer) would not bring them
+     * back.  tsdb_truncate_table_if_empty runs the emptiness check inside the
+     * same batch_mu it truncates under, so a write cannot slip between the two
+     * — closing the race an outside-the-lock re-measure could only narrow. */
+    int was_empty = 0;
+    if (tsdb_truncate_table_if_empty(db, table, &was_empty) != TSDB_OK)
+        return -1;                      /* cannot verify emptiness — never guess */
+    if (!was_empty) {
+        tsdb_metric_inc("qengine_antientropy_truncate_averted_total");
+        fprintf(stderr,
+                "[anti-entropy] %s: row(s) committed since the empty "
+                "measurement that gated this full pull — aborted destructive "
+                "truncate under the table lock to preserve locally-committed "
+                "rows; next sweep re-decides\n", table);
+        return 0;
+    }
+    return 1;
+}
+
+int tsdb_ae_full_pull_truncate_guarded_for_test(struct tsdb_db *db,
+                                                const char *table) {
+    return ae_full_pull_truncate_guarded(db, table);
+}
+
+/* Defect 2 — middle-gap log throttle registry. */
+#define AE_MIDGAP_TAB_CAP    512
+#define AE_MIDGAP_LOG_EVERY  60      /* sweeps between repeats (60 x 30 s = 30 min) */
+
+typedef struct {
+    char name[64];
+    long last_gap_sweep;   /* newest sweep this table was seen middle-gapped */
+    long last_log_sweep;   /* newest sweep we emitted the human line         */
+} ae_midgap_ent_t;
+
+static ae_midgap_ent_t g_ae_midgap[AE_MIDGAP_TAB_CAP];
+static int             g_ae_midgap_n = 0;
+
+int tsdb_ae_midgap_should_log(const char *table, long sweep_no, long every)
+{
+    if (!table) return 1;                      /* fail open */
+    ae_midgap_ent_t *e = NULL;
+    for (int i = 0; i < g_ae_midgap_n; i++)
+        if (strcmp(g_ae_midgap[i].name, table) == 0) { e = &g_ae_midgap[i]; break; }
+    if (!e) {
+        if (g_ae_midgap_n >= AE_MIDGAP_TAB_CAP) return 1;   /* full — never suppress */
+        e = &g_ae_midgap[g_ae_midgap_n++];
+        snprintf(e->name, sizeof(e->name), "%s", table);
+        e->last_gap_sweep = -1;        /* never seen -> first sight is a transition */
+        e->last_log_sweep = LONG_MIN;  /* and clears the throttle window            */
+    }
+    long prev_gap = e->last_gap_sweep;
+    /* Transition = the gap was ABSENT in the immediately-preceding sweep (which
+     * also makes a same-sweep repeat across several divergent peers a non-
+     * transition, so one table logs at most once per sweep). */
+    int transition = (prev_gap < sweep_no - 1);
+    /* `last_log_sweep <= sweep_no - every` rather than `sweep_no - last >= every`
+     * so the never-logged sentinel LONG_MIN does not underflow the subtraction
+     * (UB that `make debug`'s -fsanitize=undefined would abort on); sweep_no and
+     * every are small, so sweep_no - every cannot overflow. */
+    int throttle   = (every > 0) && (e->last_log_sweep <= sweep_no - every);
+    int should     = transition || throttle;
+    e->last_gap_sweep = sweep_no;
+    if (should) e->last_log_sweep = sweep_no;
+    return should;
+}
+
+/* Defect 4 — over-count persistence registry. */
+#define AE_OVERCOUNT_TAB_CAP   512
+#define AE_OVERCOUNT_PERSIST_N 3       /* consecutive suspect sweeps before we shout */
+
+typedef struct {
+    char name[64];
+    long streak;                       /* consecutive suspect sweeps */
+} ae_overcount_ent_t;
+
+static ae_overcount_ent_t g_ae_overcount[AE_OVERCOUNT_TAB_CAP];
+static int                g_ae_overcount_n = 0;
+
+long tsdb_ae_overcount_note(const char *table, int suspect)
+{
+    if (!table) return 0;
+    ae_overcount_ent_t *e = NULL;
+    for (int i = 0; i < g_ae_overcount_n; i++)
+        if (strcmp(g_ae_overcount[i].name, table) == 0) { e = &g_ae_overcount[i]; break; }
+    if (!e) {
+        if (g_ae_overcount_n >= AE_OVERCOUNT_TAB_CAP) return suspect ? 1 : 0;
+        e = &g_ae_overcount[g_ae_overcount_n++];
+        snprintf(e->name, sizeof(e->name), "%s", table);
+        e->streak = 0;
+    }
+    e->streak = suspect ? e->streak + 1 : 0;
+    return e->streak;
+}
+
 static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
                          tsdb_ae_action_t act, int64_t since_ts)
 {
@@ -1751,18 +1879,25 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
     case TSDB_AE_TAIL_PULL:
         return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
 
-    case TSDB_AE_FULL_PULL:
+    case TSDB_AE_FULL_PULL: {
         /* The ONLY destructive step in anti-entropy.  tsdb_antientropy_decide
-         * hands it out only when the table measured EMPTY, and the driver
-         * re-measures immediately before this call, so the truncate is a
-         * no-op on an empty table.  since_ts = 0 catches every row. */
+         * hands it out only when the table measured EMPTY — but that
+         * measurement was taken microseconds earlier, before this call, and a
+         * WRITE_BATCH committing in the window would be destroyed by the
+         * truncate and NOT restored by the pull (since_ts = 0 catches every
+         * row the PEER holds, and the peer never had the raced write).  The
+         * guard re-measures immediately before the truncate and aborts if a
+         * row landed, so a locally-committed row no peer has is never wiped. */
         fprintf(stderr,
                 "[anti-entropy] %s: empty local, full pull from peer %llu "
                 "(peer count=%llu, max_ts %lld)\n",
                 x->table, (unsigned long long)cand->node_id,
                 (unsigned long long)cand->count, (long long)cand->max_ts);
-        if (tsdb_truncate_table(x->db, x->table) != TSDB_OK) return -1;
+        int g = ae_full_pull_truncate_guarded(x->db, x->table);
+        if (g < 0)  return -1;
+        if (g == 0) return 0;   /* raced write preserved; next sweep re-decides */
         return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
+    }
 
     case TSDB_AE_SKIP_UNSAFE: {
         /* Opt-in convergence: swap ONE cold divergent partition from the
@@ -1792,14 +1927,20 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
          * two nodes answer stays different with no error on either.  Measured
          * live: cnode-1 12000, cnode-3 9000, identical max(ts).  Count it so an
          * operator can see divergence exists without reading container logs. */
+        /* The counter is the scrapeable signal — bump it EVERY occurrence.  The
+         * human line is throttled: once on the TRANSITION into middle-gap, then
+         * at most once per AE_MIDGAP_LOG_EVERY sweeps while it persists.  Before
+         * this, a table middle-gapped against three peers logged 3 lines every
+         * 30 s forever (~8,600/day/table, no rate limit). */
         tsdb_metric_inc("qengine_antientropy_middle_gap_total");
-        fprintf(stderr,
-                "[anti-entropy] %s: middle-gap vs peer %llu (peer=%llu rows, "
-                "max_ts %lld) — peer not provably a superset%s; "
-                "skipping destructive truncate to preserve local rows\n",
-                x->table, (unsigned long long)cand->node_id,
-                (unsigned long long)cand->count, (long long)cand->max_ts,
-                cand->count >= 100000000000ULL ? " (timestamp-scale count)" : "");
+        if (tsdb_ae_midgap_should_log(x->table, g_ae_sweep_no, AE_MIDGAP_LOG_EVERY))
+            fprintf(stderr,
+                    "[anti-entropy] %s: middle-gap vs peer %llu (peer=%llu rows, "
+                    "max_ts %lld) — peer not provably a superset%s; "
+                    "skipping destructive truncate to preserve local rows\n",
+                    x->table, (unsigned long long)cand->node_id,
+                    (unsigned long long)cand->count, (long long)cand->max_ts,
+                    cand->count >= 100000000000ULL ? " (timestamp-scale count)" : "");
         return 0;
     }
 
@@ -1867,11 +2008,20 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
 
     tsdb_ae_cand_t cand[TSDB_CLUSTER_MAX_NODES];
     int ncand = 0;
+    uint64_t peer_hi_count = 0;         /* fullest peer that answered           */
+    int64_t  peer_hi_ts    = INT64_MIN; /* newest ts any peer that answered has */
+    int      peers_answered = 0;
     for (int i = 0; i < npeers; i++) {
         uint64_t pc = 0; int64_t pmax = 0;
         /* A peer that cannot answer the probe never becomes a candidate, so no
          * delta pull is ever aimed at a peer we already know is unreachable. */
         if (peer_table_stats(c, peers[i], table_name, &pc, &pmax) != 0) continue;
+
+        /* Over-count watch (defect 4): remember the fullest peer and the newest
+         * peer ts across EVERY answer — admitted as a pull candidate or not. */
+        peers_answered++;
+        if (pc   > peer_hi_count) peer_hi_count = pc;
+        if (pmax > peer_hi_ts)    peer_hi_ts    = pmax;
 
         /* Admission is EXACTLY the predicate the single-`best` loop used: that
          * loop seeded `best` with the LOCAL stats and replaced it only on a
@@ -1888,6 +2038,32 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         cand[ncand].max_ts  = pmax;
         ncand++;
     }
+
+    /* Over-count watch (defect 4).  We hold MORE rows than the fullest peer at
+     * an EQUAL newest-ts horizon.  A replica that is merely async-AHEAD took the
+     * write first and so has a strictly NEWER max_ts; equal max_ts + higher
+     * local count is instead the signature of a duplicated WRITE_BATCH counted
+     * twice.  Count alone cannot PROVE a duplicate and a transient ahead-state
+     * at equal ts resolves within a sweep or two, so we NEVER truncate here —
+     * we track persistence and make a real (permanent) over-count visible.
+     * A legitimately-ahead replica clears (streak resets) before N sweeps. */
+    if (peers_answered > 0) {
+        int suspect = (local_count > peer_hi_count) &&
+                      (peer_hi_ts == local_max_ts);
+        long streak = tsdb_ae_overcount_note(table_name, suspect);
+        if (suspect && streak >= AE_OVERCOUNT_PERSIST_N) {
+            tsdb_metric_inc("qengine_antientropy_overcount_persistent_total");
+            if (streak == AE_OVERCOUNT_PERSIST_N)
+                fprintf(stderr,
+                        "[anti-entropy] %s: local holds %llu rows vs peer max %llu "
+                        "at equal max_ts for %ld sweeps — possible duplicate "
+                        "over-count (NOT auto-repaired; a legitimately-ahead "
+                        "replica would have cleared)\n",
+                        table_name, (unsigned long long)local_count,
+                        (unsigned long long)peer_hi_count, streak);
+        }
+    }
+
     if (ncand == 0) return TSDB_OK;  /* nobody is ahead of us — up-to-date */
 
     tsdb_antientropy_rank_candidates(cand, ncand);
@@ -2010,6 +2186,10 @@ long tsdb_antientropy_period_ms(void) {
  * already tested — the only new thing is that it runs more than once. */
 void tsdb_cluster_resync_all_tables(tsdb_db_t *db) {
     if (!db) return;
+
+    /* One monotonic tick per sweep — drives the middle-gap log throttle so a
+     * persistent gap logs once, not once per divergent peer per 30 s. */
+    g_ae_sweep_no++;
 
     /* Pre-open every on-disk table across every striped data dir so
      * db->tables[] reflects them.  Falls back to a single-dir scan

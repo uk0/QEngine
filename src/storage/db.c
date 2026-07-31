@@ -1460,6 +1460,97 @@ static int truncate_keep_entry(const char *name) {
     return 0;
 }
 
+/* Count durable partition rows for `tbl_dir` by summing each ts.idx header.
+ * Caller holds the table's batch_mu + compact_mtx, so no flush can be
+ * publishing a partition underneath the walk. */
+static uint64_t table_dir_durable_rows(tsdb_db_t *db, const char *name) {
+    char tbl_dir[4096];
+    table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
+    uint64_t total = 0;
+    DIR *d = opendir(tbl_dir);
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (truncate_keep_entry(ent->d_name)) continue;   /* schema.bin, *.sym */
+        char idx_path[4300];
+        snprintf(idx_path, sizeof(idx_path), "%s/%s/ts.idx", tbl_dir, ent->d_name);
+        uint64_t rows = 0;
+        if (tsdb_part_idx_probe(idx_path, NULL, NULL, NULL, &rows, NULL, NULL, NULL) > 0)
+            total += rows;
+    }
+    closedir(d);
+    return total;
+}
+
+/* TRUNCATE, but abort atomically if the table is not empty under the lock.
+ *
+ * Anti-entropy hands out a destructive FULL_PULL only for a table it measured
+ * EMPTY, and then truncates and pulls the peer's copy.  The measurement runs
+ * OUTSIDE any table lock, so a WRITE_BATCH committing between the measurement
+ * and the truncate is destroyed and the pull — sized to the peer — does not
+ * bring it back: silent loss of a row no peer holds.  The caller's own
+ * re-measure narrows that window but cannot close it, because it, too, runs
+ * before batch_mu is taken.
+ *
+ * This closes it: the emptiness check runs INSIDE the same batch_mu +
+ * compact_mtx the truncate holds, so a row_begin (which needs batch_mu) cannot
+ * land between the check and the wipe.  *was_empty tells the caller whether the
+ * truncate happened (1) or was aborted because rows appeared (0). */
+int tsdb_truncate_table_if_empty(tsdb_db_t *db, const char *name,
+                                 int *was_empty) {
+    if (!db || !name) return TSDB_ERR_INVAL;
+    if (was_empty) *was_empty = 0;
+
+    tsdb_table_internal_t *t = tsdb_db_scan_acquire(db, name);
+    if (!t) return TSDB_ERR_NOTFOUND;
+
+    pthread_mutex_lock(&t->batch_mu);
+    pthread_mutex_lock(&t->compact_mtx);
+
+    /* Emptiness under the lock: memtable rows + durable partition rows.  A
+     * WRITE_BATCH commit path holds batch_mu, so it is either already counted
+     * here or blocked until we release — it can never slip in during the wipe. */
+    uint64_t mem_rows = (t->memtable) ? tsdb_memtable_rows(t->memtable) : 0;
+    uint64_t dur_rows = table_dir_durable_rows(db, name);
+    if (mem_rows != 0 || dur_rows != 0) {
+        pthread_mutex_unlock(&t->compact_mtx);
+        pthread_mutex_unlock(&t->batch_mu);
+        tsdb_db_scan_release(db, t);
+        return TSDB_OK;                 /* not empty — nothing destroyed */
+    }
+
+    if (t->memtable) tsdb_memtable_clear(t->memtable);
+    if (t->wal)     (void)tsdb_wal_truncate(t->wal);
+    t->mem_logged = 0;
+    t->wal_incomplete = 0;
+    /* Table measured empty on disk too, so there is nothing to rm_rf — but run
+     * the same sweep the full truncate does, to clear any stray partition a
+     * concurrent-but-now-quiesced flush may have left mid-publish. */
+    {
+        char tbl_dir[4096];
+        table_dir_db(db, name, tbl_dir, sizeof(tbl_dir));
+        DIR *d = opendir(tbl_dir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                if (truncate_keep_entry(ent->d_name)) continue;
+                char sub[4096];
+                snprintf(sub, sizeof(sub), "%s/%s", tbl_dir, ent->d_name);
+                rm_rf(sub);
+            }
+            closedir(d);
+        }
+    }
+
+    pthread_mutex_unlock(&t->compact_mtx);
+    pthread_mutex_unlock(&t->batch_mu);
+    tsdb_db_scan_release(db, t);
+    if (was_empty) *was_empty = 1;
+    return TSDB_OK;
+}
+
 int tsdb_truncate_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return TSDB_ERR_INVAL;
 

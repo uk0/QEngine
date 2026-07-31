@@ -61,6 +61,14 @@ int tsdb_db_list_table_names(tsdb_db_t *db,
  * success, TSDB_ERR_NOTFOUND if the table is unknown. */
 int tsdb_truncate_table(tsdb_db_t *db, const char *name);
 
+/* TRUNCATE only if the table is empty when checked UNDER the table lock.
+ * *was_empty = 1 if it truncated, 0 if rows were present and nothing was
+ * destroyed.  Closes the anti-entropy measure-then-truncate race: the emptiness
+ * check and the wipe share one batch_mu + compact_mtx critical section, so a
+ * WRITE_BATCH cannot commit between them. */
+int tsdb_truncate_table_if_empty(tsdb_db_t *db, const char *name,
+                                 int *was_empty);
+
 /* Partition-level time-range delete.
  *
  * cutoff_ns is the boundary in nanoseconds.  op_lt=1 deletes rows with
