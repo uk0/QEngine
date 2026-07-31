@@ -363,6 +363,14 @@ typedef struct {
         } create_function;
         struct { char name[64]; } drop_function;
     } u;
+    /* SHOW vs LIST.  Both parse to the same QAST_STMT_LIST_* kind and the
+     * same filters; the flag is the only difference.  0 (LIST) reads this
+     * node's catalog replica and says nothing about the rest of the cluster.
+     * 1 (SHOW) makes the answer cluster-certified: every peer is asked for
+     * the same listing, the rows are unioned, and the statement fails rather
+     * than return a listing it could not check against every node.
+     * Set only for QAST_STMT_LIST_{DATABASES,GROUPS,VTABLES,PTABLES}. */
+    int8_t cluster_scope;
 } qast_stmt_t;
 
 #endif

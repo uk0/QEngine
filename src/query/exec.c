@@ -381,17 +381,17 @@ enum {
  * block carrying it — an availability regression against "old blocks stay
  * readable".  This is byte-identical to the gate tsdb_part_read_block{,_ref}
  * apply. */
-static tsdb_block_meta_t *col_block_pair_ex(const scan_src_t *src,
-                                            tsdb_block_meta_t *metas, size_t nb,
+static const tsdb_block_meta_t *col_block_pair_ex(const scan_src_t *src,
+                                            const tsdb_block_meta_t *metas, size_t nb,
                                             int *out_why)
 {
     int why = COLPAIR_OK;
-    tsdb_block_meta_t *hit = NULL;
+    const tsdb_block_meta_t *hit = NULL;
 
     if (src->blk_ord >= nb) {
         why = COLPAIR_SHORT;
     } else {
-        tsdb_block_meta_t *m = &metas[src->blk_ord];
+        const tsdb_block_meta_t *m = &metas[src->blk_ord];
         if (m->offset == UINT64_MAX && (m->flags & TSDB_BLOCK_FLAG_MISMATCH)) {
             /* tsdb_part_open found an entry at this ordinal and it described
              * different rows.  It is NOT a short column and must not be
@@ -412,8 +412,8 @@ static tsdb_block_meta_t *col_block_pair_ex(const scan_src_t *src,
     return hit;
 }
 
-static tsdb_block_meta_t *col_block_pair(const scan_src_t *src,
-                                         tsdb_block_meta_t *metas, size_t nb)
+static const tsdb_block_meta_t *col_block_pair(const scan_src_t *src,
+                                         const tsdb_block_meta_t *metas, size_t nb)
 {
     return col_block_pair_ex(src, metas, nb, NULL);
 }
@@ -448,7 +448,7 @@ static int bloom_can_skip_block(tsdb_part_t *part, tsdb_schema_t *s,
          * is kept.  That is the only safe direction: skipping it would delete
          * rows from the answer with rc=0, and keeping it means the scan reads
          * the column and reports the damage by name. */
-        tsdb_block_meta_t *hit = col_block_pair(src, metas, nb);
+        const tsdb_block_meta_t *hit = col_block_pair(src, metas, nb);
         int can_skip = 0;
         if (hit && (hit->flags & TSDB_BF_HAS_BLOOM)) {
             if (!tsdb_bloom_test(hit->bloom, bc[i].code)) {
@@ -2304,19 +2304,20 @@ static int try_stats_fastpath(scan_src_t *src,
     }
     if (!ts_contained) return 0;
 
-    /* Per-column meta lookups.  We cache the metas by col so each one
-     * is fetched at most once per source. */
-    tsdb_block_meta_t *col_hits[TSDB_MAX_COLS]       = {0};
-    tsdb_block_meta_t *col_metas_arr[TSDB_MAX_COLS]  = {0};
+    /* Per-column meta lookups.  Borrowed from the open partition — this path
+     * reads no data at all, so a malloc+memcpy of the whole block array per
+     * (block, column) WAS the fast path's entire cost.  col_hits[c] doubles as
+     * the per-source memo: a column that failed to pair aborts immediately, so
+     * a non-NULL entry is exactly "already fetched". */
+    const tsdb_block_meta_t *col_hits[TSDB_MAX_COLS] = {0};
     int ok = 1;
     for (int pi = 0; pi < nprojs && ok; pi++) {
         int c = projs[pi].col;
         if (c < 0 || col_hits[c]) continue;
-        tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-        if (tsdb_part_col_blocks(src->part, c, &metas, &nb) != TSDB_OK) {
+        const tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+        if (tsdb_part_col_blocks_ref(src->part, c, &metas, &nb) != TSDB_OK) {
             ok = 0; break;
         }
-        col_metas_arr[c] = metas;
         /* NULL when the column is SHORT for this block.  Declining here is
          * what makes the fast path agree with the scan path: without it,
          * `SELECT count(c) FROM t` took the `bits == 0` exit below and served
@@ -2335,7 +2336,7 @@ static int try_stats_fastpath(scan_src_t *src,
             agg_stats_requires(p, &bits, &eligible);
             if (bits == 0) continue;              /* COUNT(*): no stats */
             if (p->col < 0) { ok = 0; break; }
-            tsdb_block_meta_t *hit = col_hits[p->col];
+            const tsdb_block_meta_t *hit = col_hits[p->col];
             if (!hit || (hit->stats_flags & bits) != bits) { ok = 0; break; }
         }
     }
@@ -2343,15 +2344,13 @@ static int try_stats_fastpath(scan_src_t *src,
     if (ok) {
         for (int pi = 0; pi < nprojs; pi++) {
             proj_t *p = &projs[pi];
-            tsdb_block_meta_t *hit = (p->col >= 0) ? col_hits[p->col] : NULL;
+            const tsdb_block_meta_t *hit = (p->col >= 0) ? col_hits[p->col] : NULL;
             tsdb_block_meta_t fb;
             if (!hit) { fb = src->meta; hit = &fb; }
             agg_apply_stats(p, s, hit, src->meta.count);
         }
     }
 
-    for (int c = 0; c < TSDB_MAX_COLS; c++)
-        if (col_metas_arr[c]) free(col_metas_arr[c]);
     return ok;
 }
 
@@ -2416,12 +2415,12 @@ static size_t scan_max_block_rows(const scan_src_t *srcs, size_t nsrcs) {
  * scan they hand back to arrives here and reports it once. */
 static int scan_find_col_block(const scan_src_t *src, int c,
                                const tsdb_schema_t *s,
-                               tsdb_block_meta_t *metas, size_t nb,
-                               tsdb_block_meta_t **out_hit,
+                               const tsdb_block_meta_t *metas, size_t nb,
+                               const tsdb_block_meta_t **out_hit,
                                char *err, size_t errcap)
 {
     int why = COLPAIR_OK;
-    tsdb_block_meta_t *hit = col_block_pair_ex(src, metas, nb, &why);
+    const tsdb_block_meta_t *hit = col_block_pair_ex(src, metas, nb, &why);
     if (hit) { *out_hit = hit; return TSDB_OK; }
 
     const char *cn = (s && c >= 0 && c < s->ncols) ? s->cols[c].name : "?";
@@ -2475,15 +2474,18 @@ static int scan_load_col_block(scan_src_t *src, int c,
                                void **out_buf, void **out_owned,
                                char *err, size_t errcap)
 {
-    tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-    int rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+    /* Borrowed metadata: src->part is open for the whole scan (scan_plan_free
+     * closes it, after pool_wait), and `metas` is consumed entirely inside
+     * this call.  Copying it here cost a malloc+memcpy of the partition's
+     * WHOLE block array once per (block, column) — O(nb^2) over a scan. */
+    const tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+    int rc = tsdb_part_col_blocks_ref(src->part, c, &metas, &nb);
     if (rc != TSDB_OK) return rc;
-    tsdb_block_meta_t *hit = NULL;
+    const tsdb_block_meta_t *hit = NULL;
     rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
-    if (rc != TSDB_OK) { free(metas); return rc; }
+    if (rc != TSDB_OK) return rc;
     const void *data = NULL;
     rc = tsdb_part_read_block_ref(src->part, c, hit, &data, out_owned);
-    free(metas);
     if (rc != TSDB_OK) return rc;
     *out_buf = (void *)data;
     return TSDB_OK;
@@ -2729,7 +2731,7 @@ static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
                 tsdb_block_meta_t *metas = NULL; size_t nb = 0;
                 lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (lrc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
+                const tsdb_block_meta_t *hit = NULL;
                 lrc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
                 if (lrc != TSDB_OK) { free(metas); break; }
                 lrc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
@@ -2880,7 +2882,7 @@ static int right_mat_load_src(right_mat_t *m, scan_src_t *src, tsdb_schema_t *rs
             tsdb_block_meta_t *metas = NULL; size_t nb = 0;
             int rc = tsdb_part_col_blocks(src->part, (int)c, &metas, &nb);
             if (rc != TSDB_OK) return rc;
-            tsdb_block_meta_t *hit = NULL;
+            const tsdb_block_meta_t *hit = NULL;
             rc = scan_find_col_block(src, (int)c, rs, metas, nb, &hit, err, errcap);
             if (rc != TSDB_OK) { free(metas); return rc; }
             rc = tsdb_part_read_block(src->part, (int)c, hit, (char *)m->col_bufs[c] + off * w);
@@ -3354,7 +3356,7 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
                 tsdb_block_meta_t *metas = NULL; size_t nb = 0;
                 lrc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (lrc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
+                const tsdb_block_meta_t *hit = NULL;
                 lrc = scan_find_col_block(src, c, ls, metas, nb, &hit, err, errcap);
                 if (lrc != TSDB_OK) { free(metas); break; }
                 lrc = tsdb_part_read_block(src->part, c, hit, lbufs[c]);
@@ -4922,7 +4924,7 @@ static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 tsdb_block_meta_t *metas = NULL; size_t nb = 0;
                 src_rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
                 if (src_rc != TSDB_OK) break;
-                tsdb_block_meta_t *hit = NULL;
+                const tsdb_block_meta_t *hit = NULL;
                 src_rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
                 if (src_rc != TSDB_OK) { free(metas); break; }
                 src_rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
@@ -6946,16 +6948,18 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 bufs[c] = malloc(w * n);
                 if (!bufs[c]) { rc = TSDB_ERR_NOMEM; break; }
                 /* Find this column's block at same index. We stored ts blocks;
-                 * assume columns have aligned block counts (our flush does that). */
-                tsdb_block_meta_t *metas = NULL; size_t nb = 0;
-                rc = tsdb_part_col_blocks(src->part, c, &metas, &nb);
+                 * assume columns have aligned block counts (our flush does that).
+                 * Borrowed: src->part outlives this loop (scan_plan_free closes
+                 * it) and the decode below copies into bufs[c], so nothing
+                 * derived from `metas` escapes the iteration. */
+                const tsdb_block_meta_t *metas = NULL; size_t nb = 0;
+                rc = tsdb_part_col_blocks_ref(src->part, c, &metas, &nb);
                 if (rc != TSDB_OK) break;
                 /* match by ts_min == src->meta.ts_min */
-                tsdb_block_meta_t *hit = NULL;
+                const tsdb_block_meta_t *hit = NULL;
                 rc = scan_find_col_block(src, c, s, metas, nb, &hit, err, errcap);
-                if (rc != TSDB_OK) { free(metas); break; }
+                if (rc != TSDB_OK) break;
                 rc = tsdb_part_read_block(src->part, c, hit, bufs[c]);
-                free(metas);
                 if (rc != TSDB_OK) break;
             }
         }
@@ -7972,6 +7976,416 @@ static int exec_list_devices(tsdb_catalog_t *cat, const char *group,
     return rc;
 }
 
+/* ---- SHOW: cluster-certified catalog listing ---------------------------
+ *
+ * Why SHOW is not simply an alias for LIST.
+ *
+ * The catalog is replicated, not sharded: every node keeps a full copy of
+ * the databases / groups / stables / child tables, which is why a node's
+ * LIST already names child tables whose ROWS live on other nodes.  So the
+ * local listing looks cluster-wide, and in a healthy cluster it is.  It is
+ * not guaranteed to be.  A peer learns catalog DDL through Raft apply plus
+ * a best-effort broadcast; a peer that misses those stays divergent until
+ * the startup self-heal runs — src/storage/catalog_sync.c records a live
+ * case where one node held 0 of 50 child tables while its peers held all
+ * 50.  LIST on that node is a subset of the database, presented as all of
+ * it, with nothing in the output to say so.
+ *
+ * SHOW closes that by construction:
+ *   - it asks EVERY peer for the same listing and unions the rows, so the
+ *     answer is never smaller than the largest replica;
+ *   - each row carries `on_nodes` = "held-by/consulted", so a divergent
+ *     replica is visible in the output instead of silently deciding it;
+ *   - if any node cannot be asked — not ALIVE, RPC failure, timeout, or a
+ *     reply whose shape it cannot trust — it returns an error rather than
+ *     a listing.  A short list presented as the whole catalog is the same
+ *     defect as a backup reporting complete while holding nothing.
+ *
+ * LIST keeps its old, node-local meaning and stays the escape hatch when a
+ * node is down; every SHOW error message names it. */
+
+/* Defined below with the other DDL result helpers. */
+static int result_status(tsdb_result_t *r, const char *msg);
+
+enum { SHOW_MAX_PEERS = 64, SHOW_MAX_COLS = 12 };
+
+/* A SHOW reached while this node is serving somebody else's scatter leg must
+ * answer from local state.  The coordinator below sends LIST precisely so
+ * this cannot happen, but the fan-out is symmetric — every node scatters to
+ * every node — so a SHOW that arrived by any other route would recurse
+ * without this guard. */
+#define SHOW_IS_CLUSTER_SCOPED(st) \
+    ((st).cluster_scope && !tsdb_g_scatter_local_mode)
+
+/* Peer leg budget.  Same 5s the stable-aggregate scatter uses per peer. */
+enum { SHOW_PEER_TIMEOUT_MS = 5000 };
+
+typedef struct {
+    char    *sym[SHOW_MAX_COLS];  /* SYMBOL cells, strdup'd (codes are
+                                   * meaningless outside their own result) */
+    uint64_t raw[SHOW_MAX_COLS];  /* every other cell, verbatim 8 bytes */
+    int      nodes;               /* replicas that reported this entity */
+} show_row_t;
+
+typedef struct {
+    show_row_t *rows;
+    int         nrows, cap_rows;
+    int        *slots;            /* rows index + 1; 0 = empty */
+    uint32_t    nslots;           /* power of two */
+    int         ncols;
+    const tsdb_type_t *types;
+} show_merge_t;
+
+static uint32_t show_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
+}
+
+static void show_merge_free(show_merge_t *m) {
+    for (int i = 0; i < m->nrows; i++) {
+        for (int c = 0; c < m->ncols; c++) free(m->rows[i].sym[c]);
+    }
+    free(m->rows);
+    free(m->slots);
+    memset(m, 0, sizeof(*m));
+}
+
+static int show_merge_init(show_merge_t *m, int ncols,
+                            const tsdb_type_t *types, size_t hint) {
+    memset(m, 0, sizeof(*m));
+    m->ncols = ncols;
+    m->types = types;
+    uint32_t want = 64;
+    while ((size_t)want < hint * 4 + 4) want <<= 1;
+    m->nslots = want;
+    m->slots  = calloc(want, sizeof(int));
+    m->cap_rows = (int)(hint ? hint : 16);
+    m->rows   = calloc((size_t)m->cap_rows, sizeof(show_row_t));
+    if (!m->slots || !m->rows) { show_merge_free(m); return TSDB_ERR_NOMEM; }
+    return TSDB_OK;
+}
+
+/* Look up `key`; on miss append a row filled from (sym_of, raw_of) for the
+ * source result row `srow`.  Either way bump the holder count by one. */
+static int show_merge_add(show_merge_t *m, tsdb_result_t *src, size_t srow) {
+    /* tsdb_symtab_str dereferences its table, so a missing symtab is a crash
+     * and not a NULL return.  show_absorb rejects that shape before we get
+     * here; this keeps a future caller from turning a bad reply into a
+     * segfault on the node serving the statement. */
+    if (!src->col_symtab[0]) return TSDB_ERR_CORRUPT;
+    const char *key = tsdb_symtab_str(src->col_symtab[0],
+        (uint32_t)((uint64_t *)src->col_data[0])[srow]);
+    if (!key) return TSDB_ERR_CORRUPT;
+
+    uint32_t mask = m->nslots - 1;
+    uint32_t i = show_hash(key) & mask;
+    while (m->slots[i]) {
+        show_row_t *cand = &m->rows[m->slots[i] - 1];
+        if (cand->sym[0] && strcmp(cand->sym[0], key) == 0) {
+            cand->nodes++;
+            return TSDB_OK;
+        }
+        i = (i + 1) & mask;
+    }
+
+    if (m->nrows == m->cap_rows) {
+        int ncap = m->cap_rows * 2;
+        show_row_t *nr = realloc(m->rows, (size_t)ncap * sizeof(show_row_t));
+        if (!nr) return TSDB_ERR_NOMEM;
+        memset(nr + m->cap_rows, 0,
+               (size_t)(ncap - m->cap_rows) * sizeof(show_row_t));
+        m->rows = nr;
+        m->cap_rows = ncap;
+    }
+    show_row_t *row = &m->rows[m->nrows];
+    for (int c = 0; c < m->ncols; c++) {
+        uint64_t cell = ((uint64_t *)src->col_data[c])[srow];
+        if (m->types[c] == TSDB_TYPE_SYMBOL) {
+            const char *s = src->col_symtab[c]
+                ? tsdb_symtab_str(src->col_symtab[c], (uint32_t)cell) : NULL;
+            row->sym[c] = s ? strdup(s) : NULL;
+            if (!row->sym[c]) {
+                /* The row is not committed (nrows unchanged), so
+                 * show_merge_free will never see these cells — release the
+                 * ones already taken here. */
+                for (int k = 0; k < c; k++) { free(row->sym[k]); row->sym[k] = NULL; }
+                return src->col_symtab[c] ? TSDB_ERR_NOMEM : TSDB_ERR_CORRUPT;
+            }
+        } else {
+            row->raw[c] = cell;
+        }
+    }
+    row->nodes = 1;
+    m->slots[i] = ++m->nrows;
+
+    /* Grow the index before it gets dense enough to degrade the probe. */
+    if ((uint32_t)m->nrows * 2 >= m->nslots) {
+        uint32_t ns = m->nslots * 2;
+        int *slots = calloc(ns, sizeof(int));
+        if (!slots) return TSDB_ERR_NOMEM;
+        for (int k = 0; k < m->nrows; k++) {
+            uint32_t j = show_hash(m->rows[k].sym[0] ? m->rows[k].sym[0] : "")
+                         & (ns - 1);
+            while (slots[j]) j = (j + 1) & (ns - 1);
+            slots[j] = k + 1;
+        }
+        free(m->slots);
+        m->slots  = slots;
+        m->nslots = ns;
+    }
+    return TSDB_OK;
+}
+
+/* Absorb one replica's listing.  Rejects anything whose shape this node
+ * cannot interpret rather than merging cells it has guessed at: a peer on a
+ * different build could return a different column set, and a peer without
+ * the federation symbol dictionary returns SYMBOL columns whose codes carry
+ * no strings (col_symtab == NULL) — merging those would union rows keyed on
+ * NULL names. */
+static int show_absorb(show_merge_t *m, tsdb_result_t *src,
+                        int ncols, const char **cols, const tsdb_type_t *types,
+                        uint64_t peer_id, char *err, size_t errcap)
+{
+    if (!src || src->ncols != ncols) {
+        eset(err, errcap, "node %llu returned %d columns, expected %d",
+             (unsigned long long)peer_id, src ? src->ncols : 0, ncols);
+        return TSDB_ERR_CORRUPT;
+    }
+    for (int c = 0; c < ncols; c++) {
+        if (src->col_types[c] != types[c]) {
+            eset(err, errcap, "node %llu column %d (%s) has type %d, expected %d",
+                 (unsigned long long)peer_id, c, cols[c],
+                 (int)src->col_types[c], (int)types[c]);
+            return TSDB_ERR_CORRUPT;
+        }
+        if (types[c] == TSDB_TYPE_SYMBOL && !src->col_symtab[c]) {
+            eset(err, errcap,
+                 "node %llu returned column %d (%s) without symbol strings",
+                 (unsigned long long)peer_id, c, cols[c]);
+            return TSDB_ERR_CORRUPT;
+        }
+        /* AN EMPTY LISTING IS AN ANSWER, NOT A CORRUPT REPLY.
+         * fedrpc_decode_result() leaves col_data[c] NULL for a 0-row result —
+         * its capacity guard is `cap_rows < nrows`, which is false at 0, so it
+         * allocates nothing.  Harmless until this merge started reading a NULL
+         * col_data as "a reply this node cannot trust", which rejected every
+         * legitimately empty peer listing: a stable with no children, a group
+         * with no tables, a database with no groups.  Those are precisely the
+         * cases SHOW exists to surface.  Only demand the pointer when there are
+         * rows to read through it; show_merge_add is never reached at nrows 0. */
+        if (src->nrows > 0 && !src->col_data[c]) {
+            eset(err, errcap, "node %llu returned column %d (%s) with no data",
+                 (unsigned long long)peer_id, c, cols[c]);
+            return TSDB_ERR_CORRUPT;
+        }
+    }
+    for (size_t i = 0; i < src->nrows; i++) {
+        int rc = show_merge_add(m, src, i);
+        if (rc != TSDB_OK) return rc;
+    }
+    return TSDB_OK;
+}
+
+/* Catalog names come from IDENT tokens, so they are already [A-Za-z0-9_].
+ * Re-check before splicing one into the QTL sent to peers: a name that ever
+ * reached the catalog by another route must not be able to carry a second
+ * statement along with it. */
+static int show_ident_ok(const char *s) {
+    if (!s) return 0;
+    for (; *s; s++) {
+        if (!(isalnum((unsigned char)*s) || *s == '_')) return 0;
+    }
+    return 1;
+}
+
+static int exec_show_cluster(tsdb_db_t *db, tsdb_catalog_t *cat,
+                              const qast_stmt_t *stmt, tsdb_result_t *r)
+{
+    const char        **cols;
+    const tsdb_type_t  *types;
+    int                 ncols;
+    const char         *noun;
+    char                qtl[512];
+    const char         *f_db = "", *f_grp = "", *f_using = "";
+
+    switch (stmt->kind) {
+    case QAST_STMT_LIST_DATABASES:
+        cols = LIST_DBS_COLS; types = LIST_DBS_TYPES; ncols = LIST_DBS_NCOLS;
+        noun = "DATABASES";
+        snprintf(qtl, sizeof(qtl), "LIST DATABASES");
+        break;
+    case QAST_STMT_LIST_GROUPS:
+        cols = LIST_GROUPS_COLS; types = LIST_GROUPS_TYPES;
+        ncols = LIST_GROUPS_NCOLS; noun = "GROUPS";
+        f_db = stmt->u.list_groups.database;
+        snprintf(qtl, sizeof(qtl), "LIST GROUPS%s%s",
+                 f_db[0] ? " IN DATABASE " : "", f_db);
+        break;
+    case QAST_STMT_LIST_VTABLES:
+        cols = LIST_VTABS_COLS; types = LIST_VTABS_TYPES;
+        ncols = LIST_VTABS_NCOLS; noun = "STABLES";
+        f_db  = stmt->u.list_vtables.database;
+        f_grp = stmt->u.list_vtables.group;
+        snprintf(qtl, sizeof(qtl), "LIST VTABLES%s%s%s%s",
+                 f_db[0]  ? " IN DATABASE " : "", f_db,
+                 f_grp[0] ? " IN GROUP "    : "", f_grp);
+        break;
+    case QAST_STMT_LIST_PTABLES:
+        cols = LIST_PTABS_COLS; types = LIST_PTABS_TYPES;
+        ncols = LIST_PTABS_NCOLS; noun = "TABLES";
+        f_using = stmt->u.list_ptables.vtable;
+        f_db    = stmt->u.list_ptables.database;
+        f_grp   = stmt->u.list_ptables.group;
+        snprintf(qtl, sizeof(qtl), "LIST PTABLES%s%s%s%s%s%s",
+                 f_using[0] ? " USING "       : "", f_using,
+                 f_db[0]    ? " IN DATABASE " : "", f_db,
+                 f_grp[0]   ? " IN GROUP "    : "", f_grp);
+        break;
+    default:
+        return result_status(r, "ERR: SHOW: unsupported entity");
+    }
+
+    if (!show_ident_ok(f_db) || !show_ident_ok(f_grp) || !show_ident_ok(f_using))
+        return result_status(r, "ERR: SHOW: filter name is not a plain identifier");
+    /* show_row_t's cell arrays are fixed; a listing that outgrew them would
+     * write past them.  All four column sets are compile-time constants, so
+     * this can only fire if one is widened without widening SHOW_MAX_COLS. */
+    if (ncols > SHOW_MAX_COLS)
+        return result_status(r, "ERR: SHOW: listing has more columns than the "
+                                "merge buffer holds");
+
+    char msg[400];
+
+    /* ---- local leg ---------------------------------------------------- */
+    tsdb_result_t local;
+    memset(&local, 0, sizeof(local));
+    local.cur = -1;
+    int rc;
+    switch (stmt->kind) {
+    case QAST_STMT_LIST_DATABASES: rc = exec_list_databases(cat, &local); break;
+    case QAST_STMT_LIST_GROUPS:    rc = exec_list_groups(cat, &local, f_db); break;
+    case QAST_STMT_LIST_VTABLES:   rc = exec_list_vtables(cat, f_db, f_grp, &local); break;
+    default:                       rc = exec_list_ptables(cat, f_using, f_db, f_grp, &local); break;
+    }
+    if (rc != TSDB_OK) { tsdb_result_free_internal(&local); return rc; }
+
+    /* ---- who has to answer -------------------------------------------- */
+    int      known = 0, alive = 0;
+    uint64_t missing = 0;
+    int clustered = tsdb_cluster_peer_census(db, &known, &alive, &missing);
+
+    /* AN EMPTY MEMBERSHIP VIEW CERTIFIES NOTHING.  `known != alive` catches a
+     * peer that is known and down; it cannot catch a node that has not learned
+     * about anyone yet, because 0 == 0.  A clustered node in that state used to
+     * return its own catalog labelled complete — measured, an ~830 ms window
+     * after open in which SHOW answered "1/1" while holding 2 of the cluster's
+     * 3 tables.  Under-reporting a listing as complete is the same defect class
+     * as a backup that reports complete=1 while holding nothing, so this refuses
+     * on the same terms as an unreachable peer and points at the same fallback. */
+    if (clustered && known == 0) {
+        tsdb_result_free_internal(&local);
+        snprintf(msg, sizeof(msg),
+                 "ERR: SHOW %s: this node has not yet discovered any cluster "
+                 "peers, so its catalog replica cannot be certified as the "
+                 "cluster's; retry once gossip converges, or run LIST %s for "
+                 "this node's replica alone",
+                 noun, noun);
+        return result_status(r, msg);
+    }
+
+    if (clustered && known != alive) {
+        tsdb_result_free_internal(&local);
+        snprintf(msg, sizeof(msg),
+                 "ERR: SHOW %s: %d of %d peer node(s) are not reachable "
+                 "(first: node %llu) — this node's catalog replica cannot be "
+                 "certified against the cluster; run LIST %s for this node's "
+                 "replica alone",
+                 noun, known - alive, known, (unsigned long long)missing, noun);
+        return result_status(r, msg);
+    }
+
+    /* ---- peer legs ------------------------------------------------------ */
+    tsdb_result_t *peer[SHOW_MAX_PEERS];
+    int      npeer = 0;
+    uint64_t failed = 0;
+    if (clustered && alive > 0) {
+        if (alive > SHOW_MAX_PEERS) {
+            tsdb_result_free_internal(&local);
+            snprintf(msg, sizeof(msg),
+                     "ERR: SHOW %s: %d peers exceeds the %d-node fan-out limit",
+                     noun, alive, SHOW_MAX_PEERS);
+            return result_status(r, msg);
+        }
+        rc = tsdb_cluster_scatter_stable_agg(db, qtl, SHOW_PEER_TIMEOUT_MS,
+                                             peer, SHOW_MAX_PEERS,
+                                             &npeer, &failed);
+        if (rc != TSDB_OK || npeer != alive) {
+            for (int i = 0; i < npeer; i++) tsdb_result_free(peer[i]);
+            tsdb_result_free_internal(&local);
+            snprintf(msg, sizeof(msg),
+                     "ERR: SHOW %s: %d of %d peer node(s) answered "
+                     "(node %llu failed or timed out) — a cluster-wide listing "
+                     "would be missing their catalog; run LIST %s for this "
+                     "node's replica alone",
+                     noun, npeer, alive, (unsigned long long)failed, noun);
+            return result_status(r, msg);
+        }
+    }
+
+    /* ---- union ---------------------------------------------------------- */
+    show_merge_t m;
+    rc = show_merge_init(&m, ncols, types, local.nrows);
+    char detail[256];
+    detail[0] = '\0';
+    if (rc == TSDB_OK)
+        rc = show_absorb(&m, &local, ncols, cols, types,
+                         tsdb_cluster_local_id_for_db(db),
+                         detail, sizeof(detail));
+    for (int i = 0; i < npeer && rc == TSDB_OK; i++)
+        rc = show_absorb(&m, peer[i], ncols, cols, types, 0,
+                         detail, sizeof(detail));
+
+    int consulted = 1 + npeer;
+    if (rc == TSDB_OK) {
+        const char  *ncols_names[SHOW_MAX_COLS + 1];
+        tsdb_type_t  ntypes[SHOW_MAX_COLS + 1];
+        for (int c = 0; c < ncols; c++) { ncols_names[c] = cols[c]; ntypes[c] = types[c]; }
+        ncols_names[ncols] = "on_nodes";
+        ntypes[ncols]      = TSDB_TYPE_SYMBOL;
+        rc = result_init_ddl(r, ncols + 1, ncols_names, ntypes);
+        for (int i = 0; i < m.nrows && rc == TSDB_OK; i++) {
+            if ((rc = result_ddl_ensure_cap(r)) != TSDB_OK) break;
+            for (int c = 0; c < ncols; c++) {
+                if (types[c] == TSDB_TYPE_SYMBOL)
+                    result_append_sym(r, c, m.rows[i].sym[c]);
+                else
+                    result_append_i64_val(r, c, (int64_t)m.rows[i].raw[c]);
+            }
+            char held[24];
+            snprintf(held, sizeof(held), "%d/%d", m.rows[i].nodes, consulted);
+            result_append_sym(r, ncols, held);
+            result_ddl_end_row(r);
+        }
+    }
+
+    show_merge_free(&m);
+    for (int i = 0; i < npeer; i++) tsdb_result_free(peer[i]);
+    tsdb_result_free_internal(&local);
+
+    if (rc == TSDB_ERR_CORRUPT) {
+        tsdb_result_free_internal(r);
+        snprintf(msg, sizeof(msg),
+                 "ERR: SHOW %s: a node's reply could not be merged (%s) — "
+                 "refusing to return a listing assembled from replies this "
+                 "node does not understand; run LIST %s for this node's "
+                 "replica alone",
+                 noun, detail[0] ? detail : "shape mismatch", noun);
+        return result_status(r, msg);
+    }
+    return rc;
+}
+
 /* LIST USERS result columns: name, role, created_at. */
 static const char *LIST_USERS_COLS[]  = {"name", "role", "created_at"};
 static const tsdb_type_t LIST_USERS_TYPES[] = {
@@ -8541,16 +8955,28 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
              * never re-forwards. */
             uint64_t leader = tsdb_raft_leader_id(raft);
             if (leader != 0) {
-                char fwd[256];
+                char fwd[256] = {0};
                 int frc = tsdb_cluster_forward_ddl_to_leader(
                     db, leader, qtl, fwd, sizeof(fwd));
-                if (frc == TSDB_OK) {
+                if (frc == TSDB_OK || fwd[0]) {
+                    /* frc == TSDB_OK  — the leader ran it.
+                     * frc != TSDB_OK with a status — the leader ran it and
+                     *   REFUSED it, and fwd is the leader's own message.  That
+                     *   used to arrive as TSDB_OK (the handler ACKed and put
+                     *   the error text in the body), so this branch is where
+                     *   the honest rc lands.  Show the leader's words either
+                     *   way: falling through to the "not raft leader, retry"
+                     *   hint below would tell the operator to retry a
+                     *   statement that will fail identically on the leader.
+                     * TSDB_OK-with-a-status-row is this path's established
+                     * shape — see the err_msg block above for why an error
+                     * code here would leak the result in the HTTP provider. */
                     result_status(r, fwd);
                     *out = r;
                     return TSDB_OK;
                 }
-                /* Forward failed (leader unknown to membership, down, or a
-                 * transport error) — fall through to the retry hint below. */
+                /* No answer at all: leader unknown to membership, down, or a
+                 * transport error — fall through to the retry hint below. */
             }
             /* No known leader (mid-election) or forward failed — surface the
              * leader hint as a status row.  Return TSDB_OK (not PERMISSION)
@@ -8743,7 +9169,9 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_LIST_DATABASES:
-        rc = exec_list_databases(cat, r);
+        rc = SHOW_IS_CLUSTER_SCOPED(stmt)
+             ? exec_show_cluster(db, cat, &stmt, r)
+             : exec_list_databases(cat, r);
         break;
     case QAST_STMT_CREATE_GROUP: {
         /* If IN DATABASE was specified, ensure the parent exists. */
@@ -8807,7 +9235,9 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         break;
     }
     case QAST_STMT_LIST_GROUPS:
-        rc = exec_list_groups(cat, r, stmt.u.list_groups.database);
+        rc = SHOW_IS_CLUSTER_SCOPED(stmt)
+             ? exec_show_cluster(db, cat, &stmt, r)
+             : exec_list_groups(cat, r, stmt.u.list_groups.database);
         break;
     case QAST_STMT_CREATE_DEVICE: {
         rc = tsdb_device_create(cat, &stmt.u.create_device.spec);
@@ -8828,15 +9258,19 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         rc = exec_list_devices(cat, stmt.u.list_devices.group, r);
         break;
     case QAST_STMT_LIST_VTABLES:
-        rc = exec_list_vtables(cat,
-                               stmt.u.list_vtables.database,
-                               stmt.u.list_vtables.group, r);
+        rc = SHOW_IS_CLUSTER_SCOPED(stmt)
+             ? exec_show_cluster(db, cat, &stmt, r)
+             : exec_list_vtables(cat,
+                                 stmt.u.list_vtables.database,
+                                 stmt.u.list_vtables.group, r);
         break;
     case QAST_STMT_LIST_PTABLES:
-        rc = exec_list_ptables(cat,
-                               stmt.u.list_ptables.vtable,
-                               stmt.u.list_ptables.database,
-                               stmt.u.list_ptables.group, r);
+        rc = SHOW_IS_CLUSTER_SCOPED(stmt)
+             ? exec_show_cluster(db, cat, &stmt, r)
+             : exec_list_ptables(cat,
+                                 stmt.u.list_ptables.vtable,
+                                 stmt.u.list_ptables.database,
+                                 stmt.u.list_ptables.group, r);
         break;
 
     /* ---- STable DDL ---------------------------------------------------- */

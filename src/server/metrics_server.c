@@ -18,6 +18,8 @@
 #include "../cluster/disk_weight.h"
 #include "../../include/tsdb.h"   /* for TSDB_OK, TSDB_ERR_PERMISSION */
 #include "../../include/tsdb_cluster.h"  /* tsdb_cluster_alive_count for the alive gauge */
+#include "../storage/db.h"        /* TSDB_BACKUP_NOT_ON_DISK — /backup's contract
+                                   * with the manifest provider */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1036,11 +1038,30 @@ static void *handle_connection(void *arg) {
          * every row — see tests/e2e/backup_restore.sh. */
         tsdb_metric_inc("qengine_backup_requests_total");
 
-        /* Best-effort manifest emit before tar runs.  Failures here
-         * don't abort the backup — operators still get the bytes,
-         * just without the verify aid. */
+        /* Manifest emit before tar runs.  A manifest that could not be
+         * WRITTEN is still best-effort — operators get the bytes, just
+         * without the verify aid.
+         *
+         * TSDB_BACKUP_NOT_ON_DISK is a different animal: the emitter's
+         * tsdb_db_flush_all failed, so the rows this endpoint is about to
+         * `tar` are still in the memtable and the tarball would be an
+         * INCOMPLETE copy handed over as a backup.  It used to be a (void)
+         * cast and a 200 OK.  Refuse instead and say why — the operator can
+         * clear the condition (usually a full or read-only disk) and retry;
+         * silently shipping a short backup is the failure that is only
+         * discovered during a restore. */
         if (g_backup_manifest_fn && g_data_dir[0]) {
-            (void)g_backup_manifest_fn(g_backup_manifest_ud, g_data_dir);
+            int mrc = g_backup_manifest_fn(g_backup_manifest_ud, g_data_dir);
+            if (mrc == TSDB_BACKUP_NOT_ON_DISK) {
+                const char *err =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 112\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"flush failed; rows are not in the partition "
+                    "files and this tar would be incomplete — see node log\"}\n";
+                write_all(fd, err, strlen(err));
+                goto done;
+            }
         }
 
         if (!g_data_dir[0]) {

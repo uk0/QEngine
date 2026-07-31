@@ -725,6 +725,11 @@ int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
                                         char *out_status, size_t cap)
 {
     if (!db || !qtl || !out_status || cap == 0) return TSDB_ERR_INVAL;
+    /* Clear BEFORE any other early return.  The caller (exec.c) now branches on
+     * "is out_status non-empty" to tell "the leader refused this statement" from
+     * "nobody answered", and its buffer is an uninitialised stack array — every
+     * path out of here has to leave a defined answer in it. */
+    out_status[0] = '\0';
     if (leader_id == 0) return TSDB_ERR_NOTFOUND;   /* mid-election */
 
     tsdb_cluster_t *c = cluster_get(db);
@@ -761,11 +766,26 @@ int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
                                 payload, (uint32_t)plen,
                                 resp, sizeof(resp) - 1, &rlen);
     tsdb_rpc_conn_close(conn);
-    if (rc != TSDB_OK) return rc;
 
-    resp[rlen] = '\0';
-    snprintf(out_status, cap, "%s", (const char *)resp);
-    return TSDB_OK;
+    /* Copy the body FIRST, whatever the verdict.  The leader now answers ERR
+     * for a statement its query engine rejected (it used to ACK and put the
+     * failure text in the body for us to string-match), and that text is the
+     * only description of what actually went wrong — losing it on the way out
+     * would trade one silent failure for another.  out_status is left EMPTY
+     * when the peer sent no body, which is how the caller tells "the leader
+     * ran it and refused" from "we never got an answer".
+     *
+     * rlen is the WIRE payload length, not the number of bytes copied into
+     * resp — tsdb_rpc_call_recv reports resp.payload_len and copies at most
+     * resp_cap.  `resp[rlen] = 0` on a longer-than-511-byte reply is a stack
+     * write past the array; today no responder emits one, but this path is
+     * newly reachable on ERR and must not depend on that. */
+    if (rlen >= sizeof(resp)) rlen = (uint32_t)sizeof(resp) - 1;
+    if (rlen > 0) {
+        resp[rlen] = '\0';
+        snprintf(out_status, cap, "%s", (const char *)resp);
+    }
+    return rc;
 }
 
 /* ---- Anti-entropy resync ------------------------------------------------ */
@@ -1763,7 +1783,16 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
             int bf = ae_partition_backfill(x->db, x->c, peer, x->table, x->delwm);
             if (bf > 0) return bf;
         }
-        /* Would shrink durable data on a peer-count comparison — refuse. */
+        /* Would shrink durable data on a peer-count comparison — refuse.
+         *
+         * Refusing is right, but the gap it refuses to close is PERMANENT and
+         * until now the only trace of it was this line on stderr.  There is no
+         * periodic row anti-entropy — tsdb_resync_startup_thread runs once, 5 s
+         * after boot — so nothing revisits the decision, and the count(*) the
+         * two nodes answer stays different with no error on either.  Measured
+         * live: cnode-1 12000, cnode-3 9000, identical max(ts).  Count it so an
+         * operator can see divergence exists without reading container logs. */
+        tsdb_metric_inc("qengine_antientropy_middle_gap_total");
         fprintf(stderr,
                 "[anti-entropy] %s: middle-gap vs peer %llu (peer=%llu rows, "
                 "max_ts %lld) — peer not provably a superset%s; "
@@ -1954,27 +1983,33 @@ static int resync_is_table_dir(const char *name) {
     return 1;
 }
 
-/* Detached worker: sleep long enough for gossip + replication to settle,
- * then walk the data_dir to populate db->tables[] (which is otherwise
- * empty after a fresh restart), and for each known table call
- * tsdb_cluster_resync_table to pull any missing tail from a peer. */
-void *tsdb_resync_startup_thread(void *ud) {
-    tsdb_db_t *db = (tsdb_db_t *)ud;
-    if (!db) return NULL;
+/* The wall budget one table's candidate loop is allowed, exported so a test can
+ * pin the number the production driver actually passes (its enforcement is
+ * pinned by tests/test_ae_candidates.c).  This, times the table count, is the
+ * worst case of ONE sweep — and only for tables that have a candidate peer at
+ * all: a converged table costs one LOCAL_TABLE_STATS round-trip per alive peer
+ * and stops at `ncand == 0`. */
+long tsdb_antientropy_budget_ms(void) { return AE_RESYNC_BUDGET_MS; }
 
-    int delay_ms = 5000;
-    const char *envd = getenv("TSDB_ANTIENTROPY_DELAY_MS");
-    if (envd && *envd) delay_ms = atoi(envd);
-    struct timespec ts = { .tv_sec = delay_ms / 1000,
-                           .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
-    nanosleep(&ts, NULL);
+/* Milliseconds between anti-entropy sweeps.  0 = one shot at startup and never
+ * again, which is what this node did unconditionally until 2026-07-31.
+ *
+ * 30 s by default: the same tick tsdb_delwm_reassert_thread already runs on, so
+ * the cadence an operator has to reason about does not multiply.  Deliberately
+ * NOT cached in a static — the sweep loop reads it once per iteration, which
+ * costs one getenv per 30 s and lets a test drive two periods in one process. */
+long tsdb_antientropy_period_ms(void) {
+    const char *e = getenv("TSDB_ANTIENTROPY_PERIOD_MS");
+    long ms = (e && *e) ? atol(e) : 30000;
+    return ms > 0 ? ms : 0;
+}
 
-    /* Catalog reconcile FIRST: pull every alive peer's catalog and merge it
-     * resurrection-safe, so this node — master included — learns any table
-     * created while it was down (e.g. an SDK table that landed in stables.log
-     * on the peers).  Then materialize storage for the data-bearing ones so the
-     * per-table row pull below fills them in. */
-    (void)tsdb_catalog_reconcile_from_peers(db);
+/* ONE anti-entropy sweep: learn what tables exist, then close each one's row
+ * gap against the alive peers.  Extracted verbatim from the body of the
+ * startup thread so the periodic tick runs the code that was already there and
+ * already tested — the only new thing is that it runs more than once. */
+void tsdb_cluster_resync_all_tables(tsdb_db_t *db) {
+    if (!db) return;
 
     /* Pre-open every on-disk table across every striped data dir so
      * db->tables[] reflects them.  Falls back to a single-dir scan
@@ -2006,7 +2041,6 @@ void *tsdb_resync_startup_thread(void *ud) {
     char names[TSDB_CLUSTER_MAX_NODES * 8][64];
     int max_names = (int)(sizeof(names) / sizeof(names[0]));
     int n = tsdb_db_list_table_names(db, names, max_names);
-    fprintf(stderr, "[anti-entropy] scanning %d tables for gaps\n", n);
 
     int total = 0;
     for (int i = 0; i < n; i++) {
@@ -2019,8 +2053,76 @@ void *tsdb_resync_startup_thread(void *ud) {
                     names[i], pulled);
         }
     }
-    fprintf(stderr, "[anti-entropy] startup catch-up: %d rows across %d tables\n",
-            total, n);
+    tsdb_metric_inc("qengine_antientropy_sweeps_total");
+    if (total > 0)
+        fprintf(stderr, "[anti-entropy] sweep: %d rows across %d tables\n",
+                total, n);
+}
+
+/* Detached worker: sleep long enough for gossip + replication to settle, then
+ * sweep — and keep sweeping.
+ *
+ * This thread used to run ONE sweep and return, and that single pass was the
+ * whole of row-level anti-entropy.  Every "anti-entropy will heal it" in the
+ * replication path is a promise made to this thread, and for a peer that stays
+ * up the thread had already finished before any of them could be called in:
+ *
+ *   - TSDB_REPLICATION_QUORUM=0 acks a write no peer has yet (cluster.c);
+ *   - a gossip-DEAD peer is skipped outright — "it resyncs via anti-entropy
+ *     when it rejoins" (replica.c replica_peer_dialable);
+ *   - a fanout worker that burns MAX_ATTEMPTS gives up — "anti-entropy heals
+ *     the gap" (replica.c fanout_worker);
+ *   - a SCHEMA_SYNC the peer refused (rpc.c, above) leaves it unable to accept
+ *     writes for that table at all;
+ *   - a fanout send dropped under the in-flight byte cap (replica.c).
+ *
+ * The loop is the same body as before, run again every
+ * TSDB_ANTIENTROPY_PERIOD_MS.  Cost per sweep on a converged cluster is one
+ * LOCAL_TABLE_STATS round-trip per table per alive peer — the candidate list
+ * comes back empty and tsdb_cluster_resync_table returns before contacting
+ * anyone.  A sweep that does find work is bounded by AE_RESYNC_BUDGET_MS
+ * (30 s) per table, and sweeps cannot overlap or pile up: the period is a gap
+ * BETWEEN sweeps on one thread, not a rate. */
+void *tsdb_resync_startup_thread(void *ud) {
+    tsdb_db_t *db = (tsdb_db_t *)ud;
+    if (!db) return NULL;
+
+    int delay_ms = 5000;
+    const char *envd = getenv("TSDB_ANTIENTROPY_DELAY_MS");
+    if (envd && *envd) delay_ms = atoi(envd);
+    struct timespec ts = { .tv_sec = delay_ms / 1000,
+                           .tv_nsec = (long)(delay_ms % 1000) * 1000000 };
+    nanosleep(&ts, NULL);
+
+    /* Catalog reconcile FIRST: pull every alive peer's catalog and merge it
+     * resurrection-safe, so this node — master included — learns any table
+     * created while it was down (e.g. an SDK table that landed in stables.log
+     * on the peers).  Then materialize storage for the data-bearing ones so the
+     * per-table row pull below fills them in.
+     *
+     * Startup only.  tsdb_delwm_reassert_thread already runs exactly this
+     * reconcile every 30 s (see its comment), so repeating it inside the sweep
+     * loop below would double the CATALOG_DUMP traffic to buy nothing —
+     * materialize_missing_stables inside the sweep still picks up whatever
+     * that thread learned. */
+    (void)tsdb_catalog_reconcile_from_peers(db);
+
+    long period_ms = tsdb_antientropy_period_ms();
+    fprintf(stderr, "[anti-entropy] first sweep after %d ms, then every %ld ms\n",
+            delay_ms, period_ms);
+
+    for (;;) {
+        tsdb_cluster_resync_all_tables(db);
+
+        /* Re-read each iteration so the knob is not frozen at process start
+         * (and so a test can drive two periods in one process).  0 means the
+         * pre-2026-07-31 behaviour exactly: one sweep, then this thread ends. */
+        period_ms = tsdb_antientropy_period_ms();
+        if (period_ms <= 0) break;
+        struct timespec p = { .tv_sec = period_ms / 1000,
+                              .tv_nsec = (period_ms % 1000) * 1000000L };
+        nanosleep(&p, NULL);
+    }
     return NULL;
 }
 
@@ -2217,6 +2319,50 @@ static long mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Membership census for the catalog-introspection path (SHOW ...).
+ *
+ * The scatter below only dials ALIVE peers, so "every alive peer answered"
+ * is NOT the same claim as "every node in this cluster answered": a cluster
+ * with a dead node would report a clean fan-out over a smaller set.  SHOW
+ * has to tell those apart before it calls a listing cluster-complete, so it
+ * needs both numbers.
+ *
+ *   *out_known — peers in this node's membership view, any state, self excluded
+ *   *out_alive — the TSDB_NODE_ALIVE subset (exactly who the scatter dials)
+ *   *out_missing_id — id of the first non-ALIVE peer, 0 when there is none
+ *
+ * Returns 1 when this node is clustered, 0 when standalone (counters 0). */
+int tsdb_cluster_peer_census(tsdb_db_t *db, int *out_known, int *out_alive,
+                              uint64_t *out_missing_id)
+{
+    if (out_known) *out_known = 0;
+    if (out_alive) *out_alive = 0;
+    if (out_missing_id) *out_missing_id = 0;
+    if (!db) return 0;
+
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return 0;
+
+    tsdb_node_manager_t *mgr = tsdb_cluster_node_mgr(c);
+    tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+    int n = tsdb_node_manager_snapshot(mgr, snap, TSDB_CLUSTER_MAX_NODES);
+    tsdb_node_id_t self = tsdb_cluster_local_id(c);
+
+    int known = 0, alive = 0;
+    for (int i = 0; i < n; i++) {
+        if (snap[i].id == self) continue;
+        known++;
+        if (snap[i].state == TSDB_NODE_ALIVE) {
+            alive++;
+        } else if (out_missing_id && *out_missing_id == 0) {
+            *out_missing_id = (uint64_t)snap[i].id;
+        }
+    }
+    if (out_known) *out_known = known;
+    if (out_alive) *out_alive = alive;
+    return 1;
 }
 
 /* Coordinator fan-out for the stable-aggregation scatter.  Sequential

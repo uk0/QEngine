@@ -18,6 +18,7 @@
  */
 #include "db.h"
 #include "../../include/tsdb.h"
+#include "../server/metrics.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,18 +175,38 @@ int tsdb_backup_write_manifest_json(tsdb_db_t *db, char *buf, size_t cap) {
 }
 
 /* Write the manifest to <data_dir>/_backup_manifest.json so it gets
- * picked up by the subsequent tar -cz pass.  Best-effort: if the
- * write fails the backup itself still proceeds — the manifest is
- * a verification aid, not a hard prereq. */
+ * picked up by the subsequent tar -cz pass.
+ *
+ * Returns 0, TSDB_BACKUP_MANIFEST_FAILED (the aid is missing; a backup can
+ * still proceed) or TSDB_BACKUP_NOT_ON_DISK (the flush below failed, so a tar
+ * of this data dir is NOT a copy of this database).  See db.h. */
 int tsdb_backup_emit_manifest_file(tsdb_db_t *db, const char *data_dir) {
-    if (!db || !data_dir || !data_dir[0]) return -1;
+    if (!db || !data_dir || !data_dir[0]) return TSDB_BACKUP_MANIFEST_FAILED;
 
     /* Flush every memtable to disk first.  Otherwise the subsequent
      * tar misses any rows still buffered in RAM — a /backup taken
      * during light ingest would silently drop the tail.  Caught by
      * tests/e2e/backup_restore.sh phase 7: 100-row seed showed 0 on
-     * a freshly-restored sidecar before this flush call. */
-    (void)tsdb_db_flush_all(db);
+     * a freshly-restored sidecar before this flush call.
+     *
+     * The rc was discarded here with a (void).  db.h has promised since
+     * 90c4bc73 that the first failure is RETURNED precisely so a caller that
+     * asked for its rows on disk can find out they are not, and restore.c's
+     * export path names THIS call as the one that must not imitate it.  A
+     * failed flush under TSDB_WAL_ONLY_COMMIT (the cluster's mode) means the
+     * rows are in the redo log and in RAM and in no partition file — while the
+     * manifest written below is built from tsdb_query, which reads the
+     * memtable, so it would record counts the tarball cannot contain and the
+     * restore verify would blame the restore. */
+    int frc = tsdb_db_flush_all(db);
+    if (frc != TSDB_OK) {
+        tsdb_metric_inc("qengine_backup_flush_fail_total");
+        fprintf(stderr,
+                "[backup] refusing: tsdb_db_flush_all rc=%d (%s) — rows are "
+                "not in the partition files, a tar of %s would be incomplete\n",
+                frc, tsdb_errstr(frc), data_dir);
+        return TSDB_BACKUP_NOT_ON_DISK;
+    }
 
     char path[4096];
     snprintf(path, sizeof(path), "%s/_backup_manifest.json", data_dir);

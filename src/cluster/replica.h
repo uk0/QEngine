@@ -39,6 +39,17 @@ tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr);
 /* Free and close all connections. */
 void tsdb_replica_mgr_free(tsdb_replica_mgr_t *rmgr);
 
+/* Encoded payload bytes currently owned by in-flight fanout workers.
+ *
+ * Under TSDB_REPLICATION_QUORUM=0 the submitter does not wait, so a peer that
+ * accepted the socket and stopped answering leaves one worker per batch parked
+ * in a TSDB_REPL_SEND_TIMEOUT_MS read, each still holding the whole encoded
+ * WRITE_BATCH.  TSDB_FANOUT_MAX_INFLIGHT_BYTES (default 256 MiB, 0 = off) caps
+ * this; sends over the cap are dropped and counted on
+ * qengine_fanout_dropped_total.  Exported so the bound can be observed from
+ * outside the code that enforces it. */
+uint64_t tsdb_replica_fanout_inflight_bytes(tsdb_replica_mgr_t *rmgr);
+
 /* Install an optional cross-DC async forwarder.  Every batch payload
  * produced by tsdb_replica_push_row_batch is copied into the
  * forwarder's ring buffer for async delivery to a remote DC.  Pass

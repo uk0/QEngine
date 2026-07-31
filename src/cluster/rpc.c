@@ -577,6 +577,14 @@ static void *connection_handler(void *arg) {
                                                 table_name, sizeof(table_name),
                                                 &ncols, col_names, col_types, &ts_col_idx,
                                                 &part_unit, &block_points, &sort_by_tag_col);
+                /* The ACK used to be unconditional: `rc`, the ncols range
+                 * check and tsdb_create_table_local_ex's return were all
+                 * computed and then discarded, and ANY payload_len > 0 got an
+                 * OK.  A follower that could not create the table reported
+                 * itself synced, the leader's fanout counted it as carrying
+                 * the schema, and the divergence only surfaced later as
+                 * WRITE_BATCH failures against a table that is not there. */
+                int applied = TSDB_ERR_CORRUPT;   /* decode/range failure */
                 if (rc == 0 && ncols > 0 && ncols <= TSDB_MAX_COLS) {
                     tsdb_col_t cols[TSDB_MAX_COLS];
                     for (int i = 0; i < ncols; i++) {
@@ -590,10 +598,25 @@ static void *connection_handler(void *arg) {
                      * follower's local schema matches the leader's choice
                      * exactly.  Pre-tail (legacy) senders feed the defaults
                      * (DAY, 0, -1) which collapses to today's behavior. */
-                    tsdb_create_table_local_ex(db, table_name, cols, ncols, ts_name,
-                                                part_unit, block_points, sort_by_tag_col);
+                    applied = tsdb_create_table_local_ex(db, table_name, cols,
+                                                          ncols, ts_name,
+                                                          part_unit, block_points,
+                                                          sort_by_tag_col);
                 }
-                send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                /* EXISTS is success, and must stay success: a re-broadcast, a
+                 * startup catch-up and the periodic catalog reconcile all
+                 * replay schemas the peer already has.  Same rule
+                 * APPLY_CATALOG_QTL above already applies. */
+                if (applied == TSDB_OK || applied == TSDB_ERR_EXISTS) {
+                    send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+                } else {
+                    fprintf(stderr,
+                            "[schema-sync] '%s' refused: decode rc=%d ncols=%d "
+                            "create rc=%d (%s)\n",
+                            table_name, rc, ncols, applied, tsdb_errstr(applied));
+                    tsdb_metric_inc("qengine_schema_sync_recv_err_total");
+                    send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                }
             } else {
                 send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
             }
@@ -913,7 +936,26 @@ static void *connection_handler(void *arg) {
                     if (qr && tsdb_result_next(qr) == 1)
                         txt = tsdb_result_sym(qr, 0);   /* status row */
                     if (!txt) txt = (qrc == TSDB_OK) ? "OK" : tsdb_errstr(qrc);
-                    send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id,
+                    /* The reply TYPE now carries the verdict; the body still
+                     * carries the leader's own words.  It used to be ACK
+                     * either way, with the failure text smuggled in the
+                     * payload for the caller to string-match — so
+                     * tsdb_query returning TSDB_ERR_PARSE arrived as a
+                     * successful RPC whose body happened to read "parse
+                     * error", and every caller that only checked rc believed
+                     * the statement had run.
+                     *
+                     * EXISTS counts as success for the same reason it does in
+                     * APPLY_CATALOG_QTL: a re-forwarded CREATE is idempotent.
+                     * Note that exec.c deliberately answers TSDB_OK + a status
+                     * row for user-facing DDL errors ("ERR: not raft leader",
+                     * "table not found"), so those still ACK and the master
+                     * walk in proxy_sql_to_master keeps working unchanged —
+                     * ERR here means the query ENGINE failed. */
+                    int ok = (qrc == TSDB_OK || qrc == TSDB_ERR_EXISTS);
+                    if (!ok) tsdb_metric_inc("qengine_ddl_forward_err_total");
+                    send_reply(fd, tls,
+                               ok ? TSDB_RPC_ACK : TSDB_RPC_ERR, msg.req_id,
                                (const uint8_t *)txt, (uint32_t)strlen(txt));
                     if (qr) tsdb_result_free(qr);
                 } else {
@@ -1023,7 +1065,27 @@ static void *connection_handler(void *arg) {
         }
 
         default:
-            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, NULL, 0);
+            /* An opcode this build does not implement.  ACKing it — which is
+             * what this arm did — tells a peer on a newer binary that work
+             * this process never even looked at had succeeded.  Nothing else
+             * on this transport guards against a version skew: tsdb_rpc_decode
+             * parses `ver` at line 115 and (void)s it on the next line, so
+             * this default IS the forward-compatibility policy, and it said
+             * yes.
+             *
+             * ERR_UNSUPPORTED rather than plain ERR because the two mean
+             * different things to a caller with a fallback: the anti-entropy
+             * peer probe degrades to the legacy FED_QUERY path on
+             * "you are too old for this opcode" and SKIPS the peer on "I know
+             * it and could not answer" (db_cluster.c
+             * tsdb_cluster_peer_table_stats_conn).  Collapsing them would
+             * silently stop a mixed-version cluster from probing at all.
+             *
+             * Still a normal reply on a live connection — the frame grid stays
+             * intact and everything queued behind this call on the same pooled
+             * socket keeps working. */
+            tsdb_metric_inc("qengine_rpc_unknown_opcode_total");
+            send_reply(fd, tls, TSDB_RPC_ERR_UNSUPPORTED, msg.req_id, NULL, 0);
             break;
         }
 
@@ -1278,8 +1340,43 @@ struct tsdb_rpc_conn {
     tsdb_tls_conn_t *tls;   /* NULL → plaintext (default) */
     pthread_mutex_t  lock;
     uint32_t         next_req_id;
+    /* The socket deadline tsdb_rpc_connect installed.  tsdb_rpc_call_recv_to
+     * arms its own for the duration of one call and must put THIS back
+     * afterwards — it used to restore 0, i.e. "block forever", silently
+     * deleting the connect-time guard for every later plain call on the same
+     * pooled socket. */
+    int              io_timeout_ms;
+    /* A reply this connection had already been promised was abandoned in the
+     * socket (a deadline fired, or a frame failed to decode).  The stream
+     * offset is no longer known, so every later reply on it would answer the
+     * PREVIOUS request.  Sticky: the connection is finished, not retryable. */
+    int              desynced;
     char             addr[TSDB_ADDR_MAX];
 };
+
+/* Retire a connection whose request/response alignment is no longer known.
+ *
+ * Two things happen.  The flag makes the failure deterministic for anyone
+ * still holding this pointer.  The shutdown makes it look like what it now
+ * is — a dead peer socket — so the callers that already handle that (the
+ * fanout evict/redial in replica.c, raft_conn_evict, the scatter evict in
+ * db_cluster.c) recover through a path they exercise every time a container
+ * restarts, rather than through a new one written for this case.
+ *
+ * Caller holds conn->lock. */
+int tsdb_rpc_conn_is_desynced(const tsdb_rpc_conn_t *conn) {
+    return conn ? conn->desynced : 0;
+}
+
+static void conn_mark_desynced(tsdb_rpc_conn_t *conn) {
+    if (conn->desynced) return;
+    conn->desynced = 1;
+    /* Named for what it counts.  Most retirements are an ordinary dead peer,
+     * where no reply was ever coming; only qengine_rpc_reqid_mismatch_total
+     * below counts a wrong answer actually caught in the act. */
+    tsdb_metric_inc("qengine_rpc_conn_retired_total");
+    shutdown(conn->fd, SHUT_RDWR);
+}
 
 tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
     char host[128];
@@ -1340,8 +1437,8 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
      * query response during a rolling restart froze DDL on all nodes).
      * 30 s default — far above any healthy LAN RPC, small enough to
      * self-heal; env TSDB_RPC_IO_TIMEOUT_MS overrides (0 = unbounded). */
+    static int io_tmo_ms = -1;
     {
-        static int io_tmo_ms = -1;
         if (io_tmo_ms < 0) {
             const char *e = getenv("TSDB_RPC_IO_TIMEOUT_MS");
             io_tmo_ms = (e && *e) ? atoi(e) : 30000;
@@ -1387,7 +1484,8 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
     conn->fd  = fd;
     conn->tls = tls;
     pthread_mutex_init(&conn->lock, NULL);
-    conn->next_req_id = 1;
+    conn->next_req_id   = 1;
+    conn->io_timeout_ms = io_tmo_ms > 0 ? io_tmo_ms : 0;
     snprintf(conn->addr, sizeof(conn->addr), "%s", addr);
 
     return conn;
@@ -1419,6 +1517,10 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
                             uint8_t *resp_buf, uint32_t resp_cap,
                             uint32_t *resp_len)
 {
+    /* Never put another request onto a stream whose offset is unknown: the
+     * reply would be paired with the wrong one. */
+    if (conn->desynced) return TSDB_ERR_IO;
+
     uint32_t req_id = conn->next_req_id++;
 
     /* Header on the stack + payload referenced in place; a single writev
@@ -1439,12 +1541,20 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
     }
 
     if (writev_all(conn->fd, conn->tls, iov, iovcnt) < 0) {
+        /* A short write leaves a half-frame the peer will keep waiting on,
+         * and we cannot tell a short write from a zero-byte one here. */
+        conn_mark_desynced(conn);
         return TSDB_ERR_IO;
     }
 
     /* Read response header. */
     uint8_t hdr[TSDB_RPC_HDR_SIZE];
     if (read_full(conn->fd, conn->tls, hdr, TSDB_RPC_HDR_SIZE) < 0) {
+        /* The request is on the wire and the peer WILL answer it.  Whether
+         * this was a deadline (SO_RCVTIMEO — the replication and raft senders
+         * arm one on every call) or a real error, the reply is now owed to a
+         * request nobody is waiting for. */
+        conn_mark_desynced(conn);
         return TSDB_ERR_IO;
     }
 
@@ -1458,13 +1568,41 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
     if (!combined) { return TSDB_ERR_NOMEM; }
     memcpy(combined, hdr, TSDB_RPC_HDR_SIZE);
     if (rlen > 0 && read_full(conn->fd, conn->tls, combined + TSDB_RPC_HDR_SIZE, rlen) < 0) {
+        conn_mark_desynced(conn);   /* header consumed, body is not */
         free(combined);
         return TSDB_ERR_IO;
     }
 
     tsdb_rpc_msg_t resp = {0};
     int consumed = tsdb_rpc_decode(combined, total, &resp);
-    if (consumed < 0) { free(combined); return TSDB_ERR_CORRUPT; }
+    if (consumed < 0) {
+        conn_mark_desynced(conn);   /* bad magic/CRC — we are off the frame grid */
+        free(combined);
+        return TSDB_ERR_CORRUPT;
+    }
+
+    /* The frame has to be the answer to THE request we just sent.
+     *
+     * rpc.h has always called req_id "monotonic request ID for request/response
+     * matching" and every responder in this file echoes it back — nothing
+     * compared it.  While the stream stays in lock-step that is invisible.  It
+     * stops being invisible the moment a call abandons a reply mid-flight,
+     * which the senders do by design: a 10 s deadline on the replication fanout
+     * (TSDB_REPL_SEND_TIMEOUT_MS) and 1 s on raft's vote.  The request was
+     * fully written, so the peer answers it anyway; the NEXT call on the same
+     * socket — with TSDB_REPLICA_CONNS_PER_PEER=1 there is only one, and every
+     * fanout worker for that peer queues on it — then reads the previous
+     * batch's ACK as its own.  Its own reply, which may well have been ERR,
+     * stays buffered for the call after that.  A batch the peer never landed is
+     * counted as replicated (ack_count++), and under
+     * TSDB_REPLICATION_QUORUM=0 that count is what gates whether this node may
+     * drop its own copy of those rows (SKIP_LOCAL in db_cluster.c). */
+    if (resp.req_id != req_id) {
+        conn_mark_desynced(conn);
+        tsdb_metric_inc("qengine_rpc_reqid_mismatch_total");
+        free(combined);
+        return TSDB_ERR_CORRUPT;
+    }
 
     if (resp_len) *resp_len = resp.payload_len;
     if (resp_buf && resp_cap > 0 && resp.payload_len > 0) {
@@ -1472,7 +1610,14 @@ static int call_recv_locked(tsdb_rpc_conn_t *conn,
         memcpy(resp_buf, resp.payload, copy);
     }
 
-    int result = (resp.type == TSDB_RPC_ACK) ? TSDB_OK : TSDB_ERR_INTERNAL;
+    /* ERR_UNSUPPORTED is kept apart from ERR on purpose: a caller with a
+     * legacy fallback (tsdb_rpc_local_table_stats) has to know the difference
+     * between a peer that never heard of the opcode and one that heard it and
+     * failed.  Everything that is not an ACK is still a failure. */
+    int result;
+    if (resp.type == TSDB_RPC_ACK)                  result = TSDB_OK;
+    else if (resp.type == TSDB_RPC_ERR_UNSUPPORTED) result = TSDB_ERR_UNSUPPORTED;
+    else                                            result = TSDB_ERR_INTERNAL;
     free(combined);
     return result;
 }
@@ -1492,8 +1637,7 @@ int tsdb_rpc_call_recv(tsdb_rpc_conn_t *conn,
     return rc;
 }
 
-/* Arm (timeout_ms > 0) or clear (timeout_ms == 0) the socket I/O
- * deadline.  0 restores the blocking default the data path relies on. */
+/* Arm (timeout_ms > 0) or clear (timeout_ms == 0) the socket I/O deadline. */
 static void conn_set_io_timeout(int fd, int timeout_ms) {
     struct timeval tv = { 0, 0 };
     if (timeout_ms > 0) {
@@ -1572,7 +1716,12 @@ int tsdb_rpc_call_recv_to(tsdb_rpc_conn_t *conn,
     conn_set_io_timeout(conn->fd, timeout_ms);
     int rc = call_recv_locked(conn, type, payload, payload_len,
                               resp_buf, resp_cap, resp_len);
-    conn_set_io_timeout(conn->fd, 0);
+    /* Put back what tsdb_rpc_connect installed, not 0.  Restoring 0 means
+     * "block forever", which deleted the connect-time 30 s guard from the
+     * shared pooled socket for every later plain tsdb_rpc_call_recv on it —
+     * the unbounded read this file's own comment describes as having frozen
+     * DDL cluster-wide. */
+    conn_set_io_timeout(conn->fd, conn->io_timeout_ms);
     pthread_mutex_unlock(&conn->lock);
     return rc;
 }

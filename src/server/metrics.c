@@ -239,6 +239,45 @@ static metric_t g_metrics[] = {
       "Times the aggregate fell back to full-block scan (stats absent or gate failed)",
       MT_COUNTER, { .c = { 0 } } },
 
+    /* --- transport honesty ---
+     *
+     * tsdb_metric_inc() on a name that is not in THIS table is a silent no-op
+     * (find_metric returns NULL).  Every counter below has a caller; adding
+     * the caller without adding the row here ships a counter that can never
+     * move, which reads on /metrics exactly like a bug that never fires. */
+    { "qengine_rpc_conn_retired_total",
+      "Client RPC connections retired because request/response alignment was lost (abandoned reply, short write, bad frame)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_rpc_reqid_mismatch_total",
+      "Replies whose req_id did not match the request just sent — a wrong answer caught in the act", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replica_conn_evicted_retired_total",
+      "Retired connections dropped at the pool instead of being handed back to another caller", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_rpc_unknown_opcode_total",
+      "Requests refused because this build does not implement the opcode (peer on a newer binary)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_schema_sync_recv_err_total",
+      "SCHEMA_SYNC requests refused: payload did not decode, ncols out of range, or the local create failed", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_schema_sync_fail_total",
+      "CREATE TABLE fanouts where too few peers took the schema (peers left without it until anti-entropy)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_ddl_forward_err_total",
+      "DDL_FORWARD requests whose statement failed on this node (answered ERR, not an ACK carrying the error text)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_antientropy_sweeps_total",
+      "Anti-entropy row-resync sweeps completed (startup pass plus every periodic tick)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_antientropy_middle_gap_total",
+      "Anti-entropy refusals to close a middle gap (equal max_ts, higher peer count) — divergence that persists", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_fanout_dropped_total",
+      "Replication fanout sends dropped because in-flight payload bytes hit TSDB_FANOUT_MAX_INFLIGHT_BYTES (slow peer backpressure)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_backup_flush_fail_total",
+      "Backups refused because tsdb_db_flush_all could not put the memtable on disk", MT_COUNTER, { .c = { 0 } } },
+
     /* --- gauges --- */
     { "qengine_connections_active",
       "Current number of active client connections", MT_GAUGE, { .g = { 0 } } },
@@ -281,7 +320,7 @@ static metric_t g_metrics[] = {
  * Size is the next power of two >= 4*N_METRICS, keeping the load factor
  * <= 0.25 so expected probe length is ~1.  Empty slots are marked -1.
  */
-#define IDX_TABLE_SIZE  256   /* pow2 >= 4*N_METRICS (N_METRICS ~= 43) */
+#define IDX_TABLE_SIZE  256   /* pow2 >= 4*N_METRICS (N_METRICS ~= 60) */
 
 static int16_t g_idx_table[IDX_TABLE_SIZE];
 static pthread_once_t g_build_once = PTHREAD_ONCE_INIT;

@@ -156,6 +156,86 @@ static void test_agg_correctness(void) {
 }
 
 /* -----------------------------------------------------------------------
+ * Test 2b: unique-extremum POSITION sweep (min/max, no null bitmap)
+ *
+ * The min/max kernels split each SIMD group across four accumulators and
+ * reduce them at the end.  Drop one accumulator, or skip one lane offset,
+ * and the answer is still right for a smooth periodic input: with the
+ * v[i] = (i % 100) - 50 + 0.5 vector every other correctness test uses, the
+ * minimum lands only on i ≡ 0 or 4 (mod 8) and the maximum only on
+ * i ≡ 3 or 7 — so no size-sweep over that vector can see a kernel that
+ * ignores half its lanes.  min/max are idempotent, which also makes them
+ * immune to OVER-processing; UNDER-processing is the whole failure mode and
+ * it needs the extremum planted where the missing lane is.
+ *
+ * So plant a unique extremum at EVERY index, for sizes spanning the bulk
+ * loop, the 2-/4-wide tail and the scalar remainder of every compiled width.
+ * --------------------------------------------------------------------- */
+static void test_agg_extremum_sweep(void) {
+    static const size_t sizes[] = {1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+                                   63, 64, 65, 127, 128, 129, 255, 256, 257, 1000};
+    const size_t nsizes = sizeof(sizes) / sizeof(sizes[0]);
+    const size_t maxn = 1000;
+
+    double  *vf = (double  *)malloc(maxn * sizeof(double));
+    int64_t *vi = (int64_t *)malloc(maxn * sizeof(int64_t));
+    if (!vf || !vi) { free(vf); free(vi); fprintf(stderr, "SKIP sweep: malloc\n"); return; }
+
+    int bad_minf = -1, bad_maxf = -1, bad_mini = -1, bad_maxi = -1;
+    size_t bad_n = 0;
+
+    for (size_t si = 0; si < nsizes; si++) {
+        size_t n = sizes[si];
+        for (size_t pos = 0; pos < n; pos++) {
+            double  omin = 0.0, omax = 0.0;
+            int64_t imin = 0, imax = 0;
+
+            /* f64 min: flat 1.0 with a single -7.5 at `pos`. */
+            for (size_t i = 0; i < n; i++) vf[i] = 1.0;
+            vf[pos] = -7.5;
+            tsdb_agg_min_f64(vf, n, NULL, &omin);
+            tsdb_agg_max_f64(vf, n, NULL, &omax);
+            if (omin != -7.5 && bad_minf < 0) { bad_minf = (int)pos; bad_n = n; }
+            if (omax != (n == 1 ? -7.5 : 1.0) && bad_maxf < 0) { bad_maxf = (int)pos; bad_n = n; }
+
+            /* f64 max: flat 1.0 with a single 9.25 at `pos`. */
+            for (size_t i = 0; i < n; i++) vf[i] = 1.0;
+            vf[pos] = 9.25;
+            tsdb_agg_max_f64(vf, n, NULL, &omax);
+            tsdb_agg_min_f64(vf, n, NULL, &omin);
+            if (omax != 9.25 && bad_maxf < 0) { bad_maxf = (int)pos; bad_n = n; }
+            if (omin != (n == 1 ? 9.25 : 1.0) && bad_minf < 0) { bad_minf = (int)pos; bad_n = n; }
+
+            /* i64, same shape. */
+            for (size_t i = 0; i < n; i++) vi[i] = 100;
+            vi[pos] = -777;
+            tsdb_agg_min_i64(vi, n, NULL, &imin);
+            tsdb_agg_max_i64(vi, n, NULL, &imax);
+            if (imin != -777 && bad_mini < 0) { bad_mini = (int)pos; bad_n = n; }
+            if (imax != (n == 1 ? -777 : 100) && bad_maxi < 0) { bad_maxi = (int)pos; bad_n = n; }
+
+            for (size_t i = 0; i < n; i++) vi[i] = 100;
+            vi[pos] = 999;
+            tsdb_agg_max_i64(vi, n, NULL, &imax);
+            tsdb_agg_min_i64(vi, n, NULL, &imin);
+            if (imax != 999 && bad_maxi < 0) { bad_maxi = (int)pos; bad_n = n; }
+            if (imin != (n == 1 ? 999 : 100) && bad_mini < 0) { bad_mini = (int)pos; bad_n = n; }
+        }
+    }
+
+    CHECKF(bad_minf < 0, "agg_min_f64 missed a planted extremum at index %d (n=%zu)",
+           bad_minf, bad_n);
+    CHECKF(bad_maxf < 0, "agg_max_f64 missed a planted extremum at index %d (n=%zu)",
+           bad_maxf, bad_n);
+    CHECKF(bad_mini < 0, "agg_min_i64 missed a planted extremum at index %d (n=%zu)",
+           bad_mini, bad_n);
+    CHECKF(bad_maxi < 0, "agg_max_i64 missed a planted extremum at index %d (n=%zu)",
+           bad_maxi, bad_n);
+
+    free(vf); free(vi);
+}
+
+/* -----------------------------------------------------------------------
  * Test 3: filter_f64 correctness
  * --------------------------------------------------------------------- */
 static void test_filter_correctness(void) {
@@ -413,6 +493,9 @@ int main(void) {
     printf("[2] Aggregation correctness (%s path) ...\n",
            tsdb_cpu_level_name(tsdb_cpu_level()));
     test_agg_correctness();
+
+    printf("[2b] min/max unique-extremum position sweep ...\n");
+    test_agg_extremum_sweep();
 
     printf("[3] Filter correctness ...\n");
     test_filter_correctness();

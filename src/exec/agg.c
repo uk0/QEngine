@@ -187,10 +187,21 @@ static double min_f64_neon(const double *v, size_t n, const uint8_t *bm) {
     float64x2_t mn = vdupq_n_f64((double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 1 < n; i += 2) {
+        /* Four accumulators, same as sum_f64_neon.  A single accumulator
+         * makes this loop latency-bound on the min dependency chain rather
+         * than throughput-bound on the loads; measured 3-10x slower than
+         * sum on identical resident data. */
+        float64x2_t a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = vminq_f64(mn, vld1q_f64(v + i));
+            a0 = vminq_f64(a0, vld1q_f64(v + i + 0));
+            a1 = vminq_f64(a1, vld1q_f64(v + i + 2));
+            a2 = vminq_f64(a2, vld1q_f64(v + i + 4));
+            a3 = vminq_f64(a3, vld1q_f64(v + i + 6));
         }
+        mn = vminq_f64(vminq_f64(a0, a1), vminq_f64(a2, a3));
+        for (; i + 1 < n; i += 2)
+            mn = vminq_f64(mn, vld1q_f64(v + i));
     } else {
         const float64x2_t inf = vdupq_n_f64((double)INFINITY);
         /* Replace null lanes with +INF so vminq_f64 is a no-op for them. */
@@ -224,10 +235,17 @@ static double max_f64_neon(const double *v, size_t n, const uint8_t *bm) {
     float64x2_t mx = vdupq_n_f64(-(double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 1 < n; i += 2) {
+        float64x2_t a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = vmaxq_f64(mx, vld1q_f64(v + i));
+            a0 = vmaxq_f64(a0, vld1q_f64(v + i + 0));
+            a1 = vmaxq_f64(a1, vld1q_f64(v + i + 2));
+            a2 = vmaxq_f64(a2, vld1q_f64(v + i + 4));
+            a3 = vmaxq_f64(a3, vld1q_f64(v + i + 6));
         }
+        mx = vmaxq_f64(vmaxq_f64(a0, a1), vmaxq_f64(a2, a3));
+        for (; i + 1 < n; i += 2)
+            mx = vmaxq_f64(mx, vld1q_f64(v + i));
     } else {
         const float64x2_t neg_inf = vdupq_n_f64(-(double)INFINITY);
         for (; i + 7 < n; i += 8) {
@@ -323,10 +341,17 @@ static int64_t min_i64_neon(const int64_t *v, size_t n, const uint8_t *bm) {
     int64x2_t mn = vdupq_n_s64(INT64_MAX);
     size_t i = 0;
     if (!bm) {
-        for (; i + 1 < n; i += 2) {
+        int64x2_t a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = min_s64x2(mn, vld1q_s64(v + i));
+            a0 = min_s64x2(a0, vld1q_s64(v + i + 0));
+            a1 = min_s64x2(a1, vld1q_s64(v + i + 2));
+            a2 = min_s64x2(a2, vld1q_s64(v + i + 4));
+            a3 = min_s64x2(a3, vld1q_s64(v + i + 6));
         }
+        mn = min_s64x2(min_s64x2(a0, a1), min_s64x2(a2, a3));
+        for (; i + 1 < n; i += 2)
+            mn = min_s64x2(mn, vld1q_s64(v + i));
     } else {
         const int64x2_t imax = vdupq_n_s64(INT64_MAX);
         for (; i + 7 < n; i += 8) {
@@ -357,10 +382,17 @@ static int64_t max_i64_neon(const int64_t *v, size_t n, const uint8_t *bm) {
     int64x2_t mx = vdupq_n_s64(INT64_MIN);
     size_t i = 0;
     if (!bm) {
-        for (; i + 1 < n; i += 2) {
+        int64x2_t a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = max_s64x2(mx, vld1q_s64(v + i));
+            a0 = max_s64x2(a0, vld1q_s64(v + i + 0));
+            a1 = max_s64x2(a1, vld1q_s64(v + i + 2));
+            a2 = max_s64x2(a2, vld1q_s64(v + i + 4));
+            a3 = max_s64x2(a3, vld1q_s64(v + i + 6));
         }
+        mx = max_s64x2(max_s64x2(a0, a1), max_s64x2(a2, a3));
+        for (; i + 1 < n; i += 2)
+            mx = max_s64x2(mx, vld1q_s64(v + i));
     } else {
         const int64x2_t imin = vdupq_n_s64(INT64_MIN);
         for (; i + 7 < n; i += 8) {
@@ -491,10 +523,20 @@ static double min_f64_avx2(const double *v, size_t n, const uint8_t *bm) {
     __m256d mn = _mm256_set1_pd((double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 3 < n; i += 4) {
+        /* Four accumulators, same as sum_f64_avx2: _mm256_min_pd has 3-4
+         * cycle latency and ~1/cycle throughput, so a single chained
+         * accumulator runs at a quarter of the achievable rate. */
+        __m256d a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 15 < n; i += 16) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = _mm256_min_pd(mn, _mm256_loadu_pd(v + i));
+            a0 = _mm256_min_pd(a0, _mm256_loadu_pd(v + i +  0));
+            a1 = _mm256_min_pd(a1, _mm256_loadu_pd(v + i +  4));
+            a2 = _mm256_min_pd(a2, _mm256_loadu_pd(v + i +  8));
+            a3 = _mm256_min_pd(a3, _mm256_loadu_pd(v + i + 12));
         }
+        mn = _mm256_min_pd(_mm256_min_pd(a0, a1), _mm256_min_pd(a2, a3));
+        for (; i + 3 < n; i += 4)
+            mn = _mm256_min_pd(mn, _mm256_loadu_pd(v + i));
     } else {
         const __m256d inf = _mm256_set1_pd((double)INFINITY);
         for (; i + 7 < n; i += 8) {
@@ -528,10 +570,17 @@ static double max_f64_avx2(const double *v, size_t n, const uint8_t *bm) {
     __m256d mx = _mm256_set1_pd(-(double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 3 < n; i += 4) {
+        __m256d a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 15 < n; i += 16) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = _mm256_max_pd(mx, _mm256_loadu_pd(v + i));
+            a0 = _mm256_max_pd(a0, _mm256_loadu_pd(v + i +  0));
+            a1 = _mm256_max_pd(a1, _mm256_loadu_pd(v + i +  4));
+            a2 = _mm256_max_pd(a2, _mm256_loadu_pd(v + i +  8));
+            a3 = _mm256_max_pd(a3, _mm256_loadu_pd(v + i + 12));
         }
+        mx = _mm256_max_pd(_mm256_max_pd(a0, a1), _mm256_max_pd(a2, a3));
+        for (; i + 3 < n; i += 4)
+            mx = _mm256_max_pd(mx, _mm256_loadu_pd(v + i));
     } else {
         const __m256d neg_inf = _mm256_set1_pd(-(double)INFINITY);
         for (; i + 7 < n; i += 8) {
@@ -632,10 +681,19 @@ static int64_t min_i64_avx2(const int64_t *v, size_t n, const uint8_t *bm) {
     __m256i mn = _mm256_set1_epi64x(INT64_MAX);
     size_t i = 0;
     if (!bm) {
-        for (; i + 3 < n; i += 4) {
+        /* min_s64_avx2 is cmpgt+blendv — a 2-op chain, so the single
+         * accumulator costs even more here than in the f64 kernel. */
+        __m256i a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 15 < n; i += 16) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = min_s64_avx2(mn, _mm256_loadu_si256((const __m256i *)(v + i)));
+            a0 = min_s64_avx2(a0, _mm256_loadu_si256((const __m256i *)(v + i +  0)));
+            a1 = min_s64_avx2(a1, _mm256_loadu_si256((const __m256i *)(v + i +  4)));
+            a2 = min_s64_avx2(a2, _mm256_loadu_si256((const __m256i *)(v + i +  8)));
+            a3 = min_s64_avx2(a3, _mm256_loadu_si256((const __m256i *)(v + i + 12)));
         }
+        mn = min_s64_avx2(min_s64_avx2(a0, a1), min_s64_avx2(a2, a3));
+        for (; i + 3 < n; i += 4)
+            mn = min_s64_avx2(mn, _mm256_loadu_si256((const __m256i *)(v + i)));
     } else {
         const __m256i imax = _mm256_set1_epi64x(INT64_MAX);
         for (; i + 7 < n; i += 8) {
@@ -670,10 +728,17 @@ static int64_t max_i64_avx2(const int64_t *v, size_t n, const uint8_t *bm) {
     __m256i mx = _mm256_set1_epi64x(INT64_MIN);
     size_t i = 0;
     if (!bm) {
-        for (; i + 3 < n; i += 4) {
+        __m256i a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 15 < n; i += 16) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = max_s64_avx2(mx, _mm256_loadu_si256((const __m256i *)(v + i)));
+            a0 = max_s64_avx2(a0, _mm256_loadu_si256((const __m256i *)(v + i +  0)));
+            a1 = max_s64_avx2(a1, _mm256_loadu_si256((const __m256i *)(v + i +  4)));
+            a2 = max_s64_avx2(a2, _mm256_loadu_si256((const __m256i *)(v + i +  8)));
+            a3 = max_s64_avx2(a3, _mm256_loadu_si256((const __m256i *)(v + i + 12)));
         }
+        mx = max_s64_avx2(max_s64_avx2(a0, a1), max_s64_avx2(a2, a3));
+        for (; i + 3 < n; i += 4)
+            mx = max_s64_avx2(mx, _mm256_loadu_si256((const __m256i *)(v + i)));
     } else {
         const __m256i imin = _mm256_set1_epi64x(INT64_MIN);
         for (; i + 7 < n; i += 8) {
@@ -758,10 +823,17 @@ static double min_f64_avx512(const double *v, size_t n, const uint8_t *bm) {
     __m512d mn = _mm512_set1_pd((double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 7 < n; i += 8) {
+        __m512d a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 31 < n; i += 32) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = _mm512_min_pd(mn, _mm512_loadu_pd(v + i));
+            a0 = _mm512_min_pd(a0, _mm512_loadu_pd(v + i +  0));
+            a1 = _mm512_min_pd(a1, _mm512_loadu_pd(v + i +  8));
+            a2 = _mm512_min_pd(a2, _mm512_loadu_pd(v + i + 16));
+            a3 = _mm512_min_pd(a3, _mm512_loadu_pd(v + i + 24));
         }
+        mn = _mm512_min_pd(_mm512_min_pd(a0, a1), _mm512_min_pd(a2, a3));
+        for (; i + 7 < n; i += 8)
+            mn = _mm512_min_pd(mn, _mm512_loadu_pd(v + i));
     } else {
         for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
@@ -784,10 +856,17 @@ static double max_f64_avx512(const double *v, size_t n, const uint8_t *bm) {
     __m512d mx = _mm512_set1_pd(-(double)INFINITY);
     size_t i = 0;
     if (!bm) {
-        for (; i + 7 < n; i += 8) {
+        __m512d a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 31 < n; i += 32) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = _mm512_max_pd(mx, _mm512_loadu_pd(v + i));
+            a0 = _mm512_max_pd(a0, _mm512_loadu_pd(v + i +  0));
+            a1 = _mm512_max_pd(a1, _mm512_loadu_pd(v + i +  8));
+            a2 = _mm512_max_pd(a2, _mm512_loadu_pd(v + i + 16));
+            a3 = _mm512_max_pd(a3, _mm512_loadu_pd(v + i + 24));
         }
+        mx = _mm512_max_pd(_mm512_max_pd(a0, a1), _mm512_max_pd(a2, a3));
+        for (; i + 7 < n; i += 8)
+            mx = _mm512_max_pd(mx, _mm512_loadu_pd(v + i));
     } else {
         for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
@@ -847,10 +926,17 @@ static int64_t min_i64_avx512(const int64_t *v, size_t n, const uint8_t *bm) {
     __m512i mn = _mm512_set1_epi64(INT64_MAX);
     size_t i = 0;
     if (!bm) {
-        for (; i + 7 < n; i += 8) {
+        __m512i a0 = mn, a1 = mn, a2 = mn, a3 = mn;
+        for (; i + 31 < n; i += 32) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mn = _mm512_min_epi64(mn, _mm512_loadu_si512(v + i));
+            a0 = _mm512_min_epi64(a0, _mm512_loadu_si512(v + i +  0));
+            a1 = _mm512_min_epi64(a1, _mm512_loadu_si512(v + i +  8));
+            a2 = _mm512_min_epi64(a2, _mm512_loadu_si512(v + i + 16));
+            a3 = _mm512_min_epi64(a3, _mm512_loadu_si512(v + i + 24));
         }
+        mn = _mm512_min_epi64(_mm512_min_epi64(a0, a1), _mm512_min_epi64(a2, a3));
+        for (; i + 7 < n; i += 8)
+            mn = _mm512_min_epi64(mn, _mm512_loadu_si512(v + i));
     } else {
         for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
@@ -871,10 +957,17 @@ static int64_t max_i64_avx512(const int64_t *v, size_t n, const uint8_t *bm) {
     __m512i mx = _mm512_set1_epi64(INT64_MIN);
     size_t i = 0;
     if (!bm) {
-        for (; i + 7 < n; i += 8) {
+        __m512i a0 = mx, a1 = mx, a2 = mx, a3 = mx;
+        for (; i + 31 < n; i += 32) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);
-            mx = _mm512_max_epi64(mx, _mm512_loadu_si512(v + i));
+            a0 = _mm512_max_epi64(a0, _mm512_loadu_si512(v + i +  0));
+            a1 = _mm512_max_epi64(a1, _mm512_loadu_si512(v + i +  8));
+            a2 = _mm512_max_epi64(a2, _mm512_loadu_si512(v + i + 16));
+            a3 = _mm512_max_epi64(a3, _mm512_loadu_si512(v + i + 24));
         }
+        mx = _mm512_max_epi64(_mm512_max_epi64(a0, a1), _mm512_max_epi64(a2, a3));
+        for (; i + 7 < n; i += 8)
+            mx = _mm512_max_epi64(mx, _mm512_loadu_si512(v + i));
     } else {
         for (; i + 7 < n; i += 8) {
             __builtin_prefetch(v + i + PF_STRIDE, 0, 0);

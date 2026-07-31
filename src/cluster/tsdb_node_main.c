@@ -854,10 +854,27 @@ static int proxy_sql_to_master(tsdb_db_t *db,
                                     payload, (uint32_t)plen,
                                     resp, sizeof(resp) - 1, &rlen);
         tsdb_rpc_conn_close(conn);
-        if (rc != TSDB_OK) continue;
 
-        resp[rlen] = '\0';
-        snprintf(last_txt, sizeof(last_txt), "%s", (const char *)resp);
+        /* A master that RAN the statement and refused it now answers ERR with
+         * its message in the body (it used to ACK and hide the failure in the
+         * text).  That is a definitive answer about the statement, not about
+         * this master: report it and stop.  Walking on to the next master
+         * would re-run a statement the cluster has already rejected, and — if
+         * every master rejects it, which they will — end with last_txt empty
+         * and this function returning -1, i.e. a real error message replaced
+         * by a generic one. */
+        /* rlen is the WIRE length; only sizeof(resp)-1 bytes were copied in.
+         * Clamp before terminating — this path is newly reachable on ERR. */
+        if (rlen >= sizeof(resp)) rlen = (uint32_t)sizeof(resp) - 1;
+        if (rlen > 0) {
+            resp[rlen] = '\0';
+            snprintf(last_txt, sizeof(last_txt), "%s", (const char *)resp);
+        }
+        if (rc != TSDB_OK) {
+            if (rlen > 0) break;   /* the master answered; that IS the answer */
+            continue;              /* no body: transport failure, try the next */
+        }
+
         /* A non-leader master answers "ERR: not raft leader …" — try the
          * next master, keeping this as the fallback answer. */
         if (strncmp(last_txt, "ERR: not raft leader", 20) == 0) continue;

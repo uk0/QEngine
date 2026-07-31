@@ -22,7 +22,48 @@
 #define FED_MAX_RESULT_BUF     (64 * 1024 * 1024)  /* 64 MB */
 #define FED_MAX_COLS           128
 
+/* ---- Optional trailing SYMBOL dictionary ---------------------------------
+ *
+ * A SYMBOL cell holds a uint32 code that only means anything next to the
+ * symbol table that minted it, and the original wire format shipped the
+ * codes without the table.  fedagg_result_alloc leaves col_symtab NULL, so
+ * tsdb_result_sym() on a decoded result returned NULL for EVERY symbol
+ * column — the numbers arrived, the strings did not.  Nothing noticed
+ * because the only production consumer (the stable-aggregate scatter)
+ * ships pure numeric partials.
+ *
+ * The dictionary is appended AFTER the column data and only when at least
+ * one column is TSDB_TYPE_SYMBOL and carries a symtab:
+ *
+ *   u32   FED_SYMDICT_MAGIC
+ *   per column, in column order:
+ *     u8  present            (0 = not a symbol column, or no symtab)
+ *     if present:
+ *       u32 nentries         (distinct codes used by rows [0,nrows), ascending)
+ *       nentries x { u32 code, u16 len, len bytes }   (no NUL)
+ *
+ * Additive by construction: a numeric-only result encodes byte-for-byte as
+ * before, and a decoder that stops after the column data ignores the tail.
+ * Fields use native-endian memcpy, matching the nrows/schema encoding
+ * already in this file. */
+#define FED_SYMDICT_MAGIC 0x314D5953u  /* 'S','Y','M','1' */
+
 /* ---- Encode result -------------------------------------------------------- */
+
+/* Distinct sort key helper for the dictionary builder. */
+static int fed_cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* 1 when r has at least one SYMBOL column with a symbol table behind it. */
+static int fed_has_symbol_dict(const tsdb_result_t *r) {
+    if (!r->col_types || !r->col_symtab) return 0;
+    for (int c = 0; c < r->ncols; c++) {
+        if (r->col_types[c] == TSDB_TYPE_SYMBOL && r->col_symtab[c]) return 1;
+    }
+    return 0;
+}
 
 int fedrpc_encode_result(uint8_t *buf, uint32_t cap, tsdb_result_t *r) {
     if (!buf || !r) return -1;
@@ -64,11 +105,65 @@ int fedrpc_encode_result(uint8_t *buf, uint32_t cap, tsdb_result_t *r) {
         p += sz;
     }
 
+    /* Trailing symbol dictionary — see FED_SYMDICT_MAGIC above. */
+    if (fed_has_symbol_dict(r)) {
+        uint32_t magic = FED_SYMDICT_MAGIC;
+        NEED(4);
+        memcpy(p, &magic, 4); p += 4;
+
+        for (int c = 0; c < ncols; c++) {
+            tsdb_symtab_t *st = (r->col_types[c] == TSDB_TYPE_SYMBOL)
+                                ? r->col_symtab[c] : NULL;
+            NEED(1);
+            if (!st || !r->col_data || !r->col_data[c]) { *p++ = 0; continue; }
+            *p++ = 1;
+
+            /* Distinct codes actually used by rows [0,nrows). */
+            uint64_t *codes = NULL;
+            uint32_t  nuniq = 0;
+            if (nrows > 0) {
+                codes = (uint64_t *)malloc((size_t)nrows * 8);
+                if (!codes) return -1;
+                memcpy(codes, r->col_data[c], (size_t)nrows * 8);
+                qsort(codes, nrows, 8, fed_cmp_u64);
+                for (uint32_t i = 0; i < nrows; i++) {
+                    if (i == 0 || codes[i] != codes[nuniq - 1]) codes[nuniq++] = codes[i];
+                }
+            }
+            if (p + 4 > end) { free(codes); return -1; }
+            memcpy(p, &nuniq, 4); p += 4;
+
+            for (uint32_t i = 0; i < nuniq; i++) {
+                uint32_t code = (uint32_t)codes[i];
+                const char *s = tsdb_symtab_str(st, code);
+                size_t slen = s ? strlen(s) : 0;
+                if (slen > 65535) slen = 65535;
+                uint16_t l16 = (uint16_t)slen;
+                if (p + 4 + 2 + slen > end) { free(codes); return -1; }
+                memcpy(p, &code, 4); p += 4;
+                memcpy(p, &l16, 2);  p += 2;
+                if (slen) { memcpy(p, s, slen); p += slen; }
+            }
+            free(codes);
+        }
+    }
+
 #undef NEED
     return (int)(p - buf);
 }
 
 /* ---- Decode result -------------------------------------------------------- */
+
+/* Hand a freshly created symtab to the result so tsdb_result_free()/
+ * fedagg_result_free() release it with the rest of the result. */
+static int fed_result_own_symtab(tsdb_result_t *r, tsdb_symtab_t *st) {
+    tsdb_symtab_t **np = (tsdb_symtab_t **)realloc(
+        r->owned_symtabs, (size_t)(r->n_owned_symtabs + 1) * sizeof(*np));
+    if (!np) return -1;
+    r->owned_symtabs = np;
+    r->owned_symtabs[r->n_owned_symtabs++] = st;
+    return 0;
+}
 
 int fedrpc_decode_result(const uint8_t *buf, uint32_t len, tsdb_result_t **out) {
     if (!buf || !out) return TSDB_ERR_INVAL;
@@ -122,6 +217,94 @@ int fedrpc_decode_result(const uint8_t *buf, uint32_t len, tsdb_result_t **out) 
     r->nrows    = nrows;
     r->cap_rows = nrows;
     r->cur      = -1;
+
+    /* Trailing symbol dictionary, when the sender emitted one.  Absent for
+     * numeric-only results and for peers built before the dictionary
+     * existed: those keep the historical behaviour (col_symtab stays NULL,
+     * tsdb_result_sym returns NULL) rather than failing the decode. */
+    if (p + 4 <= end) {
+        uint32_t magic;
+        memcpy(&magic, p, 4);
+        if (magic == FED_SYMDICT_MAGIC) {
+            p += 4;
+            for (int c = 0; c < ncols; c++) {
+                if (p + 1 > end) { fedagg_result_free(r); return TSDB_ERR_CORRUPT; }
+                uint8_t present = *p++;
+                if (!present) continue;
+                if (p + 4 > end) { fedagg_result_free(r); return TSDB_ERR_CORRUPT; }
+                uint32_t nent;
+                memcpy(&nent, p, 4); p += 4;
+                /* Distinct codes cannot outnumber the rows that use them.
+                 * Without this an entry count read off a damaged frame sizes
+                 * two allocations directly. */
+                if (nent > nrows) { fedagg_result_free(r); return TSDB_ERR_CORRUPT; }
+
+                tsdb_symtab_t *st = NULL;
+                if (tsdb_symtab_new(&st) != TSDB_OK || !st) {
+                    fedagg_result_free(r); return TSDB_ERR_NOMEM;
+                }
+                if (fed_result_own_symtab(r, st) != 0) {
+                    tsdb_symtab_free(st);
+                    fedagg_result_free(r); return TSDB_ERR_NOMEM;
+                }
+                r->col_symtab[c] = st;
+
+                /* wire code -> local code, ascending in wire code so the
+                 * per-row remap below can binary-search it. */
+                uint32_t *wire = NULL, *local = NULL;
+                if (nent > 0) {
+                    wire  = (uint32_t *)malloc((size_t)nent * 4);
+                    local = (uint32_t *)malloc((size_t)nent * 4);
+                    if (!wire || !local) {
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_NOMEM;
+                    }
+                }
+                for (uint32_t i = 0; i < nent; i++) {
+                    if (p + 6 > end) {
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_CORRUPT;
+                    }
+                    uint32_t code; uint16_t slen;
+                    memcpy(&code, p, 4); p += 4;
+                    memcpy(&slen, p, 2); p += 2;
+                    if (p + slen > end) {
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_CORRUPT;
+                    }
+                    uint32_t lc = tsdb_symtab_intern_n(st, (const char *)p, slen);
+                    p += slen;
+                    if (lc == TSDB_SYMBOL_INVALID) {
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_NOMEM;
+                    }
+                    if (i > 0 && code <= wire[i - 1]) {
+                        /* Sender emits ascending distinct codes; anything
+                         * else would break the binary search below. */
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_CORRUPT;
+                    }
+                    wire[i] = code; local[i] = lc;
+                }
+
+                for (uint32_t row = 0; row < nrows; row++) {
+                    uint32_t code = (uint32_t)((uint64_t *)r->col_data[c])[row];
+                    uint32_t lo = 0, hi = nent, hit = TSDB_SYMBOL_INVALID;
+                    while (lo < hi) {
+                        uint32_t mid = lo + (hi - lo) / 2;
+                        if (wire[mid] == code) { hit = local[mid]; break; }
+                        if (wire[mid] < code) lo = mid + 1; else hi = mid;
+                    }
+                    if (hit == TSDB_SYMBOL_INVALID) {
+                        free(wire); free(local);
+                        fedagg_result_free(r); return TSDB_ERR_CORRUPT;
+                    }
+                    ((uint64_t *)r->col_data[c])[row] = hit;
+                }
+                free(wire); free(local);
+            }
+        }
+    }
 
 #undef NEED
     *out = r;

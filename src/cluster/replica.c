@@ -109,7 +109,26 @@ struct tsdb_replica_mgr {
      * Guarded by `lock`; signaled on zero via infl_cv. */
     int            fanout_inflight;
     pthread_cond_t infl_cv;
+
+    /* Payload bytes owned by those workers.  The worker count alone is not
+     * the resource: one queued 16 MiB batch costs what a thousand 16 KiB ones
+     * do, and it is the BYTES that turn a stalled peer into sender RSS.
+     * Counted per submitted worker (each holds a ref on the ctx that owns the
+     * payload) and released on the same path as fanout_inflight. */
+    uint64_t       fanout_inflight_bytes;
+    uint64_t       max_inflight_bytes;  /* 0 = unbounded; fixed at mgr_new */
 };
+
+/* Read the in-flight payload byte count.  Exported for
+ * tests/test_fanout_backpressure.c, which has to observe the cap holding from
+ * outside — a counter that only the capping code reads proves nothing. */
+uint64_t tsdb_replica_fanout_inflight_bytes(tsdb_replica_mgr_t *rmgr) {
+    if (!rmgr) return 0;
+    pthread_mutex_lock(&rmgr->lock);
+    uint64_t v = rmgr->fanout_inflight_bytes;
+    pthread_mutex_unlock(&rmgr->lock);
+    return v;
+}
 
 static int env_conns_per_peer(void) {
     const char *v = getenv("TSDB_REPLICA_CONNS_PER_PEER");
@@ -120,11 +139,28 @@ static int env_conns_per_peer(void) {
     return n;
 }
 
+/* Payload bytes the fanout may hold queued against slow peers before it starts
+ * dropping.  Sized so it never fires in healthy operation and still bounds the
+ * heap: at a typical block_points batch (8000 rows x ~10 cols x 8 B ~= 640 KB)
+ * 256 MiB is ~400 queued batches, far more than the 3-attempt worker retry can
+ * accumulate against a peer that is merely slow.  0 disables the cap (the
+ * unbounded behaviour that shipped before 2026-07-31).  Fixed at mgr_new like
+ * conns_per_peer, so the write path never pays a getenv. */
+#define TSDB_FANOUT_MAX_INFLIGHT_BYTES_DEF  (256ULL << 20)
+
+static uint64_t env_max_inflight_bytes(void) {
+    const char *v = getenv("TSDB_FANOUT_MAX_INFLIGHT_BYTES");
+    if (!v || !*v) return TSDB_FANOUT_MAX_INFLIGHT_BYTES_DEF;
+    long long n = atoll(v);
+    return n > 0 ? (uint64_t)n : 0;
+}
+
 tsdb_replica_mgr_t *tsdb_replica_mgr_new(tsdb_node_manager_t *node_mgr) {
     tsdb_replica_mgr_t *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->node_mgr = node_mgr;
     r->conns_per_peer = env_conns_per_peer();
+    r->max_inflight_bytes = env_max_inflight_bytes();
     pthread_mutex_init(&r->lock, NULL);
     pthread_cond_init(&r->infl_cv, NULL);
     return r;
@@ -213,6 +249,29 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
     unsigned idx = atomic_fetch_add_explicit(&p->rr, 1, memory_order_relaxed)
                    % (unsigned)rmgr->conns_per_peer;
     tsdb_rpc_conn_t *c = p->conns[idx];
+    /* A RETIRED CONN MUST NOT LEAVE THE POOL.  conn_mark_desynced() sets a
+     * sticky flag and shuts the socket down, so every later call on that object
+     * fails closed — correct for the object, useless if the pool keeps handing
+     * the same dead one back.  Most consumers evict on error (the fanout
+     * worker, both scatter paths, the raw-block push), but the anti-entropy
+     * probe and pull and both catalog-dump callers take the conn and do not,
+     * and those are exactly the ones that now run on a timer rather than once
+     * at boot: a single mispaired reply toward a quiet peer would otherwise
+     * make anti-entropy permanently one-way-dead in that direction.
+     *
+     * Dropping it here rather than at each call site fixes the four that exist
+     * and every future caller that forgets, which is the failure mode the
+     * evict-at-the-call-site shape has already demonstrated. */
+    if (c && tsdb_rpc_conn_is_desynced(c)) {
+        p->conns[idx] = NULL;
+        pthread_mutex_unlock(&rmgr->lock);
+        tsdb_rpc_conn_close(c);
+        tsdb_metric_inc("qengine_replica_conn_evicted_retired_total");
+        pthread_mutex_lock(&rmgr->lock);
+        p = find_slot_locked(rmgr, node_id);
+        if (!p) { pthread_mutex_unlock(&rmgr->lock); return NULL; }
+        c = p->conns[idx];
+    }
     if (c) { pthread_mutex_unlock(&rmgr->lock); return c; }
 
     /* Slot empty — need to dial.  Release lock while we connect so other
@@ -387,6 +446,50 @@ static void fanout_worker_pool_cb(void *arg) {
     (void)fanout_worker(arg);
 }
 
+/* Take one worker's inflight reservation.  Returns 1 when admitted, 0 when the
+ * queue is already at its byte cap and this send must be DROPPED.
+ *
+ * Why drop rather than block the submitter: under TSDB_REPLICATION_QUORUM=0 —
+ * the cluster's setting, and the whole point of which is that ingest does not
+ * wait on peers — blocking here would convert one slow peer into an ingest
+ * stall on every writer, which is a worse failure than the one being fixed.
+ * The write is already best-effort by configuration; dropping it loudly (a
+ * counter, and the worker counted "done" so the quorum waiter still resolves)
+ * keeps the existing contract and bounds the heap.  Under a real quorum the
+ * drop simply cannot reach quorum, so the submitter is told the write did not
+ * replicate — which is true.
+ *
+ * The check is "is there room right now", not "would this still fit", so one
+ * batch can be admitted while already at the ceiling; the overshoot is one
+ * payload, not unbounded. */
+static int fanout_slot_reserve(tsdb_replica_mgr_t *rmgr, uint32_t bytes) {
+    pthread_mutex_lock(&rmgr->lock);
+    if (rmgr->max_inflight_bytes > 0 &&
+        rmgr->fanout_inflight_bytes >= rmgr->max_inflight_bytes) {
+        pthread_mutex_unlock(&rmgr->lock);
+        return 0;
+    }
+    rmgr->fanout_inflight++;
+    rmgr->fanout_inflight_bytes += bytes;
+    pthread_mutex_unlock(&rmgr->lock);
+    return 1;
+}
+
+/* Give back one worker's inflight reservation (slot + its payload bytes).
+ * Slot and bytes are taken together and released together so the two can never
+ * drift; mgr_free waits on the slot count. */
+static void fanout_slot_release(tsdb_replica_mgr_t *rmgr, uint32_t bytes) {
+    pthread_mutex_lock(&rmgr->lock);
+    if (rmgr->fanout_inflight > 0) rmgr->fanout_inflight--;
+    rmgr->fanout_inflight_bytes = (rmgr->fanout_inflight_bytes > bytes)
+                                    ? rmgr->fanout_inflight_bytes - bytes : 0;
+    if (rmgr->fanout_inflight == 0) {
+        rmgr->fanout_inflight_bytes = 0;   /* no owners left; no residue */
+        pthread_cond_broadcast(&rmgr->infl_cv);
+    }
+    pthread_mutex_unlock(&rmgr->lock);
+}
+
 static void *fanout_worker(void *arg) {
     worker_arg_t *wa = (worker_arg_t *)arg;
     fanout_ctx_t *ctx = wa->ctx;
@@ -394,6 +497,7 @@ static void *fanout_worker(void *arg) {
     /* Capture before fanout_ctx_unref can free ctx; the submitter took our
      * inflight slot before submit, so rmgr outlives this function. */
     tsdb_replica_mgr_t *rmgr_local = ctx->rmgr;
+    uint32_t plen_local = ctx->payload_len;
     free(wa);
 
     /* Retry fanout against a single peer up to MAX_ATTEMPTS times
@@ -481,10 +585,7 @@ done:
     fanout_ctx_unref(ctx);
 
     /* Release the inflight slot the submitter reserved for us. */
-    pthread_mutex_lock(&rmgr_local->lock);
-    if (--rmgr_local->fanout_inflight == 0)
-        pthread_cond_broadcast(&rmgr_local->infl_cv);
-    pthread_mutex_unlock(&rmgr_local->lock);
+    fanout_slot_release(rmgr_local, plen_local);
     return NULL;
 }
 
@@ -517,13 +618,6 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
      * worker that exits before the loop ends can't drop refcount to 0. */
     atomic_fetch_add_explicit(&ctx->refcount, nreplicas, memory_order_acq_rel);
 
-    /* Reserve an mgr-inflight slot per worker while rmgr is guaranteed
-     * alive (we're on the submitter's thread).  Workers release theirs at
-     * exit; mgr_free waits for zero before freeing. */
-    pthread_mutex_lock(&rmgr->lock);
-    rmgr->fanout_inflight += nreplicas;
-    pthread_mutex_unlock(&rmgr->lock);
-
     tsdb_metric_add("qengine_replicate_sent_total", (uint64_t)nreplicas);
 
     pthread_attr_t attr;
@@ -532,20 +626,26 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
 
     int launched = 0;
     for (int i = 0; i < nreplicas; i++) {
-        worker_arg_t *wa = malloc(sizeof(*wa));
+        /* Reserve this worker's mgr-inflight slot (and the payload bytes it
+         * will keep alive) while rmgr is guaranteed alive — we are on the
+         * submitter's thread.  Workers release theirs at exit; mgr_free waits
+         * for the slot count to reach zero before freeing. */
+        int reserved = fanout_slot_reserve(rmgr, plen);
+
+        worker_arg_t *wa = reserved ? malloc(sizeof(*wa)) : NULL;
         if (!wa) {
-            /* Can't launch this worker — release its pre-reserved ref
-             * and count it as "done" so the waiter doesn't hang. */
+            /* Either the queue is over its byte cap and this send is being
+             * dropped, or malloc failed.  Either way the worker will not run:
+             * release the reservation (if we took one), drop its pre-taken ctx
+             * ref, and count it "done" so the quorum waiter cannot hang. */
+            if (reserved) fanout_slot_release(rmgr, plen);
+            else          tsdb_metric_inc("qengine_fanout_dropped_total");
             pthread_mutex_lock(&ctx->mu);
             ctx->done_count++;
             if (ctx->done_count >= ctx->nreplicas)
                 pthread_cond_broadcast(&ctx->cv);
             pthread_mutex_unlock(&ctx->mu);
             fanout_ctx_unref(ctx);
-            pthread_mutex_lock(&rmgr->lock);
-            if (--rmgr->fanout_inflight == 0)
-                pthread_cond_broadcast(&rmgr->infl_cv);
-            pthread_mutex_unlock(&rmgr->lock);
             continue;
         }
         wa->ctx     = ctx;
@@ -569,16 +669,13 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
         } else {
             /* Worker never ran — same handling as the malloc-fail path. */
             free(wa);
+            fanout_slot_release(rmgr, plen);
             pthread_mutex_lock(&ctx->mu);
             ctx->done_count++;
             if (ctx->done_count >= ctx->nreplicas)
                 pthread_cond_broadcast(&ctx->cv);
             pthread_mutex_unlock(&ctx->mu);
             fanout_ctx_unref(ctx);
-            pthread_mutex_lock(&rmgr->lock);
-            if (--rmgr->fanout_inflight == 0)
-                pthread_cond_broadcast(&rmgr->infl_cv);
-            pthread_mutex_unlock(&rmgr->lock);
         }
     }
     pthread_attr_destroy(&attr);

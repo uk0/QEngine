@@ -786,11 +786,15 @@ typedef struct {
     pthread_mutex_t    *ack_lock;
 } rawblk_send_arg_t;
 
-static void evict_rawblk_conn(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t nid) {
-    /* We reuse replica_mgr infrastructure; connection eviction is handled by
-     * the existing pool logic — just mark it dirty by closing. */
-    (void)rmgr; (void)nid;
-    /* Best-effort: reconnect on next call. */
+/* Actually evict.  This used to be a comment and two (void) casts: the failing
+ * conn stayed in the pool, so once a peer restarted (or one push hit the 10 s
+ * deadline) every later RAW_BLOCK_PUSH to it drew the same dead socket back out
+ * and failed forever — raw-mode replication to that peer never resumed for the
+ * life of the sender process.  replica.h has exported the evictor since the
+ * scatter path needed it for exactly this failure. */
+static void evict_rawblk_conn(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t nid,
+                              tsdb_rpc_conn_t *bad) {
+    tsdb_replica_mgr_evict_conn(rmgr, nid, bad);
 }
 
 static void *rawblk_send_thread(void *arg) {
@@ -814,7 +818,7 @@ static void *rawblk_send_thread(void *arg) {
             (*sa->ack_count)++;
             pthread_mutex_unlock(sa->ack_lock);
         } else {
-            evict_rawblk_conn(sa->rmgr, sa->node_id);
+            evict_rawblk_conn(sa->rmgr, sa->node_id, conn);
         }
     }
     free(sa);

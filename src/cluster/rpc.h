@@ -120,11 +120,41 @@ typedef enum {
 
                                          A receiver that predates this opcode
                                          falls through the dispatch switch to
-                                         `default:`, which ACKs with an EMPTY
-                                         body — so "ACK whose body is not 16
-                                         bytes" is the unambiguous too-old
-                                         signal and the caller degrades to the
-                                         legacy FED_QUERY probe. */
+                                         `default:`, which on THOSE builds ACKs
+                                         with an EMPTY body — so "ACK whose body
+                                         is not 16 bytes" is the unambiguous
+                                         too-old signal and the caller degrades
+                                         to the legacy FED_QUERY probe.  Builds
+                                         from 2026-07-31 answer an unknown
+                                         opcode with ERR_UNSUPPORTED instead;
+                                         that maps to the same
+                                         TSDB_ERR_UNSUPPORTED and the same
+                                         fallback. */,
+    TSDB_RPC_ERR_UNSUPPORTED    = 24  /* reply: "this build does not implement
+                                         that opcode".
+
+                                         The dispatch `default:` used to ACK
+                                         with an empty body, i.e. tell a peer
+                                         on a NEWER build that whatever it just
+                                         asked for had been done.  Nothing on
+                                         this transport negotiates versions —
+                                         tsdb_rpc_decode reads `ver` and
+                                         immediately (void)s it — so that arm
+                                         was the entire forward-compatibility
+                                         story, answering "yes" by default.
+
+                                         It has to be an error, and a
+                                         DISTINGUISHABLE one: the
+                                         LOCAL_TABLE_STATS probe has to keep
+                                         telling "too old for this opcode"
+                                         (fall back to the legacy query) apart
+                                         from "knows it, could not answer"
+                                         (skip the peer).  A plain
+                                         TSDB_RPC_ERR would collapse the two.
+                                         Clients map this to
+                                         TSDB_ERR_UNSUPPORTED; a client too old
+                                         to know the code sees "not ACK" and
+                                         fails, which is the safe direction. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
@@ -173,11 +203,19 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms);
 /* Close and free a connection. */
 void tsdb_rpc_conn_close(tsdb_rpc_conn_t *conn);
 
+/* 1 once this conn has been retired — a reply arrived that did not pair with
+ * the request that was sent, so the stream is out of step and every later call
+ * on it fails closed.  Pool owners must not hand a retired conn back out; the
+ * flag is sticky and only a fresh connect clears it. */
+int  tsdb_rpc_conn_is_desynced(const tsdb_rpc_conn_t *conn);
+
 /*
  * Send an RPC request and wait synchronously for an ACK/ERR response.
  * payload / payload_len: request body.
  * Returns TSDB_OK on ACK, TSDB_ERR_IO on timeout/socket error,
- * TSDB_ERR_INTERNAL if remote returned ERR.
+ * TSDB_ERR_UNSUPPORTED if the remote does not implement the opcode,
+ * TSDB_ERR_INTERNAL if remote returned ERR,
+ * TSDB_ERR_CORRUPT on a bad frame or a reply carrying another request's id.
  */
 int tsdb_rpc_call(tsdb_rpc_conn_t *conn,
                   tsdb_rpc_type_t type,

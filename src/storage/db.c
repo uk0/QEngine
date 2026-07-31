@@ -1006,9 +1006,26 @@ static int create_table_impl(tsdb_db_t *db,
 
     pthread_mutex_unlock(&db->lock);
 
-    /* Cluster schema-sync hook (if registered and not suppressed). */
+    /* Cluster schema-sync hook (if registered and not suppressed).
+     *
+     * The rc used to be dropped on the floor, which was harmless only for as
+     * long as the receiver ACKed unconditionally — it now reports a schema it
+     * failed to create, so this is where that report arrives.  It does NOT
+     * fail the create: the local table is already built and durable, and
+     * returning an error for a table that exists would make a retry answer
+     * TSDB_ERR_EXISTS forever.  What it must not do is stay invisible, because
+     * a peer without the schema silently refuses every WRITE_BATCH for it.
+     * The periodic anti-entropy sweep (tsdb_resync_startup_thread) is what
+     * closes the gap; this is how an operator knows one opened. */
     if (on_create) {
-        on_create(hook_ud, db, name, schema);
+        int hrc = on_create(hook_ud, db, name, schema);
+        if (hrc != TSDB_OK) {
+            tsdb_metric_inc("qengine_schema_sync_fail_total");
+            fprintf(stderr,
+                    "[schema-sync] '%s': too few peers took the schema (rc=%d %s)"
+                    " — they will refuse writes for it until anti-entropy\n",
+                    name, hrc, tsdb_errstr(hrc));
+        }
     }
 
     /* Mirror the table into the super-table hierarchy (local catalog only) —

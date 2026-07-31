@@ -481,6 +481,37 @@ int tsdb_part_col_blocks(tsdb_part_t *p, int col_idx,
                          tsdb_block_meta_t **out_arr, size_t *out_n);
 
 /*
+ * Borrowing variant of tsdb_part_col_blocks: O(1), no malloc, no copy.
+ *
+ * *out_arr points straight at the partition's OWN block-meta array (NULL when
+ * the column has no blocks, matching the copying variant).  The caller must
+ * NOT free it and must NOT write through it.
+ *
+ * LIFETIME — the array is built once, inside tsdb_part_open, and is never
+ * mutated again for the life of the handle; tsdb_part_close frees it, and
+ * nothing else does.  So the pointer is valid exactly as long as `p` is open,
+ * which is the SAME contract tsdb_part_read_block_ref already publishes for
+ * the .col mmap it hands out.  Immutability is also what makes it safe to
+ * share across the scan pool: every worker reads the one array.
+ *
+ * Compaction cannot invalidate it either, and the reason has to hold for EVERY
+ * caller — not just the locked ones.  Once tsdb_part_open returns, col_metas[]
+ * is private heap owned by this handle and the open fds pin the inodes, so a
+ * compactor's rename only changes what a LATER open sees; it cannot reach back
+ * into a handle that is already up.  That argument needs no lock, which matters
+ * because readers are NOT uniformly serialised against the compactor: only
+ * scan_plan_build_ex takes compact_mtx across the open (exec.c), while the
+ * parquet export and both migrate.c opens are lock-free — see the note above
+ * tsdb_part_open and compaction.h's own comment saying the lock exists to keep
+ * flush off the rename, not to gate readers.
+ *
+ * Use tsdb_part_col_blocks instead when the metadata must outlive the handle,
+ * or when the caller mutates it.
+ */
+int tsdb_part_col_blocks_ref(tsdb_part_t *p, int col_idx,
+                             const tsdb_block_meta_t **out_arr, size_t *out_n);
+
+/*
  * Decompress one block into out_buf.
  * out_buf must hold at least (meta->count * tsdb_type_width(col_type)) bytes.
  */

@@ -115,11 +115,18 @@ int tsdb_cluster_broadcast_catalog_qtl_to_data(tsdb_db_t *db,
  * RPC addr from membership and ships the QTL via TSDB_RPC_DDL_FORWARD,
  * copying the leader's status text into out_status.
  *
- * Returns TSDB_OK with out_status set on a completed round-trip.  Returns
- * TSDB_ERR_NOTFOUND when leader_id is 0 (mid-election) or unknown/down in
- * membership — the caller should then fall back to the retry hint.  Other
- * negative codes signal a transport/encode failure.  No forward loop: the
- * leader's state==LEADER so it executes locally and never re-forwards. */
+ * Returns TSDB_OK with out_status set when the leader RAN the statement.
+ * Returns TSDB_ERR_NOTFOUND when leader_id is 0 (mid-election) or unknown/down
+ * in membership — the caller should then fall back to the retry hint.  Other
+ * negative codes signal that the leader refused it or that the round-trip
+ * failed; out_status is set to the leader's own message when the refusal came
+ * WITH one, and left EMPTY when no answer arrived at all.  That is the
+ * distinction the caller needs: an empty status means "ask someone else", a
+ * populated one means "the leader ran this and it did not work — showing the
+ * retry hint instead would be a lie".  (Before 2026-07-31 a refusal came back
+ * as TSDB_OK carrying the error text, so no caller could tell at all.)
+ * No forward loop: the leader's state==LEADER so it executes locally and never
+ * re-forwards. */
 int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
                                         uint64_t leader_id,
                                         const char *qtl,
@@ -141,6 +148,25 @@ int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
 int tsdb_cluster_resync_table(tsdb_db_t *db,
                                const char *table_name,
                                int *out_rows_pulled);
+
+/* ONE anti-entropy sweep: open every on-disk table, materialize any
+ * data-bearing table the catalog knows and storage does not, then
+ * tsdb_cluster_resync_table each of them.  Bumps
+ * qengine_antientropy_sweeps_total.  This is the body
+ * tsdb_resync_startup_thread ran exactly once, 5 s after boot; it now runs it
+ * on a period, because everything in the replication path that says
+ * "anti-entropy will heal it" is depending on it running again. */
+void tsdb_cluster_resync_all_tables(tsdb_db_t *db);
+
+/* Milliseconds between sweeps (TSDB_ANTIENTROPY_PERIOD_MS, default 30000 —
+ * the same tick delete-watermark re-assert uses).  0 = one shot at startup and
+ * never again, the pre-2026-07-31 behaviour. */
+long tsdb_antientropy_period_ms(void);
+
+/* Wall budget ONE table's candidate loop gets inside a sweep
+ * (AE_RESYNC_BUDGET_MS).  Exposed so a test can pin the number the production
+ * driver passes; tests/test_ae_candidates.c pins that the loop honours it. */
+long tsdb_antientropy_budget_ms(void);
 
 /* Anti-entropy reconcile decision (exposed for unit testing).
  *
@@ -265,6 +291,14 @@ int tsdb_cluster_scatter_stable_agg(tsdb_db_t *db,
                                      tsdb_result_t **results, int cap,
                                      int *out_n,
                                      uint64_t *out_failed_peer);
+
+/* Membership census: peers in this node's view (self excluded) split into
+ * "known" (any state) and "alive" (what the scatter above actually dials),
+ * plus the id of the first non-ALIVE peer.  Returns 1 when clustered, 0 when
+ * standalone.  SHOW uses the known-vs-alive gap to refuse to call a catalog
+ * listing cluster-complete while a node it cannot reach might hold more. */
+int tsdb_cluster_peer_census(tsdb_db_t *db, int *out_known, int *out_alive,
+                              uint64_t *out_missing_id);
 
 /* Bridges into the cluster layer for modules that live above it
  * (e.g. raft.c) without exposing the full tsdb_cluster struct.  Each

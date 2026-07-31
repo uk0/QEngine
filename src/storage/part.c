@@ -3739,19 +3739,43 @@ void tsdb_part_close(tsdb_part_t *p) {
     free(p);
 }
 
-int tsdb_part_col_blocks(tsdb_part_t *p, int col_idx,
-                         tsdb_block_meta_t **out_arr, size_t *out_n)
+/* Borrowed view of the array tsdb_part_open built.  See the lifetime and
+ * immutability contract on the declaration in part.h — the whole reason this
+ * is safe is that nothing below tsdb_part_open ever writes col_metas[] again,
+ * and only tsdb_part_close frees it. */
+int tsdb_part_col_blocks_ref(tsdb_part_t *p, int col_idx,
+                             const tsdb_block_meta_t **out_arr, size_t *out_n)
 {
     if (!p || col_idx < 0 || col_idx >= p->schema->ncols || !out_arr || !out_n)
         return TSDB_ERR_INVAL;
 
     size_t n = p->col_meta_n[col_idx];
+    *out_n   = n;
+    /* Report an empty column as (NULL, 0) rather than a possibly non-NULL
+     * malloc(0), so the two variants are indistinguishable to a caller. */
+    *out_arr = n ? p->col_metas[col_idx] : NULL;
+    return TSDB_OK;
+}
+
+/* Copying variant, kept for callers whose metadata outlives the part handle
+ * or who mutate it.  Expressed in terms of the borrowing one so the two
+ * cannot drift on bounds checking or on the empty-column result. */
+int tsdb_part_col_blocks(tsdb_part_t *p, int col_idx,
+                         tsdb_block_meta_t **out_arr, size_t *out_n)
+{
+    const tsdb_block_meta_t *src = NULL;
+    size_t n = 0;
+    /* This variant's own out-params are not the ones ref validated. */
+    if (!out_arr || !out_n) return TSDB_ERR_INVAL;
+    int rc = tsdb_part_col_blocks_ref(p, col_idx, &src, &n);
+    if (rc != TSDB_OK) return rc;
+
     *out_n = n;
     if (n == 0) { *out_arr = NULL; return TSDB_OK; }
 
     *out_arr = malloc(n * sizeof(tsdb_block_meta_t));
     if (!*out_arr) return TSDB_ERR_NOMEM;
-    memcpy(*out_arr, p->col_metas[col_idx], n * sizeof(tsdb_block_meta_t));
+    memcpy(*out_arr, src, n * sizeof(tsdb_block_meta_t));
     return TSDB_OK;
 }
 

@@ -76,6 +76,16 @@ void fedagg_result_free(tsdb_result_t *r) {
     free(r->col_types);
     free(r->col_symtab);
     free(r->col_data);
+    /* Decoded federation results own a symtab per SYMBOL column (see the
+     * dictionary section in fedrpc.c).  tsdb_result_free() already released
+     * these; this path did not, so every fedrpc_decode_result error unwind
+     * leaked one table per column decoded so far. */
+    if (r->owned_symtabs) {
+        for (int i = 0; i < r->n_owned_symtabs; i++) {
+            if (r->owned_symtabs[i]) tsdb_symtab_free(r->owned_symtabs[i]);
+        }
+        free(r->owned_symtabs);
+    }
     free(r);
 }
 

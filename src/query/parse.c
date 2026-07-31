@@ -1874,11 +1874,25 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
     }
 
-    /* ---- LIST ----------------------------------------------------------- */
-    if (accept(&p, QTOK_LIST)) {
+    /* ---- LIST / SHOW ----------------------------------------------------
+     * SHOW <noun> is the operator-facing spelling of LIST <noun>: same
+     * nouns, same optional IN DATABASE / IN GROUP / USING filters, same
+     * result columns.  The one difference is scope, and it is deliberate —
+     * see qast_stmt_t.cluster_scope.  LIST answers from this node's catalog
+     * replica; SHOW answers for the cluster or fails.
+     *
+     * "show" is matched as an IDENT rather than added to the keyword table
+     * so it stays usable as a column / table / tag name. */
+    int show_scope = 0;
+    if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "show")) {
+        show_scope = 1;
+        advance(&p);
+    }
+    if (show_scope || accept(&p, QTOK_LIST)) {
         /* LIST DATABASES */
         if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "databases")) {
             out->kind = QAST_STMT_LIST_DATABASES;
+            out->cluster_scope = (int8_t)show_scope;
             advance(&p);
             accept(&p, QTOK_SEMI);
             return TSDB_OK;
@@ -1887,6 +1901,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
          * (plural not a keyword); IN DATABASE filter is optional. */
         if (p.tok.kind == QTOK_IDENT && ident_ci(&p.tok, "groups")) {
             out->kind = QAST_STMT_LIST_GROUPS;
+            out->cluster_scope = (int8_t)show_scope;
             out->u.list_groups.database[0] = '\0';
             advance(&p);
             if (accept(&p, QTOK_IN)) {
@@ -1916,6 +1931,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         if (p.tok.kind == QTOK_IDENT &&
             (ident_ci(&p.tok, "vtables") || ident_ci(&p.tok, "stables"))) {
             out->kind = QAST_STMT_LIST_VTABLES;
+            out->cluster_scope = (int8_t)show_scope;
             out->u.list_vtables.database[0] = '\0';
             out->u.list_vtables.group[0]    = '\0';
             advance(&p);
@@ -1952,6 +1968,7 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
         if (p.tok.kind == QTOK_IDENT &&
             (ident_ci(&p.tok, "ptables") || ident_ci(&p.tok, "tables"))) {
             out->kind = QAST_STMT_LIST_PTABLES;
+            out->cluster_scope = (int8_t)show_scope;
             out->u.list_ptables.vtable[0]   = '\0';
             out->u.list_ptables.database[0] = '\0';
             out->u.list_ptables.group[0]    = '\0';
@@ -1991,6 +2008,16 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             }
             accept(&p, QTOK_SEMI);
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
+        }
+
+        /* Everything past this point is a LIST-only noun: devices, functions,
+         * masters, users.  They are answered from node-local state that this
+         * change does not certify across the cluster, so SHOW refuses them
+         * rather than lend them a cluster-wide claim it has not checked. */
+        if (show_scope) {
+            perr(&p, "SHOW supports DATABASES, GROUPS, STABLES, TABLES "
+                     "(use LIST for DEVICES, FUNCTIONS, MASTERS, USERS)");
+            return TSDB_ERR_PARSE;
         }
 
         /* LIST DEVICES [IN GROUP <group>] */
@@ -2037,7 +2064,8 @@ int qparse_stmt(const char *src, tsdb_arena_t *a, qast_stmt_t *out,
             return p.errored ? TSDB_ERR_PARSE : TSDB_OK;
         }
 
-        perr(&p, "expected GROUPS, DEVICES, or USERS after LIST");
+        perr(&p, "expected DATABASES, GROUPS, STABLES, TABLES, DEVICES, "
+                 "FUNCTIONS, MASTERS, or USERS after LIST");
         return TSDB_ERR_PARSE;
     }
 

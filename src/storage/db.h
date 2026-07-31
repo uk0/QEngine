@@ -123,6 +123,22 @@ int                    tsdb_catalog_check(tsdb_db_t *db, char *buf, size_t cap);
  * Defined in backup.c. */
 int                    tsdb_backup_write_manifest_json(tsdb_db_t *db,
                                                        char *buf, size_t cap);
+
+/* tsdb_backup_emit_manifest_file return codes.
+ *
+ * The emitter does two things with very different weight, and a single -1
+ * flattened them: it flushes every memtable to disk (WITHOUT which the tar the
+ * caller is about to take is missing every unflushed row — under
+ * TSDB_WAL_ONLY_COMMIT that is most of the recent data), and it writes a
+ * verification aid.  The second failing is an inconvenience.  The first
+ * failing means the backup would be INCOMPLETE, and the caller has to be able
+ * to tell, because the manifest it would otherwise ship is built from
+ * tsdb_query — which reads the memtable, so it records counts the tarball does
+ * not contain. */
+#define TSDB_BACKUP_MANIFEST_FAILED   (-1)  /* aid missing; backup may proceed */
+#define TSDB_BACKUP_NOT_ON_DISK       (-2)  /* rows are NOT in the files; do
+                                             * not represent a tar of them as a
+                                             * backup */
 int                    tsdb_backup_emit_manifest_file(tsdb_db_t *db,
                                                      const char *data_dir);
 
