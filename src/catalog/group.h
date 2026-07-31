@@ -36,6 +36,16 @@ typedef struct tsdb_catalog tsdb_catalog_t;
 int  tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out);
 void tsdb_catalog_close(tsdb_catalog_t *c);
 
+/* Move every piece of replayed state out of `src` and into `dst`, then destroy
+ * the emptied `src`.  `dst` keeps its identity — its address, its mutexes and
+ * its compaction thread are untouched — so a reader that is holding `dst`
+ * (every read path caches the pointer: `cat = tsdb_db_catalog(db)`) stays
+ * valid across a reload.  Swapping the object instead, and freeing the old
+ * one, is a use-after-free: readers hold the pointer with no refcount.
+ * Both must come from the same data_dir.  dst->lock is held for the swap, so
+ * no reader can be inside a catalog call while the old state is freed. */
+void tsdb_catalog_adopt(tsdb_catalog_t *dst, tsdb_catalog_t *src);
+
 int  tsdb_group_create(tsdb_catalog_t *c, const tsdb_group_t *g);
 int  tsdb_group_get(tsdb_catalog_t *c, const char *name, tsdb_group_t *out);
 /* Returns array of groups in *out_arr (caller must call tsdb_group_list_free).

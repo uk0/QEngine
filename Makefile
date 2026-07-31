@@ -273,6 +273,14 @@ TEST_SRCS += tests/test_legacy_range_borrow.c
 # answer by the repair the error message asks for.
 TEST_SRCS += tests/test_repair_into_ambiguous.c
 TEST_SRCS += tests/test_ordmap_torn.c
+
+# The catalog anti-entropy tick (every 30 s) used to open a fresh catalog, swap
+# db->catalog and free the old object — while every read path caches the
+# pointer (`cat = tsdb_db_catalog(db)`) with no refcount and no lock.  ASan on
+# the unfixed tree: heap-use-after-free in sc_hmap_get, freed by
+# tsdb_db_reload_catalog.  Pins both halves: the live object keeps its identity
+# across a reload, and the reloaded state is visible through that same pointer.
+TEST_SRCS += tests/test_catalog_reload_uaf.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

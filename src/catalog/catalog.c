@@ -1023,6 +1023,90 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
     return TSDB_OK;
 }
 
+/* Move src's replayed state into dst and destroy the husk.  See group.h.
+ *
+ * The whole point is that dst's ADDRESS survives: every read path does
+ * `cat = tsdb_db_catalog(db)` and then uses `cat` for the rest of the
+ * statement, with no refcount and no lock held in between, so an object that
+ * a reload frees is an object a reader dereferences after free (proved with a
+ * running reproduction in tests/test_catalog_reload_uaf.c).
+ *
+ * Ordering:
+ *   1. stop src's compaction thread — dst already has one, and src's would
+ *      otherwise compact files whose FILE* we are about to hand to dst;
+ *   2. swap the five hmaps, the five append handles and the v2 shadow under
+ *      dst->lock, so no reader is inside a catalog call while the previous
+ *      state is freed;
+ *   3. free the previous state, still under dst->lock;
+ *   4. zero what we moved out of src so tsdb_catalog_close(src) frees only the
+ *      husk.
+ * dst->lock / dst->shadow_lock / dst->compact_thread are never touched. */
+void tsdb_catalog_adopt(tsdb_catalog_t *dst, tsdb_catalog_t *src) {
+    if (!dst || !src || dst == src) return;
+
+    if (src->compact_running) {
+        src->compact_running = 0;
+        pthread_join(src->compact_thread, NULL);
+    }
+
+    pthread_mutex_lock(&dst->lock);
+
+    hmap_t old_db = dst->databases, old_grp = dst->groups;
+    hmap_t old_dev = dst->device_index;
+    hmap_t old_stb = dst->stables, old_chl = dst->child_tables;
+    FILE *old_dbl = dst->databases_log, *old_grpl = dst->groups_log;
+    FILE *old_devl = dst->devices_log, *old_stbl = dst->stables_log;
+    FILE *old_chll = dst->children_log;
+
+    dst->databases    = src->databases;    src->databases    = (hmap_t){0};
+    dst->groups       = src->groups;       src->groups       = (hmap_t){0};
+    dst->device_index = src->device_index; src->device_index = (hmap_t){0};
+    dst->stables      = src->stables;      src->stables      = (hmap_t){0};
+    dst->child_tables = src->child_tables; src->child_tables = (hmap_t){0};
+
+    dst->databases_log = src->databases_log; src->databases_log = NULL;
+    dst->groups_log    = src->groups_log;    src->groups_log    = NULL;
+    dst->devices_log   = src->devices_log;   src->devices_log   = NULL;
+    dst->stables_log   = src->stables_log;   src->stables_log   = NULL;
+    dst->children_log  = src->children_log;  src->children_log  = NULL;
+
+    /* Release the state dst held a moment ago.  Still under dst->lock: a
+     * reader either finished before we took it or is waiting behind it and
+     * will see the adopted state. */
+    if (old_dbl)  fclose(old_dbl);
+    if (old_grpl) fclose(old_grpl);
+    if (old_devl) fclose(old_devl);
+    if (old_stbl) fclose(old_stbl);
+    if (old_chll) fclose(old_chll);
+    hmap_free_values(&old_stb); free(old_stb.buckets);
+    hmap_free_values(&old_chl); free(old_chl.buckets);
+    for (size_t i = 0; i < old_dev.cap; i++) {
+        hmap_entry_t *e = &old_dev.buckets[i];
+        if (!e->key) continue;
+        group_entry_t *ge = (group_entry_t *)e->val;
+        if (ge) { hmap_free_values(&ge->devices); hmap_destroy(&ge->devices); free(ge); }
+        free(e->key);
+    }
+    free(old_dev.buckets);
+    hmap_free_values(&old_grp); free(old_grp.buckets);
+    hmap_free_values(&old_db);  free(old_db.buckets);
+
+    pthread_mutex_unlock(&dst->lock);
+
+    /* Take src's freshly-built v2 shadow rather than rebuilding one: it was
+     * mirrored from exactly the state we just adopted, and a second
+     * shadow_v2_resync would unlink and re-create catalog.log/OIDSEQ under
+     * src's still-open shadow. */
+    pthread_mutex_lock(&dst->shadow_lock);
+    tsdb_catalog_v2_t *old_shadow = dst->shadow_v2;
+    dst->shadow_v2 = src->shadow_v2;
+    src->shadow_v2 = NULL;
+    pthread_mutex_unlock(&dst->shadow_lock);
+    if (old_shadow) tsdb_cat2_close(old_shadow);
+
+    tsdb_catalog_close(src);   /* husk: everything moved out is NULL/zeroed */
+}
+
 void tsdb_catalog_close(tsdb_catalog_t *c) {
     if (!c) return;
 

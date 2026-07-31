@@ -195,6 +195,22 @@ const char *tsdb_last_error(void) { return g_last_err; }
 
 void tsdb_last_error_clear(void) { g_last_err[0] = '\0'; }
 
+/* Log a statement that failed for an ENGINE reason, at the one point where it
+ * leaves tsdb_query.  eset() only fills the thread-local detail and the
+ * caller's err[] — and tsdb_query throws err[] away — so an engine failure was
+ * invisible on the server: the 4-day incident had `SELECT count(*) FROM env_0`
+ * answering TSDB_ERR_INTERNAL consistently with not one server-side line to
+ * point an operator at.  Client-side errors (parse, not-found, permission,
+ * schema) stay quiet: they are the caller's problem and would bury the log. */
+static void log_engine_failure(const char *what, const char *qtl, int rc) {
+    if (rc != TSDB_ERR_INTERNAL && rc != TSDB_ERR_IO &&
+        rc != TSDB_ERR_CORRUPT  && rc != TSDB_ERR_NOMEM) return;
+    fprintf(stderr, "[query] %s failed rc=%d (%s): %s | qtl=%.180s\n",
+            what, rc, tsdb_errstr(rc),
+            g_last_err[0] ? g_last_err : "(no detail)",
+            qtl ? qtl : "(null)");
+}
+
 static void eset(char *err, size_t cap, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(g_last_err, sizeof(g_last_err), fmt, ap);
@@ -8293,7 +8309,11 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
         if (qtbl2) tsdb_db_scan_release(db, qtbl2);
         if (qtbl) tsdb_db_scan_release(db, qtbl);
         tsdb_arena_free(&a);
-        if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
+        if (rc != TSDB_OK) {
+            log_engine_failure("SELECT", qtl, rc);
+            tsdb_result_free(r);
+            return rc;
+        }
         *out = r;
         return TSDB_OK;
     }
@@ -8305,7 +8325,11 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
     if (stmt.kind == QAST_STMT_INSERT) {
         rc = exec_insert(db, &stmt.u.insert_, r, err, sizeof(err));
         tsdb_arena_free(&a);
-        if (rc != TSDB_OK) { tsdb_result_free(r); return rc; }
+        if (rc != TSDB_OK) {
+            log_engine_failure("INSERT", qtl, rc);
+            tsdb_result_free(r);
+            return rc;
+        }
         *out = r;
         return TSDB_OK;
     }

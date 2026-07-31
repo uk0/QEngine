@@ -113,6 +113,7 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
+      # A segfault must leave a core on the bind mount, not just a restart.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -176,6 +177,7 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
+      # A segfault must leave a core on the bind mount, not just a restart.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
@@ -238,6 +240,7 @@ services:
       nofile:
         soft: 1048576
         hard: 1048576
+      # A segfault must leave a core on the bind mount, not just a restart.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:28094/health | grep -q ok || exit 1"]
       interval: 10s
