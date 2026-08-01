@@ -354,6 +354,7 @@ TEST_SRCS += tests/test_node_id_durable.c
 # leave its rows in the memtable: on failure they are truncated back to the
 # durable boundary so a receiver's retry re-appends once instead of doubling.
 TEST_SRCS += tests/test_batch_rollback.c
+TEST_SRCS += tests/test_migrate_unflushed.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

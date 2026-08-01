@@ -57,6 +57,15 @@ typedef struct {
     tsdb_mig_land_t land;
     /* Rename the table on the way in; NULL/"" keeps the source name. */
     const char     *rename_to;
+    /* EXPORT COMPLETENESS.  The exporter reads the source's on-disk partitions;
+     * rows still in the memtable (which, under deferred flush, is most of the
+     * recent data) are NOT on disk.  By default the export flushes the source
+     * table first so the stream is complete.  Set no_flush=1 to skip that — for
+     * a read-only source you must not mutate — in which case an export that
+     * finds un-flushed rows returns TSDB_ERR_BUSY rather than silently shipping
+     * a short stream.  A missing/zeroed opts (the common call) flushes, so the
+     * default is complete-or-nothing, never silently-short. */
+    int             no_flush;
 } tsdb_mig_opts_t;
 
 typedef struct {

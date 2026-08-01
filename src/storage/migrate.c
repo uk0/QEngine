@@ -206,7 +206,6 @@ static int write_header(int fd, const char *table, tsdb_schema_t *s) {
 int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
                         const tsdb_mig_opts_t *opts, tsdb_mig_stats_t *out)
 {
-    (void)opts;
     if (!db || !table || fd < 0) return TSDB_ERR_INVAL;
 
     /* Resolve through tsdb_open_table, not tsdb_db_find_table: the latter only
@@ -221,6 +220,31 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
     if (!ti) return TSDB_ERR_INTERNAL;
     tsdb_schema_t *s = tsdb_tbl_schema(ti);
     if (!s) return TSDB_ERR_INTERNAL;
+
+    /* COMPLETENESS.  The scan below reads on-disk partitions only; rows in the
+     * memtable are not there, and under deferred flush that is most of the
+     * recent data.  Default: flush the source so the stream is complete.  With
+     * no_flush: refuse (TSDB_ERR_BUSY) if the memtable holds rows rather than
+     * ship a silently-short stream — an export must not report success while
+     * carrying less than the table.
+     *
+     * The default flush uses the normal replicating path, so on a cluster the
+     * drained rows fan out to peers as a side effect of the export.  That is
+     * deliberate over the alternative (a skip-replicate flush): the rows are
+     * already committed and DO belong on the peers, so replicating them early
+     * is harmless, whereas a skip-replicate flush would clear the memtable
+     * without ever handing those rows to the cluster hook — and a memtable
+     * flushes once, so any row not yet replicated would be lost to replication
+     * for good (the same trap a restore-verify skip-replicate flush was
+     * rejected for).  A caller that must not mutate or replicate the source
+     * uses no_flush and accepts the BUSY refusal on un-flushed data. */
+    if (!opts || !opts->no_flush) {
+        int frc = tsdb_table_flush(db, table);
+        if (frc != TSDB_OK) return frc;
+    } else {
+        tsdb_memtable_t *mt = tsdb_tbl_memtable(ti);
+        if (mt && tsdb_memtable_rows(mt) > 0) return TSDB_ERR_BUSY;
+    }
 
     tsdb_mig_stats_t st;
     memset(&st, 0, sizeof(st));
