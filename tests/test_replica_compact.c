@@ -304,7 +304,7 @@ static void test_replica_side_compaction(void) {
     seed(src, "t", 0, R1_ROWS);
 
     HARD(tsdb_open(dd, &dst));
-    HARD(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1));
+    HARD(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1, 0));
     check(ship_all(dst, &ctx) == 0, "R1 the replica accepted all %d seed blocks",
           ctx.n);
 
@@ -378,7 +378,7 @@ static void test_both_sides_compact(void) {
     tsdb_db_set_raw_block_hook(src, cap_hook, &ctx);
     seed(src, "t", 0, R1_ROWS);
     HARD(tsdb_open(dd, &dst));
-    HARD(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1));
+    HARD(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1, 0));
     check(ship_all(dst, &ctx) == 0, "R2 replica accepted the seed");
 
     /* Replica first ... */

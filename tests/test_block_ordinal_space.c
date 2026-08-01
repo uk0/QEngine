@@ -607,7 +607,7 @@ static tsdb_db_t *build_replica(const char *dir) {
     rm_rf(dir);
     tsdb_db_t *dst = NULL;
     if (tsdb_open(dir, &dst) != TSDB_OK) return NULL;
-    if (tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1)
+    if (tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1, 0)
         != TSDB_OK) { tsdb_close(dst); return NULL; }
     return dst;
 }

@@ -371,6 +371,9 @@ int tsdb_create_table_local(tsdb_db_t *db,
  *   partition_unit_int  — TSDB_PARTITION_DAY=0 / HOUR=1
  *   block_points        — 0 means "engine default"
  *   sort_by_tag_col     — -1 = off; >=0 = column index (must be SYMBOL)
+ *   incarnation         — the leader's durable table incarnation, stamped
+ *                         verbatim so leader and follower agree; 0 (UNKNOWN)
+ *                         from a pre-incarnation sender.
  */
 int tsdb_create_table_local_ex(tsdb_db_t *db,
                                 const char *name,
@@ -378,7 +381,8 @@ int tsdb_create_table_local_ex(tsdb_db_t *db,
                                 const char *ts_col,
                                 int partition_unit_int,
                                 int block_points,
-                                int sort_by_tag_col);
+                                int sort_by_tag_col,
+                                uint64_t incarnation);
 
 /* Return the underlying schema for a table handle.  Used by code that
  * needs to read schema metadata (column types, tag-sort flag) or apply

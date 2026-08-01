@@ -391,6 +391,38 @@ typedef struct {
 static void rpc_conn_track_add(struct tsdb_rpc_server *s, int fd);
 static void rpc_conn_track_remove(struct tsdb_rpc_server *s, int fd);
 
+/* Extract the additive incarnation trailer of a WRITE_BATCH payload, if any.
+ * Walks the columnar body to find where it ends; a V5 sender wrote the
+ * incarnation as the 8 bytes immediately after.  Returns 0 (UNKNOWN) for a
+ * legacy payload with no trailer, or on any size inconsistency (the apply path
+ * re-validates the column sizing and rejects a malformed batch on its own). */
+static uint64_t write_batch_incarnation(const uint8_t *payload, uint32_t payload_len,
+                                        int ncols, int nrows, const int *col_types,
+                                        const uint8_t *col_base) {
+    if (!payload || !col_base || col_base < payload) return 0;
+    size_t hdr = (size_t)(col_base - payload);   /* bytes before the first column */
+    size_t off = 0;
+    for (int c = 0; c < ncols; c++) {
+        if (col_types[c] == TSDB_TYPE_SYMBOL) {
+            if (hdr + off + 4 > payload_len) return 0;
+            uint32_t total = 0;
+            memcpy(&total, col_base + off, 4);
+            off += 4 + (size_t)total;
+        } else {
+            off += (size_t)nrows * 8;
+        }
+        if (hdr + off > payload_len) return 0;
+    }
+    /* Incarnation trailer present iff 8 bytes follow the columnar body.  '<='
+     * (not '==') stays tolerant of any future field appended after it. */
+    if (hdr + off + 8 <= payload_len) {
+        uint64_t inc = 0;
+        memcpy(&inc, payload + hdr + off, 8);
+        return inc;
+    }
+    return 0;
+}
+
 /* Handle one client connection in its own thread. */
 /* Decode a raw WRITE_BATCH payload and apply it locally (local_only, so it
  * doesn't re-enter the cluster fanout).  Returns 1 if rows landed, 0 on any
@@ -414,6 +446,26 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
 
     tsdb_table_t *tbl = NULL;
     if (tsdb_open_table(db, table_name, &tbl) != TSDB_OK || !tbl) return 0;
+
+    /* Incarnation gate.  The batch carries the incarnation of the table it was
+     * ISSUED for; the local schema carries the incarnation of the table that
+     * exists NOW.  If both are known (non-zero) and differ, a DROP+recreate of
+     * this name happened after the batch was issued — applying it would splice
+     * a dead table's rows into the live one.  REJECT (return 0 → the sender
+     * sees ERR).  A zero on EITHER side means "cannot verify" (a legacy/other-
+     * path table, or a pre-incarnation sender) and applies exactly as before —
+     * that is the mixed-version compatibility path, and the overwhelmingly
+     * common same-incarnation batch simply passes this one comparison. */
+    {
+        uint64_t batch_inc = write_batch_incarnation(payload, payload_len, ncols,
+                                                     nrows, col_types, col_data[0]);
+        tsdb_schema_t *sch = tsdb_table_get_schema(tbl);
+        uint64_t local_inc = sch ? sch->incarnation : 0;
+        if (batch_inc != 0 && local_inc != 0 && batch_inc != local_inc) {
+            tsdb_metric_inc("qengine_replicate_incarnation_reject_total");
+            return 0;
+        }
+    }
 
     int write_ok = 0;
     tsdb_table_lock_write(tbl);
@@ -585,11 +637,13 @@ static void *connection_handler(void *arg) {
                 char col_names[TSDB_MAX_COLS][64];
                 int col_types[TSDB_MAX_COLS];
                 int part_unit = 0, block_points = 0, sort_by_tag_col = -1;
+                uint64_t incarnation = 0;
 
                 int rc = tsdb_rpc_decode_schema(msg.payload, msg.payload_len,
                                                 table_name, sizeof(table_name),
                                                 &ncols, col_names, col_types, &ts_col_idx,
-                                                &part_unit, &block_points, &sort_by_tag_col);
+                                                &part_unit, &block_points, &sort_by_tag_col,
+                                                &incarnation);
                 /* The ACK used to be unconditional: `rc`, the ncols range
                  * check and tsdb_create_table_local_ex's return were all
                  * computed and then discarded, and ANY payload_len > 0 got an
@@ -614,7 +668,8 @@ static void *connection_handler(void *arg) {
                     applied = tsdb_create_table_local_ex(db, table_name, cols,
                                                           ncols, ts_name,
                                                           part_unit, block_points,
-                                                          sort_by_tag_col);
+                                                          sort_by_tag_col,
+                                                          incarnation);
                 }
                 /* EXISTS is success, and must stay success: a re-broadcast, a
                  * startup catch-up and the periodic catalog reconcile all
@@ -1871,6 +1926,29 @@ int tsdb_rpc_encode_write_batch(uint8_t *buf, uint32_t cap,
     return (int)(p - buf);
 }
 
+int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
+                                   const char *table_name,
+                                   int ncols, const int *col_types,
+                                   int nrows, const void **col_data,
+                                   uint64_t incarnation)
+{
+    /* Lay down the identical columnar body first, then append the incarnation
+     * as an 8-byte trailer AFTER all column data — the same additive-tail
+     * precedent as the rawblock issuer (which sits after block_bytes).  A
+     * receiver that predates the trailer decodes exactly the columns and
+     * ignores the extra 8 bytes; a receiver that knows it reads them iff they
+     * are present.  incarnation == 0 (UNKNOWN) emits NO trailer, so the wire is
+     * byte-for-byte the legacy encoder — a V5 node with no incarnation and an
+     * old V4 node produce identical bytes. */
+    int n = tsdb_rpc_encode_write_batch(buf, cap, table_name,
+                                        ncols, col_types, nrows, col_data);
+    if (n < 0) return -1;
+    if (incarnation == 0) return n;
+    if ((uint32_t)n + 8 > cap) return -1;
+    memcpy(buf + n, &incarnation, 8);
+    return n + 8;
+}
+
 int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,
                                 char *out_table, int table_cap,
                                 int *out_ncols, int *out_col_types,
@@ -1918,7 +1996,7 @@ int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
                            int ncols, const char **col_names,
                            const int *col_types, int ts_col_idx,
                            int partition_unit, int block_points,
-                           int sort_by_tag_col)
+                           int sort_by_tag_col, uint64_t incarnation)
 {
     if (!buf || !table_name || !col_names || !col_types) return -1;
 
@@ -1956,6 +2034,12 @@ int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
         memcpy(p, &sc, 4); p += 4;
     }
 
+    /* incarnation trailer: 8 bytes after the v2 tail.  A decoder that predates
+     * it stops after the v2 tail and ignores these bytes; a decoder that knows
+     * it reads them iff 8 remain (0 = UNKNOWN for a pre-incarnation sender). */
+    CHECK(8);
+    memcpy(p, &incarnation, 8); p += 8;
+
 #undef CHECK
     return (int)(p - buf);
 }
@@ -1965,7 +2049,7 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
                            int *out_ncols, char out_col_names[][64],
                            int *out_col_types, int *out_ts_col_idx,
                            int *out_partition_unit, int *out_block_points,
-                           int *out_sort_by_tag_col)
+                           int *out_sort_by_tag_col, uint64_t *out_incarnation)
 {
     const uint8_t *p = buf;
     const uint8_t *end = buf + len;
@@ -1974,6 +2058,7 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
     if (out_partition_unit)  *out_partition_unit  = 0;   /* TSDB_PARTITION_DAY */
     if (out_block_points)    *out_block_points    = 0;   /* engine default */
     if (out_sort_by_tag_col) *out_sort_by_tag_col = -1;  /* off */
+    if (out_incarnation)     *out_incarnation     = 0;   /* UNKNOWN */
 
 #define NEED(n) if (p + (n) > end) return -1
 
@@ -2012,6 +2097,14 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
         int32_t sc = -1;
         memcpy(&sc, p, 4); p += 4;
         if (out_sort_by_tag_col) *out_sort_by_tag_col = (int)sc;
+
+        /* incarnation trailer: read iff 8 more bytes follow the v2 tail.
+         * Absent → stays 0 (UNKNOWN), the pre-incarnation-sender case. */
+        if ((size_t)(end - p) >= 8) {
+            uint64_t inc = 0;
+            memcpy(&inc, p, 8); p += 8;
+            if (out_incarnation) *out_incarnation = inc;
+        }
     }
 #undef NEED
     return 0;

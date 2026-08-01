@@ -508,7 +508,7 @@ static void test_repaired_legacy_index(void) {
     /* The replica got the whole ts spine and all but the MIDDLE v block — the
      * ordinary dropped-push state. */
     HARD(tsdb_open(dd, &db));
-    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1));
+    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1, 0));
     int ok = 1;
     for (int i = 0; i < A4_BLK; i++)
         if (push_block(db, cap_pick(0, i)) != TSDB_OK) ok = 0;
@@ -631,7 +631,7 @@ static void test_whole_column_resync(void) {
     }
 
     HARD(tsdb_open(dd, &db));
-    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1));
+    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1, 0));
     int ok = 1;
     for (int i = 0; i < A5_BLK; i++) {
         if (push_block(db, cap_pick(0, i)) != TSDB_OK) ok = 0;
@@ -758,7 +758,7 @@ static void test_partial_column_resync(void) {
     }
 
     HARD(tsdb_open(dd, &db));
-    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1));
+    HARD(tsdb_create_table_local_ex(db, "r", COLS2, 2, "ts", 0, BP, -1, 0));
     int ok = 1;
     for (int i = 0; i < A6_BLK; i++) {
         if (push_block(db, cap_pick(0, i)) != TSDB_OK) ok = 0;

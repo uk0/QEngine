@@ -187,7 +187,8 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
 
     int remote_acks = 0;
     int rc = tsdb_cluster_write(c, table_name, ncols, col_types,
-                                nrows, col_data, &remote_acks);
+                                nrows, col_data, &remote_acks,
+                                schema->incarnation);
 
     for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
 
@@ -274,7 +275,8 @@ static int cluster_on_create(void *ud, tsdb_db_t *db,
                                     (int)schema->partition_unit,
                                     schema->block_points,
                                     schema->sort_by_tag_col,
-                                    target_ids, ntargets);
+                                    target_ids, ntargets,
+                                    schema->incarnation);
 }
 
 /* ---- Raw-block replication hook ------------------------------------------ */

@@ -52,6 +52,15 @@ typedef struct {
      * Read path is unchanged — scanners predicate per-row, no within-block
      * ts-monotonicity assumption. */
     int                    sort_by_tag_col;
+    /* Durable per-table incarnation.  Stamped fresh at every originating
+     * CREATE and DIFFERENT on every recreate of the same name, so a
+     * DROP+recreate cannot silently reuse the old table's identity on the
+     * replication path.  0 = UNKNOWN — a legacy (pre-incarnation) schema.bin
+     * loads back as 0, which the WRITE_BATCH apply path treats as
+     * "cannot verify" and applies as before (never rejects).  Persisted as a
+     * trailing 8-byte field in schema.bin; older binaries ignore the tail
+     * (no version bump), mirroring the idx block-ordinal precedent. */
+    uint64_t               incarnation;
 } tsdb_schema_t;
 
 /*
@@ -81,6 +90,29 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
                           tsdb_partition_unit_t partition_unit,
                           int block_points,
                           tsdb_schema_t **out);
+
+/* Same as tsdb_schema_create_ex, but stamps a caller-chosen durable
+ * incarnation into the schema (persisted in schema.bin).  incarnation == 0
+ * means UNKNOWN — the table is created without an incarnation, exactly as the
+ * legacy create path did.  The originating CREATE passes a freshly minted
+ * non-zero value (tsdb_schema_new_incarnation); a follower applying a peer's
+ * CREATE passes the incarnation it received on the wire so leader and follower
+ * agree, and 0 when the peer is a pre-incarnation (older) sender. */
+int tsdb_schema_create_ex2(const char *dir, const char *name,
+                           const tsdb_col_t *cols, int ncols,
+                           const char *ts_col,
+                           tsdb_partition_unit_t partition_unit,
+                           int block_points,
+                           uint64_t incarnation,
+                           tsdb_schema_t **out);
+
+/* Mint a fresh, non-zero table incarnation.  Seeded from the table name, its
+ * directory, the realtime clock in nanoseconds, and a process-lifetime
+ * counter — the same entropy style generate_node_id() uses — so two creates of
+ * the same name (a DROP+recreate) never collide, even within one nanosecond,
+ * and a value is never reused after a data wipe (time keeps advancing).  Never
+ * returns 0 (0 is reserved for UNKNOWN). */
+uint64_t tsdb_schema_new_incarnation(const char *name, const char *dir);
 
 /*
  * Open an existing schema from disk.

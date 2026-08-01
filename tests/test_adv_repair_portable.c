@@ -324,7 +324,7 @@ static void repair_case(const char *tag, int origin, cap_ctx_t *ctx) {
             tsdb_close(dst); rm_rf(dd); return;
         }
     } else {
-        HARD(tsdb_create_table_local_ex(dst, "t", COLS3, 3, "ts", 0, BP, -1));
+        HARD(tsdb_create_table_local_ex(dst, "t", COLS3, 3, "ts", 0, BP, -1, 0));
 
         /* 1. the replica receives the whole partition from a NOT-yet-upgraded
          *    sender (on 9dab5a2 that is the only kind there is). */

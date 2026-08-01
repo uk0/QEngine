@@ -110,7 +110,7 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
-                       int *out_remote_acks);
+                       int *out_remote_acks, uint64_t incarnation);
 
 /*
  * Propagate a CREATE TABLE to cluster peers.
@@ -128,7 +128,8 @@ int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
                              const int *col_types, int ts_col_idx,
                              int partition_unit, int block_points,
                              int sort_by_tag_col,
-                             const tsdb_node_id_t *nodes, int nnodes);
+                             const tsdb_node_id_t *nodes, int nnodes,
+                             uint64_t incarnation);
 
 /*
  * Fill buf with cluster status JSON-ish string (for tsdb_cluster_stats).

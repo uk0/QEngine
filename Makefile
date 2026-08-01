@@ -355,6 +355,13 @@ TEST_SRCS += tests/test_node_id_durable.c
 # durable boundary so a receiver's retry re-appends once instead of doubling.
 TEST_SRCS += tests/test_batch_rollback.c
 TEST_SRCS += tests/test_migrate_unflushed.c
+
+# A durable per-table incarnation so DROP+recreate cannot reuse identity: a
+# WRITE_BATCH left over from a since-dropped incarnation must be REJECTED, not
+# spliced into the recreated table.  Stamped at CREATE, changed on recreate,
+# kept across a plain reopen, carried additively on the WRITE_BATCH + SCHEMA_SYNC
+# wires (older peers ignore the trailer, 0 = UNKNOWN = apply-as-before).
+TEST_SRCS += tests/test_table_incarnation.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

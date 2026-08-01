@@ -360,7 +360,7 @@ static tsdb_db_t *fresh_replica(const char *dir, const tsdb_col_t *cols, int nco
     tsdb_db_t *dst = NULL;
     if (tsdb_open(dir, &dst) != TSDB_OK) return NULL;
     if (tsdb_create_table_local_ex(dst, table, cols, (size_t)ncols, "ts",
-                                   0 /*DAY*/, BLOCK_PTS, -1) != TSDB_OK) {
+                                   0 /*DAY*/, BLOCK_PTS, -1, 0) != TSDB_OK) {
         tsdb_close(dst);
         return NULL;
     }

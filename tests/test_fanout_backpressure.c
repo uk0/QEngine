@@ -105,7 +105,7 @@ static int submit_one(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t peer, int quorum)
     int col_types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
     const void *col_data[2] = { g_ts, g_v };
     return tsdb_replica_write(rmgr, "t", 2, col_types, ROWS, col_data,
-                              &peer, 1, quorum, NULL);
+                              &peer, 1, quorum, NULL, 0);
 }
 
 int main(void) {

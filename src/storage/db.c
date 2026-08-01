@@ -893,7 +893,8 @@ static int create_table_impl(tsdb_db_t *db,
                               const char *ts_col,
                               tsdb_partition_unit_t part_unit,
                               int block_points,
-                              int suppress_hook)
+                              int suppress_hook,
+                              uint64_t forced_incarnation)
 {
     if (!db || !name || !cols || ncols == 0 || !ts_col) return TSDB_ERR_INVAL;
     if (strlen(name) > TSDB_MAX_NAME) return TSDB_ERR_INVAL;
@@ -918,9 +919,21 @@ static int create_table_impl(tsdb_db_t *db,
      * db-wide default (0 → library default inside schema_create_ex). */
     int bp = (block_points > 0) ? block_points : db->default_block_points;
 
+    /* Table incarnation.  An originating CREATE (hook NOT suppressed) mints a
+     * fresh, non-zero value so a DROP+recreate of the same name never reuses
+     * the old identity; the fresh value then rides the SCHEMA_SYNC wire to
+     * followers via the on_create hook.  A replica apply (suppress_hook=1)
+     * stamps the incarnation it was handed — the leader's value for the
+     * SCHEMA_SYNC path, or 0 (UNKNOWN) for pre-incarnation senders and other
+     * local-create callers — so leader and follower agree and same-incarnation
+     * WRITE_BATCHes still match. */
+    uint64_t incarnation = suppress_hook
+                         ? forced_incarnation
+                         : tsdb_schema_new_incarnation(name, dir);
+
     tsdb_schema_t *schema = NULL;
-    int rc = tsdb_schema_create_ex(dir, name, cols, (int)ncols, ts_col,
-                                    part_unit, bp, &schema);
+    int rc = tsdb_schema_create_ex2(dir, name, cols, (int)ncols, ts_col,
+                                    part_unit, bp, incarnation, &schema);
     if (rc != TSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return rc;
@@ -1066,7 +1079,8 @@ int tsdb_create_table(tsdb_db_t *db,
     return create_table_impl(db, name, cols, ncols, ts_col,
                              TSDB_PARTITION_DAY,
                              /*block_points*/ 0,
-                             /*suppress_hook*/ 0);
+                             /*suppress_hook*/ 0,
+                             /*forced_incarnation*/ 0);
 }
 
 int tsdb_create_table_ex(tsdb_db_t *db,
@@ -1080,7 +1094,8 @@ int tsdb_create_table_ex(tsdb_db_t *db,
                                   : TSDB_PARTITION_DAY;
     return create_table_impl(db, name, cols, ncols, ts_col, unit,
                              /*block_points*/ 0,
-                             /*suppress_hook*/ 0);
+                             /*suppress_hook*/ 0,
+                             /*forced_incarnation*/ 0);
 }
 
 int tsdb_create_table_ex2(tsdb_db_t *db,
@@ -1095,7 +1110,8 @@ int tsdb_create_table_ex2(tsdb_db_t *db,
                                   : TSDB_PARTITION_DAY;
     return create_table_impl(db, name, cols, ncols, ts_col, unit,
                              block_points,
-                             /*suppress_hook*/ 0);
+                             /*suppress_hook*/ 0,
+                             /*forced_incarnation*/ 0);
 }
 
 int tsdb_create_table_local(tsdb_db_t *db,
@@ -1103,10 +1119,14 @@ int tsdb_create_table_local(tsdb_db_t *db,
                              const tsdb_col_t *cols, size_t ncols,
                              const char *ts_col)
 {
+    /* Non-SCHEMA_SYNC replica paths (hierarchy mirror, catalog reconcile) have
+     * no incarnation to carry — stamp UNKNOWN (0).  Their tables fall back to
+     * "cannot verify" on the WRITE_BATCH apply path, and never reject. */
     return create_table_impl(db, name, cols, ncols, ts_col,
                              TSDB_PARTITION_DAY,
                              /*block_points*/ 0,
-                             /*suppress_hook*/ 1);
+                             /*suppress_hook*/ 1,
+                             /*forced_incarnation*/ 0);
 }
 
 int tsdb_create_table_local_ex(tsdb_db_t *db,
@@ -1115,14 +1135,19 @@ int tsdb_create_table_local_ex(tsdb_db_t *db,
                                 const char *ts_col,
                                 int partition_unit_int,
                                 int block_points,
-                                int sort_by_tag_col)
+                                int sort_by_tag_col,
+                                uint64_t incarnation)
 {
     tsdb_partition_unit_t unit = (partition_unit_int == (int)TSDB_PARTITION_HOUR)
                                   ? TSDB_PARTITION_HOUR
                                   : TSDB_PARTITION_DAY;
+    /* Replica of a peer's CREATE: stamp the leader's incarnation (0 from a
+     * pre-incarnation sender) so a follower agrees with the leader and
+     * same-incarnation WRITE_BATCHes match instead of being rejected. */
     int rc = create_table_impl(db, name, cols, ncols, ts_col, unit,
                                block_points,
-                               /*suppress_hook*/ 1);
+                               /*suppress_hook*/ 1,
+                               /*forced_incarnation*/ incarnation);
     if (rc != TSDB_OK) return rc;
     if (sort_by_tag_col >= 0) {
         /* Apply the leader's tag-sort choice to the freshly-created

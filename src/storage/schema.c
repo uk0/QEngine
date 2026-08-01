@@ -6,6 +6,8 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -37,6 +39,19 @@
  *
  * Readers accept all four; older writers always emitted 8192 so v1/v2
  * files resolve unambiguously.
+ *
+ * incarnation trailer (2026-08):
+ *   [incarnation u64]               -- appended AFTER the v3/v4 tail, with NO
+ *                                      version bump.  Written only when the
+ *                                      table has a non-zero incarnation, so
+ *                                      default/legacy tables stay byte-for-byte
+ *                                      identical on disk.  An older binary reads
+ *                                      the v3/v4 tail it knows and ignores the
+ *                                      trailing bytes; a newer binary reading a
+ *                                      legacy file gets a short read and defaults
+ *                                      the incarnation to 0 (UNKNOWN).  Same
+ *                                      additive-to-the-tail, 0=UNKNOWN precedent
+ *                                      as the idx block ordinal.
  */
 #define SCHEMA_MAGIC   0x53434D41u  /* "SCMA" */
 #define SCHEMA_VERSION_V3 3
@@ -135,6 +150,14 @@ static int schema_save(tsdb_schema_t *s) {
         int32_t sc = (int32_t)s->sort_by_tag_col;
         WR(&sc, 4);
     }
+    /* incarnation trailer: 8 bytes AFTER the v3/v4 tail, no version bump.
+     * Only emitted when set (!= 0) so default/legacy tables are unchanged on
+     * disk and roll back cleanly; a reader that predates it stops at the tail
+     * it knows and never sees these bytes. */
+    if (s->incarnation != 0) {
+        uint64_t inc = s->incarnation;
+        WR(&inc, 8);
+    }
 #undef WR
 
     if (!rc) {
@@ -167,6 +190,33 @@ int tsdb_schema_set_sort_by_tag_col(tsdb_schema_t *s, int col) {
     return schema_save(s);
 }
 
+/* ---- tsdb_schema_new_incarnation --------------------------------------- */
+
+uint64_t tsdb_schema_new_incarnation(const char *name, const char *dir) {
+    /* Process-lifetime counter: disambiguates two creates that read the same
+     * realtime nanosecond (e.g. a fast DROP+recreate on a coarse clock). */
+    static atomic_uint_least64_t seq = 0;
+
+    /* FNV-1a over name || dir, then folded with a nanosecond timestamp and the
+     * counter — same construction as generate_node_id() in db_cluster.c. */
+    uint64_t h = 14695981039346656037ULL;
+    if (name) {
+        for (const char *p = name; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    }
+    if (dir) {
+        for (const char *p = dir; *p; p++)  { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t t = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    h ^= t; h *= 1099511628211ULL;
+    uint64_t s = (uint64_t)atomic_fetch_add(&seq, 1) + 1;
+    h ^= s; h *= 1099511628211ULL;
+
+    if (h == 0) h = 1ULL;   /* 0 is reserved for UNKNOWN */
+    return h;
+}
+
 /* ---- tsdb_schema_create ------------------------------------------------ */
 
 int tsdb_schema_create(const char *dir, const char *name,
@@ -184,6 +234,19 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
                           tsdb_partition_unit_t partition_unit,
                           int block_points,
                           tsdb_schema_t **out)
+{
+    /* Legacy entry point — no incarnation (0 = UNKNOWN). */
+    return tsdb_schema_create_ex2(dir, name, cols, ncols, ts_col,
+                                  partition_unit, block_points, 0, out);
+}
+
+int tsdb_schema_create_ex2(const char *dir, const char *name,
+                           const tsdb_col_t *cols, int ncols,
+                           const char *ts_col,
+                           tsdb_partition_unit_t partition_unit,
+                           int block_points,
+                           uint64_t incarnation,
+                           tsdb_schema_t **out)
 {
     if (!dir || !name || !cols || ncols <= 0 || ncols > TSDB_MAX_COLS || !ts_col || !out)
         return TSDB_ERR_INVAL;
@@ -216,6 +279,7 @@ int tsdb_schema_create_ex(const char *dir, const char *name,
     s->partition_unit  = partition_unit;
     s->block_points    = clamp_block_points(block_points);
     s->sort_by_tag_col = -1;             /* off by default; opt-in via setter */
+    s->incarnation     = incarnation;    /* 0 = UNKNOWN (legacy create path) */
     s->dir             = strdup(dir);
     if (!s->dir) { free(s); return TSDB_ERR_NOMEM; }
 
@@ -336,6 +400,7 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
     s->partition_unit = TSDB_PARTITION_DAY;   /* v1 default; v2+ overrides below */
     s->block_points   = TSDB_BLOCK_POINTS;    /* v1/v2 default; v3 overrides below */
     s->sort_by_tag_col = -1;                  /* v1..v3 default; v4 overrides below */
+    s->incarnation    = 0;                    /* UNKNOWN unless the trailer is present */
     s->dir            = strdup(dir);
     if (!s->dir) { free(s); fclose(f); return TSDB_ERR_NOMEM; }
 
@@ -388,6 +453,13 @@ int tsdb_schema_open(const char *dir, tsdb_schema_t **out) {
         }
     }
 #undef RD
+    /* incarnation trailer: optional 8 bytes after the last known tail.  A short
+     * read (legacy file that never wrote it) is NOT corruption — it just means
+     * UNKNOWN (0), which the apply path treats as "cannot verify" and applies. */
+    if (rc == TSDB_OK) {
+        uint64_t inc = 0;
+        if (fread(&inc, 1, 8, f) == 8) s->incarnation = inc;
+    }
     fclose(f);
     if (rc != TSDB_OK) { tsdb_schema_free(s); return rc; }
 

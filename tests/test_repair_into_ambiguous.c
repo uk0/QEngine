@@ -279,7 +279,7 @@ int main(void) {
      * partition is rewritten as an unpatched binary leaves it. */
     tsdb_db_t *dst = NULL;
     OK(tsdb_open(dd, &dst));
-    OK(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1));
+    OK(tsdb_create_table_local_ex(dst, "t", COLS2, 2, "ts", 0, BP, -1, 0));
     for (int c = 1; c >= 0; c--)
         for (int i = 0; i < NBLK; i++)
             if (push_from(dst, pick(&ctx, c, i)) != TSDB_OK)

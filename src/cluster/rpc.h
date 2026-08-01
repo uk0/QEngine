@@ -316,6 +316,20 @@ int tsdb_rpc_encode_write_batch(uint8_t *buf, uint32_t cap,
                                 int ncols, const int *col_types,
                                 int nrows, const void **col_data);
 
+/* Same as tsdb_rpc_encode_write_batch, but stamps the table's durable
+ * incarnation as an 8-byte trailer AFTER the columnar body (the same
+ * additive-tail precedent as the rawblock issuer).  incarnation == 0 emits NO
+ * trailer, so the wire is byte-for-byte the legacy encoder — a receiver that
+ * predates the trailer decodes the columns and ignores the extra bytes, and a
+ * receiver that knows it reads the incarnation and rejects a batch stamped for
+ * a different incarnation of the same table name (a DROP+recreate in flight).
+ * Returns bytes written, or -1 if the buffer is too small. */
+int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
+                                   const char *table_name,
+                                   int ncols, const int *col_types,
+                                   int nrows, const void **col_data,
+                                   uint64_t incarnation);
+
 /* TEST-ONLY: run the receiver's WRITE_BATCH apply path (decode → open → begin →
  * append → commit-or-discard) on an encoded payload, returning what the
  * dispatch would reflect in its reply: 1 = ACK (landed), 0 = ERR.  This is the
@@ -352,6 +366,7 @@ int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,
  *   partition_unit  u8     (TSDB_PARTITION_DAY=0 / HOUR=1)
  *   block_points    u32    (per-table block size; 0 → engine default)
  *   sort_by_tag_col i32    (-1 = off; >=0 = column index)
+ *   incarnation     u64    (durable table incarnation; 0 = UNKNOWN; 2026-08)
  *
  * The v2 tail closes a latent replication gap: pre-tail receivers
  * silently used (DAY, default block_points, sort_by_tag_col=-1) even
@@ -369,13 +384,13 @@ int tsdb_rpc_encode_schema(uint8_t *buf, uint32_t cap,
                            int ncols, const char **col_names,
                            const int *col_types, int ts_col_idx,
                            int partition_unit, int block_points,
-                           int sort_by_tag_col);
+                           int sort_by_tag_col, uint64_t incarnation);
 
 /* Decode SCHEMA_SYNC payload.
  *
- * out_partition_unit / out_block_points / out_sort_by_tag_col may be
- * NULL if caller doesn't care; defaults are filled when the payload
- * has no v2 tail (DAY / 0 / -1).
+ * out_partition_unit / out_block_points / out_sort_by_tag_col /
+ * out_incarnation may be NULL if the caller doesn't care; defaults are filled
+ * when the payload has no v2 tail (DAY / 0 / -1 / 0=UNKNOWN).
  *
  * Returns 0 on success. */
 int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
@@ -383,7 +398,7 @@ int tsdb_rpc_decode_schema(const uint8_t *buf, uint32_t len,
                            int *out_ncols, char out_col_names[][64],
                            int *out_col_types, int *out_ts_col_idx,
                            int *out_partition_unit, int *out_block_points,
-                           int *out_sort_by_tag_col);
+                           int *out_sort_by_tag_col, uint64_t *out_incarnation);
 
 /* ---- Apply-truncate / apply-delete-range payload helpers ----------------
  *

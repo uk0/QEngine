@@ -81,7 +81,8 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
-                       int w_quorum, int *out_acks);
+                       int w_quorum, int *out_acks,
+                       uint64_t incarnation);
 
 /*
  * Sync schema (SCHEMA_SYNC RPC) to all given nodes.
@@ -97,7 +98,7 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                              int partition_unit, int block_points,
                              int sort_by_tag_col,
                              const tsdb_node_id_t *nodes, int nnodes,
-                             int quorum);
+                             int quorum, uint64_t incarnation);
 
 /*
  * Broadcast a TRUNCATE-TABLE apply to the given peer list (best-effort).

@@ -145,7 +145,7 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
-                       int *out_remote_acks)
+                       int *out_remote_acks, uint64_t incarnation)
 {
     if (out_remote_acks) *out_remote_acks = 0;
     if (!c || !table_name || nrows == 0) return TSDB_OK;
@@ -247,7 +247,7 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                                 ncols, col_types,
                                 nrows, col_data,
                                 remote_replicas, nremote,
-                                q, &raw_acks);
+                                q, &raw_acks, incarnation);
     /* fanout ack_count includes the already-written local copy (starts at 1),
      * so strip it: out_remote_acks is the count of REMOTE replicas that
      * durably ACKed.  The SKIP_LOCAL drop decision needs >=1 of these. */
@@ -261,13 +261,14 @@ int tsdb_cluster_sync_schema(tsdb_cluster_t *c,
                               const int *col_types, int ts_col_idx,
                               int partition_unit, int block_points,
                               int sort_by_tag_col,
-                              const tsdb_node_id_t *nodes, int nnodes)
+                              const tsdb_node_id_t *nodes, int nnodes,
+                              uint64_t incarnation)
 {
     if (!c) return TSDB_OK;
     return tsdb_replica_sync_schema(c->replica_mgr,
                                     table_name, ncols, col_names, col_types, ts_col_idx,
                                     partition_unit, block_points, sort_by_tag_col,
-                                    nodes, nnodes, TSDB_WRITE_QUORUM);
+                                    nodes, nnodes, TSDB_WRITE_QUORUM, incarnation);
 }
 
 /* ---- Sharding routing API (Phase α) ------------------------------------- */

@@ -739,7 +739,8 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
-                       int w_quorum, int *out_acks)
+                       int w_quorum, int *out_acks,
+                       uint64_t incarnation)
 {
     if (out_acks) *out_acks = 0;
     if (!rmgr || nreplicas == 0) return TSDB_OK;
@@ -767,14 +768,17 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
     size_t payload_cap = 8 + (size_t)ncols * 2
                        + (size_t)nrows * fixed_per_row
                        + sym_bytes_total
-                       + 256;  /* table_name + headers + safety margin */
+                       + 256;  /* table_name + headers + incarnation + safety margin */
     uint8_t *payload = malloc(payload_cap);
     if (!payload) return TSDB_ERR_NOMEM;
 
-    int plen = tsdb_rpc_encode_write_batch(payload, (uint32_t)payload_cap,
-                                           table_name,
-                                           ncols, col_types,
-                                           nrows, col_data);
+    /* _ex stamps the durable incarnation as an 8-byte trailer so a receiver
+     * can reject a batch left over from a since-dropped incarnation of this
+     * name.  incarnation == 0 (UNKNOWN) emits the legacy byte layout. */
+    int plen = tsdb_rpc_encode_write_batch_ex(payload, (uint32_t)payload_cap,
+                                              table_name,
+                                              ncols, col_types,
+                                              nrows, col_data, incarnation);
     if (plen < 0) { free(payload); return TSDB_ERR_INTERNAL; }
 
     /* Cross-DC fan-out piggybacks on the intra-cluster payload so we
@@ -846,7 +850,7 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                               int partition_unit, int block_points,
                               int sort_by_tag_col,
                               const tsdb_node_id_t *nodes, int nnodes,
-                              int quorum)
+                              int quorum, uint64_t incarnation)
 {
     if (!rmgr || nnodes == 0) return TSDB_OK;
 
@@ -855,7 +859,7 @@ int tsdb_replica_sync_schema(tsdb_replica_mgr_t *rmgr,
                                       table_name, ncols, col_names,
                                       col_types, ts_col_idx,
                                       partition_unit, block_points,
-                                      sort_by_tag_col);
+                                      sort_by_tag_col, incarnation);
     if (plen < 0) return TSDB_ERR_INTERNAL;
 
     /* Move onto heap so fan-out can own it past this call's return. */
