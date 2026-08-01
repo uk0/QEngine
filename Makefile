@@ -349,6 +349,7 @@ TEST_SRCS += tests/test_ae_overcount.c
 # with a smaller buffer over-read the uninitialised tail.  Pins that *resp_len
 # is the copied length and that _ex raises a distinct truncation signal.
 TEST_SRCS += tests/test_rpc_resp_len_copied.c
+TEST_SRCS += tests/test_node_id_durable.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

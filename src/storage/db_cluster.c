@@ -342,18 +342,39 @@ static tsdb_node_id_t generate_node_id(const char *data_dir, const char *addr) {
     h *= 1099511628211ULL;
     if (h == 0) h = 1ULL;
 
-    /* Persist it atomically: write to tmp + rename.  Best-effort — if
-     * the write fails we just return the id and next restart will
-     * generate a fresh one (degrading gracefully to the old behaviour). */
+    /* Persist it atomically AND DURABLY: write to tmp, fsync the tmp so its
+     * bytes are on the device before the rename names it, rename, then fsync
+     * the directory so the rename itself survives a crash.
+     *
+     * The node id is the replication ISSUER — it is the identity the block
+     * ordinal's .ordmap keys on and the natural stream identity for write-batch
+     * dedup.  If it is not durable, a crash between the rename and the metadata
+     * flush loses the file, the next restart mints a FRESH id, and every batch
+     * this node already replicated looks like it came from a new sender: old
+     * blocks appear new, dedup state is defeated.  fflush+fclose+rename (the
+     * old path) guarantees none of that — fclose only flushes stdio into the
+     * page cache, and the rename's dirent is not durable until the dir is
+     * fsynced.  Still best-effort on the error paths: a write failure returns
+     * the in-memory id and degrades to the old regenerate-on-restart behaviour,
+     * which is no worse than before. */
     if (data_dir) {
         char tmp[4096];
         snprintf(tmp, sizeof(tmp), "%s/node_id.tmp", data_dir);
         FILE *f = fopen(tmp, "w");
         if (f) {
             fprintf(f, "%llu\n", (unsigned long long)h);
-            fflush(f);
-            fclose(f);
-            (void)rename(tmp, path);
+            int ok = (fflush(f) == 0) && !ferror(f);
+            if (ok) {
+                int fd = fileno(f);
+                if (fd >= 0 && fsync(fd) != 0) ok = 0;   /* bytes -> device */
+            }
+            if (fclose(f) != 0) ok = 0;
+            if (ok && rename(tmp, path) == 0) {
+                int dfd = open(data_dir, O_RDONLY | O_DIRECTORY);
+                if (dfd >= 0) { (void)fsync(dfd); close(dfd); }  /* rename -> durable */
+            } else {
+                (void)unlink(tmp);
+            }
         }
     }
     return h;
