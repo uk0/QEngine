@@ -459,13 +459,26 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
             : TSDB_ERR_CORRUPT;
         free(ts_synth);
         if (append_rc == TSDB_OK) {
+            /* On commit failure the rows are already in the memtable but not in
+             * the WAL; discard truncates them back out so the sender's fanout
+             * retry re-appends from a clean boundary rather than doubling the
+             * batch (which anti-entropy's count comparison would never correct).
+             * discard also free()s the batch, so this closes the commit-failure
+             * struct leak too. */
             if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+            else tsdb_batch_discard(batch);
         } else {
             tsdb_batch_discard(batch);
         }
     }
     tsdb_table_unlock_write(tbl);
     return write_ok;
+}
+
+int tsdb_rpc_apply_write_batch_for_test(tsdb_db_t *db,
+                                        const uint8_t *payload,
+                                        uint32_t payload_len) {
+    return rpc_apply_write_batch(db, payload, payload_len);
 }
 
 /* Shared body of the FED_QUERY / FED_QUERY_LOCAL receive paths: decode the
@@ -737,7 +750,11 @@ static void *connection_handler(void *arg) {
                                 : TSDB_ERR_CORRUPT;
                             free(ts_synth);
                             if (append_rc == TSDB_OK) {
+                                /* commit-failure discard: see the WRITE_BATCH
+                                 * receiver above — rolls the rows back so a
+                                 * fanout retry does not duplicate them. */
                                 if (tsdb_batch_commit(batch) == TSDB_OK) write_ok = 1;
+                                else tsdb_batch_discard(batch);
                             } else {
                                 tsdb_batch_discard(batch);
                             }

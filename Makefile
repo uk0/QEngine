@@ -350,6 +350,10 @@ TEST_SRCS += tests/test_ae_overcount.c
 # is the copied length and that _ex raises a distinct truncation signal.
 TEST_SRCS += tests/test_rpc_resp_len_copied.c
 TEST_SRCS += tests/test_node_id_durable.c
+# A batch whose WAL append (wal_only) or commit-flush (default) fails must not
+# leave its rows in the memtable: on failure they are truncated back to the
+# durable boundary so a receiver's retry re-appends once instead of doubling.
+TEST_SRCS += tests/test_batch_rollback.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.

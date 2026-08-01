@@ -316,6 +316,16 @@ int tsdb_rpc_encode_write_batch(uint8_t *buf, uint32_t cap,
                                 int ncols, const int *col_types,
                                 int nrows, const void **col_data);
 
+/* TEST-ONLY: run the receiver's WRITE_BATCH apply path (decode → open → begin →
+ * append → commit-or-discard) on an encoded payload, returning what the
+ * dispatch would reflect in its reply: 1 = ACK (landed), 0 = ERR.  This is the
+ * exact code a WRITE_BATCH RPC drives, minus the socket, so a test can assert
+ * that a commit failure rolls the batch back and a retry lands it exactly once
+ * rather than doubling it. */
+int tsdb_rpc_apply_write_batch_for_test(struct tsdb_db *db,
+                                        const uint8_t *payload,
+                                        uint32_t payload_len);
+
 /*
  * Decode WRITE_BATCH payload into column pointers.
  * Caller provides pre-allocated out_col_data[ncols] void* array.

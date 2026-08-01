@@ -419,6 +419,17 @@ int tsdb_wal_sync(tsdb_wal_t *w) {
 int tsdb_wal_append_durable(tsdb_wal_t *w, const void *rec, size_t n) {
     if (!w || w->fd < 0) return TSDB_ERR_INVAL;
 
+    /* Test-only deterministic fault injection.  When TSDB_WAL_FAIL_APPEND is set
+     * to a non-empty, non-"0" value, reject the durable append with an I/O error
+     * BEFORE writing any bytes, leaving the on-disk WAL a clean replayable prefix
+     * — exactly as a full disk / write error caught up front would.  This is the
+     * per-commit redo path (not per-row), so the single getenv is negligible and
+     * a no-op unless the knob is set; production never pays for it. */
+    {
+        const char *fe = getenv("TSDB_WAL_FAIL_APPEND");
+        if (fe && fe[0] && fe[0] != '0') return TSDB_ERR_IO;
+    }
+
     /* Pre-append length, so a fsync that fails after a COMPLETE writev can put
      * the log back.  tsdb_wal_append covers the short-write case itself. */
     struct stat st;

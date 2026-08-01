@@ -96,6 +96,14 @@ typedef struct tsdb_table_internal {
      *               nrows) into the next redo record. */
     uint64_t             commit_seq;
     size_t               mem_logged;
+    /* Monotonic per-table memtable-drain counter, bumped under compact_mtx
+     * every time flush_and_clear_locked drains the memtable to a partition (or
+     * drops it via SKIP_LOCAL).  A batch snapshots it at begin; if it differs at
+     * commit/discard time, a flush landed MID-batch, so part of the batch is
+     * already durable on disk and a memtable truncate cannot fully roll the
+     * batch back (the "straddle" case) — detected so we can fail loudly instead
+     * of silently pretending a clean rollback. */
+    uint64_t             flush_gen;
     /* idle-flush (tsdb_idle_flush_thread) state — touched only by that thread
      * under db->lock, except mem_has_local which the write path also sets.
      *  idle_prev_rows : memtable row count at the previous idle tick; a table
@@ -300,6 +308,13 @@ struct tsdb_batch {
     tsdb_table_internal_t *tbl;
     int                    in_row;
     int                    local_only; /* 1 = skip replication hook (replica recv) */
+    /* Rollback anchors captured at tsdb_batch_begin.  base_nrows is the
+     * memtable row count before this batch appended anything — the boundary a
+     * discard rolls back to (undoes only THIS batch, never rows a prior batch
+     * left behind).  begin_flush_gen snapshots tbl->flush_gen so commit/discard
+     * can tell whether a flush straddled the batch (see flush_gen). */
+    size_t                 base_nrows;
+    uint64_t               begin_flush_gen;
 };
 
 /* ---- Public per-table batch lock --------------------------------------- */
@@ -1945,6 +1960,14 @@ int tsdb_batch_begin(tsdb_table_t *tbl, tsdb_batch_t **out) {
     b->db     = ti->db;
     b->tbl    = ti;
     b->in_row = 0;
+    /* Snapshot the rollback anchors.  In wal_only mode this equals mem_logged
+     * (steady state: a prior commit advanced mem_logged to nrows, and nothing
+     * else mutates the memtable between commits); in default mode it is the
+     * post-flush count (0 in steady state).  begin_flush_gen is a same-thread
+     * read; only this table's writer bumps flush_gen, and it does so after
+     * begin, so the compare at commit/discard is well-defined. */
+    b->base_nrows      = tsdb_memtable_rows(ti->memtable);
+    b->begin_flush_gen = __atomic_load_n(&ti->flush_gen, __ATOMIC_RELAXED);
     *out = b;
     return TSDB_OK;
 }
@@ -2543,6 +2566,7 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         tsdb_memtable_clear(t->memtable);
         wal_truncate_if_safe(t);
         t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
+        __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
         t->mem_has_local = 0;     /* memtable drained: reset content provenance */
         t->mem_has_received = 0;
         tsdb_metric_inc("qengine_shard_local_skipped_total");
@@ -2593,6 +2617,7 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
         tsdb_memtable_clear(t->memtable);
         t->mem_logged = 0;        /* memtable drained: nothing logged yet */
+        __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
         t->mem_has_local = 0;     /* memtable drained: reset content provenance */
         t->mem_has_received = 0;
         /* Truncate WAL after the partition (with its checkpoint) is durably
@@ -2805,7 +2830,24 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
         pthread_mutex_lock(&t->compact_mtx);
         int rc = redo_log_locked(t);
         pthread_mutex_unlock(&t->compact_mtx);
-        if (rc != TSDB_OK) return rc;
+        if (rc != TSDB_OK) {
+            /* WAL append/fsync failed: the batch's rows stay in the memtable,
+             * un-acked.  We deliberately do NOT truncate here.  A standalone
+             * writer retains a refused wal_only batch and drains it on the next
+             * flush/close, so dropping it would turn "commit returned an error"
+             * into silent data loss (test_enospc phase 11 pins exactly this:
+             * the refused batch stays in RAM and a clean close drains it once).
+             *
+             * The cluster's duplication-on-retry is closed on the RECEIVER
+             * side instead: rpc_apply_write_batch calls tsdb_batch_discard on an
+             * ERR ack, and discard rolls these rows back (see below) so the
+             * fanout retry re-appends from a clean boundary rather than doubling
+             * them.  Callers that do NOT discard (standalone, influx, server)
+             * keep the retain-and-drain-on-close behaviour.  Same split as the
+             * default flush-on-commit path, which also retains on failure and
+             * rolls back only via discard. */
+            return rc;   /* caller either discards (-> rollback) or retains */
+        }
         free(b);
         return TSDB_OK;
     }
@@ -2838,11 +2880,33 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
 
 void tsdb_batch_discard(tsdb_batch_t *b) {
     if (!b) return;
-    /* Clear any partial row state in the memtable. */
+    tsdb_table_internal_t *t = b->tbl;
+    /* Clear any partial (uncommitted) row state first — this also releases the
+     * memtable lock that row_begin holds across an open row. */
     if (b->in_row) {
-        tsdb_memtable_row_abort(b->tbl->memtable);
+        tsdb_memtable_row_abort(t->memtable);
         b->in_row = 0;
     }
+    /* Roll back the rows this batch appended to the memtable but never made
+     * durable, so the receiver's "commit-failed -> discard" else-branch (and
+     * the append-failure discard) actually undo the batch instead of leaving
+     * its rows for the next flush to persist and, in the cluster, for a retry
+     * to duplicate.  Truncate to base_nrows — this batch's start boundary — so
+     * rows a PRIOR batch left in the memtable (e.g. a default-mode failed-flush
+     * batch that is intentionally retained, or earlier wal-durable rows) are
+     * preserved.  If a flush straddled this batch, everything now in the
+     * memtable is this batch's post-flush tail (the flush drained all prior
+     * rows to a partition), so drop it all and warn that the durable prefix
+     * cannot be rolled back.  Under compact_mtx, serialised against a flush. */
+    pthread_mutex_lock(&t->compact_mtx);
+    int straddled = (__atomic_load_n(&t->flush_gen, __ATOMIC_RELAXED)
+                         != b->begin_flush_gen);
+    (void)tsdb_memtable_truncate_to(t->memtable, straddled ? 0 : b->base_nrows);
+    pthread_mutex_unlock(&t->compact_mtx);
+    if (straddled)
+        fprintf(stderr,
+            "[db] table '%s': batch discarded AFTER a mid-batch flush; rows "
+            "already persisted to a partition cannot be rolled back\n", t->name);
     free(b);
 }
 

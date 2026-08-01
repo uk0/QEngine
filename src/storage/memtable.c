@@ -439,6 +439,57 @@ void tsdb_memtable_clear(tsdb_memtable_t *m) {
     pthread_mutex_unlock(&m->lock);
 }
 
+int tsdb_memtable_truncate_to(tsdb_memtable_t *m, size_t target_nrows) {
+    if (!m) return TSDB_ERR_INVAL;
+    pthread_mutex_lock(&m->lock);
+
+    /* Never truncate across an in-progress row — the caller must abort the
+     * partial row first (the batch commit/discard paths already do). */
+    if (m->in_row) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_ERR_INVAL;
+    }
+    if (target_nrows > m->nrows) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_ERR_INVAL;
+    }
+    if (target_nrows == m->nrows) {
+        pthread_mutex_unlock(&m->lock);
+        return TSDB_OK;
+    }
+
+    m->nrows = target_nrows;
+
+    /* Rebuild the ts skip-list + sortedness state from the surviving prefix.
+     * col_bufs are append-only, so rows [0, target_nrows) still hold their
+     * values; replaying their ts through sl_insert restores the level-0 order,
+     * the per-level tail pointers, top_level and the monotonic bookkeeping to
+     * exactly what the append path would have left after inserting only those
+     * rows.  We reset-and-rebuild rather than unlink-in-place because the node
+     * pool is index-addressed (node i == row i) and a partial unlink would
+     * leave dangling level pointers.  target_nrows <= old nrows <= pool_cap,
+     * so the re-insert cannot exhaust the pool. */
+    if (m->sl_ok) {
+        sl_reset(&m->sl);
+        m->last_ts    = INT64_MIN;
+        m->all_sorted = 1;
+        const int64_t *ts_buf = (const int64_t *)m->col_bufs[m->schema->ts_col_idx];
+        for (size_t i = 0; i < target_nrows; i++) {
+            int64_t ts = ts_buf[i];
+            if (sl_insert(&m->sl, ts, (uint32_t)i) < 0) {
+                m->sl_ok = 0;   /* pool exhausted (not expected) — fall back to
+                                 * insertion-order flush, same as elsewhere. */
+                break;
+            }
+            if (ts < m->last_ts) m->all_sorted = 0;
+            m->last_ts = ts;
+        }
+    }
+
+    pthread_mutex_unlock(&m->lock);
+    return TSDB_OK;
+}
+
 void tsdb_memtable_row_abort(tsdb_memtable_t *m) {
     if (!m) return;
     /* Caller may invoke this after row_begin's lock was acquired but

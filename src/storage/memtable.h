@@ -74,6 +74,26 @@ int  tsdb_memtable_is_full(tsdb_memtable_t *m);
 void tsdb_memtable_clear(tsdb_memtable_t *m);
 
 /*
+ * Truncate the memtable back to `target_nrows` committed rows, dropping the
+ * rows [target_nrows, nrows).  Used to roll back a batch whose commit failed
+ * (or was discarded) after its rows were already appended, so a retry re-
+ * appends from a clean boundary instead of doubling the rows.
+ *
+ * The per-column value buffers are append-only, so rows [0, target_nrows)
+ * keep their values untouched and the dropped tail is simply overwritten by
+ * the next append; only nrows and the ts skip-list / sortedness tracking are
+ * rebuilt from the surviving prefix.  A truncate that forgot the skip-list
+ * would corrupt the next sorted flush — hence the full rebuild here.
+ *
+ * Takes m->lock for the whole operation, so a concurrent
+ * tsdb_memtable_snapshot observes either the pre- or post-truncate state,
+ * never a half-truncated one.  Must NOT be called with a row in progress
+ * (returns TSDB_ERR_INVAL); target_nrows > current nrows also returns
+ * TSDB_ERR_INVAL.  target_nrows == nrows is a no-op (TSDB_OK).
+ */
+int tsdb_memtable_truncate_to(tsdb_memtable_t *m, size_t target_nrows);
+
+/*
  * Abort an in-progress row (reset in_row and col_set state).
  * Safe to call even when no row is in progress.
  */
