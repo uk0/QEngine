@@ -154,7 +154,36 @@ typedef enum {
                                          Clients map this to
                                          TSDB_ERR_UNSUPPORTED; a client too old
                                          to know the code sees "not ACK" and
-                                         fails, which is the safe direction. */
+                                         fails, which is the safe direction. */,
+
+    TSDB_RPC_LOCAL_TABLE_DIGEST = 25  /* anti-entropy row-range digest probe:
+                                         the sibling of LOCAL_TABLE_STATS that
+                                         detects an EQUAL-count/EQUAL-max_ts
+                                         middle hole.  The receiver answers, from
+                                         its OWN storage, a per-ts-bucket
+                                         (count, content-hash) vector so the
+                                         caller can compare CONTENT — not just
+                                         (count,max_ts) — and find a bucket two
+                                         replicas disagree on.
+
+                                         Request payload:
+                                           name_len u8
+                                           name     [name_len bytes]
+                                           span     i64 LE   (bucket width, ns)
+                                           ts_lo    i64 LE   (INT64_MIN = open)
+                                           ts_hi    i64 LE   (INT64_MAX = open)
+                                         Response: ACK, body =
+                                           nbuckets u32 LE
+                                           nbuckets × { bstart i64, count u64,
+                                                        hsum u64, hxor u64 } LE
+
+                                         Additive: a peer whose binary predates
+                                         this opcode falls through the dispatch
+                                         `default:` to ERR_UNSUPPORTED (mapped to
+                                         TSDB_ERR_UNSUPPORTED), and the caller
+                                         degrades to the count/max_ts-only
+                                         decision — a mixed-version cluster keeps
+                                         working. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
@@ -455,6 +484,29 @@ int tsdb_rpc_decode_catalog_qtl(const uint8_t *buf, uint32_t len,
  */
 int tsdb_rpc_local_table_stats(tsdb_rpc_conn_t *conn, const char *table_name,
                                uint64_t *out_count, int64_t *out_max_ts);
+
+/* ---- Anti-entropy row-range digest probe (TSDB_RPC_LOCAL_TABLE_DIGEST) ---- */
+
+/*
+ * Ask the peer behind `conn` for the per-ts-bucket digest of what IT ITSELF
+ * holds for `table_name` over [ts_lo, ts_hi], bucketed by `span` ns.  The raw
+ * ACK body (nbuckets u32 then nbuckets × 32 bytes — see the opcode comment) is
+ * copied into resp_buf and its length into *resp_len; decode it with
+ * tsdb_rowdigest_deserialize.  Kept as raw bytes here so rpc.h owes nothing to
+ * merkle.h's bucket type.
+ *
+ * Returns:
+ *   TSDB_OK              — body in resp_buf / *resp_len.
+ *   TSDB_ERR_UNSUPPORTED — the peer predates this opcode; degrade to
+ *                          count/max_ts only.
+ *   TSDB_ERR_OVERFLOW    — the peer's vector did not fit resp_cap; degrade.
+ *   TSDB_ERR_INTERNAL    — the peer knows the opcode and could not answer.
+ *   TSDB_ERR_IO / TSDB_ERR_INVAL — transport / argument failure.
+ */
+int tsdb_rpc_local_table_digest(tsdb_rpc_conn_t *conn, const char *table_name,
+                                int64_t span, int64_t ts_lo, int64_t ts_hi,
+                                uint8_t *resp_buf, uint32_t resp_cap,
+                                uint32_t *resp_len);
 
 #ifdef __cplusplus
 }

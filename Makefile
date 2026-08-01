@@ -90,6 +90,12 @@ CLUSTER_TEST_BINS := $(patsubst tests/%.c,build/test/%,$(CLUSTER_TEST_SRCS))
 # the diff stays readable.
 TEST_SRCS += tests/test_ae_peer_stats.c
 
+# Anti-entropy row-range digest (TSDB_RPC_LOCAL_TABLE_DIGEST): the middle-hole
+# net for two replicas that tie on (count,max_ts) but hold different interior
+# rows.  In-process digest/diff/merge plus a loopback RPC server for the wire
+# exchange and the old-peer degrade.  No forks, no sleeps, no cluster.
+TEST_SRCS += tests/test_ae_rowdigest.c
+
 # Anti-entropy pull-candidate ranking + bounded retry (single process, no
 # sockets): the peer probe can no longer be trusted to identify ONE usable
 # source, so the resync keeps every peer's answer and walks them best-first.

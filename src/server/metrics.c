@@ -186,6 +186,9 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_no_source_total",
       "Anti-entropy resyncs where every candidate peer reported rows but delivered none (empty peer echoing the cluster aggregate, or a peer that lost the table)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_antientropy_digest_mismatch_total",
+      "Row-range digest buckets where a peer at EQUAL (count,max_ts) disagreed on content — a silent middle hole the (count,max_ts) probe cannot see; the divergent ts range is pull-merged (never truncated)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_shard_local_skipped_total",
       "Memtable flushes a non-owner skipped because owners ACKed the rows (Phase β.2)", MT_COUNTER, { .c = { 0 } } },
 

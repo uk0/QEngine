@@ -6,6 +6,7 @@
 
 #include "rpc.h"
 #include "rawblock.h"
+#include "merkle.h"   /* row-range digest: LOCAL_TABLE_DIGEST wire (de)serialize */
 #include "../storage/db.h"
 #include "../storage/schema.h"
 #include "../storage/memtable.h"
@@ -883,6 +884,61 @@ static void *connection_handler(void *arg) {
             memcpy(body,     &cnt, 8);
             memcpy(body + 8, &mx,  8);
             send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, body, sizeof(body));
+            break;
+        }
+
+        case TSDB_RPC_LOCAL_TABLE_DIGEST: {
+            /* Anti-entropy row-range digest probe.  Answer, from THIS node's
+             * own storage, the per-ts-bucket (count, content-hash) vector for
+             * the named table over [ts_lo, ts_hi] at the requester's `span`.
+             * Same local-only discipline as LOCAL_TABLE_STATS above; the digest
+             * lets the caller see a middle hole two replicas share at equal
+             * (count, max_ts).  A malformed request, or a table with more
+             * buckets than the cap, replies ERR — the caller degrades to the
+             * count/max_ts-only decision. */
+            char stbl[128];
+            int64_t span = 0, ts_lo = 0, ts_hi = 0;
+            if (!db || msg.payload_len < 1) {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            uint32_t nlen = msg.payload[0];
+            /* name_len + name + span(8) + ts_lo(8) + ts_hi(8) */
+            if (nlen == 0 || nlen >= sizeof(stbl) ||
+                (uint32_t)1 + nlen + 24u > msg.payload_len) {
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            memcpy(stbl, msg.payload + 1, nlen);
+            stbl[nlen] = '\0';
+            memcpy(&span,  msg.payload + 1 + nlen,      8);
+            memcpy(&ts_lo, msg.payload + 1 + nlen + 8,  8);
+            memcpy(&ts_hi, msg.payload + 1 + nlen + 16, 8);
+
+            tsdb_rowdigest_bucket_t *v = NULL;
+            size_t nb = 0;
+            if (tsdb_cluster_local_table_digest(db, stbl, span, ts_lo, ts_hi,
+                                                &v, &nb) != TSDB_OK) {
+                free(v);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            size_t cap = 4 + nb * TSDB_ROWDIGEST_REC_SIZE;
+            uint8_t *rbody = malloc(cap ? cap : 1);
+            if (!rbody) {
+                free(v);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            int wlen = tsdb_rowdigest_serialize(v, nb, rbody, cap);
+            free(v);
+            if (wlen <= 0) {
+                free(rbody);
+                send_reply(fd, tls, TSDB_RPC_ERR, msg.req_id, NULL, 0);
+                break;
+            }
+            send_reply(fd, tls, TSDB_RPC_ACK, msg.req_id, rbody, (uint32_t)wlen);
+            free(rbody);
             break;
         }
 
@@ -1866,6 +1922,35 @@ int tsdb_rpc_local_table_stats(tsdb_rpc_conn_t *conn, const char *table_name,
     memcpy(&mx,  resp + 8, 8);
     *out_count  = cnt;
     *out_max_ts = mx;
+    return TSDB_OK;
+}
+
+int tsdb_rpc_local_table_digest(tsdb_rpc_conn_t *conn, const char *table_name,
+                                int64_t span, int64_t ts_lo, int64_t ts_hi,
+                                uint8_t *resp_buf, uint32_t resp_cap,
+                                uint32_t *resp_len)
+{
+    if (!conn || !table_name || !resp_buf || !resp_len) return TSDB_ERR_INVAL;
+    size_t nlen = strlen(table_name);
+    if (nlen == 0 || nlen > 255) return TSDB_ERR_INVAL;
+
+    uint8_t req[256 + 24];
+    req[0] = (uint8_t)nlen;
+    memcpy(req + 1, table_name, nlen);
+    memcpy(req + 1 + nlen,      &span,  8);
+    memcpy(req + 1 + nlen + 8,  &ts_lo, 8);
+    memcpy(req + 1 + nlen + 16, &ts_hi, 8);
+    uint32_t reqlen = (uint32_t)(1 + nlen + 24);
+
+    /* _ex to learn if the vector overflowed resp_cap: a clamped body would
+     * deserialize into a SHORT digest and read as a false divergence, so a
+     * truncation must degrade (TSDB_ERR_OVERFLOW), never be parsed. */
+    int truncated = 0;
+    int rc = tsdb_rpc_call_recv_ex(conn, TSDB_RPC_LOCAL_TABLE_DIGEST,
+                                   req, reqlen, resp_buf, resp_cap,
+                                   resp_len, &truncated);
+    if (rc != TSDB_OK) return rc;      /* UNSUPPORTED (old peer) / INTERNAL / IO */
+    if (truncated) return TSDB_ERR_OVERFLOW;
     return TSDB_OK;
 }
 
