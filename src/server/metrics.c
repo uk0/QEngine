@@ -168,6 +168,9 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_recv_ok_total",
       "WRITE_BATCH RPCs received where the local batch_commit landed rows", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_replicate_incarnation_reject_total",
+      "WRITE_BATCH RPCs rejected because the batch's table incarnation did not match the receiver's — a stale batch for a DROP+recreated table, refused rather than applied to the wrong incarnation", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_bytes_raw_total",
       "Replication WRITE_BATCH payload bytes BEFORE lzlite compression", MT_COUNTER, { .c = { 0 } } },
 
@@ -293,6 +296,32 @@ static metric_t g_metrics[] = {
 
     { "qengine_subscriptions_active",
       "Number of active SUBSCRIBE sessions", MT_GAUGE, { .g = { 0 } } },
+
+    /* --- counters that code increments but the registry had omitted, so
+     *     tsdb_metric_inc was a silent no-op and they never appeared on
+     *     /metrics.  Caught in bulk by test_metrics' registration scan. --- */
+    { "qengine_antientropy_overcount_persistent_total",
+      "Tables where this node held MORE rows than the authority for N consecutive sweeps at equal max_ts — a probable duplicate the count comparison cannot auto-repair", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_antientropy_partition_backfills_total",
+      "Partitions rebuilt from a peer by anti-entropy", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_antientropy_truncate_averted_total",
+      "Destructive full-pull truncates aborted because rows had committed since the empty measurement — locally-committed rows preserved", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_auth_denied_total",
+      "Authentication attempts denied (bad credentials or missing grant)", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_auth_logins_total",
+      "Successful authentications", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_catalog_dump_truncated_total",
+      "CATALOG_DUMP replies that exceeded the receive buffer and were truncated", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_datadir_degraded_total",
+      "Times a configured data directory was adopted DEGRADED (failed its health probe) rather than dropped", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_rawblock_ts_deferred_total",
+      "Raw-block ts publishes deferred because a sibling non-ts column had not landed yet", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_wal_recovered_records_total",
+      "WAL redo records replayed on open", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_wal_replay_aborted_benign_total",
+      "WAL replays aborted for a benign reason (a partition checkpoint already covered the tail)", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_wal_replay_incomplete_total",
+      "WAL replays that stopped at a torn or unreadable record, freezing the table until TRUNCATE", MT_COUNTER, { .c = { 0 } } },
 
     /* --- histograms --- */
     { "qengine_query_duration_ms",

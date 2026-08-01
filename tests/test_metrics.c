@@ -245,6 +245,51 @@ static void test_concurrency(void) {
 
 /* ---- Main ------------------------------------------------------------------ */
 
+/* ---- Test 6: every metric name that code increments is REGISTERED ---------
+ *
+ * tsdb_metric_inc/add/set on a name not in g_metrics[] is a SILENT no-op, so a
+ * counter added to the code but forgotten in the registry reads on /metrics
+ * exactly like a bug that never fires — which has bitten this project more than
+ * once (the protocol-hardening and table-incarnation batches both shipped an
+ * unregistered counter).  This scans the source tree for every metric-name
+ * literal passed to inc/add/set and asserts each appears in the rendered
+ * output, so a future omission fails the gate instead of vanishing.
+ *
+ * It shells out to grep — the alternative is hard-coding the list here, which
+ * just moves the drift.  Run from the repo root (the gate does). */
+static void test_all_inc_names_registered(void) {
+    size_t len = 0;
+    char *rendered = tsdb_metrics_render(&len);
+    CHECK(rendered != NULL, "render for registration scan");
+    if (!rendered) return;
+
+    /* Pull every unique "qengine_..."-style name handed to a metric mutator. */
+    FILE *p = popen(
+        "grep -rhoE 'tsdb_metric_(inc|add|set|observe)\\(\"[a-z0-9_]+\"' src 2>/dev/null "
+        "| grep -oE '\"[a-z0-9_]+\"' | tr -d '\"' | sort -u", "r");
+    if (!p) { CHECK(0, "popen grep for metric names"); free(rendered); return; }
+
+    char name[256];
+    int scanned = 0, missing = 0;
+    while (fgets(name, sizeof(name), p)) {
+        size_t n = strlen(name);
+        while (n && (name[n-1] == '\n' || name[n-1] == '\r')) name[--n] = 0;
+        if (n == 0) continue;
+        scanned++;
+        if (!strstr(rendered, name)) {
+            fprintf(stderr, "  UNREGISTERED metric: %s (tsdb_metric_inc'd in "
+                    "src/ but absent from g_metrics[] — a silent no-op)\n", name);
+            missing++;
+        }
+    }
+    pclose(p);
+    free(rendered);
+
+    printf("  scanned %d metric names, %d unregistered\n", scanned, missing);
+    CHECK(scanned > 0, "found metric-name literals to check (grep ran)");
+    CHECK(missing == 0, "every incremented metric name is registered in g_metrics[]");
+}
+
 int main(void) {
     printf("=== test_metrics ===\n");
     tsdb_metrics_init();
@@ -254,6 +299,7 @@ int main(void) {
     test_histogram();
     test_render_format();
     test_concurrency();
+    test_all_inc_names_registered();
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;
