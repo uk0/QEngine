@@ -108,6 +108,20 @@ static __thread int g_inside_stable_child = 0;
  * every binary that runs queries. */
 __thread int tsdb_g_scatter_local_mode = 0;
 
+/* Physical-local read (anti-entropy digest).  A strict superset of scatter-local:
+ * while non-zero, the childless-data-bearing SELF-child (the super-table's own
+ * same-named storage) is covered by PHYSICAL presence, NOT hash-ownership.
+ *
+ * scatter-local alone covers the self-child only when this node is its assigned
+ * owner — correct for the cluster-wide count coordinator (each owned child
+ * counted once, no double count), but wrong for the per-node row digest: a
+ * replica that physically HOLDS divergent rows it does not OWN would read empty
+ * and the digest could not fingerprint the very rows it exists to reconcile.
+ * Only the digest path (tsdb_cluster_local_table_digest) sets this; the count
+ * coordinator never does, so aggregation counts are unaffected.  Requires
+ * scatter-local to also be set (it suppresses the cluster re-scatter). */
+__thread int tsdb_g_ae_physical_local = 0;
+
 /* Raw text of the QTL currently executing in tsdb_query (thread-local,
  * save/restore across nested queries).  The stable-aggregation coordinator
  * needs it to build the rewritten partial query it ships to peers — the
@@ -6043,8 +6057,18 @@ static int exec_stable_select(tsdb_db_t *db, qast_query_t *q,
             /* Scatter-local mode (task #175): cover only the children whose
              * primary alive owner is this node, so the coordinator's merge
              * counts each child exactly once cluster-wide.  All children
-             * qualify when the cluster is inactive. */
+             * qualify when the cluster is inactive.
+             *
+             * Physical-local exemption (anti-entropy digest): the SELF-child —
+             * a childless-data-bearing super-table's own same-named storage
+             * (ct->name == ct->stable_name) — is covered by PHYSICAL presence,
+             * not ownership, so a replica that holds divergent rows it does not
+             * own still reports them.  Only the digest arms this; the count
+             * coordinator leaves it clear, so cluster-wide counts stay
+             * once-per-owner. */
             if (tsdb_g_scatter_local_mode &&
+                !(tsdb_g_ae_physical_local &&
+                  strcmp(ct->name, ct->stable_name) == 0) &&
                 !tsdb_cluster_child_assigned_to_self(db, ct->name))
                 continue;
             matched[nmatched++] = ci;

@@ -1923,17 +1923,23 @@ int tsdb_cluster_local_table_digest(tsdb_db_t *db, const char *table_name,
                  "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
                  table_name, (long long)ts_lo, (long long)ts_hi);
 
-    /* Local-only read.  A mirrored plain table is a childless data-bearing
+    /* Physical-local read.  A mirrored plain table is a childless data-bearing
      * super-table, so a bare SELECT can scatter and gather the CLUSTER-WIDE
      * rows — the digest would then describe everyone's data, not this node's,
-     * and two divergent replicas would look identical.  Scatter-local mode is
-     * exactly the guard the FED_QUERY_LOCAL handler and the stable-agg
-     * coordinator's own local partial leg use. */
+     * and two divergent replicas would look identical.  Scatter-local alone is
+     * not enough either: it covers the self-child only when this node OWNS it by
+     * hash, so a replica holding rows it does not own reads EMPTY and the digest
+     * cannot fingerprint the divergence it exists to heal.  tsdb_g_ae_physical_local
+     * lifts the self-child's ownership gate to physical presence; scatter-local
+     * still suppresses the cluster re-scatter.  See exec.c for the rationale. */
     tsdb_result_t *res = NULL;
-    int prev = tsdb_g_scatter_local_mode;
+    int prev  = tsdb_g_scatter_local_mode;
+    int pprev = tsdb_g_ae_physical_local;
     tsdb_g_scatter_local_mode = 1;
+    tsdb_g_ae_physical_local  = 1;   /* self-child by physical presence, not ownership */
     int rc = tsdb_query(db, qtl, &res);
     tsdb_g_scatter_local_mode = prev;
+    tsdb_g_ae_physical_local  = pprev;
     if (rc != TSDB_OK || !res) {
         if (res) tsdb_result_free(res);
         return rc == TSDB_OK ? TSDB_ERR_INTERNAL : rc;
