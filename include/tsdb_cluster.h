@@ -186,6 +186,16 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
                                          uint64_t best_count,
                                          int64_t  best_max_ts);
 
+/* Is node id `x` in the `n`-element set — the co-replica membership test that
+ * confines the row-digest to a table's replica set (exposed for unit testing). */
+int tsdb_ae_node_in_set(uint64_t x, const uint64_t *set, int n);
+
+/* Hard anti-runaway pull budget for the row-digest: the rows a single sweep may
+ * pull for a table, = max(0, peer_hi_count - local_before).  Anti-entropy only
+ * copies rows IN, so catch-up can never raise local above the fullest peer;
+ * crossing that line means the merge is duplicating.  Exposed for unit testing. */
+uint64_t tsdb_ae_pull_budget(uint64_t local_before, uint64_t peer_hi_count);
+
 /* Rows THIS node holds for `table_name`, and the newest ts among them
  * (exposed for unit testing).
  *
@@ -269,6 +279,13 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
  *   - tsdb_cluster_maybe_forward_select is inert (a scattered partial
  *     must read local data, never bounce to another node). */
 extern __thread int tsdb_g_scatter_local_mode;
+
+/* Physical-local read for the anti-entropy row digest.  Superset of scatter-
+ * local: the childless-data-bearing self-child is covered by physical presence
+ * rather than hash-ownership, so a replica digests the rows it HOLDS, not only
+ * the ones it OWNS.  Set only by tsdb_cluster_local_table_digest, alongside
+ * scatter-local; see the definition in query/exec.c for the full rationale. */
+extern __thread int tsdb_g_ae_physical_local;
 
 /* Scatter-read child assignment: 1 when `child_name`'s primary alive
  * hashring owner is this node — walks tsdb_cluster_route() preference

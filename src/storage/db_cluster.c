@@ -1215,18 +1215,40 @@ static int64_t ae_table_span(tsdb_db_t *db, const char *table) {
     return span;
 }
 
+int tsdb_ae_node_in_set(uint64_t x, const uint64_t *set, int n) {
+    for (int i = 0; i < n; i++) if (set[i] == x) return 1;
+    return 0;
+}
+
+/* Anti-runaway pull budget for the row-digest (the hard bound the reverted
+ * digest lacked).  Anti-entropy only ever COPIES rows IN from peers, so a sweep
+ * that is catching this node up cannot legitimately raise its count for a table
+ * ABOVE the fullest peer's count — you cannot copy in more rows than the source
+ * holds.  The budget is therefore (peer_hi_count - local_before), clamped at 0;
+ * once the digest has merged that many rows it STOPS, so a merge that would
+ * duplicate rows (the 257M-row runaway) is bounded to at most one peer's worth
+ * instead of exploding.  local_before already >= peer_hi (our own newer writes)
+ * → budget 0 → the digest verifies (and may find NOTHING to pull) but can never
+ * add a row, which is exactly right: a node ahead of every peer is not behind. */
+uint64_t tsdb_ae_pull_budget(uint64_t local_before, uint64_t peer_hi_count) {
+    return peer_hi_count > local_before ? peer_hi_count - local_before : 0;
+}
+
 /* Row-range digest verification for the tables the (count,max_ts) probe cannot
- * distinguish: those where a peer answered EQUAL count AND EQUAL max_ts.  For
- * each such peer, exchange the per-bucket digest, and for every bucket the two
- * disagree on, content-dedup merge the peer's copy of that bucket (never
- * truncate — see pull_bucket_merge).  Returns total rows merged (>= 0).
+ * distinguish.  CONFINED to co-replicas by the caller (eqpeers holds only
+ * replica-set members) and hard-bounded by `budget` rows total this sweep, so a
+ * merge can never runaway past one peer's worth even if the confinement is
+ * wrong.  For each peer, exchange the per-bucket digest, and for every bucket
+ * they disagree on, content-dedup merge the peer's copy (never truncate — see
+ * pull_bucket_merge).  Returns total rows merged (>= 0).
  *
  * A converged table (digests match) costs one local digest + one digest RPC per
  * equal peer and merges nothing.  The local digest is recomputed only after an
  * actual merge, so an already-in-sync table never rescans its own rows twice. */
 static int ae_digest_verify_and_merge(tsdb_db_t *db, tsdb_cluster_t *c,
                                       const char *table, int64_t span,
-                                      const tsdb_node_id_t *eqpeers, int neq)
+                                      const tsdb_node_id_t *eqpeers, int neq,
+                                      uint64_t budget)
 {
     tsdb_rowdigest_bucket_t *lv = NULL;
     size_t ln = 0;
@@ -1269,6 +1291,19 @@ static int ae_digest_verify_and_merge(tsdb_db_t *db, tsdb_cluster_t *c,
                             ? ndiv : (sizeof(divs) / sizeof(divs[0]));
         int merged_here = 0;
         for (size_t di = 0; di < nmerge; di++) {
+            /* Hard anti-runaway bound: never pull past one peer's worth in a
+             * sweep.  A correct heal converges WELL within this; tripping it
+             * means the merge is duplicating (the reverted runaway), so stop and
+             * make it loud rather than pull 257M rows. */
+            if ((uint64_t)total_merged >= budget) {
+                tsdb_metric_inc("qengine_antientropy_runaway_averted_total");
+                fprintf(stderr,
+                        "[anti-entropy] %s: row-digest hit the pull budget "
+                        "(%llu rows, fullest peer's worth) — stopping to avoid a "
+                        "runaway merge; a legitimate heal never reaches this\n",
+                        table, (unsigned long long)budget);
+                goto done;
+            }
             tsdb_metric_inc("qengine_antientropy_digest_mismatch_total");
             int m = pull_bucket_merge(db, c, eqpeers[pi], table,
                                       divs[di], divs[di] + span - 1);
@@ -1288,6 +1323,7 @@ static int ae_digest_verify_and_merge(tsdb_db_t *db, tsdb_cluster_t *c,
         }
     }
 
+done:
     free(rbuf);
     free(lv);
     return total_merged;
@@ -1923,17 +1959,23 @@ int tsdb_cluster_local_table_digest(tsdb_db_t *db, const char *table_name,
                  "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
                  table_name, (long long)ts_lo, (long long)ts_hi);
 
-    /* Local-only read.  A mirrored plain table is a childless data-bearing
+    /* Physical-local read.  A mirrored plain table is a childless data-bearing
      * super-table, so a bare SELECT can scatter and gather the CLUSTER-WIDE
      * rows — the digest would then describe everyone's data, not this node's,
-     * and two divergent replicas would look identical.  Scatter-local mode is
-     * exactly the guard the FED_QUERY_LOCAL handler and the stable-agg
-     * coordinator's own local partial leg use. */
+     * and two divergent replicas would look identical.  Scatter-local alone is
+     * not enough either: it covers the self-child only when this node OWNS it by
+     * hash, so a replica holding rows it does not own reads EMPTY and the digest
+     * cannot fingerprint the divergence it exists to heal.  tsdb_g_ae_physical_local
+     * lifts the self-child's ownership gate to physical presence; scatter-local
+     * still suppresses the cluster re-scatter.  See exec.c for the rationale. */
     tsdb_result_t *res = NULL;
-    int prev = tsdb_g_scatter_local_mode;
+    int prev  = tsdb_g_scatter_local_mode;
+    int pprev = tsdb_g_ae_physical_local;
     tsdb_g_scatter_local_mode = 1;
+    tsdb_g_ae_physical_local  = 1;   /* self-child by physical presence, not ownership */
     int rc = tsdb_query(db, qtl, &res);
     tsdb_g_scatter_local_mode = prev;
+    tsdb_g_ae_physical_local  = pprev;
     if (rc != TSDB_OK || !res) {
         if (res) tsdb_result_free(res);
         return rc == TSDB_OK ? TSDB_ERR_INTERNAL : rc;
@@ -2353,6 +2395,35 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
     tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
     int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
 
+    /* Shard-aware confinement for the row-digest (the 2026-08-02 runaway fix).
+     * A childless-data-bearing table is owned by a FIXED replica set
+     * (tsdb_cluster_route); every one of its rows belongs to that set.  A node
+     * NOT in the set only ever holds TRANSIENT non-owner write copies pending
+     * SKIP_LOCAL — its physical storage is not authoritative.  The reverted
+     * digest let such a node fingerprint its full physical storage, compare it
+     * to a co-replica's, and merge toward the cross-node UNION; with
+     * SHARD_REPLICA_N < node-count that cross-contaminates shards and
+     * re-replicates without bound (a 3000-row table reached 15000 and 257M rows
+     * were pulled before it was reverted).  The digest is therefore confined to
+     * run ONLY between CO-REPLICAS: this node must be in the set, and only peers
+     * in the set are digest-verified.  route-fail / standalone (rsn==0) keeps the
+     * old whole-cluster behaviour, which is correct when nothing is sharded. */
+    tsdb_node_id_t rset[TSDB_CLUSTER_MAX_NODES];
+    int rsn = 0;
+    int self_is_replica = 1;
+    {
+        int rn = shard_replica_n_cached();
+        if (rn > 0) {
+            rsn = tsdb_cluster_route(c, table_name, "", rn, rset);
+            if (rsn > 0) {
+                tsdb_node_id_t self = tsdb_cluster_local_id(c);
+                self_is_replica = 0;
+                for (int i = 0; i < rsn; i++)
+                    if (rset[i] == self) { self_is_replica = 1; break; }
+            }
+        }
+    }
+
     tsdb_ae_cand_t cand[TSDB_CLUSTER_MAX_NODES];
     int ncand = 0;
     /* Peers that answered EQUAL count AND EQUAL max_ts — the (count,max_ts)
@@ -2376,10 +2447,33 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         if (pc   > peer_hi_count) peer_hi_count = pc;
         if (pmax > peer_hi_ts)    peer_hi_ts    = pmax;
 
-        /* Row-range digest candidate: an EXACT (count,max_ts) tie is the middle-
-         * hole blind spot.  Captured before the admission test below drops it. */
-        if (pc == local_count && pmax == local_max_ts &&
-            neq < TSDB_CLUSTER_MAX_NODES)
+        /* Row-range digest candidate.  The original case is an EXACT
+         * (count,max_ts) tie — the middle-hole blind spot: two replicas each
+         * missing a different interior batch tie here and the count/max_ts probe
+         * cannot see it.
+         *
+         * WIDENED to also verify a peer whose count DIFFERS at an EQUAL max_ts.
+         * That is the shape a replication drop leaves — a peer holds rows we
+         * lack (or vice versa) with the same newest timestamp — and the old
+         * path handles it badly: if the peer has MORE it becomes a `cand` and a
+         * `SELECT ts > local_max_ts` pull brings back nothing (max_ts already
+         * matches, the gap is interior); if the peer has FEWER, nothing looks at
+         * it at all.  Both leave a permanent divergence (observed live on the
+         * cluster: stress_t/phole stuck at unequal counts, never healing).  The
+         * digest diff is per-bucket and count-agnostic, and the merge only ever
+         * inserts the rows a bucket lacks (content-dedup, never truncates), so
+         * running it here pulls-and-merges toward the union in BOTH directions
+         * and is safe for a legitimately-ahead replica.
+         *
+         * Still gated on EQUAL max_ts: a peer with a strictly newer max_ts is
+         * genuinely ahead in time and the cheap TAIL_PULL already covers it —
+         * no need to digest the whole table for a tail.  A peer strictly behind
+         * in time is behind, not diverged, and its own sweep pulls from us. */
+        /* CO-REPLICA confinement: only a peer in this table's replica set is
+         * digest-verified.  A peer outside the set holds at most transient
+         * non-owner copies; merging against it crosses shards and runs away. */
+        if (pmax == local_max_ts && neq < TSDB_CLUSTER_MAX_NODES &&
+            (rsn == 0 || tsdb_ae_node_in_set((uint64_t)peers[i], rset, rsn)))
             eqpeers[neq++] = peers[i];
 
         /* Admission is EXACTLY the predicate the single-`best` loop used: that
@@ -2474,29 +2568,35 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         }
     }
 
-    /* Row-range digest verify — the middle-hole safety net.  Only the peers
-     * that tied us on (count,max_ts) are checked, only when no pull moved us
-     * this sweep, only on a non-empty table, throttled to one sweep in
-     * AE_DIGEST_SWEEP_EVERY, and disable-able with TSDB_AE_ROW_DIGEST=0.  A
-     * mismatch names the divergent ts bucket(s) and pull-merges the peer's copy
-     * of that range (content-dedup; never a truncate) — see pull_bucket_merge. */
-    if (neq > 0 && local_count > 0) {
+    /* Row-range digest verify — the divergence safety net for CO-REPLICAS.
+     * Checks every co-replica peer at an EQUAL max_ts (whether or not its count
+     * matches ours): an exact tie is a middle hole, an unequal count at equal
+     * max_ts is a replication drop the count/max_ts probe heals badly or not at
+     * all.  Gated on: self is in the table's replica set (self_is_replica — a
+     * non-replica holds only transient copies and must never merge), a non-empty
+     * table, one sweep in AE_DIGEST_SWEEP_EVERY, and a hard per-sweep pull budget
+     * of one peer's worth.  OFF by default after the 2026-08-02 runaway — set
+     * TSDB_AE_ROW_DIGEST=1 to opt in.  A mismatch names the divergent ts
+     * bucket(s) and pull-merges the peer's copy (content-dedup; never a
+     * truncate), so co-replicas converge to the union — see pull_bucket_merge. */
+    if (self_is_replica && neq > 0 && local_count > 0) {
         const char *de = getenv("TSDB_AE_ROW_DIGEST");
-        int enabled = !(de && strcmp(de, "0") == 0);
+        int enabled = de && strcmp(de, "1") == 0;   /* default OFF; opt-in only */
         int due     = (g_ae_sweep_no % AE_DIGEST_SWEEP_EVERY) == 1;
         if (enabled && due) {
             int64_t span = ae_table_span(db, table_name);
             if (span > 0) {
+                uint64_t budget = tsdb_ae_pull_budget(local_count, peer_hi_count);
                 int merged = ae_digest_verify_and_merge(db, c, table_name, span,
-                                                        eqpeers, neq);
+                                                        eqpeers, neq, budget);
                 if (merged > 0) {
                     if (out_rows_pulled) *out_rows_pulled += merged;
                     tsdb_metric_add("qengine_antientropy_rows_pulled_total",
                                     (uint64_t)merged);
                     fprintf(stderr,
                             "[anti-entropy] %s: row-range digest merged %d row(s) "
-                            "from an equal-(count,max_ts) peer — a middle hole the "
-                            "count/max_ts probe cannot see\n",
+                            "from a peer at equal max_ts — a divergence the "
+                            "count/max_ts probe heals badly or not at all\n",
                             table_name, merged);
                 }
             }

@@ -189,6 +189,9 @@ static metric_t g_metrics[] = {
     { "qengine_antientropy_digest_mismatch_total",
       "Row-range digest buckets where a peer at EQUAL (count,max_ts) disagreed on content — a silent middle hole the (count,max_ts) probe cannot see; the divergent ts range is pull-merged (never truncated)", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_antientropy_runaway_averted_total",
+      "Row-digest merges stopped because they hit the per-sweep pull budget (one fullest-peer's worth) — a legitimate heal never reaches this, so a nonzero value means a merge was duplicating rows and was bounded instead of running away", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_shard_local_skipped_total",
       "Memtable flushes a non-owner skipped because owners ACKed the rows (Phase β.2)", MT_COUNTER, { .c = { 0 } } },
 

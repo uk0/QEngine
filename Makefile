@@ -96,6 +96,11 @@ TEST_SRCS += tests/test_ae_peer_stats.c
 # exchange and the old-peer degrade.  No forks, no sleeps, no cluster.
 TEST_SRCS += tests/test_ae_rowdigest.c
 
+# The two pure guards that confine the anti-entropy row-digest to a table's
+# replica set and hard-bound its per-sweep pull, so it cannot cross-shard-merge
+# and run away (the 2026-08-02 257M-row incident) when re-enabled.
+TEST_SRCS += tests/test_ae_shard_safety.c
+
 # Anti-entropy pull-candidate ranking + bounded retry (single process, no
 # sockets): the peer probe can no longer be trusted to identify ONE usable
 # source, so the resync keeps every peer's answer and walks them best-first.
