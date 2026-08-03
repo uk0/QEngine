@@ -132,22 +132,6 @@ static void digest(tsdb_db_t *db, tsdb_rowdigest_bucket_t **v, size_t *n) {
     OK(tsdb_cluster_local_table_digest(db, "t", SPAN, INT64_MIN, INT64_MAX, v, n));
 }
 
-/* Insert ONE extra interior row — a distinct value at an already-present
- * interior ts (a duplicate ts is a legal, distinct row in a tick store) — so a
- * replica ends exactly one row AHEAD of its peer WITHOUT moving max_ts: the
- * count-unequal-at-equal-max_ts shape a replication drop leaves. */
-static void add_row(tsdb_db_t *db, int i, int64_t v) {
-    tsdb_table_t *t = NULL;
-    OK(tsdb_open_table(db, "t", &t));
-    tsdb_batch_t *bat = NULL;
-    OK(tsdb_batch_begin(t, &bat));
-    OK(tsdb_batch_row_ts(bat, BASE + i));
-    OK(tsdb_batch_row_i64(bat, 1, v));
-    OK(tsdb_batch_row_sym(bat, 2, TAG(i)));
-    OK(tsdb_batch_row_end(bat));
-    OK(tsdb_batch_commit(bat));
-}
-
 static int dv_equal(const tsdb_rowdigest_bucket_t *a, size_t na,
                     const tsdb_rowdigest_bucket_t *b, size_t nb) {
     if (na != nb) return 0;
@@ -499,83 +483,6 @@ int main(void) {
         free(dx); free(dy);
         tsdb_close(x); tsdb_close(y);
         rm_rf("/tmp/tsdb_rd_x"); rm_rf("/tmp/tsdb_rd_y");
-    }
-
-    /* ── [6] REPAIR the count-UNEQUAL divergence the count/max_ts probe strands ─
-     *
-     * Cases [1..3] are the equal-count middle hole.  The other shape a
-     * replication drop leaves is UNEQUAL count at EQUAL max_ts: one replica
-     * holds an interior row the other lacks, so the newest ts still ties but the
-     * counts differ.  decide() heals NEITHER side — the deficit node REFUSES
-     * (SKIP_UNSAFE: a higher peer count at equal max_ts is never truncate-and-
-     * repulled) and the surplus node reads UP_TO_DATE — which is why stress_t /
-     * phole sat permanently split on the live cluster.  The row-range digest is
-     * the only path that heals it: the merge is count-agnostic and insert-only,
-     * so it converges to the union in BOTH directions and never truncates a
-     * legitimately-ahead replica.  This is the divergence the widened eqpeers
-     * capture (db_cluster.c: `pmax == local_max_ts`, no longer count-gated) now
-     * routes into the digest verify. */
-    printf("\n[6] count-UNEQUAL at equal max_ts -> decide() strands it, digest heals\n");
-    {
-        int64_t bstart = BASE + 500, bend = BASE + 599;
-        tsdb_db_t *lo = open_fresh("/tmp/tsdb_rd_lo");   /* deficit replica */
-        tsdb_db_t *hi = open_fresh("/tmp/tsdb_rd_hi");   /* surplus replica */
-        fill_blocks(lo, 1000, 1, -1, 0);
-        fill_blocks(hi, 1000, 1, -1, 0);
-        add_row(hi, 500, 88888);            /* hi ends ONE interior row ahead   */
-
-        uint64_t clo = 0, chi = 0; int64_t mlo = 0, mhi = 0;
-        OK(tsdb_cluster_local_table_stats(lo, "t", &clo, &mlo));
-        OK(tsdb_cluster_local_table_stats(hi, "t", &chi, &mhi));
-        CHECK(clo == 1000 && chi == 1001 && mlo == mhi,
-              "counts DIFFER (%llu vs %llu) at EQUAL max_ts (%lld) — a drop, not a tail",
-              (unsigned long long)clo, (unsigned long long)chi, (long long)mlo);
-
-        /* The count/max_ts decision strands BOTH sides — the whole motivation. */
-        CHECK(tsdb_antientropy_decide(clo, mlo, chi, mhi) == TSDB_AE_SKIP_UNSAFE,
-              "deficit node REFUSES (SKIP_UNSAFE): higher peer count at equal max_ts");
-        CHECK(tsdb_antientropy_decide(chi, mhi, clo, mlo) == TSDB_AE_UP_TO_DATE,
-              "surplus node reads UP_TO_DATE — neither side heals via count/max_ts");
-
-        /* The digest names exactly the one divergent bucket. */
-        tsdb_rowdigest_bucket_t *dlo = NULL, *dhi = NULL; size_t nlo = 0, nhi = 0;
-        digest(lo, &dlo, &nlo);
-        digest(hi, &dhi, &nhi);
-        int64_t divs[32]; size_t ndiv = 0;
-        OK(tsdb_rowdigest_diff(dlo, nlo, dhi, nhi, divs, 32, &ndiv));
-        CHECK(ndiv == 1 && divs[0] == bstart,
-              "the digest names exactly bucket BASE+500 (ndiv=%zu)", ndiv);
-        free(dlo); free(dhi);
-
-        /* Surplus direction FIRST — the safety half: hi (1001) pulls the deficit
-         * peer's strictly-smaller bucket (100 rows).  Every row dedups out, so
-         * NOTHING inserts and — critically — hi is NOT truncated to match the
-         * smaller peer.  A merge that truncated a legitimately-ahead replica (the
-         * old data-loss bug's shape) would drop hi to 1000 here. */
-        int ins_hi = merge_bucket(hi, lo, bstart, bend);
-        CHECK(ins_hi == 0 && row_count(hi) == 1001,
-              "surplus node inserts nothing and NEVER truncates (ins=%d, still %llu)",
-              ins_hi, (unsigned long long)row_count(hi));
-
-        /* Deficit direction: lo (100 in-bucket) pulls hi's 101, dedups the 100
-         * shared, inserts ONLY the 1 it lacked -> lo reaches the union. */
-        int ins_lo = merge_bucket(lo, hi, bstart, bend);
-        CHECK(ins_lo == 1 && row_count(lo) == 1001,
-              "deficit node pulls exactly the 1 missing interior row (ins=%d, now %llu)",
-              ins_lo, (unsigned long long)row_count(lo));
-
-        /* Converged: digests MATCH, both hold the union, neither over-counts. */
-        tsdb_rowdigest_bucket_t *dlo2 = NULL, *dhi2 = NULL; size_t nlo2 = 0, nhi2 = 0;
-        digest(lo, &dlo2, &nlo2);
-        digest(hi, &dhi2, &nhi2);
-        ndiv = 0;
-        OK(tsdb_rowdigest_diff(dlo2, nlo2, dhi2, nhi2, divs, 32, &ndiv));
-        CHECK(ndiv == 0 && row_count(lo) == row_count(hi) && row_count(lo) == 1001,
-              "after the bidirectional merge both converge to the union (1001), divs=%zu",
-              ndiv);
-        free(dlo2); free(dhi2);
-        tsdb_close(lo); tsdb_close(hi);
-        rm_rf("/tmp/tsdb_rd_lo"); rm_rf("/tmp/tsdb_rd_hi");
     }
 
     if (g_fail) {

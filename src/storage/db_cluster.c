@@ -2376,29 +2376,10 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         if (pc   > peer_hi_count) peer_hi_count = pc;
         if (pmax > peer_hi_ts)    peer_hi_ts    = pmax;
 
-        /* Row-range digest candidate.  The original case is an EXACT
-         * (count,max_ts) tie — the middle-hole blind spot: two replicas each
-         * missing a different interior batch tie here and the count/max_ts probe
-         * cannot see it.
-         *
-         * WIDENED to also verify a peer whose count DIFFERS at an EQUAL max_ts.
-         * That is the shape a replication drop leaves — a peer holds rows we
-         * lack (or vice versa) with the same newest timestamp — and the old
-         * path handles it badly: if the peer has MORE it becomes a `cand` and a
-         * `SELECT ts > local_max_ts` pull brings back nothing (max_ts already
-         * matches, the gap is interior); if the peer has FEWER, nothing looks at
-         * it at all.  Both leave a permanent divergence (observed live on the
-         * cluster: stress_t/phole stuck at unequal counts, never healing).  The
-         * digest diff is per-bucket and count-agnostic, and the merge only ever
-         * inserts the rows a bucket lacks (content-dedup, never truncates), so
-         * running it here pulls-and-merges toward the union in BOTH directions
-         * and is safe for a legitimately-ahead replica.
-         *
-         * Still gated on EQUAL max_ts: a peer with a strictly newer max_ts is
-         * genuinely ahead in time and the cheap TAIL_PULL already covers it —
-         * no need to digest the whole table for a tail.  A peer strictly behind
-         * in time is behind, not diverged, and its own sweep pulls from us. */
-        if (pmax == local_max_ts && neq < TSDB_CLUSTER_MAX_NODES)
+        /* Row-range digest candidate: an EXACT (count,max_ts) tie is the middle-
+         * hole blind spot.  Captured before the admission test below drops it. */
+        if (pc == local_count && pmax == local_max_ts &&
+            neq < TSDB_CLUSTER_MAX_NODES)
             eqpeers[neq++] = peers[i];
 
         /* Admission is EXACTLY the predicate the single-`best` loop used: that
@@ -2493,15 +2474,12 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         }
     }
 
-    /* Row-range digest verify — the divergence safety net.  Checks every peer
-     * at an EQUAL max_ts (whether or not its count matches ours): an exact tie
-     * is a middle hole, an unequal count at equal max_ts is a replication drop
-     * the count/max_ts probe heals badly or not at all.  Runs only on a
-     * non-empty table, throttled to one sweep in AE_DIGEST_SWEEP_EVERY, and
-     * disable-able with TSDB_AE_ROW_DIGEST=0.  A mismatch names the divergent ts
-     * bucket(s) and pull-merges the peer's copy of that range (content-dedup;
-     * never a truncate), so both sides converge to the union — see
-     * pull_bucket_merge. */
+    /* Row-range digest verify — the middle-hole safety net.  Only the peers
+     * that tied us on (count,max_ts) are checked, only when no pull moved us
+     * this sweep, only on a non-empty table, throttled to one sweep in
+     * AE_DIGEST_SWEEP_EVERY, and disable-able with TSDB_AE_ROW_DIGEST=0.  A
+     * mismatch names the divergent ts bucket(s) and pull-merges the peer's copy
+     * of that range (content-dedup; never a truncate) — see pull_bucket_merge. */
     if (neq > 0 && local_count > 0) {
         const char *de = getenv("TSDB_AE_ROW_DIGEST");
         int enabled = !(de && strcmp(de, "0") == 0);
@@ -2517,8 +2495,8 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                                     (uint64_t)merged);
                     fprintf(stderr,
                             "[anti-entropy] %s: row-range digest merged %d row(s) "
-                            "from a peer at equal max_ts — a divergence the "
-                            "count/max_ts probe heals badly or not at all\n",
+                            "from an equal-(count,max_ts) peer — a middle hole the "
+                            "count/max_ts probe cannot see\n",
                             table_name, merged);
                 }
             }
