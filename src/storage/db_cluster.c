@@ -1049,11 +1049,23 @@ int tsdb_ae_local_bucket_hashes(tsdb_db_t *db, const char *table,
              "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
              table, (long long)bstart, (long long)bend);
 
+    /* PHYSICAL-local, exactly like tsdb_cluster_local_table_digest.  This set is
+     * "what rows do I already hold" — the dedup key that stops the merge from
+     * re-inserting rows this node physically has.  Reading it scatter-local ALONE
+     * (ownership-filtered) returns EMPTY on a node that physically holds rows it
+     * does not OWN, so the dedup set was empty, EVERY pulled row looked missing,
+     * and the merge duplicated the whole bucket — the real engine of the
+     * 2026-08-02 runaway (a co-replica pulled 1000 rows onto its own 600 and
+     * became 1600).  tsdb_g_ae_physical_local lifts the self-child's gate to
+     * physical presence so the set reflects what is HELD, not what is OWNED. */
     tsdb_result_t *lres = NULL;
-    int prev = tsdb_g_scatter_local_mode;
+    int prev  = tsdb_g_scatter_local_mode;
+    int pprev = tsdb_g_ae_physical_local;
     tsdb_g_scatter_local_mode = 1;
+    tsdb_g_ae_physical_local  = 1;
     int rc = tsdb_query(db, qtl, &lres);
     tsdb_g_scatter_local_mode = prev;
+    tsdb_g_ae_physical_local  = pprev;
     if (rc != TSDB_OK || !lres) {
         if (lres) tsdb_result_free(lres);
         return rc == TSDB_OK ? TSDB_ERR_INTERNAL : rc;
@@ -1294,8 +1306,10 @@ static int ae_digest_verify_and_merge(tsdb_db_t *db, tsdb_cluster_t *c,
             /* Hard anti-runaway bound: never pull past one peer's worth in a
              * sweep.  A correct heal converges WELL within this; tripping it
              * means the merge is duplicating (the reverted runaway), so stop and
-             * make it loud rather than pull 257M rows. */
-            if ((uint64_t)total_merged >= budget) {
+             * make it loud rather than pull 257M rows.  Count merged_here too —
+             * it is not folded into total_merged until the peer finishes, so a
+             * single peer with many divergent buckets must be bounded mid-loop. */
+            if ((uint64_t)(total_merged + merged_here) >= budget) {
                 tsdb_metric_inc("qengine_antientropy_runaway_averted_total");
                 fprintf(stderr,
                         "[anti-entropy] %s: row-digest hit the pull budget "
