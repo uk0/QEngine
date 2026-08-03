@@ -270,13 +270,6 @@ int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,
  *     must read local data, never bounce to another node). */
 extern __thread int tsdb_g_scatter_local_mode;
 
-/* Physical-local read for the anti-entropy row digest.  Superset of scatter-
- * local: the childless-data-bearing self-child is covered by physical presence
- * rather than hash-ownership, so a replica digests the rows it HOLDS, not only
- * the ones it OWNS.  Set only by tsdb_cluster_local_table_digest, alongside
- * scatter-local; see the definition in query/exec.c for the full rationale. */
-extern __thread int tsdb_g_ae_physical_local;
-
 /* Scatter-read child assignment: 1 when `child_name`'s primary alive
  * hashring owner is this node — walks tsdb_cluster_route() preference
  * order (TSDB_SHARD_REPLICA_N entries when sharding, every node
