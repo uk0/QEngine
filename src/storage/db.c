@@ -926,10 +926,27 @@ static int create_table_impl(tsdb_db_t *db,
      * stamps the incarnation it was handed — the leader's value for the
      * SCHEMA_SYNC path, or 0 (UNKNOWN) for pre-incarnation senders and other
      * local-create callers — so leader and follower agree and same-incarnation
-     * WRITE_BATCHes still match. */
+     * WRITE_BATCHes still match.
+     *
+     * A CREATE that is a peer's BROADCAST CATALOG DDL being replayed here is
+     * NOT an origination, even though it arrives on the unsuppressed path: the
+     * catalog fanout ships the DDL as QTL TEXT and every peer re-executes it,
+     * so minting here gave each node a DIFFERENT incarnation for the SAME
+     * table.  The WRITE_BATCH gate then saw two non-zero values that differ and
+     * rejected in BOTH directions — nodes silently stopped replicating to each
+     * other and each kept only its own writes (measured live: one table held
+     * four distinct incarnations; replicate_incarnation_reject_total climbed
+     * while counts split complementarily).  Stamp UNKNOWN(0) on a replay, the
+     * same "cannot verify, never reject" value tsdb_create_table_local uses for
+     * every other non-SCHEMA_SYNC replica path.  The origin keeps its non-zero
+     * value, so a stale batch aimed at the recreated table is still refused
+     * there. */
+    extern __thread int tsdb_g_suppress_catalog_broadcast;
     uint64_t incarnation = suppress_hook
                          ? forced_incarnation
-                         : tsdb_schema_new_incarnation(name, dir);
+                         : (tsdb_g_suppress_catalog_broadcast
+                                ? 0
+                                : tsdb_schema_new_incarnation(name, dir));
 
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_create_ex2(dir, name, cols, (int)ncols, ts_col,

@@ -180,6 +180,85 @@ static void test_reject_stale_incarnation(void) {
     printf("  [reject] stale-incarnation WRITE_BATCH rejected, table clean: OK\n");
 }
 
+/* ---- [broadcast] replaying a peer's catalog DDL must NOT mint -------------
+ *
+ * The catalog fanout ships a CREATE as QTL TEXT and every peer RE-EXECUTES it.
+ * That replay arrives on the ordinary (hook-unsuppressed) create path, so it
+ * used to mint a FRESH incarnation on each node — the same table then carried a
+ * DIFFERENT non-zero incarnation on every node, and the WRITE_BATCH gate (two
+ * known values that differ → reject) refused replication in BOTH directions.
+ * Nodes silently stopped replicating to each other and each kept only its own
+ * writes.  Measured live before this fix: one table held four distinct
+ * incarnations across four nodes and replicate_incarnation_reject_total climbed
+ * while the row counts split complementarily (each node = exactly its own
+ * writes).  A replay must stamp UNKNOWN(0) — "cannot verify, never reject" —
+ * exactly like every other non-SCHEMA_SYNC replica create. */
+extern __thread int tsdb_g_suppress_catalog_broadcast;
+
+static void test_broadcast_replay_does_not_mint(void) {
+    /* The ORIGIN of the CREATE mints, as before. */
+    const char *ldir = "/tmp/tsdb_test_incarnation_bcast_leader";
+    rm_rf(ldir);
+    tsdb_db_t *leader = NULL;
+    OK(tsdb_open(ldir, &leader));
+    make_table(leader);
+    uint64_t L = table_incarnation(leader, "t");
+    ASSERT(L != 0);                         /* origin still stamps an identity */
+
+    /* A PEER replaying the broadcast DDL must stamp UNKNOWN(0), not mint. */
+    const char *fdir = "/tmp/tsdb_test_incarnation_bcast_follower";
+    rm_rf(fdir);
+    tsdb_db_t *follower = NULL;
+    OK(tsdb_open(fdir, &follower));
+    tsdb_g_suppress_catalog_broadcast = 1;   /* what the DDL-apply handler sets */
+    make_table(follower);
+    tsdb_g_suppress_catalog_broadcast = 0;
+    uint64_t F = table_incarnation(follower, "t");
+    ASSERT(F == 0);                          /* THE FIX: replay does not mint */
+
+    /* Therefore replication flows BOTH ways instead of being mutually refused.
+     * leader → follower: batch carries L, follower is 0 → cannot verify → apply. */
+    uint8_t payload[4096];
+    int plen = encode_batch(payload, sizeof(payload), L, 5);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(follower, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(follower) == 5);
+
+    /* follower → leader: batch carries 0 (its schema is UNKNOWN) → apply. */
+    plen = encode_batch(payload, sizeof(payload), F, 5);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(leader, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(leader) == 5);
+
+    tsdb_close(leader);
+    tsdb_close(follower);
+
+    /* The bug shape, pinned: two INDEPENDENT origin creates of the same name DO
+     * mint different values, which is exactly why a replay must not be treated
+     * as an origination.  (This is the state the live cluster was found in.) */
+    const char *adir = "/tmp/tsdb_test_incarnation_bcast_a";
+    const char *bdir = "/tmp/tsdb_test_incarnation_bcast_b";
+    rm_rf(adir); rm_rf(bdir);
+    tsdb_db_t *a = NULL, *b = NULL;
+    OK(tsdb_open(adir, &a));
+    OK(tsdb_open(bdir, &b));
+    make_table(a);
+    make_table(b);
+    uint64_t IA = table_incarnation(a, "t"), IB = table_incarnation(b, "t");
+    ASSERT(IA != 0 && IB != 0 && IA != IB);  /* independent mints DIVERGE */
+
+    /* And that divergence is precisely what the gate refuses — so had the replay
+     * minted, this is the rejection every peer would have hit. */
+    plen = encode_batch(payload, sizeof(payload), IA, 5);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(b, payload, (uint32_t)plen) == 0);
+    ASSERT(count_all(b) == 0);
+
+    tsdb_close(a); tsdb_close(b);
+    rm_rf(ldir); rm_rf(fdir); rm_rf(adir); rm_rf(bdir);
+    printf("  [broadcast] DDL replay stamps UNKNOWN(0); replication flows both ways: OK\n");
+}
+
 /* ---- [match] a same-incarnation batch applies (the common case) ---------- */
 static void test_same_incarnation_applies(void) {
     const char *dir = "/tmp/tsdb_test_incarnation_match";
@@ -351,6 +430,7 @@ int main(void) {
     printf("=== durable table incarnation (DROP+recreate identity) ===\n");
     test_lifecycle();
     test_reject_stale_incarnation();
+    test_broadcast_replay_does_not_mint();
     test_same_incarnation_applies();
     test_legacy_sender_applies();
     test_wire_compat();
