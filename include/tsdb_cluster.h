@@ -190,10 +190,11 @@ tsdb_ae_action_t tsdb_antientropy_decide(uint64_t local_count,
  * confines the row-digest to a table's replica set (exposed for unit testing). */
 int tsdb_ae_node_in_set(uint64_t x, const uint64_t *set, int n);
 
-/* Hard anti-runaway pull budget for the row-digest: the rows a single sweep may
- * pull for a table, = max(0, peer_hi_count - local_before).  Anti-entropy only
- * copies rows IN, so catch-up can never raise local above the fullest peer;
- * crossing that line means the merge is duplicating.  Exposed for unit testing. */
+/* Hard anti-runaway pull budget for the row-digest: the most rows ONE sweep may
+ * merge for a table = peer_hi_count (the union of two replicas is at most
+ * local + peer_hi, so no legitimate heal needs more than the fullest peer HOLDS).
+ * NOT (peer_hi - local): that is 0 at equal counts, i.e. exactly the middle hole
+ * the digest exists to heal.  Exposed for unit testing. */
 uint64_t tsdb_ae_pull_budget(uint64_t local_before, uint64_t peer_hi_count);
 
 /* Rows THIS node holds for `table_name`, and the newest ts among them

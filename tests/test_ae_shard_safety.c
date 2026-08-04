@@ -61,25 +61,32 @@ int main(void) {
     /* ── Guard 2: anti-runaway pull budget ───────────────────────────────── */
     printf("\n[2] anti-runaway pull budget (tsdb_ae_pull_budget)\n");
     {
-        /* Behind the fullest peer: may pull exactly the gap. */
-        CHECK(tsdb_ae_pull_budget(2400, 3000) == 600,
-              "local 2400, fullest peer 3000 -> budget 600 (the real gap)");
+        /* The bound is the fullest peer's TOTAL: a heal can never need to insert
+         * more rows than the source holds (union <= local + peer_hi). */
+        CHECK(tsdb_ae_pull_budget(2400, 3000) == 3000,
+              "local 2400, fullest peer 3000 -> budget 3000 (a peer's worth)");
 
-        /* Level with / ahead of every peer: cannot pull — AE only copies IN. */
-        CHECK(tsdb_ae_pull_budget(3000, 3000) == 0,
-              "local == fullest peer -> budget 0 (nothing legitimately to pull)");
-        CHECK(tsdb_ae_pull_budget(3000, 2400) == 0,
-              "local AHEAD of every peer (own writes) -> budget 0, never negative");
+        /* THE REGRESSION THIS PINS.  At EQUAL counts the budget must still be
+         * positive: equal-count-different-content IS the middle hole the digest
+         * exists to heal.  The earlier (peer_hi - local) form gave 0 here and
+         * silently neutered the heal — the live cluster logged "hit the pull
+         * budget (0 rows)" every sweep while merging nothing. */
+        CHECK(tsdb_ae_pull_budget(3000, 3000) == 3000,
+              "EQUAL counts (the middle hole) -> budget POSITIVE, heal not neutered");
 
-        /* THE RUNAWAY SCENARIO, bounded.  A merge has already duplicated local up
-         * to 15000 while the fullest peer holds 3000; the budget is 0, so the
-         * next sweep pulls NOTHING more instead of exploding to 257M. */
-        CHECK(tsdb_ae_pull_budget(15000, 3000) == 0,
-              "runaway state (local 15000 >> peer 3000) -> budget 0: the pull STOPS");
+        /* Holding MORE than a peer does not mean "done": this node can still be
+         * missing that peer's interior rows. */
+        CHECK(tsdb_ae_pull_budget(3000, 2400) == 2400,
+              "local ahead in COUNT can still lack interior rows -> budget 2400");
 
-        /* Boundary: exactly one row behind. */
-        CHECK(tsdb_ae_pull_budget(2999, 3000) == 1,
-              "one row behind -> budget 1");
+        /* Still hard-bounded: one sweep can never merge past a peer's worth, so
+         * the 257M-row explosion is impossible however wrong the diff is. */
+        CHECK(tsdb_ae_pull_budget(15000, 3000) == 3000,
+              "runaway state is capped at one peer's worth (3000), never 257M");
+
+        /* A peer that holds nothing can contribute nothing. */
+        CHECK(tsdb_ae_pull_budget(1000, 0) == 0,
+              "empty peer -> budget 0 (nothing to copy from)");
     }
 
     /* ── Composed: the incident cannot recur ─────────────────────────────── */
@@ -91,14 +98,16 @@ int main(void) {
         uint64_t peer_hi     = 3000;   /* the real fullest co-replica */
 
         int confined_out = (tsdb_ae_node_in_set(non_replica, rset, 2) == 0);
-        int budget_zero  = (tsdb_ae_pull_budget(local_junk, peer_hi) == 0);
+        uint64_t budget  = tsdb_ae_pull_budget(local_junk, peer_hi);
 
         CHECK(confined_out,
               "guard 1: the runaway node is not a replica -> it never digests");
-        CHECK(budget_zero,
-              "guard 2: even if it did, its pull budget is 0 -> zero rows merged");
-        CHECK(confined_out && budget_zero,
-              "both guards independently prevent the 257M-row runaway");
+        CHECK(budget <= peer_hi,
+              "guard 2: even if it did, one sweep merges at most a peer's worth (%llu)",
+              (unsigned long long)budget);
+        CHECK(confined_out && budget <= peer_hi && budget < local_junk,
+              "both guards bound the 257M-row runaway (cap %llu << runaway 15000)",
+              (unsigned long long)budget);
     }
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);

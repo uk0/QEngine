@@ -1232,18 +1232,24 @@ int tsdb_ae_node_in_set(uint64_t x, const uint64_t *set, int n) {
     return 0;
 }
 
-/* Anti-runaway pull budget for the row-digest (the hard bound the reverted
- * digest lacked).  Anti-entropy only ever COPIES rows IN from peers, so a sweep
- * that is catching this node up cannot legitimately raise its count for a table
- * ABOVE the fullest peer's count — you cannot copy in more rows than the source
- * holds.  The budget is therefore (peer_hi_count - local_before), clamped at 0;
- * once the digest has merged that many rows it STOPS, so a merge that would
- * duplicate rows (the 257M-row runaway) is bounded to at most one peer's worth
- * instead of exploding.  local_before already >= peer_hi (our own newer writes)
- * → budget 0 → the digest verifies (and may find NOTHING to pull) but can never
- * add a row, which is exactly right: a node ahead of every peer is not behind. */
+/* Anti-runaway pull budget for the row-digest: the most rows ONE sweep may merge
+ * for a table.  A sweep pulls only rows a peer holds and this node lacks, so it
+ * can never legitimately need to insert MORE than the fullest peer's entire
+ * table — the union of two replicas is at most local + peer_hi.  The budget is
+ * therefore peer_hi_count.  Anything beyond that is the merge duplicating rather
+ * than converging (the 257M-row runaway), so the merge stops and says so.
+ *
+ * It deliberately is NOT (peer_hi - local).  That difference is 0 whenever the
+ * counts are EQUAL — which is precisely the middle hole the digest exists to
+ * heal (two replicas, equal counts, each missing an interior row the other has)
+ * — and 0 whenever this node legitimately holds rows a peer lacks.  Using the
+ * difference silently neutered the heal: the live cluster logged "hit the pull
+ * budget (0 rows)" every sweep on divergent tables while merging nothing.  A
+ * node holding MORE than a peer is not "ahead and done"; it can still be missing
+ * that peer's interior rows. */
 uint64_t tsdb_ae_pull_budget(uint64_t local_before, uint64_t peer_hi_count) {
-    return peer_hi_count > local_before ? peer_hi_count - local_before : 0;
+    (void)local_before;   /* deliberately unused — see above */
+    return peer_hi_count;
 }
 
 /* Row-range digest verification for the tables the (count,max_ts) probe cannot
