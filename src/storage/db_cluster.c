@@ -931,6 +931,15 @@ static int peer_table_stats(tsdb_cluster_t *c,
 /* Pull every row at ts > since_ts from `peer_id` and insert locally
  * with local_only = 1 so the write does not re-fan-out.  Returns the
  * number of rows inserted, or -1 on transport / schema failure. */
+/* Defined further down; used by the tail pull for content-dedup. */
+int tsdb_ae_local_bucket_hashes(tsdb_db_t *db, const char *table,
+                                int64_t bstart, int64_t bend,
+                                uint64_t **out, size_t *out_n);
+int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
+                               tsdb_result_t *peer_res,
+                               const uint64_t *lset, size_t ln,
+                               int *out_inserted);
+
 static int pull_table_delta(tsdb_db_t *db,
                              tsdb_cluster_t *c,
                              tsdb_node_id_t peer_id,
@@ -939,6 +948,7 @@ static int pull_table_delta(tsdb_db_t *db,
 {
     tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
     if (!rmgr) return -1;
+    if (since_ts == INT64_MAX) return 0;    /* nothing can be newer */
 
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
     if (!conn) return -1;
@@ -958,68 +968,43 @@ static int pull_table_delta(tsdb_db_t *db,
     int ncols = tsdb_result_ncols(res);
     if (ncols < 1) { tsdb_result_free(res); return 0; }
 
-    tsdb_table_t *tbl = NULL;
-    if (tsdb_open_table(db, table_name, &tbl) != TSDB_OK || !tbl) {
+    /* CONTENT-DEDUP the tail pull.  This used to insert every fetched row
+     * unconditionally, which duplicates rows whenever ANOTHER repair path
+     * delivers the same range concurrently — and that is the normal case right
+     * after a peer reconnects: anti-entropy pulls the gap while the sender's
+     * replication catch-up pushes the very same rows.  Measured live: a node
+     * cut off for 5 batches came back holding those 250 rows TWICE
+     * (count 1250 vs 1000, sum 644375 vs 500500, every v in [451,700] present
+     * exactly twice) — a silent over-count with rc=OK.
+     *
+     * Reuse the digest merge's tested primitive: hash what we already hold in
+     * the pulled range, then insert only rows whose content is absent.  The set
+     * is built AFTER the network fetch so the race window excludes the whole
+     * round trip, and in the common case it is EMPTY (nothing local can be
+     * newer than the max_ts we pulled from) — so this costs nothing and only
+     * bites in exactly the raced overlap.  It also fixes two latent bugs in the
+     * old loop: FLOAT32 columns were silently dropped (`default: break` wrote
+     * no value), and an unknown column type produced a partial row instead of a
+     * loud failure.
+     *
+     * Trade-off, inherited from the same primitive the digest uses: a row whose
+     * content is byte-identical to one we already hold is not inserted, so a
+     * legitimately-duplicated identical row is not re-created.  Preferring that
+     * over silently doubling a reconnect's worth of rows. */
+    uint64_t *lset = NULL;
+    size_t ln = 0;
+    if (tsdb_ae_local_bucket_hashes(db, table_name, since_ts + 1, INT64_MAX,
+                                    &lset, &ln) != TSDB_OK) {
         tsdb_result_free(res);
         return -1;
     }
 
-    int ts_ci = -1;
-    for (int i = 0; i < ncols; i++) {
-        if (tsdb_result_col_type(res, i) == TSDB_TYPE_TIMESTAMP) {
-            ts_ci = i; break;
-        }
-    }
-    if (ts_ci < 0) { tsdb_result_free(res); return -1; }
-
-    tsdb_table_lock_write(tbl);
-    tsdb_batch_t *batch = NULL;
-    if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
-        tsdb_table_unlock_write(tbl);
-        tsdb_result_free(res);
-        return -1;
-    }
-    tsdb_batch_set_local_only(batch);
-
-    int pulled = 0;
-    while (tsdb_result_next(res)) {
-        tsdb_batch_row_ts(batch, tsdb_result_ts(res, ts_ci));
-        for (int i = 0; i < ncols; i++) {
-            if (i == ts_ci) continue;
-            switch (tsdb_result_col_type(res, i)) {
-            case TSDB_TYPE_INT64:
-                tsdb_batch_row_i64(batch, i, tsdb_result_i64(res, i));
-                break;
-            case TSDB_TYPE_FLOAT64:
-                tsdb_batch_row_f64(batch, i, tsdb_result_f64(res, i));
-                break;
-            case TSDB_TYPE_SYMBOL: {
-                /* Resolve the symbol via the source's symtab (already
-                 * decoded in tsdb_result_sym) and re-intern locally.
-                 * Without this case the column would never be set
-                 * and row_end would fail with TSDB_ERR_SCHEMA — every
-                 * pulled row silently dropped on tables that have a
-                 * symbol column (i.e. most IoT / metrics tables). */
-                const char *s = tsdb_result_sym(res, i);
-                tsdb_batch_row_sym(batch, i, s ? s : "");
-                break;
-            }
-            default:
-                break;
-            }
-        }
-        tsdb_batch_row_end(batch);
-        pulled++;
-    }
-
-    if (tsdb_batch_commit(batch) != TSDB_OK) {
-        tsdb_table_unlock_write(tbl);
-        tsdb_result_free(res);
-        return -1;
-    }
-    tsdb_table_unlock_write(tbl);
+    int inserted = 0;
+    int mrc = tsdb_ae_merge_result_dedup(db, table_name, res, lset, ln,
+                                         &inserted);
     tsdb_result_free(res);
-    return pulled;
+    free(lset);
+    return mrc == TSDB_OK ? inserted : -1;
 }
 
 /* ---- Row-range digest repair: content-dedup bucket merge ----------------- */

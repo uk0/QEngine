@@ -578,6 +578,99 @@ int main(void) {
         rm_rf("/tmp/tsdb_rd_lo"); rm_rf("/tmp/tsdb_rd_hi");
     }
 
+    /* ── [7] the TAIL PULL must not duplicate what replication already gave ──
+     *
+     * Anti-entropy's count/max_ts tail pull used to insert every fetched row
+     * unconditionally.  Right after a peer reconnects BOTH repair paths run: AE
+     * pulls `ts > local_max_ts` while the sender's replication catch-up pushes
+     * the very same rows.  The pull's `since_ts` was captured BEFORE the
+     * catch-up landed, so the fetched range was already local by insert time and
+     * every row went in twice.  Measured live: a node cut off for 5 batches came
+     * back holding those 250 rows TWICE (count 1250 vs 1000, sum 644375 vs
+     * 500500, every v in [451,700] present exactly twice) — silent over-count,
+     * rc=OK, and the count/max_ts probe cannot repair an over-count.
+     *
+     * The fix routes the tail pull through the same content-dedup the digest
+     * merge uses, over the pulled range [since_ts+1, INT64_MAX]. */
+    printf("\n[7] tail pull dedups rows replication already delivered\n");
+    {
+        tsdb_db_t *peer = open_fresh("/tmp/tsdb_rd_tp_peer");
+        tsdb_db_t *node = open_fresh("/tmp/tsdb_rd_tp_node");
+
+        /* Peer holds the whole table; the node was cut off after row 449. */
+        fill_blocks(peer, 1000, 1, -1, 0);
+        fill_blocks(node, 450, 1, -1, 0);
+        CHECK(row_count(node) == 450, "node starts behind at %llu rows",
+              (unsigned long long)row_count(node));
+
+        /* AE measures the node HERE — since_ts is the node's max_ts right now. */
+        int64_t since_ts = BASE + 449;
+
+        /* ...then replication catch-up delivers 450..999 BEFORE the pull lands.
+         * (fill_blocks re-inserts 0..999; the 0..449 half is content-identical
+         * and dedups out below, exactly as the live overlap did.) */
+        {
+            tsdb_table_t *t = NULL;
+            OK(tsdb_open_table(node, "t", &t));
+            tsdb_batch_t *b = NULL;
+            OK(tsdb_batch_begin(t, &b));
+            for (int i = 450; i < 1000; i++) {
+                OK(tsdb_batch_row_ts(b, BASE + i));
+                OK(tsdb_batch_row_i64(b, 1, i));
+                OK(tsdb_batch_row_sym(b, 2, TAG(i)));
+                OK(tsdb_batch_row_end(b));
+            }
+            OK(tsdb_batch_commit(b));
+        }
+        CHECK(row_count(node) == 1000,
+              "replication catch-up brought the node to %llu (complete)",
+              (unsigned long long)row_count(node));
+
+        /* Now the tail pull fires with the STALE since_ts — the exact race.
+         * Same two primitives pull_table_delta now uses, same range. */
+        uint64_t *lset = NULL; size_t ln = 0;
+        OK(tsdb_ae_local_bucket_hashes(node, "t", since_ts + 1, INT64_MAX,
+                                       &lset, &ln));
+        char qtl[160];
+        snprintf(qtl, sizeof(qtl), "SELECT * FROM t WHERE ts > %lld",
+                 (long long)since_ts);
+        tsdb_result_t *res = NULL;
+        OK(tsdb_query(peer, qtl, &res));
+        int inserted = -1;
+        OK(tsdb_ae_merge_result_dedup(node, "t", res, lset, ln, &inserted));
+        tsdb_result_free(res);
+        free(lset);
+
+        CHECK(inserted == 0,
+              "the raced tail pull inserts NOTHING (got %d) — rows already held",
+              inserted);
+        CHECK(row_count(node) == 1000,
+              "node stays at the correct 1000, not 1550 (got %llu)",
+              (unsigned long long)row_count(node));
+
+        /* And a GENUINE gap still pulls: drop the node's tail by rebuilding it
+         * short, then the same path must deliver the missing rows. */
+        tsdb_db_t *node2 = open_fresh("/tmp/tsdb_rd_tp_node2");
+        fill_blocks(node2, 450, 1, -1, 0);
+        uint64_t *l2 = NULL; size_t n2 = 0;
+        OK(tsdb_ae_local_bucket_hashes(node2, "t", since_ts + 1, INT64_MAX,
+                                       &l2, &n2));
+        CHECK(n2 == 0, "a genuinely-behind node holds nothing past since_ts");
+        tsdb_result_t *res2 = NULL;
+        OK(tsdb_query(peer, qtl, &res2));
+        int ins2 = -1;
+        OK(tsdb_ae_merge_result_dedup(node2, "t", res2, l2, n2, &ins2));
+        tsdb_result_free(res2);
+        free(l2);
+        CHECK(ins2 == 550 && row_count(node2) == 1000,
+              "a REAL gap still pulls all 550 missing rows (got %d, now %llu)",
+              ins2, (unsigned long long)row_count(node2));
+
+        tsdb_close(peer); tsdb_close(node); tsdb_close(node2);
+        rm_rf("/tmp/tsdb_rd_tp_peer"); rm_rf("/tmp/tsdb_rd_tp_node");
+        rm_rf("/tmp/tsdb_rd_tp_node2");
+    }
+
     if (g_fail) {
         printf("\n=== test_ae_rowdigest FAILED (%d) ===\n", g_fail);
         return 1;
