@@ -1570,7 +1570,18 @@ int tsdb_truncate_table_if_empty(tsdb_db_t *db, const char *name,
      * here or blocked until we release — it can never slip in during the wipe. */
     uint64_t mem_rows = (t->memtable) ? tsdb_memtable_rows(t->memtable) : 0;
     uint64_t dur_rows = table_dir_durable_rows(db, name);
-    if (mem_rows != 0 || dur_rows != 0) {
+    /* A FROZEN table (wal_incomplete) is NOT empty, however it measures.  An
+     * aborted redo replay leaves acked records in the log that no partition and
+     * no memtable covers; when the abort happened on the FIRST record nothing
+     * applied at all, so mem_rows and dur_rows are both 0 and the table looks
+     * empty here — while its WAL is the ONLY copy of those rows.  Truncating
+     * then destroys acked data and this function even cleared wal_incomplete
+     * below, erasing the evidence.  That is exactly the state the freeze exists
+     * to protect: the abort path promises "no flush, no checkpoint advance, NO
+     * TRUNCATE ... until the log is repaired or removed".  Report not-empty so
+     * anti-entropy leaves the table alone; explicit TRUNCATE TABLE remains the
+     * operator's deliberate way to unfreeze it. */
+    if (mem_rows != 0 || dur_rows != 0 || t->wal_incomplete) {
         pthread_mutex_unlock(&t->compact_mtx);
         pthread_mutex_unlock(&t->batch_mu);
         tsdb_db_scan_release(db, t);

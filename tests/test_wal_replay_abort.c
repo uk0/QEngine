@@ -47,6 +47,7 @@
  *   [C] no seq reuse           -> a post-freeze commit never re-uses an un-read seq
  *   [D] ALTER'd un-walkable log-> durable old-schema records skip, they don't abort
  *   [E] mid-replay flush       -> must not truncate the log under the reader
+ *   [F] frozen + AE empty-wipe -> the wipe is refused, log and freeze intact
  */
 
 #include "../include/tsdb.h"
@@ -674,6 +675,64 @@ static void case_e(void) {
     rm_rf(dir);
 }
 
+/* =======================================================================
+ * CASE F — anti-entropy's "wipe it if it is empty" must refuse a FROZEN table.
+ *
+ * tsdb_truncate_table_if_empty is what anti-entropy calls before a destructive
+ * full pull: it wipes the memtable AND truncates the WAL when the table
+ * measures empty.  A frozen table must never be wiped that way — the freeze
+ * contract is "no flush, no checkpoint advance, NO TRUNCATE until the log is
+ * repaired or removed", and the un-read acked records live ONLY in that log.
+ *
+ * Reachability note, measured: the aborting record always applies at least one
+ * row (the row loop reads a short payload as a zero-filled row before it
+ * fails), so a hand-written log cannot produce the mem=0 AND dur=0 AND frozen
+ * state — that needs an allocation failure on the very first row, which this
+ * hook-free harness cannot inject.  So this case pins the reachable half of the
+ * contract; the `|| t->wal_incomplete` term in the emptiness test covers the
+ * unreachable-by-test half, rather than leaning on the incidental fact that an
+ * aborting record happens to leave a row behind.
+ * ======================================================================= */
+static void case_f(void) {
+    const char *dir = "/tmp/tsdb_test_wal_replay_abort_f";
+    printf("\n[F] the anti-entropy empty-wipe refuses a frozen table\n");
+
+    build_frozen_log(dir);
+
+    struct log_stat before;
+    parse_log(dir, "t", &before);
+    CHECK(before.redo == 100, "setup: 100 records in the log (redo=%d)", before.redo);
+
+    tsdb_db_t *db = NULL;
+    env_wal_only();
+    OK(tsdb_open(dir, &db));
+    tsdb_table_t *tbl = NULL;
+    OK(tsdb_open_table(db, "t", &tbl));   /* replay aborts + freezes here */
+
+    /* Anti-entropy's pre-full-pull wipe must refuse this table. */
+    int was_empty = -1;
+    OK(tsdb_truncate_table_if_empty(db, "t", &was_empty));
+    CHECK(was_empty == 0,
+          "a frozen table is reported NOT empty (was_empty=%d) — the wipe is refused",
+          was_empty);
+
+    struct log_stat after;
+    parse_log(dir, "t", &after);
+    CHECK(after.redo == 100,
+          "the log still holds all 100 acked records (redo=%d, want 100)", after.redo);
+    CHECK(after.has[100] && after.has[52],
+          "the un-read records behind the poison survived");
+
+    /* Still frozen: a new commit is refused, exactly as case B requires. */
+    int rc = write_rows(db, "t", 1, 1, DAY1 + 900);
+    CHECK(rc == TSDB_ERR_BUSY,
+          "the table is STILL frozen after the refused wipe (rc=%d, want %d)",
+          rc, TSDB_ERR_BUSY);
+
+    tsdb_close(db);
+    rm_rf(dir);
+}
+
 int main(void) {
     printf("=== test_wal_replay_abort ===\n");
     case_a();
@@ -681,6 +740,7 @@ int main(void) {
     case_c();
     case_d();
     case_e();
+    case_f();
     if (g_fail) {
         fprintf(stderr, "\ntest_wal_replay_abort: %d FAILURE(S)\n", g_fail);
         return 1;
