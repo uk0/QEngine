@@ -2101,6 +2101,14 @@ static uint64_t redo_get_u64le(const uint8_t *p) {
 
 /* Append a growable byte buffer; returns 0 on success, -1 on OOM. */
 struct redo_buf { uint8_t *p; size_t n, cap; };
+/* Optional tagged trailer on a redo record: [magic u32][stream u64][seq u64].
+ * Tagged, not bare, so redo_rec_cutoff can tell it apart from the leftover bytes
+ * a schema change leaves behind — those are row data and will not carry the
+ * magic.  Bare trailing bytes are still rejected, which is what keeps the
+ * ALTER'd-log protection intact. */
+#define TSDB_REDO_TRAILER_MAGIC 0x44454455u   /* 'DEDU' */
+#define TSDB_REDO_TRAILER_SZ    20u
+
 static int redo_buf_reserve(struct redo_buf *b, size_t extra) {
     if (b->n + extra <= b->cap) return 0;
     size_t nc = b->cap ? b->cap * 2 : 256;
@@ -2163,6 +2171,18 @@ static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
                 if (redo_buf_put(&b, vb, 8) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
             }
         }
+    }
+
+    /* Dedup id, tagged so the walker accepts it (see TSDB_REDO_TRAILER_MAGIC).
+     * This is what makes the id durable in the SAME fsync as the rows it
+     * identifies, closing the window where a crash after the commit but before
+     * the id is remembered lets a retry re-apply the batch. */
+    if (dstream != 0 && dseq != 0) {
+        uint8_t tr[TSDB_REDO_TRAILER_SZ];
+        redo_put_u32le(tr + 0,  TSDB_REDO_TRAILER_MAGIC);
+        redo_put_u64le(tr + 4,  dstream);
+        redo_put_u64le(tr + 12, dseq);
+        if (redo_buf_put(&b, tr, sizeof(tr)) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
     }
 
     *out = b.p; *out_n = b.n;
@@ -2306,8 +2326,19 @@ static uint64_t redo_rec_cutoff(const struct redo_replay_ctx *ctx,
     }
     /* A record serialised under a NARROWER schema leaves bytes over; one whose
      * declared nrows outruns its payload was caught above.  Either way the
-     * layout does not match, so the per-row lookups cannot be trusted. */
-    if (so != n) { *ok = 0; return 0; }
+     * layout does not match, so the per-row lookups cannot be trusted.
+     *
+     * The ONE exception is a trailer this writer put there deliberately, which
+     * is why it carries a magic word: leftover bytes from a schema mismatch are
+     * row data and will not spell it.  Without the tag the two cases are
+     * indistinguishable and tolerating either would silently accept a record
+     * whose columns are being read at the wrong offsets. */
+    if (so != n) {
+        if (!(n - so == TSDB_REDO_TRAILER_SZ &&
+              redo_get_u32le(p + so) == TSDB_REDO_TRAILER_MAGIC)) {
+            *ok = 0; return 0;
+        }
+    }
     if (rec_cutoff == UINT64_MAX) rec_cutoff = 0;   /* nrows == 0 */
     return rec_cutoff;
 }
@@ -2444,6 +2475,25 @@ static int redo_replay_apply(const void *rec, size_t n,
             tsdb_dedup_global_lock();
             tsdb_dedup_ledger_t *led = tsdb_dedup_global();
             if (led) (void)tsdb_dedup_record(led, dstream, dseq);
+            tsdb_dedup_global_unlock();
+        }
+    }
+
+    /* Restore the dedup id this record carries.  It is the whole reason the
+     * trailer exists: the id became durable in the SAME fsync as its rows, so a
+     * crash between "rows committed" and "id remembered" no longer loses it —
+     * recovery puts it back and the sender's retry is recognised instead of
+     * applied a second time.  Located by the magic at the END of the record, so
+     * no second walk is needed.  Anything already under the frontier comes back
+     * EXISTS, which makes repeated restarts idempotent. */
+    if (tsdb_dedup_is_enabled() && n >= TSDB_REDO_TRAILER_SZ &&
+        redo_get_u32le(p + n - TSDB_REDO_TRAILER_SZ) == TSDB_REDO_TRAILER_MAGIC) {
+        uint64_t ds = redo_get_u64le(p + n - TSDB_REDO_TRAILER_SZ + 4);
+        uint64_t dq = redo_get_u64le(p + n - TSDB_REDO_TRAILER_SZ + 12);
+        if (ds != 0 && dq != 0) {
+            tsdb_dedup_global_lock();
+            tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+            if (led) (void)tsdb_dedup_record(led, ds, dq);
             tsdb_dedup_global_unlock();
         }
     }

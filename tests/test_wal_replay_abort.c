@@ -53,6 +53,7 @@
 
 #include "../include/tsdb.h"
 #include "../src/storage/db.h"
+#include "../src/cluster/dedup.h"
 
 #include <dirent.h>
 #include <stdint.h>
@@ -187,7 +188,8 @@ static void emit_record(FILE *f, const uint8_t *payload, size_t plen) {
 /* A record with the dedup (stream, seq) trailer redo_serialize appends after
  * the last row.  Used to prove the trailer is TRANSPARENT to replay. */
 static void emit_rows_dedup(FILE *f, uint64_t seq, int64_t base_ts,
-                            int64_t base_v, uint64_t dstream, uint64_t dseq)
+                            int64_t base_v, uint64_t dstream, uint64_t dseq,
+                            uint32_t magic)
 {
     uint8_t p[64];
     memset(p, 0, sizeof(p));
@@ -195,9 +197,10 @@ static void emit_rows_dedup(FILE *f, uint64_t seq, int64_t base_ts,
     put_u32le(p + 8, 1);
     put_u64le(p + 12, (uint64_t)base_ts);
     put_u64le(p + 20, (uint64_t)base_v);
-    put_u64le(p + 28, dstream);
-    put_u64le(p + 36, dseq);
-    emit_record(f, p, 44);
+    put_u32le(p + 28, magic);          /* 'DEDU' when tagged correctly */
+    put_u64le(p + 32, dstream);
+    put_u64le(p + 40, dseq);
+    emit_record(f, p, 48);
 }
 
 static void emit_rows(FILE *f, uint64_t seq, uint32_t declared_rows,
@@ -751,21 +754,23 @@ static void case_f(void) {
 }
 
 /* =======================================================================
- * CASE G — replay does NOT tolerate trailing bytes after the last row.
+ * CASE G — a redo record may be extended, but only with a TAGGED trailer.
  *
- * This looked safe by inspection: the row loop bounds-checks every read against
- * `n` and never requires `off == n` at the end, so extra bytes ought to be
- * ignored.  They are not.  Measured here: two identical records recover 2 rows
- * plain and ZERO with 16 trailing bytes appended.  A dedup-id trailer written
- * into the WAL on that assumption was reverted because of this case.
+ * redo_rec_cutoff requires that walking `nrows` rows consumes the record
+ * EXACTLY, and that is load-bearing: leftover bytes mean the record was written
+ * under a different schema, so the per-row column offsets cannot be trusted —
+ * case [D] depends on it.  An earlier attempt appended a bare 16-byte dedup id
+ * on the assumption that trailing bytes were ignored; measured, such a record
+ * recovered ZERO rows, and it was reverted.
  *
- * Kept as the standing contract: anything that wants to extend a redo record
- * must make the reader accept the extension FIRST and prove it here.  The
- * WRITE_BATCH wire trailer is a different format with a different decoder and is
- * unaffected — this is only about redo records.
+ * The trailer therefore carries a MAGIC word.  Leftover bytes from a schema
+ * mismatch are row data and will not spell it, so the walker can accept the one
+ * case and keep rejecting the other. Both halves are asserted here: a correctly
+ * tagged trailer replays identically to no trailer at all, and a trailer with
+ * the wrong tag is still refused.
  * ======================================================================= */
 static void case_g(void) {
-    printf("\n[G] replay is NOT tolerant of trailing bytes after the last row\n");
+    printf("\n[G] a TAGGED redo trailer is accepted; an untagged one is not\n");
 
     const char *plain = "/tmp/tsdb_test_wal_trailer_plain";
     rm_rf(plain);
@@ -791,27 +796,68 @@ static void case_g(void) {
     {
         FILE *f = open_log(tr, "wb");
         if (!f) { FAILF("open_log tagged"); return; }
-        emit_rows_dedup(f, 1, DAY1 + 100, 0,   0xABCDEF01ULL, 41);
-        emit_rows_dedup(f, 2, DAY1 + 200, 500, 0xABCDEF01ULL, 42);
+        emit_rows_dedup(f, 1, DAY1 + 100, 0,   0xABCDEF01ULL, 41, 0x44454455u);
+        emit_rows_dedup(f, 2, DAY1 + 200, 500, 0xABCDEF01ULL, 42, 0x44454455u);
         fclose(f);
     }
+    /* Dedup on for THIS open: the ids must be restored by the very replay that
+     * recovers the rows.  Checked here and not on a later reopen, because the
+     * first open truncates the log once it flushes — a second open would have
+     * nothing left to read and would prove nothing. */
+    tsdb_dedup_global_reset_for_test();
+    setenv("TSDB_DEDUP", "1", 1);
     tsdb_db_t *dbt = NULL;
     OK(tsdb_open(tr, &dbt));
     tsdb_table_t *tt = NULL;
     OK(tsdb_open_table(dbt, "t", &tt));
     int ct = count_rows(dbt, "SELECT v FROM t");
+    tsdb_dedup_global_lock();
+    tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+    int seen41 = led && tsdb_dedup_seen(led, 0xABCDEF01ULL, 41);
+    int seen42 = led && tsdb_dedup_seen(led, 0xABCDEF01ULL, 42);
+    int seen99 = led && tsdb_dedup_seen(led, 0xABCDEF01ULL, 99);
+    tsdb_dedup_global_unlock();
     tsdb_close(dbt);
+    unsetenv("TSDB_DEDUP");
+    tsdb_dedup_global_reset_for_test();
 
     /* The baseline is whatever an untrailered log of these records recovers —
      * asserted only to be non-empty.  Pinning an absolute number here would
      * encode a belief about this harness that is NOT established: a two-record
      * log recovers ONE row even with no trailer involved, which is worth
      * understanding but is not what this case is about. */
+    /* And the same records with a WRONGLY tagged trailer — the schema-mismatch
+     * shape the exact-consumption rule exists to catch. */
+    const char *bad = "/tmp/tsdb_test_wal_trailer_untagged";
+    rm_rf(bad);
+    make_table(bad, 0);
+    {
+        FILE *f = open_log(bad, "wb");
+        if (!f) { FAILF("open_log untagged"); return; }
+        emit_rows_dedup(f, 1, DAY1 + 100, 0,   0xABCDEF01ULL, 41, 0xDEADBEEFu);
+        emit_rows_dedup(f, 2, DAY1 + 200, 500, 0xABCDEF01ULL, 42, 0xDEADBEEFu);
+        fclose(f);
+    }
+    tsdb_db_t *dbb = NULL;
+    OK(tsdb_open(bad, &dbb));
+    tsdb_table_t *tb2 = NULL;
+    OK(tsdb_open_table(dbb, "t", &tb2));
+    int cb = count_rows(dbb, "SELECT v FROM t");
+    tsdb_close(dbb);
+
     CHECK(cp == 2, "an untrailered 2-record log recovers both rows (got %d)", cp);
-    CHECK(ct != cp,
-          "the SAME records with 16 trailing bytes recover DIFFERENTLY "
-          "(%d vs %d) — replay is NOT trailing-byte tolerant, so a redo record "
-          "cannot be extended without changing the reader first", ct, cp);
+    CHECK(ct == cp,
+          "a correctly TAGGED trailer recovers identically (%d vs %d) — the id "
+          "can ride in the record with its rows", ct, cp);
+    CHECK(seen41 && seen42,
+          "the replay that recovered the rows also restored BOTH ids (%d, %d) — "
+          "so a retry arriving after recovery is recognised, not re-applied",
+          seen41, seen42);
+    CHECK(!seen99, "and invented no id that was not in the log (seq 99 unseen)");
+    CHECK(cb != cp,
+          "an UNTAGGED trailer is still refused (%d vs %d) — the exact-consumption "
+          "rule that protects an ALTER'd log is intact", cb, cp);
+    rm_rf(bad);
 
     rm_rf(plain); rm_rf(tr);
 }
