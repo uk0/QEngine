@@ -104,8 +104,10 @@ static int64_t g_v[ROWS];
 static int submit_one(tsdb_replica_mgr_t *rmgr, tsdb_node_id_t peer, int quorum) {
     int col_types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
     const void *col_data[2] = { g_ts, g_v };
+    /* incarnation 0 + no batch id: the legacy wire shape, which is what this
+     * backpressure test is about — it measures the fanout, not the payload. */
     return tsdb_replica_write(rmgr, "t", 2, col_types, ROWS, col_data,
-                              &peer, 1, quorum, NULL, 0);
+                              &peer, 1, quorum, NULL, 0, NULL);
 }
 
 int main(void) {

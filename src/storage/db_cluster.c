@@ -31,6 +31,8 @@
 #include "../cluster/rawblock.h"
 #include "../cluster/replica.h"
 #include "../cluster/rpc.h"
+#include "../cluster/dedup.h"
+#include "../cluster/outbox.h"
 #include "../cluster/merkle.h" /* row-range digest: middle-hole detection */
 #include "../federation/fedrpc.h"
 #include "../../include/tsdb_cluster.h"
@@ -119,6 +121,56 @@ static int shard_replica_n_cached(void);
  * userdata is the tsdb_cluster_t *.
  * We extract columnar data from the memtable and fan-out via tsdb_cluster_write.
  */
+/* ---- Sender-side dedup stamp (opt-in) ----------------------------------
+ *
+ * OFF unless TSDB_DEDUP=1, and then the payload carries (stream, seq, base) so a
+ * retry of the SAME batch is recognisable.  Off, every field is 0 and the wire
+ * bytes are exactly what a build without dedup emits.
+ *
+ * The outbox is per NODE (one file next to the data), not per table: seq only
+ * has to be unique within a stream, and stream already carries the table's
+ * incarnation.  Opened lazily under the same lock that guards every use.
+ *
+ * A failure here is never fatal to the write — it just falls back to an
+ * unstamped batch, i.e. today's behaviour.  Refusing to replicate because the
+ * dedup bookkeeping hiccuped would trade a duplicate for a lost row. */
+static tsdb_outbox_t   *g_outbox;
+static pthread_mutex_t  g_outbox_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void dedup_stamp(tsdb_db_t *db, tsdb_cluster_t *c,
+                        uint64_t incarnation, tsdb_batch_id_t *out)
+{
+    out->stream = 0; out->seq = 0; out->base = 0;
+
+    const char *e = getenv("TSDB_DEDUP");
+    if (!(e && strcmp(e, "1") == 0)) return;
+
+    uint64_t stream = tsdb_stream_id((uint64_t)tsdb_cluster_local_id(c),
+                                     incarnation);
+    if (stream == 0) return;      /* identity unknown -> no dedup, apply as before */
+
+    const char *dd = tsdb_db_data_dir_at(db, 0);
+    if (!dd) return;
+
+    pthread_mutex_lock(&g_outbox_mu);
+    if (!g_outbox) {
+        char p[4200];
+        snprintf(p, sizeof(p), "%s/outbox.bin", dd);
+        /* 1024 seqs per durable reservation: one fsync per 1024 batches, and a
+         * crash skips at most that many — which `base` then settles. */
+        if (tsdb_outbox_open(p, 1024, &g_outbox) != TSDB_OK) g_outbox = NULL;
+    }
+    uint64_t seq = 0, base = 0;
+    int rc = g_outbox ? tsdb_outbox_next(g_outbox, stream, &seq, &base)
+                      : TSDB_ERR_IO;
+    pthread_mutex_unlock(&g_outbox_mu);
+    if (rc != TSDB_OK || seq == 0) return;
+
+    out->stream = stream;
+    out->seq    = seq;
+    out->base   = base;
+}
+
 static int cluster_on_replicate(void *ud, tsdb_db_t *db,
                                   const char *table_name,
                                   tsdb_schema_t *schema,
@@ -186,10 +238,13 @@ static int cluster_on_replicate(void *ud, tsdb_db_t *db,
         }
     }
 
+    tsdb_batch_id_t bid;
+    dedup_stamp(db, c, schema->incarnation, &bid);
+
     int remote_acks = 0;
     int rc = tsdb_cluster_write(c, table_name, ncols, col_types,
                                 nrows, col_data, &remote_acks,
-                                schema->incarnation);
+                                schema->incarnation, &bid);
 
     for (int i = 0; i < ncols; i++) free(resolved_buf[i]);
 

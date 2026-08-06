@@ -359,6 +359,15 @@ int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
                                    int nrows, const void **col_data,
                                    uint64_t incarnation);
 
+/* One batch's dedup identity, threaded from the flush hook down to the encoder.
+ * All-zero means "no identity" — the wire then carries no dedup fields and the
+ * bytes are exactly what a build without dedup emits. */
+typedef struct {
+    uint64_t stream;   /* tsdb_stream_id(issuer, incarnation); 0 = none */
+    uint64_t seq;      /* from the sender's durable outbox; 0 = none     */
+    uint64_t base;     /* lowest seq the sender may still send; <=1 = n/a */
+} tsdb_batch_id_t;
+
 /* Same again, plus the dedup identity (stream_id, seq) as two more 8-byte
  * fields AFTER the incarnation — the trailer is additive, and the incarnation
  * decoder was already written with `<=` so a peer that predates these fields

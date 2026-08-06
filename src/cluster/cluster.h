@@ -110,7 +110,8 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
-                       int *out_remote_acks, uint64_t incarnation);
+                       int *out_remote_acks, uint64_t incarnation,
+                       const tsdb_batch_id_t *bid);
 
 /*
  * Propagate a CREATE TABLE to cluster peers.

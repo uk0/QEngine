@@ -145,7 +145,8 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                        const char *table_name,
                        int ncols, const int *col_types,
                        int nrows, const void **col_data,
-                       int *out_remote_acks, uint64_t incarnation)
+                       int *out_remote_acks, uint64_t incarnation,
+                       const tsdb_batch_id_t *bid)
 {
     if (out_remote_acks) *out_remote_acks = 0;
     if (!c || !table_name || nrows == 0) return TSDB_OK;
@@ -247,7 +248,7 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
                                 ncols, col_types,
                                 nrows, col_data,
                                 remote_replicas, nremote,
-                                q, &raw_acks, incarnation);
+                                q, &raw_acks, incarnation, bid);
     /* fanout ack_count includes the already-written local copy (starts at 1),
      * so strip it: out_remote_acks is the count of REMOTE replicas that
      * durably ACKed.  The SKIP_LOCAL drop decision needs >=1 of these. */

@@ -740,7 +740,8 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
                        int w_quorum, int *out_acks,
-                       uint64_t incarnation)
+                       uint64_t incarnation,
+                       const tsdb_batch_id_t *bid)
 {
     if (out_acks) *out_acks = 0;
     if (!rmgr || nreplicas == 0) return TSDB_OK;
@@ -775,10 +776,13 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
     /* _ex stamps the durable incarnation as an 8-byte trailer so a receiver
      * can reject a batch left over from a since-dropped incarnation of this
      * name.  incarnation == 0 (UNKNOWN) emits the legacy byte layout. */
-    int plen = tsdb_rpc_encode_write_batch_ex(payload, (uint32_t)payload_cap,
-                                              table_name,
-                                              ncols, col_types,
-                                              nrows, col_data, incarnation);
+    int plen = tsdb_rpc_encode_write_batch_ex2(payload, (uint32_t)payload_cap,
+                                               table_name,
+                                               ncols, col_types,
+                                               nrows, col_data, incarnation,
+                                               bid ? bid->stream : 0,
+                                               bid ? bid->seq    : 0,
+                                               bid ? bid->base   : 0);
     if (plen < 0) { free(payload); return TSDB_ERR_INTERNAL; }
 
     /* Cross-DC fan-out piggybacks on the intra-cluster payload so we

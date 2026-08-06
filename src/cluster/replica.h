@@ -82,7 +82,8 @@ int tsdb_replica_write(tsdb_replica_mgr_t *rmgr,
                        int nrows, const void **col_data,
                        const tsdb_node_id_t *replicas, int nreplicas,
                        int w_quorum, int *out_acks,
-                       uint64_t incarnation);
+                       uint64_t incarnation,
+                       const tsdb_batch_id_t *bid);
 
 /*
  * Sync schema (SCHEMA_SYNC RPC) to all given nodes.
