@@ -2165,23 +2165,6 @@ static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
         }
     }
 
-    /* Dedup id trailer, appended AFTER the last row.  The replay walks exactly
-     * `nrows` rows and never requires that it consumed the whole record, so
-     * these bytes are invisible to a build that does not know them — the same
-     * additive discipline the WRITE_BATCH trailer uses.  Emitted only when the
-     * batch actually carries an id, so an ordinary local write is byte-for-byte
-     * what it always was.
-     *
-     * This is what closes the last window: the id becomes durable in the SAME
-     * fsync as the rows it identifies, so a crash after the commit still finds
-     * the id in the log and replay puts it back in the ledger. */
-    if (dstream != 0 && dseq != 0) {
-        uint8_t tr[16];
-        redo_put_u64le(tr + 0, dstream);
-        redo_put_u64le(tr + 8, dseq);
-        if (redo_buf_put(&b, tr, 16) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
-    }
-
     *out = b.p; *out_n = b.n;
     return TSDB_OK;
 }

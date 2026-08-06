@@ -48,6 +48,7 @@
  *   [D] ALTER'd un-walkable log-> durable old-schema records skip, they don't abort
  *   [E] mid-replay flush       -> must not truncate the log under the reader
  *   [F] frozen + AE empty-wipe -> the wipe is refused, log and freeze intact
+ *   [G] trailing bytes           -> replay is NOT tolerant of them (contract)
  */
 
 #include "../include/tsdb.h"
@@ -750,24 +751,21 @@ static void case_f(void) {
 }
 
 /* =======================================================================
- * CASE G — the dedup id trailer must be INVISIBLE to replay.
+ * CASE G — replay does NOT tolerate trailing bytes after the last row.
  *
- * redo_serialize appends (stream, seq) after the last row of a record.  Replay
- * walks exactly `nrows` rows and never requires that it consumed the record, so
- * the extra bytes should change nothing.  "Should" is not evidence: this is the
- * WAL, the trailer ships enabled on a live cluster, and a record that replayed
- * differently because of it would lose or abort rows on every recovery.
+ * This looked safe by inspection: the row loop bounds-checks every read against
+ * `n` and never requires `off == n` at the end, so extra bytes ought to be
+ * ignored.  They are not.  Measured here: two identical records recover 2 rows
+ * plain and ZERO with 16 trailing bytes appended.  A dedup-id trailer written
+ * into the WAL on that assumption was reverted because of this case.
  *
- * Two logs, same rows, one trailered — both must recover identically.
- *
- * Honest limit: the baseline itself recovers ONE row from a two-record log, for
- * a reason unrelated to trailers and not yet understood, so the differential is
- * narrower than intended.  It still compares the two directly — a trailer that
- * aborted or truncated replay would show up as ct != cp — but it is not a strong
- * test, and a stronger one needs that baseline explained first.
+ * Kept as the standing contract: anything that wants to extend a redo record
+ * must make the reader accept the extension FIRST and prove it here.  The
+ * WRITE_BATCH wire trailer is a different format with a different decoder and is
+ * unaffected — this is only about redo records.
  * ======================================================================= */
 static void case_g(void) {
-    printf("\n[G] the dedup trailer is transparent to replay\n");
+    printf("\n[G] replay is NOT tolerant of trailing bytes after the last row\n");
 
     const char *plain = "/tmp/tsdb_test_wal_trailer_plain";
     rm_rf(plain);
@@ -784,7 +782,7 @@ static void case_g(void) {
     OK(tsdb_open(plain, &dbp));
     tsdb_table_t *tp = NULL;
     OK(tsdb_open_table(dbp, "t", &tp));
-    int cp = count_rows(dbp, "SELECT count(*) FROM t");
+    int cp = count_rows(dbp, "SELECT v FROM t");
     tsdb_close(dbp);
 
     const char *tr = "/tmp/tsdb_test_wal_trailer_tagged";
@@ -801,7 +799,7 @@ static void case_g(void) {
     OK(tsdb_open(tr, &dbt));
     tsdb_table_t *tt = NULL;
     OK(tsdb_open_table(dbt, "t", &tt));
-    int ct = count_rows(dbt, "SELECT count(*) FROM t");
+    int ct = count_rows(dbt, "SELECT v FROM t");
     tsdb_close(dbt);
 
     /* The baseline is whatever an untrailered log of these records recovers —
@@ -809,10 +807,11 @@ static void case_g(void) {
      * encode a belief about this harness that is NOT established: a two-record
      * log recovers ONE row even with no trailer involved, which is worth
      * understanding but is not what this case is about. */
-    CHECK(cp > 0, "the untrailered log recovers rows (got %d)", cp);
-    CHECK(ct == cp,
-          "and the SAME records WITH dedup trailers recover identically "
-          "(%d vs %d) — the trailer is invisible to replay", ct, cp);
+    CHECK(cp == 2, "an untrailered 2-record log recovers both rows (got %d)", cp);
+    CHECK(ct != cp,
+          "the SAME records with 16 trailing bytes recover DIFFERENTLY "
+          "(%d vs %d) — replay is NOT trailing-byte tolerant, so a redo record "
+          "cannot be extended without changing the reader first", ct, cp);
 
     rm_rf(plain); rm_rf(tr);
 }

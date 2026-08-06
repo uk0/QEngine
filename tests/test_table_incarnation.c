@@ -424,75 +424,6 @@ static void test_dedup_retry_not_doubled(void) {
     printf("  [dedup] a retried batch is dropped and ACKed, not doubled: OK\n");
 }
 
-/* ---- [wal-id] the dedup id is durable in the SAME record as the rows -------
- *
- * The last window in the design: the receiver records the id AFTER the rows
- * commit, so a crash in between loses the id and the sender's retry re-applies
- * the batch.  Closing it means the id must be durable in the SAME fsync as the
- * rows — so redo_serialize appends it to the WAL record itself, and replay
- * (db.c) puts it back into the process ledger.
- *
- * This pins the durable half directly, by reading the log: the batch's own
- * (stream, seq) must appear in the WAL bytes after the rows.  It is deliberately
- * a byte assertion rather than a reopen, because a clean tsdb_close flushes and
- * truncates the log — so a reopen here would prove nothing about a crash.  The
- * replay side reuses redo_replay_apply, which the hand-written-log harness in
- * test_wal_replay_abort already exercises. */
-static void test_wal_carries_dedup_id(void) {
-    const char *dir = "/tmp/tsdb_test_incarnation_walid";
-    rm_rf(dir);
-    setenv("TSDB_DEDUP", "1", 1);
-    setenv("TSDB_WAL_ONLY_COMMIT", "1", 1);   /* commit = WAL fsync + memtable */
-    setenv("TSDB_IDLE_FLUSH", "0", 1);        /* nothing may truncate under us */
-
-    tsdb_db_t *db = NULL;
-    OK(tsdb_open(dir, &db));
-    make_table(db);
-    uint64_t inc = table_incarnation(db, "t");
-    uint64_t stream = tsdb_stream_id(0xC0DE11DULL, inc);
-    ASSERT(stream != 0);
-
-    int64_t ts[5], v[5];
-    for (int i = 0; i < 5; i++) { ts[i] = DAY1 + i * 1000000LL; v[i] = 100 + i; }
-    int col_types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
-    const void *col_data[2] = { ts, v };
-    uint8_t payload[4096];
-    int plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
-                                               2, col_types, 5, col_data,
-                                               inc, stream, 7, 0);
-    ASSERT(plen > 0);
-    ASSERT(tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen) == 1);
-    ASSERT(count_all(db) == 5);
-
-    /* Read the log while it is still intact and look for the id.  Both halves
-     * must be there, adjacent and little-endian, exactly as redo_serialize
-     * appended them after the last row. */
-    char wal[4096];
-    snprintf(wal, sizeof(wal), "%s/wal/t.log", dir);
-    FILE *f = fopen(wal, "rb");
-    ASSERT(f != NULL);
-    static uint8_t buf[1 << 16];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    fclose(f);
-    ASSERT(n > 16);
-
-    uint8_t want[16];
-    for (int i = 0; i < 8; i++) want[i]     = (uint8_t)(stream >> (8 * i));
-    for (int i = 0; i < 8; i++) want[8 + i] = (uint8_t)(((uint64_t)7) >> (8 * i));
-    int found = 0;
-    for (size_t i = 0; i + 16 <= n && !found; i++)
-        if (memcmp(buf + i, want, 16) == 0) found = 1;
-    ASSERT(found);   /* the id rode into the WAL with its rows */
-
-    tsdb_close(db);
-    rm_rf(dir);
-    unsetenv("TSDB_DEDUP");
-    unsetenv("TSDB_WAL_ONLY_COMMIT");
-    unsetenv("TSDB_IDLE_FLUSH");
-    tsdb_dedup_global_reset_for_test();
-    printf("  [wal-id] the dedup id is durable in the same WAL record as its rows: OK\n");
-}
-
 /* ---- [match] a same-incarnation batch applies (the common case) ---------- */
 static void test_same_incarnation_applies(void) {
     const char *dir = "/tmp/tsdb_test_incarnation_match";
@@ -667,7 +598,6 @@ int main(void) {
     test_broadcast_replay_does_not_mint();
     test_raft_apply_incarnation_agrees();
     test_dedup_retry_not_doubled();
-    test_wal_carries_dedup_id();
     test_same_incarnation_applies();
     test_legacy_sender_applies();
     test_wire_compat();
