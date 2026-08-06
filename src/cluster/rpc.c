@@ -445,26 +445,11 @@ static uint64_t write_batch_incarnation(const uint8_t *payload, uint32_t payload
  * removes the failure that was actually observed — a fanout retry milliseconds
  * after a lost ACK, in the same live process — and it strictly shrinks the
  * window rather than moving it: today EVERY such retry duplicates. */
-static tsdb_dedup_ledger_t *g_dedup;
-static pthread_mutex_t      g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
-
-/* Read every time rather than caching in a static.  A cached first-use value is
- * order-dependent — anything that touches this path before the flag is set locks
- * it off for the life of the process, which is exactly how the first version of
- * this test silently exercised nothing.  A getenv is noise next to appending and
- * committing a batch. */
-static int dedup_enabled(void) {
-    const char *e = getenv("TSDB_DEDUP");
-    return (e && strcmp(e, "1") == 0);
-}
-
-/* Lazily opened under the same lock that guards every use, so there is no
- * initialise-once race.  Sized for a handful of peers and a modest reorder
- * window; both are hard bounds, and exceeding the window fails CLOSED. */
-static tsdb_dedup_ledger_t *dedup_ledger_locked(void) {
-    if (!g_dedup) (void)tsdb_dedup_open(64, 4096, &g_dedup);
-    return g_dedup;
-}
+/* The ledger is process-wide (dedup.c) because the WAL replay re-records ids
+ * into the SAME instance — see tsdb_dedup_global. */
+#define dedup_enabled()      tsdb_dedup_is_enabled()
+#define g_dedup_mu_lock()    tsdb_dedup_global_lock()
+#define g_dedup_mu_unlock()  tsdb_dedup_global_unlock()
 
 /* Dedup identity, if the sender emitted it: two 8-byte fields immediately after
  * the incarnation.  Both come back 0 when absent (an older sender, or one that
@@ -544,15 +529,15 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
         write_batch_dedup_id(payload, payload_len, body_end, batch_inc,
                              &dedup_stream, &dedup_seq, &dedup_base);
         if (dedup_enabled() && dedup_stream != 0 && dedup_seq != 0) {
-            pthread_mutex_lock(&g_dedup_mu);
-            tsdb_dedup_ledger_t *led = dedup_ledger_locked();
+            g_dedup_mu_lock();
+            tsdb_dedup_ledger_t *led = tsdb_dedup_global();
             /* Apply the sender's promise FIRST.  It settles the hole a
              * crash-skipped reservation left, which is what stops the
              * out-of-order window filling up and jamming the stream. */
             if (led && dedup_base > 1)
                 (void)tsdb_dedup_advance_base(led, dedup_stream, dedup_base);
             int already = led && tsdb_dedup_seen(led, dedup_stream, dedup_seq);
-            pthread_mutex_unlock(&g_dedup_mu);
+            g_dedup_mu_unlock();
             if (already) {
                 /* ACK, not error: from the sender's side this batch DID land,
                  * and an error would make it retry this forever. */
@@ -567,6 +552,11 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) == TSDB_OK) {
         tsdb_batch_set_local_only(batch);
+        /* Carry the id INTO the WAL record with the rows.  The post-commit
+         * ledger write below keeps the running process fast; this is what makes
+         * the id survive a crash between the two. */
+        if (dedup_enabled() && dedup_stream != 0 && dedup_seq != 0)
+            tsdb_batch_set_dedup_id(batch, dedup_stream, dedup_seq);
 
         /* Wire layout: non-symbol cols are nrows×8 raw bytes, symbol cols are
          * [u32 total][u16 len][bytes]…  Compute per-column offsets into the
@@ -624,14 +614,14 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
      * — losing the batch entirely, which is worse than the duplicate this gate
      * exists to prevent. */
     if (write_ok && dedup_enabled() && dedup_stream != 0 && dedup_seq != 0) {
-        pthread_mutex_lock(&g_dedup_mu);
-        tsdb_dedup_ledger_t *led = dedup_ledger_locked();
+        g_dedup_mu_lock();
+        tsdb_dedup_ledger_t *led = tsdb_dedup_global();
         if (led) {
             int drc = tsdb_dedup_record(led, dedup_stream, dedup_seq);
             if (drc == TSDB_ERR_FULL)
                 tsdb_metric_inc("qengine_replicate_dedup_window_full_total");
         }
-        pthread_mutex_unlock(&g_dedup_mu);
+        g_dedup_mu_unlock();
     }
     return write_ok;
 }

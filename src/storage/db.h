@@ -331,6 +331,12 @@ void tsdb_db_get_raw_block_hook(tsdb_db_t *db,
  */
 void tsdb_batch_set_local_only(tsdb_batch_t *b);
 
+/* Attach the WRITE_BATCH dedup identity to this batch.  redo_serialize then
+ * appends it to the SAME WAL record as the rows, so the id is durable in the
+ * same fsync — closing the window where a crash after "rows committed" but
+ * before "id remembered" let a retry re-apply the batch. */
+void tsdb_batch_set_dedup_id(tsdb_batch_t *b, uint64_t stream, uint64_t seq);
+
 /*
  * Bulk columnar append on a batch — pushes `n` rows directly via
  * tsdb_memtable_append_bulk, skipping the per-row begin/end + per-cell

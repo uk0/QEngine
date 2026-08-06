@@ -117,6 +117,28 @@ int  tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
 int  tsdb_dedup_advance_base(tsdb_dedup_ledger_t *l, uint64_t stream,
                              uint64_t base);
 
+/* ---- Process-wide ledger ------------------------------------------------
+ *
+ * One ledger per process, shared by the WRITE_BATCH receiver (which consults it
+ * before applying) and the WAL replay (which re-records ids from the log so the
+ * out-of-order tail the checkpoint deliberately omits is rebuilt).  Both need
+ * the SAME instance or the tail restored by one would be invisible to the other.
+ *
+ * Lazily opened, thread-safe.  Returns NULL if dedup is off or the open failed —
+ * callers must treat NULL as "no dedup" and apply as they always did. */
+tsdb_dedup_ledger_t *tsdb_dedup_global(void);
+void tsdb_dedup_global_lock(void);
+void tsdb_dedup_global_unlock(void);
+
+/* 1 when TSDB_DEDUP=1.  Read live rather than cached: a cached first-use value
+ * is order-dependent, and that already caused a test to silently verify nothing. */
+int  tsdb_dedup_is_enabled(void);
+
+/* TEST-ONLY: drop the process ledger, modelling the memory a crash loses.  What
+ * a restart then recovers must come from the WAL and the checkpoint, which is
+ * exactly the property worth testing. */
+void tsdb_dedup_global_reset_for_test(void);
+
 /* ---- Durable checkpoint -------------------------------------------------
  *
  * ONLY THE FRONTIER IS PERSISTED, never the out-of-order tail.  That is

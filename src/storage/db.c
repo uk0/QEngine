@@ -4,6 +4,7 @@
 #include "schema.h"
 #include "memtable.h"
 #include "part.h"
+#include "../cluster/dedup.h"
 #include "wal.h"
 #include "../core/symbol.h"
 #include "../../include/tsdb.h"
@@ -315,7 +316,19 @@ struct tsdb_batch {
      * can tell whether a flush straddled the batch (see flush_gen). */
     size_t                 base_nrows;
     uint64_t               begin_flush_gen;
+    /* Dedup identity of the WRITE_BATCH this batch is applying, if any.  Set by
+     * the replication receiver before commit so the id lands in the SAME fsync
+     * as the rows (redo_serialize appends it), which is what makes a crash
+     * between "rows durable" and "id remembered" impossible. */
+    uint64_t               dedup_stream;
+    uint64_t               dedup_seq;
 };
+
+void tsdb_batch_set_dedup_id(tsdb_batch_t *b, uint64_t stream, uint64_t seq) {
+    if (!b) return;
+    b->dedup_stream = stream;
+    b->dedup_seq    = seq;
+}
 
 /* ---- Public per-table batch lock --------------------------------------- */
 
@@ -2110,6 +2123,7 @@ static int redo_buf_put(struct redo_buf *b, const void *src, size_t n) {
  */
 static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
                           size_t from, size_t to,
+                          uint64_t dstream, uint64_t dseq,
                           uint8_t **out, size_t *out_n)
 {
     tsdb_schema_t *s = t->schema;
@@ -2150,6 +2164,24 @@ static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
             }
         }
     }
+
+    /* Dedup id trailer, appended AFTER the last row.  The replay walks exactly
+     * `nrows` rows and never requires that it consumed the whole record, so
+     * these bytes are invisible to a build that does not know them — the same
+     * additive discipline the WRITE_BATCH trailer uses.  Emitted only when the
+     * batch actually carries an id, so an ordinary local write is byte-for-byte
+     * what it always was.
+     *
+     * This is what closes the last window: the id becomes durable in the SAME
+     * fsync as the rows it identifies, so a crash after the commit still finds
+     * the id in the log and replay puts it back in the ledger. */
+    if (dstream != 0 && dseq != 0) {
+        uint8_t tr[16];
+        redo_put_u64le(tr + 0, dstream);
+        redo_put_u64le(tr + 8, dseq);
+        if (redo_buf_put(&b, tr, 16) != 0) { free(b.p); return TSDB_ERR_NOMEM; }
+    }
+
     *out = b.p; *out_n = b.n;
     return TSDB_OK;
 }
@@ -2160,7 +2192,8 @@ static int redo_serialize(tsdb_table_internal_t *t, uint64_t seq,
  * t->compact_mtx.  No-op (TSDB_OK) when there are no new rows or no WAL.
  * On success advances t->commit_seq and t->mem_logged.
  */
-static int redo_log_locked(tsdb_table_internal_t *t) {
+static int redo_log_locked(tsdb_table_internal_t *t,
+                           uint64_t dstream, uint64_t dseq) {
     if (!t->wal) return TSDB_OK;
     /* Frozen log (see wal_incomplete): a record appended here would sit ABOVE
      * the record that aborts every replay, so it could never be read back and
@@ -2172,7 +2205,8 @@ static int redo_log_locked(tsdb_table_internal_t *t) {
 
     uint64_t seq = t->commit_seq + 1;
     uint8_t *payload = NULL; size_t plen = 0;
-    int rc = redo_serialize(t, seq, t->mem_logged, nrows, &payload, &plen);
+    int rc = redo_serialize(t, seq, t->mem_logged, nrows,
+                            dstream, dseq, &payload, &plen);
     if (rc != TSDB_OK) return rc;
 
     /* Append + fsync as one unit: commit_seq only advances on success, so a
@@ -2414,6 +2448,23 @@ static int redo_replay_apply(const void *rec, size_t n,
         ctx->applied = 1;
     }
     ctx->last_complete = seq;   /* this record is now fully applied */
+    /* Dedup id trailer, if this record carries one.  Restoring it here is what
+     * makes the WAL — not the checkpoint — the source of truth for the
+     * out-of-order tail: the checkpoint only persists the contiguous frontier,
+     * deliberately, and replay rebuilds everything above it exactly.  Anything
+     * already under the frontier is refused as EXISTS, which is correct and
+     * makes replay idempotent across repeated restarts. */
+    if (off + 16 <= n && tsdb_dedup_is_enabled()) {
+        uint64_t dstream = redo_get_u64le(p + off);
+        uint64_t dseq    = redo_get_u64le(p + off + 8);
+        if (dstream != 0 && dseq != 0) {
+            tsdb_dedup_global_lock();
+            tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+            if (led) (void)tsdb_dedup_record(led, dstream, dseq);
+            tsdb_dedup_global_unlock();
+        }
+    }
+
     return TSDB_OK;
 }
 
@@ -2907,7 +2958,7 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
          * memtable flush is this mode's whole point, and correctness is the
          * priority over commit throughput. */
         pthread_mutex_lock(&t->compact_mtx);
-        int rc = redo_log_locked(t);
+        int rc = redo_log_locked(t, b->dedup_stream, b->dedup_seq);
         pthread_mutex_unlock(&t->compact_mtx);
         if (rc != TSDB_OK) {
             /* WAL append/fsync failed: the batch's rows stay in the memtable,

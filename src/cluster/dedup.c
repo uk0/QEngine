@@ -12,6 +12,34 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
+static tsdb_dedup_ledger_t *g_global;
+static pthread_mutex_t      g_global_mu = PTHREAD_MUTEX_INITIALIZER;
+
+int tsdb_dedup_is_enabled(void) {
+    const char *e = getenv("TSDB_DEDUP");
+    return (e && strcmp(e, "1") == 0);
+}
+
+void tsdb_dedup_global_lock(void)   { pthread_mutex_lock(&g_global_mu); }
+void tsdb_dedup_global_unlock(void) { pthread_mutex_unlock(&g_global_mu); }
+
+/* Call with the lock held.  Sized for a handful of peers and a modest reorder
+ * window; both are hard bounds and exceeding the window fails CLOSED. */
+tsdb_dedup_ledger_t *tsdb_dedup_global(void) {
+    if (!tsdb_dedup_is_enabled()) return NULL;
+    if (!g_global) (void)tsdb_dedup_open(64, 4096, &g_global);
+    return g_global;
+}
+
+void tsdb_dedup_global_reset_for_test(void) {
+    pthread_mutex_lock(&g_global_mu);
+    tsdb_dedup_close(g_global);
+    g_global = NULL;
+    pthread_mutex_unlock(&g_global_mu);
+}
+
 uint64_t tsdb_stream_id(uint64_t issuer_node_id, uint64_t table_incarnation) {
     /* 0 on either side means the identity is UNKNOWN — a pre-incarnation sender
      * or a table created down a path that stamps 0.  Refuse to mint an id from
