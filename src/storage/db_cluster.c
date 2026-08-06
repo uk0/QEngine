@@ -643,6 +643,20 @@ int tsdb_cluster_broadcast_delete_range(tsdb_db_t *db,
 __thread int tsdb_g_suppress_catalog_broadcast = 0;
 __thread int tsdb_g_inside_raft_apply          = 0;
 
+/* tsdb_g_raft_apply_seed
+ *   The committed Raft entry's (term, index), mixed into one non-zero word, set
+ *   by the apply callback for the duration of one QTL.  A CREATE replayed from
+ *   Raft must NOT mint a fresh table incarnation — every node replays the SAME
+ *   entry, so minting gave each node a different value for the same table and
+ *   the WRITE_BATCH incarnation gate then rejected replication in both
+ *   directions (fixed in 7cc45e1 by stamping UNKNOWN(0), which is safe but
+ *   leaves the gate inert in a Raft cluster).  (term, index) is consensus-agreed
+ *   and unique per creation event, so deriving the incarnation from it gives
+ *   every node the SAME non-zero value AND changes on a DROP+recreate — the
+ *   gate works again without any node disagreeing.  0 = not applying a Raft
+ *   entry. */
+__thread uint64_t tsdb_g_raft_apply_seed = 0;
+
 /* ---- Bridges for modules that live above the cluster layer ----------
  * raft.c wants node_mgr + replica_mgr + local_id but has no reason to
  * pull in the full cluster.h (which would pull gossip / autobalance).

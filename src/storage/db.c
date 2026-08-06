@@ -941,12 +941,29 @@ static int create_table_impl(tsdb_db_t *db,
      * every other non-SCHEMA_SYNC replica path.  The origin keeps its non-zero
      * value, so a stale batch aimed at the recreated table is still refused
      * there. */
-    extern __thread int tsdb_g_suppress_catalog_broadcast;
-    uint64_t incarnation = suppress_hook
-                         ? forced_incarnation
-                         : (tsdb_g_suppress_catalog_broadcast
-                                ? 0
-                                : tsdb_schema_new_incarnation(name, dir));
+    extern __thread int      tsdb_g_suppress_catalog_broadcast;
+    extern __thread uint64_t tsdb_g_raft_apply_seed;
+    uint64_t incarnation;
+    if (suppress_hook) {
+        incarnation = forced_incarnation;
+    } else if (!tsdb_g_suppress_catalog_broadcast) {
+        incarnation = tsdb_schema_new_incarnation(name, dir);   /* origination */
+    } else if (tsdb_g_raft_apply_seed != 0) {
+        /* Replaying a COMMITTED RAFT entry.  Derive from the entry's
+         * (term, index) — which every node applying this same entry sees
+         * identically — mixed with the table name, so all nodes agree on one
+         * non-zero value while a DROP+recreate (a different log index) gets a
+         * different one.  That restores the gate inside a Raft cluster, where
+         * stamping 0 had left it inert. */
+        uint64_t h = tsdb_g_raft_apply_seed;
+        for (const char *p = name; p && *p; p++) {
+            h ^= (unsigned char)*p;
+            h *= 1099511628211ULL;          /* FNV-1a mix, same as elsewhere */
+        }
+        incarnation = h ? h : 1ULL;
+    } else {
+        incarnation = 0;    /* non-Raft broadcast replay → UNKNOWN, never rejects */
+    }
 
     tsdb_schema_t *schema = NULL;
     int rc = tsdb_schema_create_ex2(dir, name, cols, (int)ncols, ts_col,

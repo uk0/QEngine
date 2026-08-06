@@ -259,6 +259,89 @@ static void test_broadcast_replay_does_not_mint(void) {
     printf("  [broadcast] DDL replay stamps UNKNOWN(0); replication flows both ways: OK\n");
 }
 
+/* ---- [raft] a committed Raft entry gives every node the SAME identity -----
+ *
+ * Stamping UNKNOWN(0) on a broadcast replay (above) stops the false rejects but
+ * leaves the gate INERT in a Raft cluster: catalog DDL is applied on every node
+ * from the committed entry, so every table ended up with incarnation 0 and a
+ * stale batch after a DROP+recreate could no longer be refused anywhere.
+ *
+ * A committed entry's (term, index) is consensus-agreed and unique per creation
+ * event, so deriving the incarnation from it — mixed with the table name — gives
+ * every node the SAME non-zero value while a recreate (a later log index) gets a
+ * different one.  Agreement AND protection, with no wire change. */
+extern __thread uint64_t tsdb_g_raft_apply_seed;
+
+/* Model one node applying a committed entry: both flags on, seed = f(term,index)
+ * exactly as raft_apply_cb computes it. */
+static uint64_t raft_seed(uint64_t term, uint64_t index) {
+    uint64_t s = term * 0x9E3779B97F4A7C15ULL;
+    s ^= index + 0x165667B19E3779F9ULL + (s << 6) + (s >> 2);
+    return s ? s : 1ULL;
+}
+
+static uint64_t apply_create_as_raft(const char *dir, uint64_t term, uint64_t index) {
+    rm_rf(dir);
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dir, &db));
+    tsdb_g_suppress_catalog_broadcast = 1;
+    tsdb_g_raft_apply_seed            = raft_seed(term, index);
+    make_table(db);
+    tsdb_g_raft_apply_seed            = 0;
+    tsdb_g_suppress_catalog_broadcast = 0;
+    uint64_t inc = table_incarnation(db, "t");
+    tsdb_close(db);
+    return inc;
+}
+
+static void test_raft_apply_incarnation_agrees(void) {
+    /* Three "nodes" applying the SAME committed entry must agree, and the value
+     * must be usable (non-zero) — otherwise the gate stays inert. */
+    uint64_t n1 = apply_create_as_raft("/tmp/tsdb_test_inc_raft_n1", 7, 42);
+    uint64_t n2 = apply_create_as_raft("/tmp/tsdb_test_inc_raft_n2", 7, 42);
+    uint64_t n3 = apply_create_as_raft("/tmp/tsdb_test_inc_raft_n3", 7, 42);
+    ASSERT(n1 != 0);
+    ASSERT(n1 == n2 && n2 == n3);      /* every node agrees — no false rejects */
+
+    /* A DROP+recreate is a LATER log index, so the identity must change —
+     * that is the whole point of the gate. */
+    uint64_t later = apply_create_as_raft("/tmp/tsdb_test_inc_raft_r", 7, 43);
+    ASSERT(later != 0);
+    ASSERT(later != n1);
+
+    /* A different TERM at the same index also differs (a re-elected leader
+     * re-proposing must not collide with the entry it replaced). */
+    uint64_t other_term = apply_create_as_raft("/tmp/tsdb_test_inc_raft_t", 8, 42);
+    ASSERT(other_term != 0);
+    ASSERT(other_term != n1);
+
+    /* Agreement means a batch stamped by one node APPLIES on another... */
+    tsdb_db_t *a = NULL;
+    OK(tsdb_open("/tmp/tsdb_test_inc_raft_n2", &a));
+    uint8_t payload[4096];
+    int plen = encode_batch(payload, sizeof(payload), n1, 5);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(a, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(a) == 5);
+
+    /* ...while a batch stamped for the PRE-recreate identity is REFUSED by a
+     * node that has since applied the recreate — the protection that stamping
+     * 0 had given up. */
+    tsdb_db_t *b = NULL;
+    OK(tsdb_open("/tmp/tsdb_test_inc_raft_r", &b));
+    plen = encode_batch(payload, sizeof(payload), n1, 5);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(b, payload, (uint32_t)plen) == 0);
+    ASSERT(count_all(b) == 0);
+
+    tsdb_close(a);
+    tsdb_close(b);
+    rm_rf("/tmp/tsdb_test_inc_raft_n1"); rm_rf("/tmp/tsdb_test_inc_raft_n2");
+    rm_rf("/tmp/tsdb_test_inc_raft_n3"); rm_rf("/tmp/tsdb_test_inc_raft_r");
+    rm_rf("/tmp/tsdb_test_inc_raft_t");
+    printf("  [raft] committed-entry identity: all nodes agree, recreate differs: OK\n");
+}
+
 /* ---- [match] a same-incarnation batch applies (the common case) ---------- */
 static void test_same_incarnation_applies(void) {
     const char *dir = "/tmp/tsdb_test_incarnation_match";
@@ -431,6 +514,7 @@ int main(void) {
     test_lifecycle();
     test_reject_stale_incarnation();
     test_broadcast_replay_does_not_mint();
+    test_raft_apply_incarnation_agrees();
     test_same_incarnation_applies();
     test_legacy_sender_applies();
     test_wire_compat();

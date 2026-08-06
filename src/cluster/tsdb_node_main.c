@@ -53,6 +53,7 @@ static int raft_json_cb(void *ud, char *buf, size_t cap);
  * on the apply thread before replaying the QTL. */
 extern __thread int tsdb_g_suppress_catalog_broadcast;
 extern __thread int tsdb_g_inside_raft_apply;
+extern __thread uint64_t tsdb_g_raft_apply_seed;
 
 /* Forward decl: g_local_data_dir is defined further down but used by
  * the snapshot callbacks that live up here (they need to be visible
@@ -253,12 +254,24 @@ static int raft_apply_cb(void *ud, const tsdb_raft_entry_t *e) {
     memcpy(qtl, e->payload, e->payload_len);
     qtl[e->payload_len] = '\0';
 
+    /* Consensus-agreed identity for anything this entry CREATES.  Every node
+     * applies the same (term, index), so a table created here gets the same
+     * incarnation everywhere — and a DROP+recreate lands on a different log
+     * index, so it gets a different one.  Mixed to a non-zero word (0 means
+     * "not applying an entry"); create_table_impl derives the per-table value
+     * from this plus the table name. */
+    {
+        uint64_t s = e->term * 0x9E3779B97F4A7C15ULL;
+        s ^= e->index + 0x165667B19E3779F9ULL + (s << 6) + (s >> 2);
+        tsdb_g_raft_apply_seed = s ? s : 1ULL;
+    }
     tsdb_g_suppress_catalog_broadcast = 1;
     tsdb_g_inside_raft_apply          = 1;
     tsdb_result_t *res = NULL;
     int qrc = tsdb_query(db, qtl, &res);
     tsdb_g_inside_raft_apply          = 0;
     tsdb_g_suppress_catalog_broadcast = 0;
+    tsdb_g_raft_apply_seed            = 0;
 
     if (res) tsdb_result_free(res);
     if (qrc != TSDB_OK && qrc != TSDB_ERR_EXISTS) {
