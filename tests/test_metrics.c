@@ -264,8 +264,12 @@ static void test_all_inc_names_registered(void) {
     if (!rendered) return;
 
     /* Pull every unique "qengine_..."-style name handed to a metric mutator. */
+    /* Covers the gauge mutators too (tsdb_metric_gauge_set/inc/dec): they are
+     * the same silent no-op when the name is missing from g_metrics[], and the
+     * older pattern — which required `tsdb_metric_` to be followed directly by
+     * inc/add/set/observe — did not match them at all. */
     FILE *p = popen(
-        "grep -rhoE 'tsdb_metric_(inc|add|set|observe)\\(\"[a-z0-9_]+\"' src 2>/dev/null "
+        "grep -rhoE 'tsdb_metric_(gauge_)?(inc|add|set|dec|observe)\\(\"[a-z0-9_]+\"' src 2>/dev/null "
         "| grep -oE '\"[a-z0-9_]+\"' | tr -d '\"' | sort -u", "r");
     if (!p) { CHECK(0, "popen grep for metric names"); free(rendered); return; }
 

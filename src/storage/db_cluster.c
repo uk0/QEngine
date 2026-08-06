@@ -2671,6 +2671,84 @@ static int resync_is_table_dir(const char *name) {
     return 1;
 }
 
+/* Count table directories on disk that the catalog knows NOTHING about, and
+ * make them visible.  REPORT ONLY — nothing is deleted or moved here.
+ *
+ * A DROP removes the catalog row cluster-wide and the storage on every node that
+ * RUNS it (tsdb_drop_table has no not-found path; it always reaps the WAL and
+ * trash_or_rm's the dir).  A node that was DOWN for the DROP never runs it: the
+ * catalog tombstone correctly keeps the table out of its catalog when it
+ * rejoins, but its local directory stays forever, and DROP cannot reach it
+ * either — exec.c refuses to propose a DROP for a name the LEADER does not know.
+ * Measured live 2026-08-04: one node alone held five such directories while the
+ * catalog listed only the real tables.
+ *
+ * That matters beyond disk: hierarchy mirroring registers every plain table as a
+ * childless data-bearing super-table and the sweep calls
+ * materialize_missing_stables, so an orphan directory is a resurrection
+ * candidate.  Reaping it automatically would be a delete decided by this code —
+ * refused deliberately (see the design options on task #8); surfacing it is not.
+ *
+ * Cheap: one readdir per data dir per sweep plus two catalog lookups per entry.
+ * The name list is logged only when the COUNT CHANGES, so a steady state costs
+ * one gauge update and no log lines. */
+static void ae_report_orphan_storage(tsdb_db_t *db) {
+    tsdb_catalog_t *cat = tsdb_db_catalog(db);
+    if (!cat) return;
+
+    long  n_orphan = 0;
+    char  names[8][128];
+    int   nnames = 0;
+    int   ndirs = tsdb_db_data_dir_count(db);
+
+    for (int di = 0; di < ndirs; di++) {
+        const char *dd = tsdb_db_data_dir_at(db, di);
+        if (!dd) continue;
+        DIR *d = opendir(dd);
+        if (!d) continue;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!resync_is_table_dir(de->d_name)) continue;
+            char path[4600];
+            snprintf(path, sizeof(path), "%s/%s", dd, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+            /* Known to the catalog in EITHER role → not an orphan.  A plain
+             * table is mirrored as a childless super-table, so the stable
+             * lookup covers the ordinary case. */
+            tsdb_stable_t       stmp;
+            tsdb_child_table_t  ctmp;
+            if (tsdb_stable_get(cat, de->d_name, &stmp) == TSDB_OK)      continue;
+            if (tsdb_child_table_get(cat, de->d_name, &ctmp) == TSDB_OK) continue;
+
+            n_orphan++;
+            if (nnames < 8)
+                snprintf(names[nnames++], sizeof(names[0]), "%s", de->d_name);
+        }
+        closedir(d);
+    }
+
+    tsdb_metric_gauge_set("qengine_orphan_table_dirs", (double)n_orphan);
+
+    static long last_reported = -1;
+    if (n_orphan == last_reported) return;
+    last_reported = n_orphan;
+    if (n_orphan <= 0) return;
+
+    char list[1100];
+    size_t off = 0;
+    for (int i = 0; i < nnames && off < sizeof(list) - 1; i++)
+        off += (size_t)snprintf(list + off, sizeof(list) - off,
+                                "%s%s", i ? ", " : "", names[i]);
+    fprintf(stderr,
+            "[storage] %ld table director(ies) on disk are unknown to the "
+            "catalog (%s%s) — most likely dropped while this node was down, so "
+            "the tombstone kept them out of the catalog but nothing reaped the "
+            "files; DROP cannot reach them either.  Nothing was deleted.\n",
+            n_orphan, list, n_orphan > nnames ? ", ..." : "");
+}
+
 /* The wall budget one table's candidate loop is allowed, exported so a test can
  * pin the number the production driver actually passes (its enforcement is
  * pinned by tests/test_ae_candidates.c).  This, times the table count, is the
@@ -2702,6 +2780,11 @@ void tsdb_cluster_resync_all_tables(tsdb_db_t *db) {
     /* One monotonic tick per sweep — drives the middle-gap log throttle so a
      * persistent gap logs once, not once per divergent peer per 30 s. */
     g_ae_sweep_no++;
+
+    /* Report-only: surface table dirs the catalog knows nothing about.  Runs
+     * BEFORE the pre-open below, which would otherwise register them in
+     * db->tables[] and hide the discrepancy. */
+    ae_report_orphan_storage(db);
 
     /* Pre-open every on-disk table across every striped data dir so
      * db->tables[] reflects them.  Falls back to a single-dir scan

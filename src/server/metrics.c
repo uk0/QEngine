@@ -297,6 +297,9 @@ static metric_t g_metrics[] = {
     { "qengine_disk_bytes",
       "Approximate total bytes used by all column files on disk", MT_GAUGE, { .g = { 0 } } },
 
+    { "qengine_orphan_table_dirs",
+      "Table directories on disk that the catalog knows nothing about — typically dropped while this node was down, so the tombstone kept them out of the catalog but nothing reaped the files (DROP cannot reach them either). Report only; nothing is deleted", MT_GAUGE, { .g = { 0 } } },
+
     { "qengine_cluster_nodes_alive",
       "Number of cluster nodes currently considered alive", MT_GAUGE, { .g = { 0 } } },
 
