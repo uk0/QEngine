@@ -1589,6 +1589,109 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
                                                 uint64_t expected_local_rows,
                                                 uint64_t *out_rows_written)
 {
+    /* Anti-entropy's policy: grow only, keep every row. */
+    return tsdb_cluster_rewrite_partition_from_result(db, table_name, part_name,
+                                                      res, expected_local_rows,
+                                                      /*allow_shrink*/ 0,
+                                                      /*drop_duplicates*/ 0,
+                                                      out_rows_written);
+}
+
+/* Remove EXACT duplicate rows from one partition, atomically.
+ *
+ * The repair for over-counts that were already on disk before the dedup work
+ * existed.  New ones cannot form — the receiver gate, the sender outbox and the
+ * replay skip each refuse a duplicate at a point where it is PROVABLE — but a
+ * historical duplicate is indistinguishable from a legitimately-repeated row by
+ * any inspection of the data, so removing it is a judgement only the operator
+ * can make.  Hence: never called by anti-entropy, never on a timer, only when
+ * something explicitly asks for this table and this partition.
+ *
+ * Two identical rows are LEGAL in a tick store, so this is not a correctness
+ * pass — invoking it is the operator asserting that repeats in this partition
+ * are duplicates.  Pair it with the over-count report, which names the exact ts
+ * buckets and the excess count.
+ *
+ * Safety comes from reusing the rewrite path anti-entropy already uses: the
+ * deduped partition is built in full, in a temp dir, through the normal
+ * col-writer path, and only then swapped in under compact_mtx with a staleness
+ * guard — all columns or none.  A crash before the swap leaves the original
+ * untouched; a concurrent flush aborts the swap with TSDB_ERR_BUSY. */
+int tsdb_dedup_partition(tsdb_db_t *db, const char *table_name,
+                         const char *part_name, uint64_t *out_removed)
+{
+    if (out_removed) *out_removed = 0;
+    if (!db || !table_name || !part_name) return TSDB_ERR_INVAL;
+
+    tsdb_partition_unit_t unit = TSDB_PARTITION_DAY;
+    {
+        tsdb_table_internal_t *ti = tsdb_db_scan_acquire(db, table_name);
+        if (!ti) return TSDB_ERR_NOTFOUND;
+        tsdb_schema_t *sc = tsdb_tbl_schema(ti);
+        if (sc) unit = sc->partition_unit;
+        tsdb_db_scan_release(db, ti);
+    }
+
+    int64_t lo = 0, hi = 0;
+    if (aebf_part_dir_to_range(part_name, unit, &lo, &hi) != 0)
+        return TSDB_ERR_INVAL;
+
+    /* What the partition holds right now — also the staleness baseline. */
+    uint64_t live_rows = 0;
+    {
+        int ndirs = tsdb_db_data_dir_count(db);
+        for (int di = 0; di < ndirs; di++) {
+            const char *dd = tsdb_db_data_dir_at(db, di);
+            if (!dd) continue;
+            char idx[5200];
+            snprintf(idx, sizeof(idx), "%s/%s/%s/ts.idx", dd, table_name, part_name);
+            uint64_t r = 0;
+            if (tsdb_part_idx_probe(idx, NULL, NULL, NULL, &r, NULL, NULL, NULL) > 0)
+                { live_rows = r; break; }
+        }
+    }
+    if (live_rows == 0) return TSDB_ERR_NOTFOUND;
+
+    /* Read THIS node's copy of the partition — physical-local, so the rows are
+     * the ones actually stored here rather than a cluster-wide gather. */
+    char qtl[320];
+    snprintf(qtl, sizeof(qtl),
+             "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
+             table_name, (long long)lo, (long long)hi);
+    tsdb_result_t *res = NULL;
+    int prev  = tsdb_g_scatter_local_mode;
+    int pprev = tsdb_g_ae_physical_local;
+    tsdb_g_scatter_local_mode = 1;
+    tsdb_g_ae_physical_local  = 1;
+    int rc = tsdb_query(db, qtl, &res);
+    tsdb_g_scatter_local_mode = prev;
+    tsdb_g_ae_physical_local  = pprev;
+    if (rc != TSDB_OK || !res) { if (res) tsdb_result_free(res); return TSDB_ERR_IO; }
+
+    uint64_t kept = 0;
+    rc = tsdb_cluster_rewrite_partition_from_result(db, table_name, part_name,
+                                                   res, live_rows,
+                                                   /*allow_shrink*/ 1,
+                                                   /*drop_duplicates*/ 1,
+                                                   &kept);
+    tsdb_result_free(res);
+    if (rc != TSDB_OK) return rc;
+
+    if (out_removed) *out_removed = (live_rows > kept) ? live_rows - kept : 0;
+    tsdb_metric_add("qengine_dedup_rows_removed_total",
+                    (live_rows > kept) ? live_rows - kept : 0);
+    return TSDB_OK;
+}
+
+int tsdb_cluster_rewrite_partition_from_result(tsdb_db_t *db,
+                                               const char *table_name,
+                                               const char *part_name,
+                                               tsdb_result_t *res,
+                                               uint64_t expected_local_rows,
+                                               int allow_shrink,
+                                               int drop_duplicates,
+                                               uint64_t *out_rows_written)
+{
     if (out_rows_written) *out_rows_written = 0;
     if (!db || !table_name || !part_name || !res) return TSDB_ERR_INVAL;
 
@@ -1668,7 +1771,26 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
                          ? (size_t)s->block_points : (size_t)TSDB_BLOCK_POINTS;
     uint64_t rows = 0;
     size_t inmem = 0;
+    /* Exact-duplicate filter for the de-duplication caller.  Keyed on the same
+     * canonical row fingerprint the digest and the AE merge use, so "identical"
+     * means identical in every column, never merely the same timestamp. */
+    uint64_t *seen = NULL; size_t nseen = 0, seencap = 0;
+    uint64_t dropped = 0;
+
     while (tsdb_result_next(res)) {
+        if (drop_duplicates) {
+            uint64_t h = tsdb_rowdigest_row_hash(res, ncols);
+            int dup = 0;
+            for (size_t k = 0; k < nseen && !dup; k++) if (seen[k] == h) dup = 1;
+            if (dup) { dropped++; continue; }
+            if (nseen == seencap) {
+                size_t nc = seencap ? seencap * 2 : 256;
+                uint64_t *ns = realloc(seen, nc * sizeof(uint64_t));
+                if (!ns) { free(seen); rc = TSDB_ERR_NOMEM; goto fail; }
+                seen = ns; seencap = nc;
+            }
+            seen[nseen++] = h;
+        }
         int64_t ts = tsdb_result_ts(res, rmap[s->ts_col_idx]);
         if (ts < pstart || ts > pend) { rc = TSDB_ERR_INVAL; goto fail; }
         if (tsdb_memtable_row_begin(mt) != TSDB_OK ||
@@ -1710,7 +1832,12 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
     }
 
     /* Never shrink durable data: the peer copy must be strictly fuller. */
-    if (rows == 0 || rows <= expected_local_rows) { rc = TSDB_ERR_INVAL; goto fail; }
+    /* Anti-entropy must never shrink durable data, so its policy is "strictly
+     * more than we had".  The de-duplication caller writes FEWER rows on purpose
+     * and passes allow_shrink; the staleness guard in phase 2 is untouched
+     * either way, so a concurrent flush still aborts the swap. */
+    if (rows == 0) { rc = TSDB_ERR_INVAL; goto fail; }
+    if (!allow_shrink && rows <= expected_local_rows) { rc = TSDB_ERR_INVAL; goto fail; }
 
     /* Newly interned symbols exist only in memory until close; persist the
      * dictionaries now so the swapped codes survive an unclean shutdown. */
@@ -1790,6 +1917,12 @@ int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
     aebf_scratch_remove(s, scratch_part, scratch);
     tsdb_memtable_free(mt);
     tsdb_db_scan_release(db, t);
+    if (dropped)
+        fprintf(stderr,
+                "[dedup] %s/%s: rewrote partition without %llu exact duplicate "
+                "row(s) (%llu kept)\n", table_name, part_name,
+                (unsigned long long)dropped, (unsigned long long)rows);
+    free(seen);
     if (out_rows_written) *out_rows_written = rows;
     return TSDB_OK;
 

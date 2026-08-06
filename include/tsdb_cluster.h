@@ -251,6 +251,38 @@ int tsdb_cluster_peer_table_stats_conn(struct tsdb_rpc_conn *conn,
  * reduces durable rows.  On success *out_rows_written is the new partition
  * row count.  Local-unique rows in the swapped partition are replaced by
  * the peer copy (MVP limitation; logged loudly by the resync caller). */
+/* Rewrite one partition from a result set, all columns or none.
+ *
+ * The mechanism anti-entropy's backfill already used, with its POLICY made
+ * explicit so a second caller can have a different one:
+ *   allow_shrink    — 0 keeps AE's rule that the rewrite must hold strictly MORE
+ *                     rows than the live partition (anti-entropy never shrinks
+ *                     durable data).  1 permits fewer, which de-duplication
+ *                     needs by definition.
+ *   drop_duplicates — skip a row whose canonical fingerprint (the one the digest
+ *                     and the AE merge use) has already been written, so
+ *                     "identical" means identical in EVERY column.
+ * The phase-2 staleness guard is unconditional either way: if the live partition
+ * moved while phase 1 ran, the swap aborts and the table is left untouched. */
+/* Remove EXACT duplicate rows from one partition, atomically (all columns or
+ * none, temp build + guarded swap — a crash before the swap changes nothing).
+ *
+ * The repair for over-counts already on disk.  NEVER called automatically: two
+ * identical rows are legal in a tick store, so only an operator can assert that
+ * repeats in a given partition are duplicates.  Pair with the over-count report,
+ * which names the ts buckets and the excess.  *out_removed = rows dropped. */
+int tsdb_dedup_partition(tsdb_db_t *db, const char *table_name,
+                         const char *part_name, uint64_t *out_removed);
+
+int tsdb_cluster_rewrite_partition_from_result(tsdb_db_t *db,
+                                               const char *table_name,
+                                               const char *part_name,
+                                               tsdb_result_t *res,
+                                               uint64_t expected_local_rows,
+                                               int allow_shrink,
+                                               int drop_duplicates,
+                                               uint64_t *out_rows_written);
+
 int tsdb_cluster_backfill_partition_from_result(tsdb_db_t *db,
                                                 const char *table_name,
                                                 const char *part_name,

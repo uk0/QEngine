@@ -309,6 +309,9 @@ static metric_t g_metrics[] = {
     { "qengine_batch_split_across_flush_total",
       "Bulk batches larger than one memtable, which therefore SPLIT across a flush: a prefix becomes durable and cannot be rolled back, so the batch is not atomic and a commit-failure rollback can only undo the tail", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_dedup_rows_removed_total",
+      "Exact duplicate rows removed by an explicit operator-invoked partition de-duplication (never automatic — two identical rows are legal in a tick store, so only an operator can assert repeats are duplicates)", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_orphan_table_dirs_reaped_total",
       "Orphan table directories quarantined into .trash by the anti-entropy sweep (opt-in TSDB_AE_REAP_ORPHANS=1; only for names the catalog holds a DROP tombstone for, never on mere absence). Moved, not deleted", MT_COUNTER, { .c = { 0 } } },
 

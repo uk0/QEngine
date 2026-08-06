@@ -54,6 +54,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_fail = 0;
@@ -719,6 +720,70 @@ int main(void) {
         free(dg); free(gg);
         tsdb_close(good); tsdb_close(dup);
         rm_rf("/tmp/tsdb_rd_oc_good"); rm_rf("/tmp/tsdb_rd_oc_dup");
+    }
+
+    /* ── [9] the operator repair: remove exact duplicates from a partition ──
+     *
+     * Prevention stops NEW over-counts; this is the repair for rows already on
+     * disk.  It must remove only EXACT duplicates and keep every distinct row —
+     * including rows that merely share a timestamp, which are legitimate in a
+     * tick store and are exactly what a careless "dedup by ts" would destroy. */
+    printf("\n[9] explicit partition de-duplication removes only exact repeats\n");
+    {
+        tsdb_db_t *db = open_fresh("/tmp/tsdb_rd_dedup");
+        fill_blocks(db, 200, 1, -1, 0);
+        /* Three exact duplicates... */
+        for (int i = 0; i < 3; i++) add_row(db, 50 + i, 50 + i);
+        /* ...and two rows that SHARE a ts with an existing row but differ in
+         * value.  These must survive: same-ts is not same-row. */
+        add_row(db, 10, 999001);
+        add_row(db, 11, 999002);
+        OK(tsdb_db_flush_all(db));
+
+        uint64_t before = row_count(db);
+        CHECK(before == 205, "205 rows on disk (200 + 3 dups + 2 same-ts distinct), got %llu",
+              (unsigned long long)before);
+
+        /* The partition name for BASE (a DAY partition). */
+        char part[32];
+        {
+            time_t t = (time_t)(BASE / 1000000000LL);
+            struct tm g; gmtime_r(&t, &g);
+            snprintf(part, sizeof(part), "%04d%02d%02d",
+                     g.tm_year + 1900, g.tm_mon + 1, g.tm_mday);
+        }
+
+        uint64_t removed = 0;
+        int rc = tsdb_dedup_partition(db, "t", part, &removed);
+        CHECK(rc == TSDB_OK, "de-duplication succeeded (rc=%d, part=%s)", rc, part);
+        CHECK(removed == 3, "it removed exactly the 3 duplicates (got %llu)",
+              (unsigned long long)removed);
+
+        uint64_t after = row_count(db);
+        CHECK(after == 202,
+              "202 rows remain — the 2 same-ts DISTINCT rows survived (got %llu)",
+              (unsigned long long)after);
+
+        /* Prove the survivors are the right ones, not just the right count. */
+        tsdb_result_t *r = NULL;
+        int seen999 = 0;
+        if (tsdb_query(db, "SELECT v FROM t WHERE v >= 999001", &r) == TSDB_OK && r) {
+            while (tsdb_result_next(r)) seen999++;
+            tsdb_result_free(r);
+        }
+        CHECK(seen999 == 2, "both same-ts distinct rows are still readable (got %d)",
+              seen999);
+
+        /* Running it again is a no-op: nothing left to remove. */
+        uint64_t again = 1;
+        rc = tsdb_dedup_partition(db, "t", part, &again);
+        CHECK(rc == TSDB_OK && again == 0,
+              "a second pass removes nothing (rc=%d, removed=%llu) — idempotent",
+              rc, (unsigned long long)again);
+        CHECK(row_count(db) == 202, "and the row count is unchanged");
+
+        tsdb_close(db);
+        rm_rf("/tmp/tsdb_rd_dedup");
     }
 
     if (g_fail) {
