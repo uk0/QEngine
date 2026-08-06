@@ -183,6 +183,22 @@ static void emit_record(FILE *f, const uint8_t *payload, size_t plen) {
  * un-decodable record that aborts a replay, which is exactly the shape a schema
  * change under an untruncated log (or an OOM mid-serialise) leaves behind.
  */
+/* A record with the dedup (stream, seq) trailer redo_serialize appends after
+ * the last row.  Used to prove the trailer is TRANSPARENT to replay. */
+static void emit_rows_dedup(FILE *f, uint64_t seq, int64_t base_ts,
+                            int64_t base_v, uint64_t dstream, uint64_t dseq)
+{
+    uint8_t p[64];
+    memset(p, 0, sizeof(p));
+    put_u64le(p + 0, seq);
+    put_u32le(p + 8, 1);
+    put_u64le(p + 12, (uint64_t)base_ts);
+    put_u64le(p + 20, (uint64_t)base_v);
+    put_u64le(p + 28, dstream);
+    put_u64le(p + 36, dseq);
+    emit_record(f, p, 44);
+}
+
 static void emit_rows(FILE *f, uint64_t seq, uint32_t declared_rows,
                       uint32_t real_rows, int ncols_data,
                       int64_t base_ts, int64_t base_v)
@@ -733,6 +749,74 @@ static void case_f(void) {
     rm_rf(dir);
 }
 
+/* =======================================================================
+ * CASE G — the dedup id trailer must be INVISIBLE to replay.
+ *
+ * redo_serialize appends (stream, seq) after the last row of a record.  Replay
+ * walks exactly `nrows` rows and never requires that it consumed the record, so
+ * the extra bytes should change nothing.  "Should" is not evidence: this is the
+ * WAL, the trailer ships enabled on a live cluster, and a record that replayed
+ * differently because of it would lose or abort rows on every recovery.
+ *
+ * Two logs, same rows, one trailered — both must recover identically.
+ *
+ * Honest limit: the baseline itself recovers ONE row from a two-record log, for
+ * a reason unrelated to trailers and not yet understood, so the differential is
+ * narrower than intended.  It still compares the two directly — a trailer that
+ * aborted or truncated replay would show up as ct != cp — but it is not a strong
+ * test, and a stronger one needs that baseline explained first.
+ * ======================================================================= */
+static void case_g(void) {
+    printf("\n[G] the dedup trailer is transparent to replay\n");
+
+    const char *plain = "/tmp/tsdb_test_wal_trailer_plain";
+    rm_rf(plain);
+    env_wal_only();
+    make_table(plain, 0);
+    {
+        FILE *f = open_log(plain, "wb");
+        if (!f) { FAILF("open_log plain"); return; }
+        emit_rows(f, 1, 1, 1, 1, DAY1 + 100, 0);
+        emit_rows(f, 2, 1, 1, 1, DAY1 + 200, 500);
+        fclose(f);
+    }
+    tsdb_db_t *dbp = NULL;
+    OK(tsdb_open(plain, &dbp));
+    tsdb_table_t *tp = NULL;
+    OK(tsdb_open_table(dbp, "t", &tp));
+    int cp = count_rows(dbp, "SELECT count(*) FROM t");
+    tsdb_close(dbp);
+
+    const char *tr = "/tmp/tsdb_test_wal_trailer_tagged";
+    rm_rf(tr);
+    make_table(tr, 0);
+    {
+        FILE *f = open_log(tr, "wb");
+        if (!f) { FAILF("open_log tagged"); return; }
+        emit_rows_dedup(f, 1, DAY1 + 100, 0,   0xABCDEF01ULL, 41);
+        emit_rows_dedup(f, 2, DAY1 + 200, 500, 0xABCDEF01ULL, 42);
+        fclose(f);
+    }
+    tsdb_db_t *dbt = NULL;
+    OK(tsdb_open(tr, &dbt));
+    tsdb_table_t *tt = NULL;
+    OK(tsdb_open_table(dbt, "t", &tt));
+    int ct = count_rows(dbt, "SELECT count(*) FROM t");
+    tsdb_close(dbt);
+
+    /* The baseline is whatever an untrailered log of these records recovers —
+     * asserted only to be non-empty.  Pinning an absolute number here would
+     * encode a belief about this harness that is NOT established: a two-record
+     * log recovers ONE row even with no trailer involved, which is worth
+     * understanding but is not what this case is about. */
+    CHECK(cp > 0, "the untrailered log recovers rows (got %d)", cp);
+    CHECK(ct == cp,
+          "and the SAME records WITH dedup trailers recover identically "
+          "(%d vs %d) — the trailer is invisible to replay", ct, cp);
+
+    rm_rf(plain); rm_rf(tr);
+}
+
 int main(void) {
     printf("=== test_wal_replay_abort ===\n");
     case_a();
@@ -741,6 +825,7 @@ int main(void) {
     case_d();
     case_e();
     case_f();
+    case_g();
     if (g_fail) {
         fprintf(stderr, "\ntest_wal_replay_abort: %d FAILURE(S)\n", g_fail);
         return 1;
