@@ -854,6 +854,34 @@ static void case_g(void) {
           "so a retry arriving after recovery is recognised, not re-applied",
           seen41, seen42);
     CHECK(!seen99, "and invented no id that was not in the log (seq 99 unseen)");
+    /* A log that holds the SAME batch twice must replay it ONCE.  Two records,
+     * same tagged (stream, seq), DIFFERENT rows so the count says which landed. */
+    {
+        const char *dupdir = "/tmp/tsdb_test_wal_trailer_dup";
+        rm_rf(dupdir);
+        make_table(dupdir, 0);
+        FILE *f = open_log(dupdir, "wb");
+        if (f) {
+            emit_rows_dedup(f, 1, DAY1 + 300, 10, 0xFEED0001ULL, 7, 0x44454455u);
+            emit_rows_dedup(f, 2, DAY1 + 400, 20, 0xFEED0001ULL, 7, 0x44454455u);
+            fclose(f);
+        }
+        tsdb_dedup_global_reset_for_test();
+        setenv("TSDB_DEDUP", "1", 1);
+        tsdb_db_t *dbd = NULL;
+        OK(tsdb_open(dupdir, &dbd));
+        tsdb_table_t *td = NULL;
+        OK(tsdb_open_table(dbd, "t", &td));
+        int cd = count_rows(dbd, "SELECT v FROM t");
+        tsdb_close(dbd);
+        unsetenv("TSDB_DEDUP");
+        tsdb_dedup_global_reset_for_test();
+        CHECK(cd == 1,
+              "a log holding the same batch TWICE replays it once (got %d rows, "
+              "2 = the over-count was faithfully reproduced)", cd);
+        rm_rf(dupdir);
+    }
+
     CHECK(cb != cp,
           "an UNTAGGED trailer is still refused (%d vs %d) — the exact-consumption "
           "rule that protects an ALTER'd log is intact", cb, cp);

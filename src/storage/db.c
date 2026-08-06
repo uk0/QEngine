@@ -2396,6 +2396,30 @@ static int redo_replay_apply(const void *rec, size_t n,
      * the un-read remainder of the log is worth. */
     if (!cut_ok) return TSDB_ERR_CORRUPT;
 
+    /* A record whose tagged (stream, seq) is ALREADY applied is a duplicate
+     * batch, and here that is PROOF rather than inference: a sender assigns a
+     * seq to exactly one batch, so two records bearing it are that batch written
+     * twice.  Skip it before a single row reaches the memtable, so recovery
+     * applies it once instead of faithfully reproducing an over-count that no
+     * count comparison could ever repair afterwards.  (The id is recorded after
+     * the rows below, so without this the duplicate would apply and only then be
+     * recognised.) */
+    if (tsdb_dedup_is_enabled() && n >= TSDB_REDO_TRAILER_SZ &&
+        redo_get_u32le(p + n - TSDB_REDO_TRAILER_SZ) == TSDB_REDO_TRAILER_MAGIC) {
+        uint64_t ds = redo_get_u64le(p + n - TSDB_REDO_TRAILER_SZ + 4);
+        uint64_t dq = redo_get_u64le(p + n - TSDB_REDO_TRAILER_SZ + 12);
+        if (ds != 0 && dq != 0) {
+            tsdb_dedup_global_lock();
+            tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+            int dup = led && tsdb_dedup_seen(led, ds, dq);
+            tsdb_dedup_global_unlock();
+            if (dup) {
+                tsdb_metric_inc("qengine_wal_replay_dedup_skipped_total");
+                return TSDB_OK;
+            }
+        }
+    }
+
     size_t off = 12;
 
     /* Flush at this CLEAN record boundary if the whole record won't fit the

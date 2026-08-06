@@ -168,6 +168,9 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_recv_ok_total",
       "WRITE_BATCH RPCs received where the local batch_commit landed rows", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_wal_replay_dedup_skipped_total",
+      "Redo records skipped during replay because their tagged (stream, seq) was already applied — the log held the same batch twice, so recovery applies it once instead of reproducing an over-count no count comparison could repair", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_dedup_dropped_total",
       "WRITE_BATCH RPCs dropped as already-applied by the (stream_id, seq) dedup gate and ACKed rather than re-applied (opt-in TSDB_DEDUP=1)", MT_COUNTER, { .c = { 0 } } },
 
