@@ -132,6 +132,12 @@ int tsdb_cluster_forward_ddl_to_leader(tsdb_db_t *db,
                                         const char *qtl,
                                         char *out_status, size_t cap);
 
+/* 1 when some ALIVE peer holds a table by this name.  Lets DROP TABLE act on a
+ * table that exists only on a peer — positive evidence, rather than proposing a
+ * DROP for a name nobody has confirmed, which would destroy a table the leader
+ * has merely not learned yet.  0 in standalone mode. */
+int tsdb_cluster_any_peer_has_table(tsdb_db_t *db, const char *table_name);
+
 /* Anti-entropy resync.  Pulls missing rows (ts > local_max_ts) from
  * the peer that holds the most up-to-date copy of `table_name`.  The
  * pulled rows are applied with the local-only flag so they do not

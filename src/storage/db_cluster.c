@@ -1267,6 +1267,38 @@ static int pull_bucket_merge(tsdb_db_t *db, tsdb_cluster_t *c,
     return rc == TSDB_OK ? inserted : -1;
 }
 
+/* Does ANY alive peer hold a table by this name?
+ *
+ * DROP TABLE is refused when the LEADER's catalog does not know the name, which
+ * is right for a typo but wrong for a table that exists only on a peer — that
+ * table then cannot be dropped through SQL at all, and its storage is
+ * unreachable (the orphan-reap path only handles names the catalog once knew).
+ *
+ * Proposing the DROP unconditionally would fix it by GUESSING: a name the leader
+ * has merely not learned yet — exactly what the resurrection-safe merge exists to
+ * ADD — would be destroyed on the peers that legitimately hold it.  Asking first
+ * turns that guess into positive evidence: if a peer answers "I have this table",
+ * dropping it is the operator acting on a table that demonstrably exists.  It is
+ * the same discipline the tombstone-gated reap uses — act on evidence, never on
+ * absence.
+ *
+ * A peer that cannot answer, or answers with an error (which is what a missing
+ * table produces), is not evidence and is ignored. */
+int tsdb_cluster_any_peer_has_table(tsdb_db_t *db, const char *table_name) {
+    if (!db || !table_name) return 0;
+    tsdb_cluster_t *c = cluster_get(db);
+    if (!c) return 0;                       /* standalone: nothing to ask */
+
+    tsdb_node_id_t peers[TSDB_CLUSTER_MAX_NODES];
+    int npeers = collect_alive_peers(c, peers, TSDB_CLUSTER_MAX_NODES);
+    for (int i = 0; i < npeers; i++) {
+        uint64_t cnt = 0; int64_t mx = 0;
+        if (peer_table_stats(c, peers[i], table_name, &cnt, &mx) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* Bucket width for the row-range digest: the table's own partition span, so
  * buckets align 1:1 with partitions (the granularity ae_partition_backfill and
  * the rawblock idempotency comment already reason in).  0 = table unknown. */

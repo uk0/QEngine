@@ -8945,7 +8945,16 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
                 int has_child = (tsdb_child_table_get(pc,
                                     stmt.u.drop_table.name, &ctmp) == TSDB_OK);
                 int has_table = (tsdb_db_find_table(db, stmt.u.drop_table.name) != NULL);
-                if (!has_child && !has_table) {
+                /* A table can exist only on a PEER — created while this node was
+                 * down, or left behind when a DROP could not reach it.  Refusing
+                 * here made such a table undroppable through SQL forever.  Ask
+                 * before refusing: a peer that answers "I hold this" is positive
+                 * evidence the table exists, so proposing the DROP acts on a real
+                 * table rather than guessing.  Proposing WITHOUT asking would
+                 * destroy a table the leader has merely not learned yet — the
+                 * case the resurrection-safe merge exists to ADD. */
+                if (!has_child && !has_table &&
+                    !tsdb_cluster_any_peer_has_table(db, stmt.u.drop_table.name)) {
                     err_msg = "ERR: table not found"; err_rc = TSDB_ERR_NOTFOUND;
                 }
                 break;
