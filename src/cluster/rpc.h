@@ -359,6 +359,37 @@ int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
                                    int nrows, const void **col_data,
                                    uint64_t incarnation);
 
+/* Same again, plus the dedup identity (stream_id, seq) as two more 8-byte
+ * fields AFTER the incarnation — the trailer is additive, and the incarnation
+ * decoder was already written with `<=` so a peer that predates these fields
+ * reads the incarnation and ignores them.
+ *
+ * The dedup fields are emitted ONLY when the incarnation is non-zero, which is
+ * not a limitation: stream_id is DERIVED from the incarnation (see
+ * tsdb_stream_id), so incarnation == 0 means the identity is unknown and there
+ * is no stream to name.  That keeps the layout unambiguous — the 8 bytes at the
+ * end of the columnar body are always the incarnation, never a stream_id — and
+ * keeps the incarnation-only encoding byte-identical to what ships today.
+ *
+ * stream_id == 0 or seq == 0 also emits no dedup fields, so passing zeros
+ * reproduces tsdb_rpc_encode_write_batch_ex exactly.
+ * Returns bytes written, or -1 if the buffer is too small. */
+int tsdb_rpc_encode_write_batch_ex2(uint8_t *buf, uint32_t cap,
+                                    const char *table_name,
+                                    int ncols, const int *col_types,
+                                    int nrows, const void **col_data,
+                                    uint64_t incarnation,
+                                    uint64_t stream_id, uint64_t seq);
+
+/* TEST-ONLY: read back the trailer a payload carries.  Any out-param may be
+ * NULL.  Absent fields come back as 0.  Exposed so a test can assert the
+ * mixed-version contract in both directions without a socket. */
+int tsdb_rpc_write_batch_trailer_for_test(const uint8_t *payload,
+                                          uint32_t payload_len,
+                                          uint64_t *out_incarnation,
+                                          uint64_t *out_stream_id,
+                                          uint64_t *out_seq);
+
 /* TEST-ONLY: run the receiver's WRITE_BATCH apply path (decode → open → begin →
  * append → commit-or-discard) on an encoded payload, returning what the
  * dispatch would reflect in its reply: 1 = ACK (landed), 0 = ERR.  This is the

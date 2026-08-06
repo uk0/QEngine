@@ -17,7 +17,10 @@
  */
 
 #include "../src/cluster/dedup.h"
+#include "../src/cluster/rpc.h"
 #include "../include/tsdb.h"
+
+#include <string.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +200,92 @@ int main(void) {
         CHECK(tsdb_dedup_seen(t, 222, 1) == 0, "and the unrecorded stream is not seen");
         tsdb_dedup_close(t);
         tsdb_dedup_close(l);
+    }
+
+    /* ── [8] stream_id: both halves required, and they must not cancel ── */
+    printf("\n[8] stream_id = (issuer, incarnation)\n");
+    {
+        uint64_t a = tsdb_stream_id(0xD00D0001ULL, 0xC0FFEE01ULL);
+        CHECK(a != 0, "two valid halves yield a non-zero stream id");
+        CHECK(tsdb_stream_id(0xD00D0001ULL, 0xC0FFEE01ULL) == a, "and it is stable");
+
+        /* A DROP+recreate changes the incarnation, so the SAME sender writing
+         * the SAME table name must get a DIFFERENT stream — otherwise the new
+         * table's seq 1.. would be dropped as "already applied". */
+        CHECK(tsdb_stream_id(0xD00D0001ULL, 0xC0FFEE02ULL) != a,
+              "a new incarnation (DROP+recreate) is a DIFFERENT stream");
+        /* Two senders replicating the same table each number from 1, so they
+         * must not share a stream either. */
+        CHECK(tsdb_stream_id(0xD00D0002ULL, 0xC0FFEE01ULL) != a,
+              "a different issuer is a DIFFERENT stream");
+        /* Swapping the halves must not collide — a plain XOR would. */
+        CHECK(tsdb_stream_id(0xC0FFEE01ULL, 0xD00D0001ULL) != a,
+              "the two halves are not interchangeable (no XOR-style collision)");
+
+        CHECK(tsdb_stream_id(0, 0xC0FFEE01ULL) == 0,
+              "an unknown issuer yields NO stream (0), never a fabricated one");
+        CHECK(tsdb_stream_id(0xD00D0001ULL, 0) == 0,
+              "an unknown incarnation yields NO stream (0)");
+    }
+
+    /* ── [9] the wire trailer, both mixed-version directions ───────────── */
+    printf("\n[9] WRITE_BATCH trailer stays additive and legacy-compatible\n");
+    {
+        int64_t ts[4] = { 1, 2, 3, 4 }, v[4] = { 10, 20, 30, 40 };
+        int types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
+        const void *cols[2] = { ts, v };
+        uint8_t legacy[512], inc_only[512], full[512];
+
+        int n_legacy = tsdb_rpc_encode_write_batch_ex(legacy, sizeof(legacy), "t",
+                                                      2, types, 4, cols, 0);
+        int n_inc    = tsdb_rpc_encode_write_batch_ex(inc_only, sizeof(inc_only), "t",
+                                                      2, types, 4, cols, 0xABCDULL);
+        int n_full   = tsdb_rpc_encode_write_batch_ex2(full, sizeof(full), "t",
+                                                       2, types, 4, cols,
+                                                       0xABCDULL, 0x1111ULL, 7);
+        CHECK(n_legacy > 0 && n_inc == n_legacy + 8 && n_full == n_legacy + 24,
+              "trailer is purely additive: %d -> %d -> %d bytes",
+              n_legacy, n_inc, n_full);
+        CHECK(memcmp(legacy, inc_only, (size_t)n_legacy) == 0 &&
+              memcmp(legacy, full,     (size_t)n_legacy) == 0,
+              "the columnar body is byte-identical in all three encodings");
+        CHECK(memcmp(inc_only, full, (size_t)n_inc) == 0,
+              "and a dedup batch is byte-identical to today's V5 up to the new fields");
+
+        /* Zeros must reproduce the incarnation-only encoding exactly, so a
+         * sender with no stream to name changes nothing on the wire. */
+        uint8_t zeros[512];
+        int n_zeros = tsdb_rpc_encode_write_batch_ex2(zeros, sizeof(zeros), "t",
+                                                      2, types, 4, cols,
+                                                      0xABCDULL, 0, 0);
+        CHECK(n_zeros == n_inc && memcmp(zeros, inc_only, (size_t)n_inc) == 0,
+              "stream_id/seq of 0 reproduces the incarnation-only bytes exactly");
+
+        /* Read-back, all three shapes. */
+        uint64_t i2 = 9, s2 = 9, q2 = 9;
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(legacy, (uint32_t)n_legacy,
+                                                    &i2, &s2, &q2) == TSDB_OK &&
+              i2 == 0 && s2 == 0 && q2 == 0,
+              "a legacy payload reads back as no incarnation and no identity");
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(inc_only, (uint32_t)n_inc,
+                                                    &i2, &s2, &q2) == TSDB_OK &&
+              i2 == 0xABCDULL && s2 == 0 && q2 == 0,
+              "an OLD sender's payload gives the incarnation and NO identity — "
+              "the new receiver falls back to applying without dedup");
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(full, (uint32_t)n_full,
+                                                    &i2, &s2, &q2) == TSDB_OK &&
+              i2 == 0xABCDULL && s2 == 0x1111ULL && q2 == 7,
+              "a dedup payload gives incarnation, stream and seq");
+
+        /* The other direction: an OLD receiver reading a NEW payload must still
+         * see the right incarnation and ignore the extra bytes.  That is what
+         * the existing decoder's `<=` guarantees — assert it by decoding the
+         * full payload while pretending the dedup fields are not understood. */
+        uint64_t i3 = 0;
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(full, (uint32_t)n_full,
+                                                    &i3, NULL, NULL) == TSDB_OK &&
+              i3 == 0xABCDULL,
+              "an old receiver still reads the incarnation out of a new payload");
     }
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);

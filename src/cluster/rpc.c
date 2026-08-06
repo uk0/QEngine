@@ -399,7 +399,9 @@ static void rpc_conn_track_remove(struct tsdb_rpc_server *s, int fd);
  * re-validates the column sizing and rejects a malformed batch on its own). */
 static uint64_t write_batch_incarnation(const uint8_t *payload, uint32_t payload_len,
                                         int ncols, int nrows, const int *col_types,
-                                        const uint8_t *col_base) {
+                                        const uint8_t *col_base,
+                                        size_t *out_body_end) {
+    if (out_body_end) *out_body_end = 0;
     if (!payload || !col_base || col_base < payload) return 0;
     size_t hdr = (size_t)(col_base - payload);   /* bytes before the first column */
     size_t off = 0;
@@ -415,13 +417,34 @@ static uint64_t write_batch_incarnation(const uint8_t *payload, uint32_t payload
         if (hdr + off > payload_len) return 0;
     }
     /* Incarnation trailer present iff 8 bytes follow the columnar body.  '<='
-     * (not '==') stays tolerant of any future field appended after it. */
+     * (not '==') stays tolerant of any future field appended after it — which
+     * is exactly what the dedup (stream_id, seq) fields are. */
     if (hdr + off + 8 <= payload_len) {
         uint64_t inc = 0;
         memcpy(&inc, payload + hdr + off, 8);
+        if (out_body_end) *out_body_end = hdr + off;
         return inc;
     }
+    if (out_body_end) *out_body_end = hdr + off;
     return 0;
+}
+
+/* Dedup identity, if the sender emitted it: two 8-byte fields immediately after
+ * the incarnation.  Both come back 0 when absent (an older sender, or one that
+ * had no stream to name), and the caller then applies without dedup exactly as
+ * it does today.  Reading them is only meaningful when the incarnation itself is
+ * present, since the encoder emits them only in that case — so the 8 bytes at
+ * the end of the columnar body can never be mistaken for a stream_id. */
+static void write_batch_dedup_id(const uint8_t *payload, uint32_t payload_len,
+                                 size_t body_end, uint64_t incarnation,
+                                 uint64_t *out_stream, uint64_t *out_seq)
+{
+    if (out_stream) *out_stream = 0;
+    if (out_seq)    *out_seq    = 0;
+    if (incarnation == 0) return;                 /* no trailer => no identity */
+    if (body_end + 24 > payload_len) return;      /* incarnation only */
+    if (out_stream) memcpy(out_stream, payload + body_end + 8,  8);
+    if (out_seq)    memcpy(out_seq,    payload + body_end + 16, 8);
 }
 
 /* Handle one client connection in its own thread. */
@@ -459,7 +482,8 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
      * common same-incarnation batch simply passes this one comparison. */
     {
         uint64_t batch_inc = write_batch_incarnation(payload, payload_len, ncols,
-                                                     nrows, col_types, col_data[0]);
+                                                     nrows, col_types, col_data[0],
+                                                     NULL);
         tsdb_schema_t *sch = tsdb_table_get_schema(tbl);
         uint64_t local_inc = sch ? sch->incarnation : 0;
         if (batch_inc != 0 && local_inc != 0 && batch_inc != local_inc) {
@@ -2025,13 +2049,65 @@ int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
      * are present.  incarnation == 0 (UNKNOWN) emits NO trailer, so the wire is
      * byte-for-byte the legacy encoder — a V5 node with no incarnation and an
      * old V4 node produce identical bytes. */
+    return tsdb_rpc_encode_write_batch_ex2(buf, cap, table_name, ncols,
+                                           col_types, nrows, col_data,
+                                           incarnation, 0, 0);
+}
+
+int tsdb_rpc_write_batch_trailer_for_test(const uint8_t *payload,
+                                          uint32_t payload_len,
+                                          uint64_t *out_incarnation,
+                                          uint64_t *out_stream_id,
+                                          uint64_t *out_seq)
+{
+    if (out_incarnation) *out_incarnation = 0;
+    if (out_stream_id)   *out_stream_id   = 0;
+    if (out_seq)         *out_seq         = 0;
+
+    char  table_name[128];
+    int   ncols = 0, nrows = 0;
+    int   col_types[TSDB_MAX_COLS];
+    void *col_data[TSDB_MAX_COLS];
+    if (tsdb_rpc_decode_write_batch(payload, payload_len,
+                                    table_name, sizeof(table_name),
+                                    &ncols, col_types, &nrows,
+                                    (uint8_t **)col_data) != 0)
+        return TSDB_ERR_CORRUPT;
+
+    size_t body_end = 0;
+    uint64_t inc = write_batch_incarnation(payload, payload_len, ncols,
+                                           nrows, col_types,
+                                           (const uint8_t *)col_data[0],
+                                           &body_end);
+    if (out_incarnation) *out_incarnation = inc;
+    write_batch_dedup_id(payload, payload_len, body_end, inc,
+                         out_stream_id, out_seq);
+    return TSDB_OK;
+}
+
+int tsdb_rpc_encode_write_batch_ex2(uint8_t *buf, uint32_t cap,
+                                    const char *table_name,
+                                    int ncols, const int *col_types,
+                                    int nrows, const void **col_data,
+                                    uint64_t incarnation,
+                                    uint64_t stream_id, uint64_t seq)
+{
     int n = tsdb_rpc_encode_write_batch(buf, cap, table_name,
                                         ncols, col_types, nrows, col_data);
     if (n < 0) return -1;
-    if (incarnation == 0) return n;
+    if (incarnation == 0) return n;          /* legacy bytes, no trailer at all */
     if ((uint32_t)n + 8 > cap) return -1;
     memcpy(buf + n, &incarnation, 8);
-    return n + 8;
+    n += 8;
+
+    /* Dedup identity rides AFTER the incarnation.  Only emitted when both are
+     * meaningful — a zero here reproduces the incarnation-only encoding exactly,
+     * so nothing that does not use dedup changes a single byte on the wire. */
+    if (stream_id == 0 || seq == 0) return n;
+    if ((uint32_t)n + 16 > cap) return -1;
+    memcpy(buf + n,     &stream_id, 8);
+    memcpy(buf + n + 8, &seq,       8);
+    return n + 16;
 }
 
 int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,

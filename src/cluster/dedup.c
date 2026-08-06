@@ -7,6 +7,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint64_t tsdb_stream_id(uint64_t issuer_node_id, uint64_t table_incarnation) {
+    /* 0 on either side means the identity is UNKNOWN — a pre-incarnation sender
+     * or a table created down a path that stamps 0.  Refuse to mint an id from
+     * it: a fabricated stream would either collide with a real one or make every
+     * retry look new.  The caller applies without dedup instead. */
+    if (issuer_node_id == 0 || table_incarnation == 0) return 0;
+
+    /* 128 -> 64 mix.  Both inputs are already well-distributed (an FNV-1a node
+     * id, a Raft-(term,index)-derived incarnation), so this only has to avoid
+     * cancelling them against each other — hence the asymmetric constants and
+     * the final avalanche rather than a plain XOR. */
+    uint64_t h = issuer_node_id * 0x9E3779B97F4A7C15ULL;
+    h ^= table_incarnation + 0x165667B19E3779F9ULL + (h << 6) + (h >> 2);
+    h ^= h >> 33; h *= 0xFF51AFD7ED558CCDULL;
+    h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ULL;
+    h ^= h >> 33;
+    return h ? h : 1ULL;   /* 0 is reserved for "no stream" */
+}
+
 /* One stream's state: a contiguous frontier plus the exact out-of-order tail.
  * `gaps` is kept SORTED ASCENDING so absorbing a newly-contiguous run after the
  * frontier advances is a prefix walk, and membership is a binary search. */

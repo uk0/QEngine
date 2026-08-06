@@ -48,6 +48,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The stream a batch belongs to: one SENDER's view of one TABLE INCARNATION.
+ *
+ * Both halves had to become durable and cluster-agreed before this was possible
+ * — they are dedup prerequisites 2 and 3.  The issuer alone is not enough: a
+ * table's seq numbering restarts at 1 after a DROP+recreate, so without the
+ * incarnation the new table's seq 1.. would collide with the old table's
+ * history and its rows would be dropped as "already applied".  The incarnation
+ * alone is not enough either: two senders replicating the same table each
+ * number their own batches from 1.
+ *
+ * Returns 0 iff either half is 0 (identity unknown) — and 0 means "no stream",
+ * so the caller must fall back to applying without dedup rather than inventing
+ * an id.  Never returns 0 for two valid halves. */
+uint64_t tsdb_stream_id(uint64_t issuer_node_id, uint64_t table_incarnation);
+
 typedef struct tsdb_dedup_ledger tsdb_dedup_ledger_t;
 
 /* max_streams — capacity for distinct stream ids (a stream is one sender's view
