@@ -1435,6 +1435,71 @@ done:
     return total_merged;
 }
 
+/* Localise a persistent over-count to the ts buckets that hold the excess.
+ *
+ * The watch below can only say "this table has N more rows than any peer", which
+ * is not something an operator can act on — the table may hold billions of rows
+ * across months.  The row digest already carries a per-bucket multiset
+ * fingerprint, so comparing it with the fullest peer's names the exact ts ranges
+ * where the extra copies live, and by how many.
+ *
+ * REPORT ONLY, and that is a deliberate limit, not an omission.  Repairing an
+ * over-count means DELETING rows, and "local has 2 copies, peer has 1" cannot be
+ * distinguished from "the client legitimately wrote the same row twice and the
+ * peer is the one missing a copy" by any count comparison — the ambiguity that
+ * makes this unrepairable in general.  A majority vote across replicas would be
+ * evidence rather than proof, and a destructive anti-entropy action taken on
+ * evidence is exactly the class of change that has gone wrong here before.  So
+ * this makes the damage precise enough for a human to fix deliberately (delete
+ * the named range and re-pull, or restore) and stops there. */
+static void ae_report_overcount_buckets(tsdb_db_t *db, tsdb_cluster_t *c,
+                                        const char *table, int64_t span,
+                                        tsdb_node_id_t peer)
+{
+    if (span <= 0 || peer == 0) return;
+
+    tsdb_rowdigest_bucket_t *lv = NULL; size_t ln = 0;
+    if (tsdb_cluster_local_table_digest(db, table, span, INT64_MIN, INT64_MAX,
+                                        &lv, &ln) != TSDB_OK)
+        return;
+
+    tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
+    tsdb_rpc_conn_t *conn = rmgr ? tsdb_replica_mgr_get_conn(rmgr, peer) : NULL;
+    uint8_t *rbuf = conn ? malloc(TSDB_ROWDIGEST_WIRE_MAX) : NULL;
+    tsdb_rowdigest_bucket_t *pv = NULL; size_t pn = 0;
+    uint32_t rlen = 0;
+    if (rbuf &&
+        tsdb_rpc_local_table_digest(conn, table, span, INT64_MIN, INT64_MAX,
+                                    rbuf, TSDB_ROWDIGEST_WIRE_MAX, &rlen) == TSDB_OK)
+        (void)tsdb_rowdigest_deserialize(rbuf, rlen, &pv, &pn);
+    free(rbuf);
+
+    if (pv) {
+        int named = 0;
+        for (size_t i = 0; i < ln && named < 8; i++) {
+            uint64_t peer_cnt = 0;
+            for (size_t j = 0; j < pn; j++)
+                if (pv[j].bstart == lv[i].bstart) { peer_cnt = pv[j].count; break; }
+            if (lv[i].count > peer_cnt) {
+                fprintf(stderr,
+                        "[anti-entropy] %s: over-count localised — ts bucket "
+                        "[%lld, %lld) holds %llu rows here vs %llu on peer %llu "
+                        "(+%llu). Delete that range and re-pull, or restore; "
+                        "anti-entropy will not remove rows on its own.\n",
+                        table, (long long)lv[i].bstart,
+                        (long long)(lv[i].bstart + span),
+                        (unsigned long long)lv[i].count,
+                        (unsigned long long)peer_cnt,
+                        (unsigned long long)peer,
+                        (unsigned long long)(lv[i].count - peer_cnt));
+                named++;
+            }
+        }
+        free(pv);
+    }
+    free(lv);
+}
+
 /* ---- Partition-level backfill (middle-gap convergence, env-gated) --------
  *
  * A "middle gap" (equal max_ts, higher peer count) is never resolved by the
@@ -2539,6 +2604,7 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
     tsdb_node_id_t eqpeers[TSDB_CLUSTER_MAX_NODES];
     int neq = 0;
     uint64_t peer_hi_count = 0;         /* fullest peer that answered           */
+    tsdb_node_id_t peer_hi_node = 0;    /* ...and which peer that was           */
     int64_t  peer_hi_ts    = INT64_MIN; /* newest ts any peer that answered has */
     int      peers_answered = 0;
     for (int i = 0; i < npeers; i++) {
@@ -2550,7 +2616,7 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
         /* Over-count watch (defect 4): remember the fullest peer and the newest
          * peer ts across EVERY answer — admitted as a pull candidate or not. */
         peers_answered++;
-        if (pc   > peer_hi_count) peer_hi_count = pc;
+        if (pc   > peer_hi_count) { peer_hi_count = pc; peer_hi_node = peers[i]; }
         if (pmax > peer_hi_ts)    peer_hi_ts    = pmax;
 
         /* Row-range digest candidate.  The original case is an EXACT
@@ -2620,6 +2686,12 @@ int tsdb_cluster_resync_table(tsdb_db_t *db,
                         "replica would have cleared)\n",
                         table_name, (unsigned long long)local_count,
                         (unsigned long long)peer_hi_count, streak);
+            /* Say WHERE, once, so the report is actionable rather than a
+             * table-wide "somewhere there are extra rows". */
+            if (streak == AE_OVERCOUNT_PERSIST_N)
+                ae_report_overcount_buckets(db, c, table_name,
+                                            ae_table_span(db, table_name),
+                                            peer_hi_node);
         }
     }
 

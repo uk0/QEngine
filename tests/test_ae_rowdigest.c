@@ -671,6 +671,56 @@ int main(void) {
         rm_rf("/tmp/tsdb_rd_tp_node2");
     }
 
+    /* ── [8] an over-count is LOCALISABLE from the digest ────────────────
+     *
+     * The over-count watch can only say "this table has N more rows than any
+     * peer", which no operator can act on across months of data.  The digest's
+     * per-bucket multiset fingerprint narrows it to the exact ts ranges holding
+     * the excess — which is what the report uses.  Repair stays manual: "local
+     * has 2 copies, peer has 1" cannot be distinguished from "the client wrote
+     * the row twice and the PEER is short" by counting, so deleting on that
+     * basis would be a guess. */
+    printf("\n[8] the digest localises an over-count to its ts buckets\n");
+    {
+        tsdb_db_t *good = open_fresh("/tmp/tsdb_rd_oc_good");
+        tsdb_db_t *dup  = open_fresh("/tmp/tsdb_rd_oc_dup");
+        fill_blocks(good, 1000, 1, -1, 0);
+        fill_blocks(dup,  1000, 1, -1, 0);
+        /* Duplicate three rows that all land in ONE bucket. */
+        for (int i = 0; i < 3; i++) add_row(dup, 500 + i, 500 + i);
+
+        CHECK(row_count(dup) == row_count(good) + 3,
+              "the duplicated replica holds 3 extra rows (%llu vs %llu)",
+              (unsigned long long)row_count(dup),
+              (unsigned long long)row_count(good));
+
+        tsdb_rowdigest_bucket_t *dg = NULL, *gg = NULL; size_t dn = 0, gn = 0;
+        digest(dup, &dg, &dn);
+        digest(good, &gg, &gn);
+
+        /* Exactly one bucket must account for the whole excess, and it must be
+         * the one the duplicates fall in — that is the localisation. */
+        int64_t hot = BASE + 500 - ((BASE + 500) % SPAN);
+        uint64_t excess_here = 0, excess_total = 0;
+        for (size_t i = 0; i < dn; i++) {
+            uint64_t g = 0;
+            for (size_t j = 0; j < gn; j++)
+                if (gg[j].bstart == dg[i].bstart) { g = gg[j].count; break; }
+            if (dg[i].count > g) {
+                excess_total += dg[i].count - g;
+                if (dg[i].bstart == hot) excess_here = dg[i].count - g;
+            }
+        }
+        CHECK(excess_total == 3, "the digest accounts for all 3 extra rows (%llu)",
+              (unsigned long long)excess_total);
+        CHECK(excess_here == 3,
+              "and puts all of them in the ONE bucket starting %lld — an operator "
+              "can delete that range instead of the whole table", (long long)hot);
+        free(dg); free(gg);
+        tsdb_close(good); tsdb_close(dup);
+        rm_rf("/tmp/tsdb_rd_oc_good"); rm_rf("/tmp/tsdb_rd_oc_dup");
+    }
+
     if (g_fail) {
         printf("\n=== test_ae_rowdigest FAILED (%d) ===\n", g_fail);
         return 1;
