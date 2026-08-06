@@ -244,7 +244,7 @@ int main(void) {
                                                       2, types, 4, cols, 0xABCDULL);
         int n_full   = tsdb_rpc_encode_write_batch_ex2(full, sizeof(full), "t",
                                                        2, types, 4, cols,
-                                                       0xABCDULL, 0x1111ULL, 7);
+                                                       0xABCDULL, 0x1111ULL, 7, 0);
         CHECK(n_legacy > 0 && n_inc == n_legacy + 8 && n_full == n_legacy + 24,
               "trailer is purely additive: %d -> %d -> %d bytes",
               n_legacy, n_inc, n_full);
@@ -259,23 +259,23 @@ int main(void) {
         uint8_t zeros[512];
         int n_zeros = tsdb_rpc_encode_write_batch_ex2(zeros, sizeof(zeros), "t",
                                                       2, types, 4, cols,
-                                                      0xABCDULL, 0, 0);
+                                                      0xABCDULL, 0, 0, 0);
         CHECK(n_zeros == n_inc && memcmp(zeros, inc_only, (size_t)n_inc) == 0,
               "stream_id/seq of 0 reproduces the incarnation-only bytes exactly");
 
         /* Read-back, all three shapes. */
         uint64_t i2 = 9, s2 = 9, q2 = 9;
         CHECK(tsdb_rpc_write_batch_trailer_for_test(legacy, (uint32_t)n_legacy,
-                                                    &i2, &s2, &q2) == TSDB_OK &&
+                                                    &i2, &s2, &q2, NULL) == TSDB_OK &&
               i2 == 0 && s2 == 0 && q2 == 0,
               "a legacy payload reads back as no incarnation and no identity");
         CHECK(tsdb_rpc_write_batch_trailer_for_test(inc_only, (uint32_t)n_inc,
-                                                    &i2, &s2, &q2) == TSDB_OK &&
+                                                    &i2, &s2, &q2, NULL) == TSDB_OK &&
               i2 == 0xABCDULL && s2 == 0 && q2 == 0,
               "an OLD sender's payload gives the incarnation and NO identity — "
               "the new receiver falls back to applying without dedup");
         CHECK(tsdb_rpc_write_batch_trailer_for_test(full, (uint32_t)n_full,
-                                                    &i2, &s2, &q2) == TSDB_OK &&
+                                                    &i2, &s2, &q2, NULL) == TSDB_OK &&
               i2 == 0xABCDULL && s2 == 0x1111ULL && q2 == 7,
               "a dedup payload gives incarnation, stream and seq");
 
@@ -285,7 +285,7 @@ int main(void) {
          * full payload while pretending the dedup fields are not understood. */
         uint64_t i3 = 0;
         CHECK(tsdb_rpc_write_batch_trailer_for_test(full, (uint32_t)n_full,
-                                                    &i3, NULL, NULL) == TSDB_OK &&
+                                                    &i3, NULL, NULL, NULL) == TSDB_OK &&
               i3 == 0xABCDULL,
               "an old receiver still reads the incarnation out of a new payload");
     }
@@ -412,6 +412,52 @@ int main(void) {
         CHECK(tsdb_outbox_open(ob_path, 16, &bad) == TSDB_ERR_CORRUPT && bad == NULL,
               "a corrupt reservation file REFUSES to open (never restarts from 1)");
         unlink(ob_path);
+    }
+
+    /* ── [12] base on the WIRE: additive, and it unjams a real receiver ─── */
+    printf("\n[12] the base field travels and settles a crash-skip\n");
+    {
+        int64_t ts[4] = { 1, 2, 3, 4 }, v[4] = { 10, 20, 30, 40 };
+        int types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
+        const void *cols[2] = { ts, v };
+        uint8_t no_base[512], with_base[512];
+
+        int n_nb = tsdb_rpc_encode_write_batch_ex2(no_base, sizeof(no_base), "t",
+                                                   2, types, 4, cols,
+                                                   0xABCDULL, 0x1111ULL, 17, 1);
+        int n_wb = tsdb_rpc_encode_write_batch_ex2(with_base, sizeof(with_base), "t",
+                                                   2, types, 4, cols,
+                                                   0xABCDULL, 0x1111ULL, 17, 17);
+        CHECK(n_wb == n_nb + 8,
+              "base is a 5th field, purely additive (%d -> %d)", n_nb, n_wb);
+        CHECK(memcmp(no_base, with_base, (size_t)n_nb) == 0,
+              "and everything before it is byte-identical");
+
+        uint64_t i4 = 0, s4 = 0, q4 = 0, b4 = 99;
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(no_base, (uint32_t)n_nb,
+                                                    &i4, &s4, &q4, &b4) == TSDB_OK &&
+              s4 == 0x1111ULL && q4 == 17 && b4 == 0,
+              "base 1 emits NOTHING — a sender that never restarted changes no bytes");
+        CHECK(tsdb_rpc_write_batch_trailer_for_test(with_base, (uint32_t)n_wb,
+                                                    &i4, &s4, &q4, &b4) == TSDB_OK &&
+              s4 == 0x1111ULL && q4 == 17 && b4 == 17,
+              "and a real promise reads back intact");
+
+        /* THE POINT, end to end: a receiver that only ever sees seq 17 after a
+         * crash-skip jams without the promise and recovers with it. */
+        tsdb_dedup_ledger_t *jam = NULL;
+        tsdb_dedup_open(4, /*max_gap*/2, &jam);
+        for (uint64_t k = 1; k <= 3; k++) tsdb_dedup_record(jam, S1, k);
+        tsdb_dedup_record(jam, S1, 17);
+        tsdb_dedup_record(jam, S1, 18);
+        CHECK(tsdb_dedup_record(jam, S1, 19) == TSDB_ERR_FULL,
+              "without the promise the window fills and the stream JAMS");
+        CHECK(tsdb_dedup_advance_base(jam, S1, 17) == TSDB_OK, "the wire base arrives");
+        CHECK(tsdb_dedup_frontier(jam, S1) == 18 && tsdb_dedup_gap_count(jam, S1) == 0,
+              "it settles 4..16, absorbs 17 and 18, and frees the window");
+        CHECK(tsdb_dedup_record(jam, S1, 19) == TSDB_OK,
+              "so the stream flows again — this is why the field exists");
+        tsdb_dedup_close(jam);
     }
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);

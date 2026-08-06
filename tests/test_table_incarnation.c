@@ -378,7 +378,7 @@ static void test_dedup_retry_not_doubled(void) {
     uint8_t payload[4096];
     int plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
                                                2, col_types, 5, col_data,
-                                               inc, stream, 1);
+                                               inc, stream, 1, 0);
     ASSERT(plen > 0);
 
     ASSERT(tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen) == 1);
@@ -393,7 +393,7 @@ static void test_dedup_retry_not_doubled(void) {
     for (int i = 0; i < 5; i++) { ts[i] = DAY1 + (100 + i) * 1000000LL; v[i] = 200 + i; }
     plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
                                            2, col_types, 5, col_data,
-                                           inc, stream, 2);
+                                           inc, stream, 2, 0);
     ASSERT(plen > 0);
     ASSERT(tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen) == 1);
     ASSERT(count_all(db) == 10);
@@ -414,7 +414,7 @@ static void test_dedup_retry_not_doubled(void) {
     for (int i = 0; i < 5; i++) { ts[i] = DAY1 + i * 1000000LL; v[i] = 100 + i; }
     plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
                                            2, col_types, 5, col_data,
-                                           inc2, st2, 1);
+                                           inc2, st2, 1, 0);
     ASSERT(tsdb_rpc_apply_write_batch_for_test(db2, payload, (uint32_t)plen) == 1);
     ASSERT(tsdb_rpc_apply_write_batch_for_test(db2, payload, (uint32_t)plen) == 1);
     ASSERT(count_all(db2) == 10);       /* doubled: the gate is genuinely load-bearing */

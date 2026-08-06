@@ -474,14 +474,20 @@ static tsdb_dedup_ledger_t *dedup_ledger_locked(void) {
  * the end of the columnar body can never be mistaken for a stream_id. */
 static void write_batch_dedup_id(const uint8_t *payload, uint32_t payload_len,
                                  size_t body_end, uint64_t incarnation,
-                                 uint64_t *out_stream, uint64_t *out_seq)
+                                 uint64_t *out_stream, uint64_t *out_seq,
+                                 uint64_t *out_base)
 {
     if (out_stream) *out_stream = 0;
     if (out_seq)    *out_seq    = 0;
+    if (out_base)   *out_base   = 0;
     if (incarnation == 0) return;                 /* no trailer => no identity */
     if (body_end + 24 > payload_len) return;      /* incarnation only */
     if (out_stream) memcpy(out_stream, payload + body_end + 8,  8);
     if (out_seq)    memcpy(out_seq,    payload + body_end + 16, 8);
+    /* `base` is optional even when the identity is present — a sender that has
+     * never restarted has nothing to promise beyond the default. */
+    if (body_end + 32 > payload_len) return;
+    if (out_base) memcpy(out_base, payload + body_end + 24, 8);
 }
 
 /* Handle one client connection in its own thread. */
@@ -534,11 +540,17 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
         /* Dedup gate.  Runs AFTER the incarnation check on purpose: a batch for
          * a dead incarnation must be refused outright, not recorded as applied
          * under an id that the live table will later see again. */
+        uint64_t dedup_base = 0;
         write_batch_dedup_id(payload, payload_len, body_end, batch_inc,
-                             &dedup_stream, &dedup_seq);
+                             &dedup_stream, &dedup_seq, &dedup_base);
         if (dedup_enabled() && dedup_stream != 0 && dedup_seq != 0) {
             pthread_mutex_lock(&g_dedup_mu);
             tsdb_dedup_ledger_t *led = dedup_ledger_locked();
+            /* Apply the sender's promise FIRST.  It settles the hole a
+             * crash-skipped reservation left, which is what stops the
+             * out-of-order window filling up and jamming the stream. */
+            if (led && dedup_base > 1)
+                (void)tsdb_dedup_advance_base(led, dedup_stream, dedup_base);
             int already = led && tsdb_dedup_seen(led, dedup_stream, dedup_seq);
             pthread_mutex_unlock(&g_dedup_mu);
             if (already) {
@@ -2123,18 +2135,20 @@ int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
      * old V4 node produce identical bytes. */
     return tsdb_rpc_encode_write_batch_ex2(buf, cap, table_name, ncols,
                                            col_types, nrows, col_data,
-                                           incarnation, 0, 0);
+                                           incarnation, 0, 0, 0);
 }
 
 int tsdb_rpc_write_batch_trailer_for_test(const uint8_t *payload,
                                           uint32_t payload_len,
                                           uint64_t *out_incarnation,
                                           uint64_t *out_stream_id,
-                                          uint64_t *out_seq)
+                                          uint64_t *out_seq,
+                                          uint64_t *out_base)
 {
     if (out_incarnation) *out_incarnation = 0;
     if (out_stream_id)   *out_stream_id   = 0;
     if (out_seq)         *out_seq         = 0;
+    if (out_base)        *out_base        = 0;
 
     char  table_name[128];
     int   ncols = 0, nrows = 0;
@@ -2153,7 +2167,7 @@ int tsdb_rpc_write_batch_trailer_for_test(const uint8_t *payload,
                                            &body_end);
     if (out_incarnation) *out_incarnation = inc;
     write_batch_dedup_id(payload, payload_len, body_end, inc,
-                         out_stream_id, out_seq);
+                         out_stream_id, out_seq, out_base);
     return TSDB_OK;
 }
 
@@ -2162,7 +2176,8 @@ int tsdb_rpc_encode_write_batch_ex2(uint8_t *buf, uint32_t cap,
                                     int ncols, const int *col_types,
                                     int nrows, const void **col_data,
                                     uint64_t incarnation,
-                                    uint64_t stream_id, uint64_t seq)
+                                    uint64_t stream_id, uint64_t seq,
+                                    uint64_t base)
 {
     int n = tsdb_rpc_encode_write_batch(buf, cap, table_name,
                                         ncols, col_types, nrows, col_data);
@@ -2179,7 +2194,18 @@ int tsdb_rpc_encode_write_batch_ex2(uint8_t *buf, uint32_t cap,
     if ((uint32_t)n + 16 > cap) return -1;
     memcpy(buf + n,     &stream_id, 8);
     memcpy(buf + n + 8, &seq,       8);
-    return n + 16;
+    n += 16;
+
+    /* `base` — the sender's promise that it will never send a seq below this.
+     * Emitted only when it says something (> 1); base 1 is the default state and
+     * carrying it would change the bytes for every sender that has never
+     * restarted.  Without this field a crash-skipped reservation leaves a hole
+     * the receiver can never close, and the stream jams once its out-of-order
+     * window fills. */
+    if (base <= 1) return n;
+    if ((uint32_t)n + 8 > cap) return -1;
+    memcpy(buf + n, &base, 8);
+    return n + 8;
 }
 
 int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,

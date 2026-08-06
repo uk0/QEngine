@@ -373,13 +373,20 @@ int tsdb_rpc_encode_write_batch_ex(uint8_t *buf, uint32_t cap,
  *
  * stream_id == 0 or seq == 0 also emits no dedup fields, so passing zeros
  * reproduces tsdb_rpc_encode_write_batch_ex exactly.
+ *
+ * `base` is a FIFTH field after seq: the sender's promise that it will never
+ * send a seq below it, which is what lets the receiver close the hole a
+ * crash-skipped reservation leaves (see tsdb_dedup_advance_base).  Emitted only
+ * when > 1, since base 1 is the default and carrying it would change the bytes
+ * for every sender that has never restarted.
  * Returns bytes written, or -1 if the buffer is too small. */
 int tsdb_rpc_encode_write_batch_ex2(uint8_t *buf, uint32_t cap,
                                     const char *table_name,
                                     int ncols, const int *col_types,
                                     int nrows, const void **col_data,
                                     uint64_t incarnation,
-                                    uint64_t stream_id, uint64_t seq);
+                                    uint64_t stream_id, uint64_t seq,
+                                    uint64_t base);
 
 /* TEST-ONLY: read back the trailer a payload carries.  Any out-param may be
  * NULL.  Absent fields come back as 0.  Exposed so a test can assert the
@@ -388,7 +395,8 @@ int tsdb_rpc_write_batch_trailer_for_test(const uint8_t *payload,
                                           uint32_t payload_len,
                                           uint64_t *out_incarnation,
                                           uint64_t *out_stream_id,
-                                          uint64_t *out_seq);
+                                          uint64_t *out_seq,
+                                          uint64_t *out_base);
 
 /* TEST-ONLY: run the receiver's WRITE_BATCH apply path (decode → open → begin →
  * append → commit-or-discard) on an encoded payload, returning what the
