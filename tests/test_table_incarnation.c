@@ -38,7 +38,8 @@
 #include "tsdb.h"
 #include "../src/storage/db.h"          /* tsdb_table_get_schema, tsdb_schema_t */
 #include "../src/storage/schema.h"
-#include "../src/cluster/rpc.h"         /* encode/_ex, decode, the apply seam */
+#include "../src/cluster/rpc.h"
+#include "../src/cluster/dedup.h"         /* encode/_ex, decode, the apply seam */
 
 #include <dirent.h>
 #include <stdio.h>
@@ -342,6 +343,87 @@ static void test_raft_apply_incarnation_agrees(void) {
     printf("  [raft] committed-entry identity: all nodes agree, recreate differs: OK\n");
 }
 
+/* ---- [dedup] a retry of an ALREADY-APPLIED batch is dropped, not doubled --
+ *
+ * The bug this whole line of work targets: fanout retries the same payload 3x,
+ * and under TSDB_REPLICATION_QUORUM=0 a lost ACK is invisible to the writer, so
+ * the peer applies the batch twice and holds the rows twice — permanently, since
+ * no count comparison can tell an over-count from legitimate local writes.
+ *
+ * With the (stream_id, seq) gate on, the second delivery is recognised and
+ * DROPPED — and ACKed, because from the sender's side the batch really did land
+ * and an error would make it retry forever.
+ *
+ * Runs the REAL receiver path (decode -> incarnation gate -> dedup gate -> begin
+ * -> append -> commit), so it pins the wiring, not a stand-in. */
+static void test_dedup_retry_not_doubled(void) {
+    const char *dir = "/tmp/tsdb_test_incarnation_dedup";
+    rm_rf(dir);
+    setenv("TSDB_DEDUP", "1", 1);
+
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dir, &db));
+    make_table(db);
+    uint64_t inc = table_incarnation(db, "t");
+    ASSERT(inc != 0);
+
+    uint64_t stream = tsdb_stream_id(0xDEDA0AAULL, inc);
+    ASSERT(stream != 0);
+
+    /* One batch, stamped (stream, seq=1) — exactly what a sender would emit. */
+    int64_t ts[5], v[5];
+    for (int i = 0; i < 5; i++) { ts[i] = DAY1 + i * 1000000LL; v[i] = 100 + i; }
+    int col_types[2] = { TSDB_TYPE_TIMESTAMP, TSDB_TYPE_INT64 };
+    const void *col_data[2] = { ts, v };
+    uint8_t payload[4096];
+    int plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
+                                               2, col_types, 5, col_data,
+                                               inc, stream, 1);
+    ASSERT(plen > 0);
+
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(db) == 5);
+
+    /* THE RETRY — byte-identical, as fanout re-sends it. */
+    int again = tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen);
+    ASSERT(again == 1);                 /* ACKed, so the sender stops retrying */
+    ASSERT(count_all(db) == 5);         /* and NOT doubled to 10 */
+
+    /* A genuinely NEW batch on the same stream still applies. */
+    for (int i = 0; i < 5; i++) { ts[i] = DAY1 + (100 + i) * 1000000LL; v[i] = 200 + i; }
+    plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
+                                           2, col_types, 5, col_data,
+                                           inc, stream, 2);
+    ASSERT(plen > 0);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(db, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(db) == 10);
+
+    tsdb_close(db);
+    rm_rf(dir);
+    unsetenv("TSDB_DEDUP");
+
+    /* And with the gate OFF the old behaviour is intact — the retry DOES double,
+     * which is both the bug being fixed and proof the gate is what fixes it. */
+    const char *dir2 = "/tmp/tsdb_test_incarnation_dedup_off";
+    rm_rf(dir2);
+    tsdb_db_t *db2 = NULL;
+    OK(tsdb_open(dir2, &db2));
+    make_table(db2);
+    uint64_t inc2 = table_incarnation(db2, "t");
+    uint64_t st2 = tsdb_stream_id(0xDEDA0AAULL, inc2);
+    for (int i = 0; i < 5; i++) { ts[i] = DAY1 + i * 1000000LL; v[i] = 100 + i; }
+    plen = tsdb_rpc_encode_write_batch_ex2(payload, sizeof(payload), "t",
+                                           2, col_types, 5, col_data,
+                                           inc2, st2, 1);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(db2, payload, (uint32_t)plen) == 1);
+    ASSERT(tsdb_rpc_apply_write_batch_for_test(db2, payload, (uint32_t)plen) == 1);
+    ASSERT(count_all(db2) == 10);       /* doubled: the gate is genuinely load-bearing */
+    tsdb_close(db2);
+    rm_rf(dir2);
+
+    printf("  [dedup] a retried batch is dropped and ACKed, not doubled: OK\n");
+}
+
 /* ---- [match] a same-incarnation batch applies (the common case) ---------- */
 static void test_same_incarnation_applies(void) {
     const char *dir = "/tmp/tsdb_test_incarnation_match";
@@ -515,6 +597,7 @@ int main(void) {
     test_reject_stale_incarnation();
     test_broadcast_replay_does_not_mint();
     test_raft_apply_incarnation_agrees();
+    test_dedup_retry_not_doubled();
     test_same_incarnation_applies();
     test_legacy_sender_applies();
     test_wire_compat();

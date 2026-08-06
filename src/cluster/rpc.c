@@ -5,6 +5,7 @@
  */
 
 #include "rpc.h"
+#include "dedup.h"
 #include "rawblock.h"
 #include "merkle.h"   /* row-range digest: LOCAL_TABLE_DIGEST wire (de)serialize */
 #include "../storage/db.h"
@@ -429,6 +430,42 @@ static uint64_t write_batch_incarnation(const uint8_t *payload, uint32_t payload
     return 0;
 }
 
+/* ---- Receiver-side dedup gate (opt-in) ---------------------------------
+ *
+ * OFF unless TSDB_DEDUP=1.  When on, a batch whose (stream, seq) the ledger has
+ * already recorded is DROPPED and ACKed — ACK, not error, because "already
+ * applied" is success from the sender's point of view and an error would make
+ * it retry forever.
+ *
+ * RESIDUAL WINDOW, stated plainly: the id is recorded AFTER the rows commit, so
+ * a crash between the commit and the record loses the id and a later retry
+ * re-applies the batch.  Closing that needs the WAL record itself to carry the
+ * id (append rows -> fsync ONE record holding id AND rows -> publish -> ACK),
+ * which is a WAL format change and is the remaining work.  What is here already
+ * removes the failure that was actually observed — a fanout retry milliseconds
+ * after a lost ACK, in the same live process — and it strictly shrinks the
+ * window rather than moving it: today EVERY such retry duplicates. */
+static tsdb_dedup_ledger_t *g_dedup;
+static pthread_mutex_t      g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Read every time rather than caching in a static.  A cached first-use value is
+ * order-dependent — anything that touches this path before the flag is set locks
+ * it off for the life of the process, which is exactly how the first version of
+ * this test silently exercised nothing.  A getenv is noise next to appending and
+ * committing a batch. */
+static int dedup_enabled(void) {
+    const char *e = getenv("TSDB_DEDUP");
+    return (e && strcmp(e, "1") == 0);
+}
+
+/* Lazily opened under the same lock that guards every use, so there is no
+ * initialise-once race.  Sized for a handful of peers and a modest reorder
+ * window; both are hard bounds, and exceeding the window fails CLOSED. */
+static tsdb_dedup_ledger_t *dedup_ledger_locked(void) {
+    if (!g_dedup) (void)tsdb_dedup_open(64, 4096, &g_dedup);
+    return g_dedup;
+}
+
 /* Dedup identity, if the sender emitted it: two 8-byte fields immediately after
  * the incarnation.  Both come back 0 when absent (an older sender, or one that
  * had no stream to name), and the caller then applies without dedup exactly as
@@ -471,6 +508,8 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
     tsdb_table_t *tbl = NULL;
     if (tsdb_open_table(db, table_name, &tbl) != TSDB_OK || !tbl) return 0;
 
+    uint64_t dedup_stream = 0, dedup_seq = 0;
+
     /* Incarnation gate.  The batch carries the incarnation of the table it was
      * ISSUED for; the local schema carries the incarnation of the table that
      * exists NOW.  If both are known (non-zero) and differ, a DROP+recreate of
@@ -481,14 +520,33 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
      * that is the mixed-version compatibility path, and the overwhelmingly
      * common same-incarnation batch simply passes this one comparison. */
     {
+        size_t body_end = 0;
         uint64_t batch_inc = write_batch_incarnation(payload, payload_len, ncols,
                                                      nrows, col_types, col_data[0],
-                                                     NULL);
+                                                     &body_end);
         tsdb_schema_t *sch = tsdb_table_get_schema(tbl);
         uint64_t local_inc = sch ? sch->incarnation : 0;
         if (batch_inc != 0 && local_inc != 0 && batch_inc != local_inc) {
             tsdb_metric_inc("qengine_replicate_incarnation_reject_total");
             return 0;
+        }
+
+        /* Dedup gate.  Runs AFTER the incarnation check on purpose: a batch for
+         * a dead incarnation must be refused outright, not recorded as applied
+         * under an id that the live table will later see again. */
+        write_batch_dedup_id(payload, payload_len, body_end, batch_inc,
+                             &dedup_stream, &dedup_seq);
+        if (dedup_enabled() && dedup_stream != 0 && dedup_seq != 0) {
+            pthread_mutex_lock(&g_dedup_mu);
+            tsdb_dedup_ledger_t *led = dedup_ledger_locked();
+            int already = led && tsdb_dedup_seen(led, dedup_stream, dedup_seq);
+            pthread_mutex_unlock(&g_dedup_mu);
+            if (already) {
+                /* ACK, not error: from the sender's side this batch DID land,
+                 * and an error would make it retry this forever. */
+                tsdb_metric_inc("qengine_replicate_dedup_dropped_total");
+                return 1;
+            }
         }
     }
 
@@ -549,6 +607,20 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
         }
     }
     tsdb_table_unlock_write(tbl);
+    /* Record the id only once the rows are durable.  Recording it earlier would
+     * make a failed commit look applied and the sender's retry would be dropped
+     * — losing the batch entirely, which is worse than the duplicate this gate
+     * exists to prevent. */
+    if (write_ok && dedup_enabled() && dedup_stream != 0 && dedup_seq != 0) {
+        pthread_mutex_lock(&g_dedup_mu);
+        tsdb_dedup_ledger_t *led = dedup_ledger_locked();
+        if (led) {
+            int drc = tsdb_dedup_record(led, dedup_stream, dedup_seq);
+            if (drc == TSDB_ERR_FULL)
+                tsdb_metric_inc("qengine_replicate_dedup_window_full_total");
+        }
+        pthread_mutex_unlock(&g_dedup_mu);
+    }
     return write_ok;
 }
 

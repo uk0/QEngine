@@ -168,6 +168,12 @@ static metric_t g_metrics[] = {
     { "qengine_replicate_recv_ok_total",
       "WRITE_BATCH RPCs received where the local batch_commit landed rows", MT_COUNTER, { .c = { 0 } } },
 
+    { "qengine_replicate_dedup_dropped_total",
+      "WRITE_BATCH RPCs dropped as already-applied by the (stream_id, seq) dedup gate and ACKed rather than re-applied (opt-in TSDB_DEDUP=1)", MT_COUNTER, { .c = { 0 } } },
+
+    { "qengine_replicate_dedup_window_full_total",
+      "Dedup ledger records refused because a stream's out-of-order window was exhausted — the batch still applied, but its id could not be remembered, so a later retry may duplicate it", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_replicate_incarnation_reject_total",
       "WRITE_BATCH RPCs rejected because the batch's table incarnation did not match the receiver's — a stale batch for a DROP+recreated table, refused rather than applied to the wrong incarnation", MT_COUNTER, { .c = { 0 } } },
 
