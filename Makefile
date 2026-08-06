@@ -101,6 +101,11 @@ TEST_SRCS += tests/test_ae_rowdigest.c
 # and run away (the 2026-08-02 257M-row incident) when re-enabled.
 TEST_SRCS += tests/test_ae_shard_safety.c
 
+# The tombstone predicate gating orphan-storage quarantine: absence must NEVER
+# authorise a reap (a table created while this node was down is absent too);
+# only a DROP tombstone in this node's own catalog log may.
+TEST_SRCS += tests/test_orphan_reap.c
+
 # Anti-entropy pull-candidate ranking + bounded retry (single process, no
 # sockets): the peer probe can no longer be trusted to identify ONE usable
 # source, so the resync keeps every peer's answer and walks them best-first.

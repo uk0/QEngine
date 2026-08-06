@@ -66,6 +66,10 @@ int tsdb_truncate_table(tsdb_db_t *db, const char *name);
  * destroyed.  Closes the anti-entropy measure-then-truncate race: the emptiness
  * check and the wipe share one batch_mu + compact_mtx critical section, so a
  * WRITE_BATCH cannot commit between them. */
+/* Quarantine a table directory by renaming it into .trash (background GC
+ * reclaims it).  The same mechanism DROP uses — moves, never unlinks. */
+void tsdb_db_trash_or_rm(tsdb_db_t *db, const char *tbl_dir);
+
 int tsdb_truncate_table_if_empty(tsdb_db_t *db, const char *name,
                                  int *was_empty);
 

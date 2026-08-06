@@ -297,6 +297,9 @@ static metric_t g_metrics[] = {
     { "qengine_disk_bytes",
       "Approximate total bytes used by all column files on disk", MT_GAUGE, { .g = { 0 } } },
 
+    { "qengine_orphan_table_dirs_reaped_total",
+      "Orphan table directories quarantined into .trash by the anti-entropy sweep (opt-in TSDB_AE_REAP_ORPHANS=1; only for names the catalog holds a DROP tombstone for, never on mere absence). Moved, not deleted", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_orphan_table_dirs",
       "Table directories on disk that the catalog knows nothing about — typically dropped while this node was down, so the tombstone kept them out of the catalog but nothing reaped the files (DROP cannot reach them either). Report only; nothing is deleted", MT_GAUGE, { .g = { 0 } } },
 

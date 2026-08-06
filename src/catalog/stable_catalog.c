@@ -228,6 +228,52 @@ static int child_log_write(tsdb_catalog_t *c, char op, const tsdb_child_table_t 
  * pattern as compact_databases / compact_groups in catalog.c. */
 #include <unistd.h>
 
+/* Does this catalog's on-disk log carry a DROP tombstone for `name`?
+ *
+ * Positive evidence that the name was dropped at some point in this node's
+ * catalog view — as opposed to merely being absent, which a name that never
+ * existed here is too.  That distinction is the whole point: absence alone can
+ * also mean "created while this node was down and not yet learned", and acting
+ * on it would destroy a live table.  A tombstone cannot mean that.
+ *
+ * Reads the same `<droptok>\t<name>` records sc_keep_tombstones preserves, in
+ * both logs, so a created-then-dropped stable AND child both answer yes.  A
+ * created→dropped→recreated name also has a tombstone, so callers must first
+ * establish the name is NOT currently live (tsdb_stable_get / child_get fail).
+ *
+ * Cheap and rare: called only for a directory already known to be unknown to
+ * the catalog.  Returns 1 = tombstoned, 0 = no evidence (including on any I/O
+ * error — fail closed, never claim a drop we cannot prove). */
+static int sc_log_has_tombstone(const char *path, const char *droptok,
+                                const char *name) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t tl = strlen(droptok);
+    char line[8192];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f)) {
+        if (strncmp(line, droptok, tl) != 0 || line[tl] != '\t') continue;
+        char nm[TSDB_STABLE_NAME_MAX + 1];
+        size_t w = 0;
+        for (const char *p = line + tl + 1;
+             *p && *p != '\t' && *p != '\n' && *p != '\r' && w < sizeof(nm) - 1; p++)
+            nm[w++] = *p;
+        nm[w] = '\0';
+        if (nm[0] && strcmp(nm, name) == 0) found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
+int tsdb_catalog_name_tombstoned(tsdb_catalog_t *c, const char *name) {
+    if (!c || !name || !name[0]) return 0;
+    char p[4200];
+    snprintf(p, sizeof(p), "%s/stables.log", c->cat_dir);
+    if (sc_log_has_tombstone(p, "-stable", name)) return 1;
+    snprintf(p, sizeof(p), "%s/child_tables.log", c->cat_dir);
+    return sc_log_has_tombstone(p, "-child", name);
+}
+
 /* Re-emit drop tombstones whose name is still dropped (absent from `live`), so
  * compaction does not strip the evidence the cluster reconcile guard relies on
  * to refuse resurrecting a dropped stable/child (see keep_tombstones_pct in

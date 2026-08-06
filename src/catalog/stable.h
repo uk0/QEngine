@@ -93,4 +93,13 @@ int tsdb_child_table_list  (tsdb_catalog_t *c, const char *stable_name_filter,
                              tsdb_child_table_t **out_arr, size_t *out_n);
 int tsdb_child_table_drop  (tsdb_catalog_t *c, const char *name);
 
+/* 1 when this catalog's on-disk log carries a DROP tombstone for `name` (as a
+ * stable or as a child), i.e. POSITIVE evidence the name was dropped in this
+ * node's catalog view — as opposed to merely being absent, which is also true
+ * of a name created while this node was down and not yet learned.  Callers must
+ * first establish the name is not currently live, since a
+ * created->dropped->recreated name is tombstoned too.  Fails closed (0) on any
+ * I/O error: never claim a drop that cannot be proven. */
+int tsdb_catalog_name_tombstoned(tsdb_catalog_t *c, const char *name);
+
 #endif

@@ -2701,6 +2701,9 @@ static void ae_report_orphan_storage(tsdb_db_t *db) {
     tsdb_catalog_t *cat = tsdb_db_catalog(db);
     if (!cat) return;
 
+    const char *re = getenv("TSDB_AE_REAP_ORPHANS");
+    const int   reap = (re && strcmp(re, "1") == 0);
+
     long  n_orphan = 0;
     char  names[8][128];
     int   nnames = 0;
@@ -2726,6 +2729,28 @@ static void ae_report_orphan_storage(tsdb_db_t *db) {
             tsdb_child_table_t  ctmp;
             if (tsdb_stable_get(cat, de->d_name, &stmp) == TSDB_OK)      continue;
             if (tsdb_child_table_get(cat, de->d_name, &ctmp) == TSDB_OK) continue;
+
+            /* Opt-in quarantine.  OFF unless TSDB_AE_REAP_ORPHANS=1, and even
+             * then it only touches a directory whose name carries a DROP
+             * TOMBSTONE in this node's catalog log — positive evidence the
+             * table was dropped here, never mere absence (absence is also what
+             * a table created while this node was down looks like, and moving
+             * THAT would hide live data).  Moves, never deletes: the same
+             * .trash rename DROP itself uses, so it is reversible until the
+             * background GC reclaims it. */
+            if (reap && tsdb_catalog_name_tombstoned(cat, de->d_name)) {
+                char tdir[4096];
+                snprintf(tdir, sizeof(tdir), "%s", path);
+                tsdb_db_trash_or_rm(db, tdir);
+                tsdb_metric_inc("qengine_orphan_table_dirs_reaped_total");
+                fprintf(stderr,
+                        "[storage] quarantined orphan table dir '%s': the "
+                        "catalog holds a DROP tombstone for it and no live "
+                        "entry, so its files were left behind by a DROP this "
+                        "node missed.  Moved to .trash, not deleted "
+                        "(TSDB_AE_REAP_ORPHANS=1).\n", de->d_name);
+                continue;   /* no longer an orphan */
+            }
 
             n_orphan++;
             if (nnames < 8)

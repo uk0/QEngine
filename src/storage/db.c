@@ -1307,6 +1307,15 @@ static void rm_rf(const char *path) {
  * thread reclaims it later.  Falls back to inline rm_rf on a cross-fs / failed
  * rename so behaviour is never worse than before.  is_table_dir() rejects names
  * starting with '.', so .trash is invisible to every table dir-scan. */
+/* Public wrapper: quarantine a table directory by renaming it into .trash
+ * (the background GC reclaims it later).  Exposed so the anti-entropy orphan
+ * reaper can reuse the EXACT mechanism DROP uses instead of inventing a second
+ * removal path — in particular it moves rather than unlinks, so an operator can
+ * still recover the files. */
+void tsdb_db_trash_or_rm(tsdb_db_t *db, const char *tbl_dir) {
+    trash_or_rm(db, tbl_dir);
+}
+
 static void trash_or_rm(tsdb_db_t *db, const char *tbl_dir) {
     /* Trash dir = <parent-of-tbl_dir>/.trash, keeping the rename same-fs even
      * under TSDB_DATA_DIRS striping. */
