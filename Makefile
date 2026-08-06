@@ -106,6 +106,10 @@ TEST_SRCS += tests/test_ae_shard_safety.c
 # only a DROP tombstone in this node's own catalog log may.
 TEST_SRCS += tests/test_orphan_reap.c
 
+# A bulk batch must not be SPLIT across a flush: the prefix would go durable
+# and no rollback could undo it (dedup prerequisite 5).
+TEST_SRCS += tests/test_batch_atomic_flush.c
+
 # Anti-entropy pull-candidate ranking + bounded retry (single process, no
 # sockets): the peer probe can no longer be trusted to identify ONE usable
 # source, so the resync keeps every peer's answer and walks them best-first.

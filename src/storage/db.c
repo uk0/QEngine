@@ -3043,6 +3043,41 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
         sym_cursor[d] = (col_types[d] == TSDB_TYPE_SYMBOL)
                             ? (const uint8_t *)col_arrs[d] + 4 : NULL;
 
+    /* BATCH ATOMICITY.  The chunk loop below flushes when the memtable fills,
+     * so a batch that starts on a partly-full memtable gets SPLIT: a prefix
+     * becomes durable in a partition and the rest stays in memory.  Nothing can
+     * undo that prefix — tsdb_batch_discard can only truncate the memtable, so
+     * the receiver's commit-failure rollback silently leaves half the batch
+     * applied, and a sender retry then duplicates only the other half.  It is
+     * also the missing foundation for WRITE_BATCH dedup, which needs "apply
+     * this batch exactly once, atomically".
+     *
+     * When the batch WOULD fit in an empty memtable, flush FIRST — before a
+     * single row of it is appended — so it lands entirely in one memtable
+     * generation and a discard can undo all of it.  Same number of flushes and
+     * the same durable bytes as before; only the boundary moves.  The anchors
+     * are then re-taken, which is sound precisely because this batch has
+     * appended nothing yet: base_nrows 0 is now its true start, and the fresh
+     * flush_gen stops discard reporting a straddle for a flush that carried
+     * only PRIOR batches' rows.
+     *
+     * A batch larger than one memtable cannot be made atomic this way; count
+     * those so the dedup work can see how often true atomicity is unavailable. */
+    {
+        size_t cur = tsdb_memtable_rows(b->tbl->memtable);
+        if (n <= (size_t)bp) {
+            if (cur > 0 && cur + n > (size_t)bp) {
+                int rc = flush_and_clear_ex(b->tbl, b->local_only);
+                if (rc != TSDB_OK) return rc;
+                b->base_nrows      = 0;
+                b->begin_flush_gen = __atomic_load_n(&b->tbl->flush_gen,
+                                                     __ATOMIC_RELAXED);
+            }
+        } else {
+            tsdb_metric_inc("qengine_batch_split_across_flush_total");
+        }
+    }
+
     size_t consumed = 0;
     while (consumed < n) {
         size_t cur_rows = tsdb_memtable_rows(b->tbl->memtable);

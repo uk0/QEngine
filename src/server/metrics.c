@@ -297,6 +297,9 @@ static metric_t g_metrics[] = {
     { "qengine_disk_bytes",
       "Approximate total bytes used by all column files on disk", MT_GAUGE, { .g = { 0 } } },
 
+    { "qengine_batch_split_across_flush_total",
+      "Bulk batches larger than one memtable, which therefore SPLIT across a flush: a prefix becomes durable and cannot be rolled back, so the batch is not atomic and a commit-failure rollback can only undo the tail", MT_COUNTER, { .c = { 0 } } },
+
     { "qengine_orphan_table_dirs_reaped_total",
       "Orphan table directories quarantined into .trash by the anti-entropy sweep (opt-in TSDB_AE_REAP_ORPHANS=1; only for names the catalog holds a DROP tombstone for, never on mere absence). Moved, not deleted", MT_COUNTER, { .c = { 0 } } },
 
