@@ -318,7 +318,22 @@ static void t_blocking(void) {
  *
  * So if this ever trips, re-measure all three rows — idle AND loaded — before
  * loosening the bound.  The row that matters is the middle one; raising
- * ABBA_PER_PROD or ABBA_TIMEOUT widens the gap, raising the bound only hides it. */
+ * ABBA_PER_PROD or ABBA_TIMEOUT widens the gap, raising the bound only hides it.
+ *
+ * 2026-08-06 — it tripped, and the bound was NOT touched.  The gate reported
+ * push=1 pop=10 (11 > 10) while the data was exactly right (600000 consumed,
+ * sum exact), i.e. a lost-wakeup guard firing on a scheduling artefact rather
+ * than on a lost wakeup.  Re-measured: under 8 spinning CPU hogs a correct
+ * build produced push=0 pop=5 on EVERY run — the structural row, unchanged.
+ * CPU load was therefore not the trigger; the failing run was a full-suite pass
+ * where other tests were doing fsync-heavy I/O, and a stall longer than the
+ * 1000 ms timeout turns a park that WAS going to be signalled into a counted
+ * timeout.  ABBA_TIMEOUT 1000 -> 3000 per the rule above: a lost wakeup costs
+ * one timeout PER PARK regardless of how long the timeout is, so the mutant row
+ * (14..30) does not move and the guard keeps its teeth, while a stall now has
+ * to be 3x longer to manufacture a false one.  Cost is bounded and small: the
+ * ABBA_CONS-1 structural parks at the end are never signalled and so wait the
+ * full timeout once, concurrently — about two seconds more wall time. */
 
 #define ABBA_CAP      2
 #define ABBA_PROD     6
@@ -331,7 +346,7 @@ static void t_blocking(void) {
  * noise without touching the signal: a genuinely missing wake still costs the
  * whole timeout, so the mutant's count is unchanged while the correct build's
  * stays at its structural floor.  The cost is about a second of tail, once. */
-#define ABBA_TIMEOUT  1000      /* ms */
+#define ABBA_TIMEOUT  3000      /* ms — see the load note below */
 #define ABBA_MAX_TIMEOUTS (ABBA_CONS + 4)   /* see the measurement table above */
 #define ABBA_TOTAL    ((uint64_t)ABBA_PROD * ABBA_PER_PROD)
 
