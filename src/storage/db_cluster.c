@@ -2667,7 +2667,12 @@ static int resync_is_table_dir(const char *name) {
     if (!name || name[0] == '.' || name[0] == '_') return 0;
     if (strcmp(name, "catalog") == 0 ||
         strcmp(name, "wal")     == 0 ||
-        strcmp(name, "raft")    == 0) return 0;
+        strcmp(name, "raft")    == 0 ||
+        /* Core dumps live in $TSDB_DATA_DIR/cores (deployment/entrypoint.sh
+         * puts them there so a crash cannot fill the data dir itself).  It is
+         * plumbing, not a table: the sweep was opening it as one every tick,
+         * and the orphan report named it as a table the catalog forgot. */
+        strcmp(name, "cores")   == 0) return 0;
     return 1;
 }
 
