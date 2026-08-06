@@ -100,6 +100,23 @@ size_t   tsdb_dedup_gap_count(const tsdb_dedup_ledger_t *l, uint64_t stream);
 int  tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
                              uint64_t frontier);
 
+/* Advance past seqs the SENDER has promised it will never send.
+ *
+ * A durable sender allocator reserves seqs in chunks, so a crash leaves a hole:
+ * it reserved up to 100, used 3, and resumes at 101.  Seqs 4..100 will never
+ * arrive.  Left alone that hole is fatal — the frontier can never advance over
+ * it, the out-of-order window fills with 101, 102, ... and the stream jams at
+ * TSDB_ERR_FULL forever.  It cannot be fixed by a timeout either: "nothing
+ * arrived for a while" is exactly what a slow batch looks like, and advancing on
+ * that guess is the silent row loss this whole design refuses.
+ *
+ * `base` is the sender's PROMISE — the lowest seq it may still send.  That is
+ * positive evidence, carried by the sender that alone knows the answer, so
+ * advancing the frontier to base-1 is safe.  Forward-only, like every other
+ * frontier move; a stale base is ignored. */
+int  tsdb_dedup_advance_base(tsdb_dedup_ledger_t *l, uint64_t stream,
+                             uint64_t base);
+
 /* ---- Durable checkpoint -------------------------------------------------
  *
  * ONLY THE FRONTIER IS PERSISTED, never the out-of-order tail.  That is

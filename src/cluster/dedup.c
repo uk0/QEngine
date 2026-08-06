@@ -202,6 +202,17 @@ int tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
     return TSDB_OK;
 }
 
+int tsdb_dedup_advance_base(tsdb_dedup_ledger_t *l, uint64_t stream,
+                            uint64_t base)
+{
+    if (!l) return TSDB_ERR_INVAL;
+    if (base <= 1) return TSDB_OK;      /* nothing below seq 1 to skip */
+    /* base is "the lowest seq I may still send", so everything under it is
+     * settled — either applied or never coming.  Reuse set_frontier so the
+     * forward-only rule and the gap absorption are the same code path. */
+    return tsdb_dedup_set_frontier(l, stream, base - 1);
+}
+
 /* ---- Durable checkpoint -------------------------------------------------
  *
  * Layout, all little-endian:

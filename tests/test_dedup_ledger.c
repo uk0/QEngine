@@ -18,6 +18,7 @@
 
 #include "../src/cluster/dedup.h"
 #include "../src/cluster/rpc.h"
+#include "../src/cluster/outbox.h"
 #include "../include/tsdb.h"
 
 #include <string.h>
@@ -350,6 +351,67 @@ int main(void) {
         CHECK(tsdb_dedup_frontier(e, S1) == 0, "and restores nothing");
         tsdb_dedup_close(e);
         unlink(ck);
+    }
+
+    /* ── [11] sender outbox: a retry keeps its seq, a restart never reuses ─ */
+    printf("\n[11] sender outbox allocator\n");
+    {
+        const char *ob_path = "/tmp/tsdb_test_outbox.bin";
+        unlink(ob_path);
+
+        tsdb_outbox_t *ob = NULL;
+        CHECK(tsdb_outbox_open(ob_path, /*chunk*/16, &ob) == TSDB_OK && ob,
+              "outbox opens fresh");
+        uint64_t q = 0, base = 0;
+        for (int i = 1; i <= 3; i++) {
+            CHECK(tsdb_outbox_next(ob, S1, &q, &base) == TSDB_OK && q == (uint64_t)i,
+                  "seq %d handed out in order (got %llu)", i, (unsigned long long)q);
+        }
+        CHECK(base == 1, "base is 1 — nothing has been skipped yet");
+        CHECK(tsdb_outbox_reserved(ob, S1) == 16,
+              "one durable reservation covers the whole chunk (%llu)",
+              (unsigned long long)tsdb_outbox_reserved(ob, S1));
+        tsdb_outbox_close(ob);   /* == a crash: `next` was never persisted */
+
+        /* THE POINT: after a restart no seq may be reused, or every retry would
+         * look like a new batch and the receiver would apply them all. */
+        tsdb_outbox_t *ob2 = NULL;
+        CHECK(tsdb_outbox_open(ob_path, 16, &ob2) == TSDB_OK && ob2, "outbox reopens");
+        CHECK(tsdb_outbox_next(ob2, S1, &q, &base) == TSDB_OK,
+              "a seq is available after the restart");
+        CHECK(q == 17, "it resumes ABOVE the whole reservation (got %llu, want 17)",
+              (unsigned long long)q);
+        CHECK(base == 17,
+              "and base rises to 17 — the promise that 4..16 will never be sent");
+
+        /* That promise is exactly what unjams the receiver. */
+        tsdb_dedup_ledger_t *rx = NULL;
+        tsdb_dedup_open(8, /*max_gap*/4, &rx);
+        for (uint64_t k = 1; k <= 3; k++) tsdb_dedup_record(rx, S1, k);
+        CHECK(tsdb_dedup_frontier(rx, S1) == 3, "receiver frontier 3 before the skip");
+        CHECK(tsdb_dedup_record(rx, S1, 17) == TSDB_OK, "seq 17 arrives after the gap");
+        CHECK(tsdb_dedup_frontier(rx, S1) == 3,
+              "the frontier CANNOT advance on its own — 4..16 may still be coming");
+        CHECK(tsdb_dedup_advance_base(rx, S1, base) == TSDB_OK,
+              "the sender's base is applied");
+        CHECK(tsdb_dedup_frontier(rx, S1) == 17,
+              "frontier jumps to 17: base-1 = 16 settles the hole, then 17 absorbs");
+        CHECK(tsdb_dedup_gap_count(rx, S1) == 0,
+              "and the window is free again — without base it would have jammed at FULL");
+        /* A stale base must not rewind anything. */
+        CHECK(tsdb_dedup_advance_base(rx, S1, 5) == TSDB_OK, "a STALE base is accepted...");
+        CHECK(tsdb_dedup_frontier(rx, S1) == 17, "...and ignored, never rewinding");
+        tsdb_dedup_close(rx);
+        tsdb_outbox_close(ob2);
+
+        /* A damaged reservation must refuse to open rather than restart from 1
+         * — restarting from 1 would reuse every seq it ever issued. */
+        FILE *cf = fopen(ob_path, "r+b");
+        if (cf) { fseek(cf, 18, SEEK_SET); fputc(0xFF, cf); fclose(cf); }
+        tsdb_outbox_t *bad = NULL;
+        CHECK(tsdb_outbox_open(ob_path, 16, &bad) == TSDB_ERR_CORRUPT && bad == NULL,
+              "a corrupt reservation file REFUSES to open (never restarts from 1)");
+        unlink(ob_path);
     }
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
