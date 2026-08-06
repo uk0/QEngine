@@ -100,4 +100,27 @@ size_t   tsdb_dedup_gap_count(const tsdb_dedup_ledger_t *l, uint64_t stream);
 int  tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
                              uint64_t frontier);
 
+/* ---- Durable checkpoint -------------------------------------------------
+ *
+ * ONLY THE FRONTIER IS PERSISTED, never the out-of-order tail.  That is
+ * deliberate, not a shortcut: the frontier is the one value with a standalone
+ * meaning ("every seq up to here is applied"), so a stale copy of it is merely
+ * conservative — it re-admits batches that were already applied, which the
+ * receiver's own WAL replay then reconciles.  Persisting the tail would need it
+ * to be fsynced in lockstep with the rows, and the design already has a better
+ * mechanism for that: the WAL record carries the batch id alongside its rows, so
+ * replay rebuilds the tail exactly.  Checkpoint = fast path; WAL = truth.
+ *
+ * Written atomically and durably (tmp -> fsync -> rename -> fsync dir), the
+ * pattern the node-id and schema writers use.
+ *
+ * Load FAILS CLOSED: a missing file restores nothing and returns TSDB_OK (a
+ * fresh node); a corrupt or truncated one restores NOTHING and returns
+ * TSDB_ERR_CORRUPT.  Partially trusting a damaged checkpoint could skip a batch
+ * that was never applied — silent row loss — whereas restoring nothing only
+ * degrades to today's no-dedup behaviour.  Frontiers are applied through
+ * tsdb_dedup_set_frontier, so a stale file can never rewind a live ledger. */
+int  tsdb_dedup_checkpoint_save(const tsdb_dedup_ledger_t *l, const char *path);
+int  tsdb_dedup_checkpoint_load(tsdb_dedup_ledger_t *l, const char *path);
+
 #endif /* TSDB_DEDUP_H */

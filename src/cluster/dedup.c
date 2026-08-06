@@ -4,8 +4,13 @@
 #include "dedup.h"
 #include "../../include/tsdb.h"
 
+#include "../server/proto.h"   /* tsdb_crc32c */
+
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 uint64_t tsdb_stream_id(uint64_t issuer_node_id, uint64_t table_incarnation) {
     /* 0 on either side means the identity is UNKNOWN — a pre-incarnation sender
@@ -194,5 +199,119 @@ int tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
         }
         absorb(s);
     }
+    return TSDB_OK;
+}
+
+/* ---- Durable checkpoint -------------------------------------------------
+ *
+ * Layout, all little-endian:
+ *   magic u32 'DDP1' | version u32 | count u32 | reserved u32
+ *   count x { stream u64, frontier u64 }
+ *   crc32c u32 over everything above
+ *
+ * The CRC is what makes "fail closed" possible: without it a truncated file
+ * would silently restore a PREFIX of the streams, and the streams left out
+ * would then re-admit already-applied batches while the ones restored looked
+ * fine — the worst kind of half-state.  With it, damage restores nothing.
+ */
+
+#define DDP_MAGIC   0x31504444u   /* 'DDP1' */
+#define DDP_VERSION 1u
+#define DDP_HDR     16u
+
+static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+static void put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+static uint32_t get32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t get64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+int tsdb_dedup_checkpoint_save(const tsdb_dedup_ledger_t *l, const char *path) {
+    if (!l || !path) return TSDB_ERR_INVAL;
+
+    /* Only streams that have actually advanced are worth a record. */
+    size_t n = 0;
+    for (size_t i = 0; i < l->max_streams; i++)
+        if (l->streams[i].stream != 0 && l->streams[i].frontier != 0) n++;
+
+    size_t body = DDP_HDR + n * 16;
+    uint8_t *buf = malloc(body + 4);
+    if (!buf) return TSDB_ERR_NOMEM;
+
+    put32(buf + 0,  DDP_MAGIC);
+    put32(buf + 4,  DDP_VERSION);
+    put32(buf + 8,  (uint32_t)n);
+    put32(buf + 12, 0);
+    size_t off = DDP_HDR;
+    for (size_t i = 0; i < l->max_streams; i++) {
+        if (l->streams[i].stream == 0 || l->streams[i].frontier == 0) continue;
+        put64(buf + off,     l->streams[i].stream);
+        put64(buf + off + 8, l->streams[i].frontier);
+        off += 16;
+    }
+    put32(buf + body, tsdb_crc32c(buf, body));
+
+    char tmp[4200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int rc = TSDB_ERR_IO;
+    FILE *f = fopen(tmp, "wb");
+    if (f) {
+        if (fwrite(buf, 1, body + 4, f) == body + 4 &&
+            fflush(f) == 0 && fsync(fileno(f)) == 0) {
+            rc = TSDB_OK;
+        }
+        fclose(f);
+    }
+    free(buf);
+    if (rc != TSDB_OK) { unlink(tmp); return rc; }
+
+    if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+
+    /* The rename itself must survive a crash, or the checkpoint can vanish and
+     * take the dedup state with it — the same reason the node id fsyncs its
+     * directory. */
+    char dir[4200];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        int dfd = open(dir[0] ? dir : "/", O_RDONLY);
+        if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+    }
+    return TSDB_OK;
+}
+
+int tsdb_dedup_checkpoint_load(tsdb_dedup_ledger_t *l, const char *path) {
+    if (!l || !path) return TSDB_ERR_INVAL;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return TSDB_OK;            /* fresh node — nothing to restore */
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return TSDB_ERR_IO; }
+    long sz = ftell(f);
+    if (sz < (long)(DDP_HDR + 4)) { fclose(f); return TSDB_ERR_CORRUPT; }
+    rewind(f);
+
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return TSDB_ERR_NOMEM; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return TSDB_ERR_IO;
+    }
+    fclose(f);
+
+    size_t body = (size_t)sz - 4;
+    if (get32(buf) != DDP_MAGIC || get32(buf + 4) != DDP_VERSION ||
+        tsdb_crc32c(buf, body) != get32(buf + body)) {
+        free(buf);
+        return TSDB_ERR_CORRUPT;       /* restore NOTHING — see the header */
+    }
+    uint32_t n = get32(buf + 8);
+    if (DDP_HDR + (size_t)n * 16 != body) { free(buf); return TSDB_ERR_CORRUPT; }
+
+    /* Only now, with the whole file verified, is anything applied — so a
+     * damaged tail can never leave a half-restored ledger. */
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *rec = buf + DDP_HDR + (size_t)i * 16;
+        (void)tsdb_dedup_set_frontier(l, get64(rec), get64(rec + 8));
+    }
+    free(buf);
     return TSDB_OK;
 }

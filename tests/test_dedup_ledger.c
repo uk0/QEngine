@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int g_pass = 0, g_fail = 0;
 
@@ -286,6 +287,69 @@ int main(void) {
                                                     &i3, NULL, NULL) == TSDB_OK &&
               i3 == 0xABCDULL,
               "an old receiver still reads the incarnation out of a new payload");
+    }
+
+    /* ── [10] durable checkpoint: survives restart, fails closed ──────── */
+    printf("\n[10] frontier checkpoint\n");
+    {
+        const char *ck = "/tmp/tsdb_test_dedup_ck.bin";
+        unlink(ck);
+
+        tsdb_dedup_ledger_t *a = NULL;
+        tsdb_dedup_open(8, 64, &a);
+        for (uint64_t q = 1; q <= 9; q++) tsdb_dedup_record(a, S1, q);
+        tsdb_dedup_record(a, S2, 1);
+        tsdb_dedup_record(a, S2, 2);
+        /* An out-of-order tail that is deliberately NOT persisted. */
+        tsdb_dedup_record(a, S1, 50);
+        CHECK(tsdb_dedup_frontier(a, S1) == 9 && tsdb_dedup_gap_count(a, S1) == 1,
+              "before save: frontier 9 with a tail of 1");
+        CHECK(tsdb_dedup_checkpoint_save(a, ck) == TSDB_OK, "checkpoint saved");
+        tsdb_dedup_close(a);
+
+        tsdb_dedup_ledger_t *b = NULL;
+        tsdb_dedup_open(8, 64, &b);
+        CHECK(tsdb_dedup_checkpoint_load(b, ck) == TSDB_OK, "checkpoint loads");
+        CHECK(tsdb_dedup_frontier(b, S1) == 9, "stream A frontier restored to 9");
+        CHECK(tsdb_dedup_frontier(b, S2) == 2, "stream B frontier restored to 2");
+        CHECK(tsdb_dedup_record(b, S1, 5) == TSDB_ERR_EXISTS,
+              "an already-applied seq is still refused after the restart");
+        CHECK(tsdb_dedup_seen(b, S1, 50) == 0,
+              "the tail was NOT persisted — seq 50 re-admits, and the WAL replay "
+              "is what rebuilds it (checkpoint = fast path, WAL = truth)");
+        tsdb_dedup_close(b);
+
+        /* A missing file is a fresh node, not an error. */
+        tsdb_dedup_ledger_t *c = NULL;
+        tsdb_dedup_open(8, 64, &c);
+        CHECK(tsdb_dedup_checkpoint_load(c, "/tmp/tsdb_test_dedup_absent.bin") == TSDB_OK,
+              "a missing checkpoint is OK (fresh node), restores nothing");
+        CHECK(tsdb_dedup_frontier(c, S1) == 0, "and leaves the ledger empty");
+        tsdb_dedup_close(c);
+
+        /* CORRUPTION MUST RESTORE NOTHING.  A half-restored ledger is the worst
+         * outcome: the streams left out would re-admit applied batches while the
+         * restored ones looked fine. */
+        FILE *f = fopen(ck, "r+b");
+        if (f) { fseek(f, 20, SEEK_SET); fputc(0xFF, f); fclose(f); }
+        tsdb_dedup_ledger_t *d = NULL;
+        tsdb_dedup_open(8, 64, &d);
+        int rc = tsdb_dedup_checkpoint_load(d, ck);
+        CHECK(rc == TSDB_ERR_CORRUPT, "a corrupted checkpoint is REFUSED (rc=%d)", rc);
+        CHECK(tsdb_dedup_frontier(d, S1) == 0 && tsdb_dedup_frontier(d, S2) == 0,
+              "and restores NOTHING — never a half-restored ledger");
+        tsdb_dedup_close(d);
+
+        /* Truncation is corruption too, not a short-but-valid file. */
+        FILE *t2 = fopen(ck, "r+b");
+        if (t2) { fclose(t2); truncate(ck, 20); }
+        tsdb_dedup_ledger_t *e = NULL;
+        tsdb_dedup_open(8, 64, &e);
+        CHECK(tsdb_dedup_checkpoint_load(e, ck) == TSDB_ERR_CORRUPT,
+              "a truncated checkpoint is REFUSED");
+        CHECK(tsdb_dedup_frontier(e, S1) == 0, "and restores nothing");
+        tsdb_dedup_close(e);
+        unlink(ck);
     }
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
