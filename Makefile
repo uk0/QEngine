@@ -110,6 +110,11 @@ TEST_SRCS += tests/test_orphan_reap.c
 # and no rollback could undo it (dedup prerequisite 5).
 TEST_SRCS += tests/test_batch_atomic_flush.c
 
+# The exact receiver-side dedup ledger (WRITE_BATCH dedup prerequisite 4): a
+# CONTIGUOUS frontier plus an exact out-of-order tail, so an out-of-order seq is
+# never reported applied. A scalar watermark would drop its rows silently.
+TEST_SRCS += tests/test_dedup_ledger.c
+
 # Anti-entropy pull-candidate ranking + bounded retry (single process, no
 # sockets): the peer probe can no longer be trusted to identify ONE usable
 # source, so the resync keeps every peer's answer and walks them best-first.

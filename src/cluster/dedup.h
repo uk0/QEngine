@@ -1,0 +1,88 @@
+/* dedup.h — exact receiver-side dedup ledger for replicated batches.
+ *
+ * THE PROBLEM.  WRITE_BATCH carries no identity, so a fanout retry whose ACK
+ * was lost is applied twice and the peer holds the rows twice — and no count
+ * comparison can repair that afterwards ("local has more" is indistinguishable
+ * from "local has unique legitimate writes").  The fix has to stop the SECOND
+ * apply, which means the receiver must be able to answer "have I already
+ * applied (stream, seq)?" exactly.
+ *
+ * WHY A SCALAR HIGH-WATER IS WRONG.  The obvious ledger is one number per
+ * stream and the test `seq <= high_water`.  It is unsafe here: batches are
+ * dispatched by independent per-peer workers with no FIFO guarantee, so seq 7
+ * can arrive before seq 5.  Recording 7 as the watermark then makes the later,
+ * never-applied seq 5 look "already applied" and its rows are DROPPED — the
+ * watermark converts a duplicate-rows bug into a silent MISSING-rows bug, which
+ * is strictly worse.  A Bloom filter fails the same way: a false positive is
+ * silent row loss.
+ *
+ * THE SHAPE THAT WORKS.  Per stream keep
+ *
+ *     frontier : every seq <= frontier is applied — and it only ever advances
+ *                over a CONTIGUOUS prefix, so that statement is a proof, not an
+ *                assumption.  This is also the GC frontier: once a seq is under
+ *                it, its individual record is redundant and is dropped.
+ *     gaps[]   : the exact set of applied seqs ABOVE the frontier — the
+ *                out-of-order tail, which is what the scalar form loses.
+ *
+ * Recording seq == frontier+1 advances the frontier and then absorbs whatever
+ * run of gaps has become contiguous, which is what keeps `gaps` small: it holds
+ * only the genuinely out-of-order window, not history.  Memory is therefore
+ * bounded by concurrency, not by uptime — the unbounded-growth objection that
+ * blocked this design.
+ *
+ * FAIL CLOSED.  `gaps` is capped.  When a stream's out-of-order window is full
+ * the ledger REFUSES the record (TSDB_ERR_FULL) and does NOT mark the seq seen,
+ * so the sender's retry can still deliver it.  Refusing a batch costs a retry;
+ * silently accepting one we cannot remember costs rows.
+ *
+ * Pure and in-memory: no I/O, no locking, no globals.  Persisting the frontier
+ * (and replaying the tail) is the caller's job — see the ordering the dedup
+ * design requires: append rows -> fsync ONE record carrying id and rows ->
+ * publish -> ACK.  Nothing here can be correct-by-itself across a crash; it is
+ * the exactness primitive that layer needs, and it is unit-testable alone.
+ */
+#ifndef TSDB_DEDUP_H
+#define TSDB_DEDUP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct tsdb_dedup_ledger tsdb_dedup_ledger_t;
+
+/* max_streams — capacity for distinct stream ids (a stream is one sender's view
+ *               of one table incarnation; DROP+recreate mints a new one).
+ * max_gap     — the most out-of-order seqs ONE stream may hold above its
+ *               frontier before records are refused.  Bounds memory and makes
+ *               a stuck sender loud instead of unbounded. */
+int  tsdb_dedup_open(size_t max_streams, size_t max_gap,
+                     tsdb_dedup_ledger_t **out);
+void tsdb_dedup_close(tsdb_dedup_ledger_t *l);
+
+/* 1 = this (stream, seq) is KNOWN applied; 0 = not known.  Never a false 1. */
+int  tsdb_dedup_seen(const tsdb_dedup_ledger_t *l, uint64_t stream, uint64_t seq);
+
+/* Record (stream, seq) as applied.
+ *   TSDB_OK        — recorded (the caller may apply the batch)
+ *   TSDB_ERR_EXISTS— already applied; the caller must DROP the batch
+ *   TSDB_ERR_FULL  — out-of-order window exhausted; NOT recorded, caller must
+ *                    refuse the batch so the sender retries
+ *   TSDB_ERR_INVAL — seq 0 (sequences start at 1) or bad args
+ *   TSDB_ERR_NOMEM — out of memory / no stream slot left */
+int  tsdb_dedup_record(tsdb_dedup_ledger_t *l, uint64_t stream, uint64_t seq);
+
+/* Highest seq S such that EVERY seq in [1, S] is applied (0 = none).  Safe GC
+ * point and the only value that needs to survive a restart. */
+uint64_t tsdb_dedup_frontier(const tsdb_dedup_ledger_t *l, uint64_t stream);
+
+/* How many out-of-order seqs this stream currently holds above its frontier —
+ * the pressure against max_gap.  Exposed for tests and telemetry. */
+size_t   tsdb_dedup_gap_count(const tsdb_dedup_ledger_t *l, uint64_t stream);
+
+/* Restore a stream's frontier after a restart (from the durable checkpoint).
+ * Only ever moves it FORWARD: a lower value would re-admit seqs already applied
+ * and duplicate rows, which is the bug this file exists to prevent. */
+int  tsdb_dedup_set_frontier(tsdb_dedup_ledger_t *l, uint64_t stream,
+                             uint64_t frontier);
+
+#endif /* TSDB_DEDUP_H */
