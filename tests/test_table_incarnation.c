@@ -400,7 +400,9 @@ static void test_dedup_retry_not_doubled(void) {
 
     tsdb_close(db);
     rm_rf(dir);
-    unsetenv("TSDB_DEDUP");
+    /* The gate now defaults ON (unset == enabled), so "off" must be spelled
+     * with the explicit opt-out. */
+    setenv("TSDB_DEDUP", "0", 1);
 
     /* And with the gate OFF the old behaviour is intact — the retry DOES double,
      * which is both the bug being fixed and proof the gate is what fixes it. */
@@ -420,6 +422,7 @@ static void test_dedup_retry_not_doubled(void) {
     ASSERT(count_all(db2) == 10);       /* doubled: the gate is genuinely load-bearing */
     tsdb_close(db2);
     rm_rf(dir2);
+    unsetenv("TSDB_DEDUP");             /* leave the process at the default */
 
     printf("  [dedup] a retried batch is dropped and ACKed, not doubled: OK\n");
 }

@@ -460,6 +460,72 @@ int main(void) {
         tsdb_dedup_close(jam);
     }
 
+    /* ── [13] the gate DEFAULTS ON — unset means enabled ──────────────── */
+    printf("\n[13] default-on: a lost-ACK retry is deduplicated without opt-in\n");
+    {
+        /* Unset is the deployed reality — TSDB_DEDUP appears in no deployment
+         * config — so THIS is the configuration the cluster actually runs.
+         * If unset means disabled, the fanout's deadline retry (replica.c)
+         * of a batch whose ACK was lost is applied twice, and the over-count
+         * is unrepairable by design (anti-entropy only reports it). */
+        unsetenv("TSDB_DEDUP");
+        CHECK(tsdb_dedup_is_enabled() == 1, "unset TSDB_DEDUP means ENABLED");
+
+        tsdb_dedup_global_reset_for_test();
+        tsdb_dedup_global_lock();
+        tsdb_dedup_ledger_t *g = tsdb_dedup_global();
+        tsdb_dedup_global_unlock();
+        CHECK(g != NULL, "and the process ledger exists without opt-in");
+
+        /* The value, on the very ledger the default arms: a duplicate of an
+         * applied (stream, seq) is recognised... */
+        tsdb_dedup_global_lock();
+        int r1 = tsdb_dedup_record(g, S1, 1);
+        int r2 = tsdb_dedup_record(g, S1, 1);
+        tsdb_dedup_global_unlock();
+        CHECK(r1 == TSDB_OK, "first delivery records");
+        CHECK(r2 == TSDB_ERR_EXISTS, "and the retry reports already-applied");
+
+        /* ...and a FULL window refuses WITHOUT marking the seq seen, so the
+         * default can refuse a batch (the sender retries it) but never lose
+         * one.  4096 is the global ledger's max_gap (dedup.c); seq 1 stays
+         * missing so nothing can be absorbed. */
+        tsdb_dedup_global_lock();
+        for (uint64_t s = 2; s <= 4097; s++)
+            (void)tsdb_dedup_record(g, S2, s);
+        int rc_full = tsdb_dedup_record(g, S2, 4099);
+        int refused_seen = tsdb_dedup_seen(g, S2, 4099);
+        tsdb_dedup_global_unlock();
+        CHECK(rc_full == TSDB_ERR_FULL, "a full window REFUSES (rc=%d)", rc_full);
+        CHECK(refused_seen == 0,
+              "and the refused seq is NOT marked seen — still retryable");
+
+        /* reset_for_test must still isolate cases now that the ledger exists
+         * without opt-in, or every later test inherits this state. */
+        tsdb_dedup_global_reset_for_test();
+        tsdb_dedup_global_lock();
+        tsdb_dedup_ledger_t *g2 = tsdb_dedup_global();
+        int inherited = g2 && (tsdb_dedup_seen(g2, S1, 1) ||
+                               tsdb_dedup_frontier(g2, S2) != 0 ||
+                               tsdb_dedup_gap_count(g2, S2) != 0);
+        tsdb_dedup_global_unlock();
+        CHECK(g2 != NULL && !inherited,
+              "reset_for_test yields a FRESH ledger — no inherited state");
+
+        /* The rollback lever: "0" — and only "0" — disables. */
+        setenv("TSDB_DEDUP", "0", 1);
+        CHECK(tsdb_dedup_is_enabled() == 0, "TSDB_DEDUP=0 is the explicit opt-out");
+        tsdb_dedup_global_lock();
+        int off_null = (tsdb_dedup_global() == NULL);
+        tsdb_dedup_global_unlock();
+        CHECK(off_null, "opted out, the global ledger is NULL (no dedup)");
+        setenv("TSDB_DEDUP", "1", 1);
+        CHECK(tsdb_dedup_is_enabled() == 1,
+              "TSDB_DEDUP=1 still enables (the deployed spelling)");
+        unsetenv("TSDB_DEDUP");
+        tsdb_dedup_global_reset_for_test();
+    }
+
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

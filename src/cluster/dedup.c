@@ -17,9 +17,24 @@
 static tsdb_dedup_ledger_t *g_global;
 static pthread_mutex_t      g_global_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* ON unless TSDB_DEDUP=0.  Default-on is what actually closes the lost-ACK
+ * duplicate: the fanout retries on a deadline (TSDB_REPL_SEND_TIMEOUT_MS)
+ * after abandoning a reply the receiver may ALREADY have committed
+ * (rpc.c: "the peer WILL answer it"), so with the gate off every such retry
+ * lands twice — and the over-count is unrepairable by design (anti-entropy
+ * only REPORTS it; "local has more" is indistinguishable from legitimate
+ * local writes).  Flipping the default is safe because every failure mode of
+ * the ledger degrades toward refusal or no-dedup, never toward loss: a full
+ * out-of-order window returns TSDB_ERR_FULL WITHOUT marking the seq seen
+ * (the FAIL CLOSED contract in dedup.h), seen() never returns a false 1, and
+ * an unknown identity (stream 0) applies exactly as a legacy sender would.
+ * The worst case is a batch refused or double-applied — today's behaviour —
+ * never a dropped row.  "0" stays as the explicit opt-out for rollback.
+ * Read LIVE, never cached: a cached first-use value made this gate
+ * order-dependent once already. */
 int tsdb_dedup_is_enabled(void) {
     const char *e = getenv("TSDB_DEDUP");
-    return (e && strcmp(e, "1") == 0);
+    return !(e && strcmp(e, "0") == 0);
 }
 
 void tsdb_dedup_global_lock(void)   { pthread_mutex_lock(&g_global_mu); }

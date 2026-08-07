@@ -94,8 +94,20 @@ services:
       # replication) must NOT loopback into the same cluster — that
       # caused 2x doubling on whichever node was the DR target (it
       # received both the cluster broadcast and a DR-forwarded copy).
-      # dr_replication.sh sets this temporarily when running.
+      # dr_replication.sh sets this temporarily when running.  Loopback was
+      # never the ONLY 2x source, though: a fanout retry after a lost ACK
+      # re-sends a batch the peer already committed — that path is closed
+      # by the WRITE_BATCH dedup gate below, not by this override.
       TSDB_DR_REMOTE: ""
+      # WRITE_BATCH (stream, seq) dedup gate — ON by default (unset means
+      # enabled); set explicitly so the deployed value is visible.  The
+      # opt-out for rollback is TSDB_DEDUP=0, which restores the old
+      # duplicate-on-retry behaviour.  A full out-of-order window refuses
+      # the batch for the sender to retry, never drops rows.  Alert on
+      # qengine_replicate_dedup_dropped_total (retries absorbed — should
+      # track lost ACKs) and qengine_antientropy_overcount_persistent_total
+      # (duplicates that still landed) after any change here.
+      TSDB_DEDUP: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"   # opt-in, see note above
       # node1 is the seed — no TSDB_SEEDS.
     ports:
@@ -157,8 +169,20 @@ services:
       # replication) must NOT loopback into the same cluster — that
       # caused 2x doubling on whichever node was the DR target (it
       # received both the cluster broadcast and a DR-forwarded copy).
-      # dr_replication.sh sets this temporarily when running.
+      # dr_replication.sh sets this temporarily when running.  Loopback was
+      # never the ONLY 2x source, though: a fanout retry after a lost ACK
+      # re-sends a batch the peer already committed — that path is closed
+      # by the WRITE_BATCH dedup gate below, not by this override.
       TSDB_DR_REMOTE: ""
+      # WRITE_BATCH (stream, seq) dedup gate — ON by default (unset means
+      # enabled); set explicitly so the deployed value is visible.  The
+      # opt-out for rollback is TSDB_DEDUP=0, which restores the old
+      # duplicate-on-retry behaviour.  A full out-of-order window refuses
+      # the batch for the sender to retry, never drops rows.  Alert on
+      # qengine_replicate_dedup_dropped_total (retries absorbed — should
+      # track lost ACKs) and qengine_antientropy_overcount_persistent_total
+      # (duplicates that still landed) after any change here.
+      TSDB_DEDUP: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"
       # Seeds are gossip addresses (= RPC port − 1).
       TSDB_SEEDS:                  qengine-cnode-1:28080
@@ -221,8 +245,20 @@ services:
       # replication) must NOT loopback into the same cluster — that
       # caused 2x doubling on whichever node was the DR target (it
       # received both the cluster broadcast and a DR-forwarded copy).
-      # dr_replication.sh sets this temporarily when running.
+      # dr_replication.sh sets this temporarily when running.  Loopback was
+      # never the ONLY 2x source, though: a fanout retry after a lost ACK
+      # re-sends a batch the peer already committed — that path is closed
+      # by the WRITE_BATCH dedup gate below, not by this override.
       TSDB_DR_REMOTE: ""
+      # WRITE_BATCH (stream, seq) dedup gate — ON by default (unset means
+      # enabled); set explicitly so the deployed value is visible.  The
+      # opt-out for rollback is TSDB_DEDUP=0, which restores the old
+      # duplicate-on-retry behaviour.  A full out-of-order window refuses
+      # the batch for the sender to retry, never drops rows.  Alert on
+      # qengine_replicate_dedup_dropped_total (retries absorbed — should
+      # track lost ACKs) and qengine_antientropy_overcount_persistent_total
+      # (duplicates that still landed) after any change here.
+      TSDB_DEDUP: "1"
       # TSDB_WAL_ONLY_COMMIT:        "1"
       TSDB_SEEDS:                  qengine-cnode-1:28080,qengine-cnode-2:28080
     ports:

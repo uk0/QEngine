@@ -121,11 +121,15 @@ static int shard_replica_n_cached(void);
  * userdata is the tsdb_cluster_t *.
  * We extract columnar data from the memtable and fan-out via tsdb_cluster_write.
  */
-/* ---- Sender-side dedup stamp (opt-in) ----------------------------------
+/* ---- Sender-side dedup stamp (on by default) ----------------------------
  *
- * OFF unless TSDB_DEDUP=1, and then the payload carries (stream, seq, base) so a
- * retry of the SAME batch is recognisable.  Off, every field is 0 and the wire
- * bytes are exactly what a build without dedup emits.
+ * Gated by tsdb_dedup_is_enabled() — the SAME predicate the receiver gate
+ * (rpc.c) and the WAL replay (db.c) read, deliberately not an inline getenv:
+ * a second spelling of the check is how sender and receiver end up disagreeing
+ * about whether ids exist when the default changes in only one of them.
+ * Enabled, the payload carries (stream, seq, base) so a retry of the SAME
+ * batch is recognisable.  Opted out (TSDB_DEDUP=0), every field is 0 and the
+ * wire bytes are exactly what a build without dedup emits.
  *
  * The outbox is per NODE (one file next to the data), not per table: seq only
  * has to be unique within a stream, and stream already carries the table's
@@ -142,8 +146,7 @@ static void dedup_stamp(tsdb_db_t *db, tsdb_cluster_t *c,
 {
     out->stream = 0; out->seq = 0; out->base = 0;
 
-    const char *e = getenv("TSDB_DEDUP");
-    if (!(e && strcmp(e, "1") == 0)) return;
+    if (!tsdb_dedup_is_enabled()) return;
 
     uint64_t stream = tsdb_stream_id((uint64_t)tsdb_cluster_local_id(c),
                                      incarnation);
