@@ -638,7 +638,14 @@ static void do_local_write(void *arg) {
                 | ((uint32_t)col_data[c][1] <<  8)
                 | ((uint32_t)col_data[c][2] << 16)
                 | ((uint32_t)col_data[c][3] << 24);
-            if (total + 4 > col_sizes[c]) {
+            /* The invariant is "4 + total <= col_sizes[c]" in unbounded
+             * arithmetic, but `total + 4` is uint32 and wraps for total >
+             * 0xFFFFFFFB — a wire frame declaring total=0xFFFFFFFD computed
+             * 1 > csz, passed, and handed a ~4 GiB extent to the bulk
+             * append.  Compare by subtraction instead; the < 4 arm keeps the
+             * subtraction unsigned-safe on its own, independent of the
+             * identical check above. */
+            if (col_sizes[c] < 4 || total > col_sizes[c] - 4) {
                 tsdb_batch_discard(batch); tsdb_table_unlock_write(tbl); write_lock_release(&srv->write_locks, table_name);
                 cx->err = TSDB_ERR_INVAL; cx->msg = "symbol total > csz"; return;
             }
@@ -1561,8 +1568,33 @@ static void *accept_loop(void *arg) {
         socklen_t clen = sizeof(cli);
         int cfd = accept(my_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+            /* This thread is spawned exactly once per listener at start and
+             * nothing ever restarts it, so leaving the loop is PERMANENT:
+             * the listen fd stays open, the kernel keeps completing
+             * handshakes into the backlog, clients see connect() succeed
+             * with replies that never come, and /health (its own thread)
+             * still answers — an outage no healthcheck can see.  A transient
+             * errno (fd exhaustion, an aborted or reset handshake, momentary
+             * kernel memory pressure) must therefore RETRY, never break.
+             *
+             * Only proof that THIS listen fd is dead may end the loop.
+             * EINVAL/ENOTSOCK are that proof.  EBADF is ambiguous: Linux
+             * raises it for a closed fd, but Darwin raises it for hitting
+             * RLIMIT_NOFILE (where POSIX says EMFILE) — so ask the kernel:
+             * fcntl(F_GETFD) failing means my_fd is really gone, succeeding
+             * means the EBADF was fd exhaustion in disguise.  Exhaustion
+             * sleeps 10 ms so the loop does not spin hot while the process
+             * is out of descriptors.  Shutdown stays safe under "continue":
+             * tsdb_server_stop clears srv->running before touching the fd
+             * and this loop re-checks it at least every 200 ms poll. */
+            int e = errno;
+            if (e == EINVAL || e == ENOTSOCK) break;
+            if (e == EBADF && fcntl(my_fd, F_GETFD) == -1) break;
+            if (e == EMFILE || e == ENFILE || e == EBADF) {
+                struct timespec ts = { 0, 10 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+            continue;
         }
 
         /* Disable Nagle for lower latency. */

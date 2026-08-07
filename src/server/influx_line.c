@@ -1105,8 +1105,23 @@ static void *http_accept_loop(void *arg) {
         socklen_t clen = sizeof(cli);
         int cfd = accept(my_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+            /* Same posture as the wire accept loop (see accept_loop in
+             * server.c): this thread is never restarted, so a transient
+             * errno must retry, not break — breaking here permanently kills
+             * the ingest endpoint while its listen fd keeps completing
+             * handshakes.  Break only on proof the listen fd is dead;
+             * Darwin reports fd exhaustion as EBADF, so EBADF is fatal only
+             * when fcntl confirms the fd is gone.  Stop stays safe:
+             * tsdb_influx_http_stop clears g_http_running before closing
+             * the fds and the loop re-checks it every 200 ms poll. */
+            int e = errno;
+            if (e == EINVAL || e == ENOTSOCK) break;
+            if (e == EBADF && fcntl(my_fd, F_GETFD) == -1) break;
+            if (e == EMFILE || e == ENFILE || e == EBADF) {
+                struct timespec ts = { 0, 10 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+            continue;
         }
 
         http_conn_ctx_t *ctx = (http_conn_ctx_t *)malloc(sizeof(*ctx));

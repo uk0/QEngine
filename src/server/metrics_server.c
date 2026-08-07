@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <poll.h>
 #include <time.h>
@@ -2749,8 +2750,23 @@ static void *accept_loop(void *arg) {
         socklen_t clen = sizeof(cli);
         int cfd = accept(ms->listen_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+            /* Same posture as the wire accept loop (see accept_loop in
+             * server.c): this thread is never restarted, so a transient
+             * errno must retry, not break — breaking here silently kills
+             * the management plane AND /health while the listen fd keeps
+             * completing handshakes.  Break only on proof the listen fd is
+             * dead; Darwin reports fd exhaustion as EBADF, so EBADF is
+             * fatal only when fcntl confirms the fd is gone.  Stop stays
+             * safe: tsdb_metrics_server_stop clears ms->running before
+             * closing the fd and the loop re-checks it every 200 ms poll. */
+            int e = errno;
+            if (e == EINVAL || e == ENOTSOCK) break;
+            if (e == EBADF && fcntl(ms->listen_fd, F_GETFD) == -1) break;
+            if (e == EMFILE || e == ENFILE || e == EBADF) {
+                struct timespec ts = { 0, 10 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+            continue;
         }
 
         int one = 1;
