@@ -263,14 +263,18 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
      * and every future caller that forgets, which is the failure mode the
      * evict-at-the-call-site shape has already demonstrated. */
     if (c && tsdb_rpc_conn_is_desynced(c)) {
+        /* Leak-and-clear, exactly like evict_one_conn below — NEVER
+         * tsdb_rpc_conn_close() here.  get_conn hands out raw pointers with
+         * no refcount and drops rmgr->lock before callers use them, so this
+         * same object may right now be mid-call on other threads (fanout
+         * workers queued on conn->lock, the AE probe/pull): closing destroys
+         * the mutex they hold and frees memory they are reading → UAF →
+         * heap abort.  Unlink the slot so the fall-through below redials,
+         * and intentionally leak the retired object; evict_one_conn's
+         * comment records the leak bound for both eviction paths. */
         p->conns[idx] = NULL;
-        pthread_mutex_unlock(&rmgr->lock);
-        tsdb_rpc_conn_close(c);
+        c = NULL;
         tsdb_metric_inc("qengine_replica_conn_evicted_retired_total");
-        pthread_mutex_lock(&rmgr->lock);
-        p = find_slot_locked(rmgr, node_id);
-        if (!p) { pthread_mutex_unlock(&rmgr->lock); return NULL; }
-        c = p->conns[idx];
     }
     if (c) { pthread_mutex_unlock(&rmgr->lock); return c; }
 
@@ -325,11 +329,13 @@ tsdb_rpc_conn_t *tsdb_replica_mgr_get_conn(tsdb_replica_mgr_t *rmgr,
  * glibc heap abort.  Instead we clear the slot so future get_conn calls
  * redial, and intentionally leak the old conn's socket and struct.
  *
- * The leak is bounded: at most (nreplicas * conns_per_peer) per cluster
- * lifetime; a few KB of sockets if half the pool ever goes bad.  Closing
- * the conn at process exit is the cluster mgr's responsibility — we
- * accept the leak during runtime in exchange for memory safety across
- * concurrent RPCs.
+ * The leak is bounded by eviction events, not by pool size: each
+ * evict-then-redial cycle — here or in get_conn's retired-conn eviction,
+ * which leaks for the same reason — abandons one conn struct plus its
+ * socket, so the total grows with peer failures/restarts over the process
+ * lifetime, a few hundred bytes per flap.  Closing the conn at process
+ * exit is the cluster mgr's responsibility — we accept the leak during
+ * runtime in exchange for memory safety across concurrent RPCs.
  */
 static void evict_one_conn(tsdb_replica_mgr_t *rmgr,
                            tsdb_node_id_t node_id,
