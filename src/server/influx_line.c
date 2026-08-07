@@ -401,6 +401,29 @@ static int auto_create_table(tsdb_db_t *db, const char *name,
 }
 
 /*
+ * Report an auto-create that did not happen.  Without this the rows just
+ * raise nerrors and disappear: the HTTP reply carries a count, never a reason,
+ * so a measurement the storage layer refuses (a name that is not a single path
+ * component, a full table registry) looks identical to a parse error.
+ *
+ * The measurement is wire-supplied, so it is printed through a printable-ASCII
+ * filter — a raw control byte would forge log lines — and one line per rejected
+ * measurement per request, not per row, keeps an unauthenticated client from
+ * turning this into a log flood.
+ */
+static void log_create_failed(const char *meas, int rc) {
+    char safe[TSDB_MAX_NAME + 1];
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)meas;
+         *p && n < sizeof(safe) - 1; p++) {
+        safe[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : '?';
+    }
+    safe[n] = '\0';
+    fprintf(stderr, "[influx] auto-create refused for measurement '%s' (rc=%d) — "
+                    "its rows are dropped\n", safe, rc);
+}
+
+/*
  * Find column index in schema by name; returns -1 if not found.
  */
 static int schema_find_col(tsdb_schema_t *schema, const char *name) {
@@ -868,6 +891,7 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
             }
             pthread_mutex_unlock(&g_create_mu);
             if (rc != TSDB_OK && rc != TSDB_ERR_EXISTS) {
+                log_create_failed(meas, rc);
                 /* Mark all rows for this measurement as errors. */
                 for (size_t j = i; j < nrows; j++) {
                     if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0) {

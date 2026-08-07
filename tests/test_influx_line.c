@@ -11,8 +11,10 @@
  *  7. Ingest: 3 cpu lines → table auto-created, count=3
  *  8. Ingest: duplicate measurement → idempotent table creation
  *  9. HTTP: POST /write with 3 lines → 204; then query count=3
- * 10. Parse throughput benchmark (lines/sec)
- * 11. Ingest throughput benchmark (rows/sec)
+ * 10. Ingest: a measurement holding ".." writes nothing outside the data dir
+ * 11. Ingest: legacy-shaped measurement names still ingest after a restart
+ * 12. Parse throughput benchmark (lines/sec)
+ * 13. Ingest throughput benchmark (rows/sec)
  */
 
 #include "../src/server/influx_line.h"
@@ -28,6 +30,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -380,6 +383,117 @@ static void test_http_write(void) {
     tsdb_close(db);
 }
 
+/* ---- Table-name path containment ---------------------------------------- */
+
+static void rmrf(const char *dir) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+    (void)system(cmd);
+}
+
+/*
+ * The measurement of an unauthenticated line becomes a directory name under
+ * the data dir, so a name carrying a path separator or ".." names a directory
+ * OUTSIDE it.  Both halves matter: the benign row must still land inside, and
+ * the traversal attempt must leave nothing behind anywhere.
+ */
+static void test_ingest_path_escape(void) {
+    printf("\n[Test 10] Ingest: '..' in a measurement writes nothing outside the data dir\n");
+
+    char base[256], data[320], outside[384], outside_schema[448];
+    char stray_wal[448], inside_schema[448];
+    snprintf(base, sizeof(base), "/tmp/tsdb_influx_esc_%d", (int)getpid());
+    /* A previous run that reused this pid would leave its tree here and make
+     * "nothing outside the data dir" fail for the wrong reason. */
+    rmrf(base);
+
+    snprintf(data,           sizeof(data),           "%s/data", base);
+    snprintf(outside,        sizeof(outside),        "%s/pwn", base);        /* <data>/../pwn */
+    snprintf(outside_schema, sizeof(outside_schema), "%s/schema.bin", outside);
+    snprintf(stray_wal,      sizeof(stray_wal),      "%s/pwn.log", data);    /* <data>/wal/../pwn.log */
+    snprintf(inside_schema,  sizeof(inside_schema),  "%s/ok/schema.bin", data);
+
+    tsdb_db_t *db = NULL;
+    int rc = tsdb_open(data, &db);
+    ASSERT_OK(rc, "DB open for traversal test");
+
+    const char *body =
+        "ok,host=a usage=0.5 1000\n"          /* control: must be ingested */
+        "../pwn,host=a usage=0.5 2000\n";     /* escape:  must be rejected */
+
+    size_t nlines = 0, nerrors = 0;
+    rc = tsdb_influx_ingest(db, body, strlen(body), &nlines, &nerrors);
+    ASSERT_OK(rc, "ingest returns OK");
+    ASSERT_EQ_INT(nlines,  2, "2 lines parsed");
+    ASSERT_EQ_INT(nerrors, 1, "traversal line rejected");
+
+    struct stat st;
+    CHECK(stat(inside_schema,  &st) == 0, "control table landed inside the data dir");
+    CHECK(stat(outside,        &st) != 0, "no table directory outside the data dir");
+    CHECK(stat(outside_schema, &st) != 0, "no schema.bin outside the data dir");
+    CHECK(stat(stray_wal,      &st) != 0, "no WAL file for the rejected name");
+
+    tsdb_close(db);
+    rmrf(base);
+}
+
+/*
+ * The containment rule is enforced at CREATE, and the table registry is
+ * rebuilt lazily — so after a restart the FIRST write to a table that already
+ * exists on disk goes through auto-create again.  A rule wider than the escape
+ * needs therefore does not just refuse new names, it stops ingesting into
+ * tables an earlier binary created.  These names cannot escape anything, so
+ * they must survive that round trip.
+ */
+static void test_legacy_name_after_restart(void) {
+    printf("\n[Test 11] Ingest: legacy measurement names still ingest after a restart\n");
+
+    char base[256], spaced_schema[512], dotted_schema[512], utf8_schema[512];
+    snprintf(base, sizeof(base), "/tmp/tsdb_influx_legacy_%d", (int)getpid());
+    rmrf(base);
+    snprintf(spaced_schema, sizeof(spaced_schema), "%s/cpu load/schema.bin", base);
+    snprintf(dotted_schema, sizeof(dotted_schema), "%s/sys.cpu.usage/schema.bin", base);
+    /* "\xe6\xb8\xa9\xe5\xba\xa6" — a two-character non-ASCII name in UTF-8. */
+    snprintf(utf8_schema,   sizeof(utf8_schema),   "%s/\xe6\xb8\xa9\xe5\xba\xa6/schema.bin", base);
+
+    /* A space (escaped on the wire), interior dots, and non-ASCII bytes — all
+     * shapes a real Influx deployment produces. */
+    const char *body1 =
+        "cpu\\ load,host=a usage=0.5 1000\n"
+        "sys.cpu.usage,host=a usage=0.5 1000\n"
+        "\xe6\xb8\xa9\xe5\xba\xa6,host=a v=1 1000\n";
+    const char *body2 =
+        "cpu\\ load,host=a usage=0.6 2000\n"
+        "sys.cpu.usage,host=a usage=0.6 2000\n"
+        "\xe6\xb8\xa9\xe5\xba\xa6,host=a v=2 2000\n";
+
+    tsdb_db_t *db = NULL;
+    int rc = tsdb_open(base, &db);
+    ASSERT_OK(rc, "DB open for legacy-name test");
+
+    size_t nlines = 0, nerrors = 0;
+    rc = tsdb_influx_ingest(db, body1, strlen(body1), &nlines, &nerrors);
+    ASSERT_OK(rc, "first ingest ok");
+    ASSERT_EQ_INT(nerrors, 0, "legacy names accepted at first CREATE");
+    tsdb_close(db);
+
+    db = NULL;
+    rc = tsdb_open(base, &db);
+    ASSERT_OK(rc, "DB reopen (restart)");
+    nlines = nerrors = 0;
+    rc = tsdb_influx_ingest(db, body2, strlen(body2), &nlines, &nerrors);
+    ASSERT_OK(rc, "second ingest ok");
+    ASSERT_EQ_INT(nlines,  3, "3 lines parsed after restart");
+    ASSERT_EQ_INT(nerrors, 0, "legacy names still ingest after restart");
+    tsdb_close(db);
+
+    struct stat st;
+    CHECK(stat(spaced_schema, &st) == 0, "spaced name is a table dir in the data dir");
+    CHECK(stat(dotted_schema, &st) == 0, "dotted name is a table dir in the data dir");
+    CHECK(stat(utf8_schema,   &st) == 0, "non-ASCII name is a table dir in the data dir");
+    rmrf(base);
+}
+
 /* ---- Throughput benchmarks ---------------------------------------------- */
 
 static double now_sec(void) {
@@ -389,7 +503,7 @@ static double now_sec(void) {
 }
 
 static void bench_parse(void) {
-    printf("\n[Bench 10] Parse throughput\n");
+    printf("\n[Bench 12] Parse throughput\n");
     const char *line = "cpu,host=web01,region=us-east usage_user=42.5,usage_system=3.1i,ready=true 1609459200000000000";
     size_t linelen = strlen(line);
 
@@ -420,7 +534,7 @@ static void bench_parse(void) {
 }
 
 static void bench_ingest(void) {
-    printf("\n[Bench 11] Ingest throughput (rows/sec)\n");
+    printf("\n[Bench 13] Ingest throughput (rows/sec)\n");
 
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/tsdb_influx_bench_%d", (int)getpid());
@@ -470,6 +584,8 @@ int main(void) {
     test_ingest_basic();
     test_ingest_idempotent();
     test_http_write();
+    test_ingest_path_escape();
+    test_legacy_name_after_restart();
     bench_parse();
     bench_ingest();
 

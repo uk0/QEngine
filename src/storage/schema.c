@@ -93,6 +93,59 @@ int tsdb_mkdir_p(const char *path) {
     return mkdir_p(path, 0755);
 }
 
+/* ---- table-name path containment ---------------------------------------- */
+
+/*
+ * A table name is used as ONE path component: the table dir is
+ * <data_dir>/<name> and the WAL is <data_dir>/wal/<name>.log.  Names arrive
+ * from the wire unauthenticated (Influx measurement, WRITE_BATCH/SCHEMA_SYNC
+ * table_name), so a name carrying a separator or ".." names a directory
+ * outside the data dir — measured before this guard: a schema.bin plus a whole
+ * partition written to <data_dir>/../pwn.
+ *
+ * Rejected: '/', '\\', a LEADING '.', and bytes below 0x20.  With '/' gone the
+ * name cannot carry a subpath at all, so no interior ".." component can exist
+ * and the leading-dot rule covers the name that IS "..".  '\\' is not a
+ * separator on POSIX, so banning it is defence in depth — it IS one to anything
+ * that later resolves these names as Windows paths, e.g. a backup unpacked
+ * there.  Control bytes are rejected because the name is emitted verbatim into
+ * logs and into the JSON backup manifest (backup.c writes "name":"<name>" with
+ * no escaping).
+ *
+ * Everything else stays legal — spaces, interior dots, UTF-8 — and that is
+ * deliberate: this runs at CREATE, and the table registry is rebuilt lazily,
+ * so every create-on-miss path (influx auto-create, SCHEMA_SYNC, WRITE_BATCH
+ * auto-create, idempotent SQL CREATE) re-runs it against tables that ALREADY
+ * exist on disk.
+ * A rule wider than the escape needs would therefore not merely refuse new
+ * names, it would stop ingesting into tables an earlier binary created.
+ *
+ * CREATE is not the only caller.  DROP composes the same two paths and then
+ * REMOVES them, and tsdb_drop_table runs that removal even when the name
+ * matches no registered table (its `idx >= 0` guards cover only the in-memory
+ * teardown), so an escaping name there needs nothing pre-existing to destroy
+ * something outside the data dir.  That path calls this predicate too — see
+ * tsdb_drop_table.
+ *
+ * Still open, deliberately: OPENING a table already on disk does not come
+ * through here.  tsdb_open_table composes <data_dir>/<name> for
+ * tsdb_schema_open and then O_CREATs <data_dir>/wal/<name>.log, so if a
+ * schema.bin already sits at an escaped path — put there by a second instance,
+ * or by a restored tree alongside this one — a wire-supplied name can still
+ * attach to it and still drop a WAL file outside this db's data dir.  Gating
+ * the open path would refuse EXISTING on-disk tables whose names predate this
+ * rule, which is an availability change that does not belong inside a security
+ * fix.  This gate stops escapes from being created or destroyed through; it is
+ * not a repair for one that already exists on disk.
+ */
+int tsdb_name_is_one_path_component(const char *name) {
+    if (name[0] == '\0' || name[0] == '.') return 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p < 0x20) return 0;
+    }
+    return 1;
+}
+
 /* ---- schema_save -------------------------------------------------------- */
 
 static int schema_save(tsdb_schema_t *s) {
@@ -254,6 +307,11 @@ int tsdb_schema_create_ex2(const char *dir, const char *name,
         return TSDB_ERR_INVAL;
 
     if (strlen(name) > TSDB_MAX_NAME)
+        return TSDB_ERR_INVAL;
+
+    /* Every CREATE funnels through here, and this is the last point before
+     * mkdir_p turns the name into a directory — see tsdb_name_is_one_path_component. */
+    if (!tsdb_name_is_one_path_component(name))
         return TSDB_ERR_INVAL;
 
     /* Validate column names, find ts_col. */
