@@ -3373,6 +3373,35 @@ static int part_align_column(const tsdb_schema_t *s, int ci,
     return TSDB_OK;
 }
 
+/* Classify an open()/fopen()/mmap() failure inside tsdb_part_open.  ENOENT
+ * and kin mean the COLUMN has no data here (never flushed, ALTER-added later)
+ * — the open loop keeps reading the partition without it, which is the
+ * long-standing contract every bare `continue` below implements.  EMFILE /
+ * ENFILE / ENOMEM / EAGAIN are different in kind: the data IS on disk but
+ * THIS PROCESS ran out of fds / memory / maps while reaching for it.
+ * Treating that as "column absent" feeds col_meta_n == 0 into the recovery
+ * passes below — for ts the whole partition silently reads as 0 rows (with
+ * no log line at all, since both the clamp and the align pass key off a
+ * non-empty ts), for a value column the torn-column clamp drives the durable
+ * prefix to 0 — and either way tsdb_part_open still returned TSDB_OK, so a
+ * scan under fd pressure answered SHORT with rc=0.  Only these transient
+ * process-level resource errnos are promoted to a hard TSDB_ERR_IO; they
+ * describe the process, not the partition, so failing loudly and letting the
+ * caller retry is the only answer that never mis-states the data.
+ *
+ * EBADF is in the set for one reason: Darwin.  Measured on macOS (Darwin 27),
+ * an open()/fopen() blocked by RLIMIT_NOFILE reports EBADF, not EMFILE, once
+ * any descriptor slot has been consumed since the limit was set — the very
+ * situation a partition-open loop that keeps one col fd per column creates.
+ * Promoting it can never mis-classify a legitimately absent column: open(2)
+ * and fopen(3) take no fd argument, so POSIX defines no EBADF failure for
+ * them, and the mmap fd below was returned by open() two lines earlier — an
+ * EBADF from any of these calls is only ever the descriptor-limit anomaly. */
+static int part_open_rsrc_exhausted(int e) {
+    return e == EMFILE || e == ENFILE || e == ENOMEM || e == EAGAIN
+        || e == EBADF;
+}
+
 int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **out) {
     if (!s || !partition_dir || !out) return TSDB_ERR_INVAL;
 
@@ -3444,7 +3473,19 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                  partition_dir, s->cols[ci].name);
 
         FILE *idx_f = fopen(idx_path, "rb");
-        if (!idx_f) continue;
+        if (!idx_f) {
+            int e = errno;
+            if (part_open_rsrc_exhausted(e)) {
+                fprintf(stderr,
+                        "[part] %s/%s.idx: open failed (errno=%d %s); "
+                        "resource exhaustion — failing the partition open "
+                        "instead of silently dropping the column\n",
+                        partition_dir, s->cols[ci].name, e, strerror(e));
+                tsdb_part_close(p);
+                return TSDB_ERR_IO;
+            }
+            continue;
+        }
         tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(partition_dir),
                                      fileno(idx_f));
 
@@ -3514,7 +3555,20 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                  partition_dir, s->cols[ci].name);
 
         int fd = open(col_path, O_RDONLY);
-        if (fd < 0) { free(entries); continue; }
+        if (fd < 0) {
+            int e = errno;
+            free(entries);
+            if (part_open_rsrc_exhausted(e)) {
+                fprintf(stderr,
+                        "[part] %s/%s.col: open failed (errno=%d %s); "
+                        "resource exhaustion — failing the partition open "
+                        "instead of silently dropping the column\n",
+                        partition_dir, s->cols[ci].name, e, strerror(e));
+                tsdb_part_close(p);
+                return TSDB_ERR_IO;
+            }
+            continue;
+        }
 
         struct stat st;
         if (fstat(fd, &st) < 0 || st.st_size == 0) {
@@ -3541,7 +3595,21 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
         }
 
         void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map == MAP_FAILED) { free(entries); close(fd); continue; }
+        if (map == MAP_FAILED) {
+            int e = errno;
+            free(entries);
+            close(fd);
+            if (part_open_rsrc_exhausted(e)) {
+                fprintf(stderr,
+                        "[part] %s/%s.col: mmap failed (errno=%d %s); "
+                        "resource exhaustion — failing the partition open "
+                        "instead of silently dropping the column\n",
+                        partition_dir, s->cols[ci].name, e, strerror(e));
+                tsdb_part_close(p);
+                return TSDB_ERR_IO;
+            }
+            continue;
+        }
 
         tsdb_iopolicy_advise_read(tsdb_iopolicy_detect(partition_dir),
                                   map, (size_t)st.st_size);
