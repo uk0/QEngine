@@ -436,6 +436,108 @@ static void test_limit_correctness_vs_full(void) {
     printf("  passed (first 10 bucket sums match full-scan)\n");
 }
 
+/* ---- Test 7: per-projection accumulators + typed int64 emit ------------- */
+/* Multi-aggregate SAMPLE BY: every projection must fold ONLY its own column
+ * into ONLY its own accumulator — a shared accumulator makes
+ * count(*), sum(p), sum(q), avg(p) over 10 rows report count=40 and mix
+ * p's and q's values into one sum.  INT64-declared aggregate cells must
+ * carry a raw int64, not the bit pattern of a double.  Both are asserted
+ * through SAMPLE BY and again through a SESSION window, whose
+ * accumulate/flush path is a separate copy of the logic. */
+static void test_per_projection_accumulators(void) {
+    printf("[7] per-projection accumulators + typed int64 emit (SAMPLE BY / SESSION)\n");
+
+    const char *dir = "/tmp/tsdb_sbstream_t7";
+    rm_rf(dir);
+
+    tsdb_db_t *db = NULL;
+    OK(tsdb_open(dir, &db));
+
+    tsdb_col_t cols[] = {
+        {"ts",  TSDB_TYPE_TIMESTAMP},
+        {"p",   TSDB_TYPE_FLOAT64},
+        {"q",   TSDB_TYPE_FLOAT64},
+        {"vol", TSDB_TYPE_INT64},
+    };
+    OK(tsdb_create_table(db, "t", cols, 4, "ts"));
+    tsdb_table_t *tbl = NULL;
+    OK(tsdb_open_table(db, "t", &tbl));
+
+    /* 10 rows inside one 1s bucket: p=1.0, q=100.0, vol=7. */
+    tsdb_batch_t *bk = NULL;
+    OK(tsdb_batch_begin(tbl, &bk));
+    for (int i = 0; i < 10; i++) {
+        OK(tsdb_batch_row_ts(bk, (tsdb_ts_t)((int64_t)i * 100000000LL)));
+        OK(tsdb_batch_row_f64(bk, 1, 1.0));
+        OK(tsdb_batch_row_f64(bk, 2, 100.0));
+        OK(tsdb_batch_row_i64(bk, 3, 7));
+        OK(tsdb_batch_row_end(bk));
+    }
+    OK(tsdb_batch_commit(bk));
+
+    /* (i) multiple aggregates over one bucket. */
+    tsdb_result_t *res = NULL;
+    OK(tsdb_query(db,
+        "SELECT time_bucket(ts, 1000000000), count(*), sum(p), sum(q), avg(p) "
+        "FROM t SAMPLE BY 1s", &res));
+    ASSERT(tsdb_result_next(res));
+    int64_t cnt   = tsdb_result_i64(res, 1);
+    double  sum_p = tsdb_result_f64(res, 2);
+    double  sum_q = tsdb_result_f64(res, 3);
+    double  avg_p = tsdb_result_f64(res, 4);
+    if (cnt != 10)
+        FAIL("SAMPLE BY count(*)=%lld expected 10", (long long)cnt);
+    if (fabs(sum_p - 10.0) > 1e-9)
+        FAIL("SAMPLE BY sum(p)=%.3f expected 10.0", sum_p);
+    if (fabs(sum_q - 1000.0) > 1e-9)
+        FAIL("SAMPLE BY sum(q)=%.3f expected 1000.0", sum_q);
+    if (fabs(avg_p - 1.0) > 1e-9)
+        FAIL("SAMPLE BY avg(p)=%.3f expected 1.0", avg_p);
+    ASSERT(!tsdb_result_next(res));
+    tsdb_result_free(res);
+
+    /* (ii) INT64 sum comes back as a raw int64 cell, not double bits. */
+    OK(tsdb_query(db,
+        "SELECT time_bucket(ts, 1000000000), sum(vol) FROM t SAMPLE BY 1s",
+        &res));
+    ASSERT(tsdb_result_next(res));
+    int64_t sum_vol = tsdb_result_i64(res, 1);
+    if (sum_vol != 70)
+        FAIL("SAMPLE BY sum(vol)=%lld expected 70", (long long)sum_vol);
+    tsdb_result_free(res);
+
+    /* (iii) same assertions through a SESSION window (one 10-row session). */
+    OK(tsdb_query(db,
+        "SELECT count(*), sum(p), sum(q), avg(p) FROM t SESSION(ts, 10s)",
+        &res));
+    ASSERT(tsdb_result_next(res));
+    cnt   = tsdb_result_i64(res, 0);
+    sum_p = tsdb_result_f64(res, 1);
+    sum_q = tsdb_result_f64(res, 2);
+    avg_p = tsdb_result_f64(res, 3);
+    if (cnt != 10)
+        FAIL("SESSION count(*)=%lld expected 10", (long long)cnt);
+    if (fabs(sum_p - 10.0) > 1e-9)
+        FAIL("SESSION sum(p)=%.3f expected 10.0", sum_p);
+    if (fabs(sum_q - 1000.0) > 1e-9)
+        FAIL("SESSION sum(q)=%.3f expected 1000.0", sum_q);
+    if (fabs(avg_p - 1.0) > 1e-9)
+        FAIL("SESSION avg(p)=%.3f expected 1.0", avg_p);
+    ASSERT(!tsdb_result_next(res));
+    tsdb_result_free(res);
+
+    OK(tsdb_query(db, "SELECT sum(vol) FROM t SESSION(ts, 10s)", &res));
+    ASSERT(tsdb_result_next(res));
+    sum_vol = tsdb_result_i64(res, 0);
+    if (sum_vol != 70)
+        FAIL("SESSION sum(vol)=%lld expected 70", (long long)sum_vol);
+    tsdb_result_free(res);
+
+    tsdb_close(db);
+    rm_rf(dir);
+    printf("  passed (independent accumulators, raw int64 cells)\n");
+}
+
 int main(void) {
     printf("=== test_sample_by_stream ===\n\n");
 
@@ -445,7 +547,8 @@ int main(void) {
     test_limit_larger_than_buckets();
     test_zero_rows();
     test_limit_correctness_vs_full();
+    test_per_projection_accumulators();
 
-    printf("\n=== 6 passed, 0 failed ===\n");
+    printf("\n=== 7 passed, 0 failed ===\n");
     return 0;
 }

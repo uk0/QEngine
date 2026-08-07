@@ -400,6 +400,52 @@ int main(void) {
 
     tsdb_set_query_parallel(1); /* restore parallel default */
 
+    /* --- Test 16: ORDER BY permutes whole 8-byte cells (SYMBOL pairing) --- */
+    /* Result cells are uniformly 8-byte slots — SYMBOL codes are u32
+     * zero-extended into a u64 cell.  A 4-byte permute stride on the SYMBOL
+     * column shuffles half-cells and mispairs symbols with every other
+     * column, so row0 of ORDER BY v DESC came back ("alpha", 4). */
+    printf("\n[16] SELECT sym, v ORDER BY v DESC keeps symbol paired with row\n");
+    {
+        tsdb_col_t ocols[] = {
+            {"ts",  TSDB_TYPE_TIMESTAMP},
+            {"sym", TSDB_TYPE_SYMBOL},
+            {"v",   TSDB_TYPE_INT64},
+        };
+        OK(tsdb_create_table(db, "ordsym", ocols, 3, "ts"));
+        tsdb_table_t *ot = NULL;
+        OK(tsdb_open_table(db, "ordsym", &ot));
+        tsdb_batch_t *ob = NULL;
+        OK(tsdb_batch_begin(ot, &ob));
+        const char *onames[] = {"alpha", "bravo", "charlie", "delta"};
+        for (int i = 0; i < 4; i++) {
+            OK(tsdb_batch_row_ts(ob, ts_at(0, i)));
+            OK(tsdb_batch_row_sym(ob, 1, onames[i]));
+            OK(tsdb_batch_row_i64(ob, 2, i + 1));
+            OK(tsdb_batch_row_end(ob));
+        }
+        OK(tsdb_batch_commit(ob));
+
+        tsdb_result_t *orr = NULL;
+        OK(tsdb_query(db, "SELECT sym, v FROM ordsym ORDER BY v DESC", &orr));
+        const char *want_sym[] = {"delta", "charlie", "bravo", "alpha"};
+        int64_t     want_v[]   = {4, 3, 2, 1};
+        int oi = 0;
+        while (tsdb_result_next(orr)) {
+            assert(oi < 4);
+            const char *gs = tsdb_result_sym(orr, 0);
+            int64_t     gv = tsdb_result_i64(orr, 1);
+            printf("  row%d: sym=%s v=%lld (want %s %lld)\n", oi,
+                   gs ? gs : "(null)", (long long)gv,
+                   want_sym[oi], (long long)want_v[oi]);
+            assert(gv == want_v[oi]);
+            assert(gs && strcmp(gs, want_sym[oi]) == 0);
+            oi++;
+        }
+        assert(oi == 4);
+        tsdb_result_free(orr);
+    }
+
     tsdb_close(db);
     printf("\n=== All query tests PASSED ===\n");
     rm_rf(dir);

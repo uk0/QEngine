@@ -592,7 +592,28 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
         if (cmtx) pthread_mutex_lock(cmtx);
         rc = tsdb_part_open(s, dirs[i], &part);
         if (cmtx) pthread_mutex_unlock(cmtx);
-        if (rc != TSDB_OK) { free(dirs[i]); continue; }
+        if (rc != TSDB_OK) {
+            /* TSDB_ERR_IO / TSDB_ERR_NOMEM mean the partition's data EXISTS
+             * but could not be reached — tsdb_part_open promotes fd / memory
+             * / map exhaustion to these (part_open_rsrc_exhausted in part.c).
+             * Swallowing them here is how a wide scan under the default
+             * ulimit used to answer with a fraction of the true rows and
+             * rc=0: every partition that failed to open simply vanished from
+             * the plan.  Fail the whole scan loudly instead — skipping stays
+             * correct only for "nothing to read here" outcomes (e.g.
+             * TSDB_ERR_NOTFOUND).  Close the sources already opened: under
+             * exhaustion they hold the very fds a retrying caller needs
+             * back, and no caller frees the plan on a build error. */
+            if (rc == TSDB_ERR_IO || rc == TSDB_ERR_NOMEM) {
+                for (size_t j = i; j < nd; j++) free(dirs[j]);
+                free(dirs);
+                scan_plan_free(p);
+                memset(p, 0, sizeof(*p));
+                return rc;
+            }
+            free(dirs[i]);
+            continue;
+        }
 
         /* File-level zone-map prune: if the whole partition's [ts_min, ts_max]
          * is outside the caller's WHERE predicate range, skip it entirely —
@@ -6397,24 +6418,112 @@ static int result_apply_order_by(tsdb_result_t *r, qast_query_t *q,
     g_ord_ctx.desc     = (q->order_dir == QAST_ORDER_DESC);
     qsort(idx, n, sizeof(size_t), order_cmp_idx);
 
-    /* Permute each column by the index array.  Result columns store
-     * uint32 for SYMBOL and uint64 for everything else (matching how
-     * result_append_cell writes them).  All other shapes default to
-     * 8-byte slots so a single per-column scratch buffer covers them. */
+    /* Permute each column by the index array.  Result cells are uniformly
+     * 8-byte slots — result_append_cell widens every value into a uint64
+     * cell, including SYMBOL, whose u32 code is zero-extended on write and
+     * read back from the LOW 32 bits by tsdb_result_sym.  A 4-byte SYMBOL
+     * stride here would move half-cells: row i's slot would be rebuilt from
+     * fragments of rows idx[i]/2, mispairing every symbol with the other
+     * (correctly 8-byte-permuted) columns of its row. */
     for (int c = 0; c < r->ncols; c++) {
-        size_t w = (r->col_types[c] == TSDB_TYPE_SYMBOL) ? 4 : 8;
         uint8_t *src = (uint8_t *)r->col_data[c];
         if (!src) continue;
-        uint8_t *tmp = (uint8_t *)malloc(n * w);
+        uint8_t *tmp = (uint8_t *)malloc(n * 8);
         if (!tmp) { free(idx); return TSDB_ERR_NOMEM; }
         for (size_t i = 0; i < n; i++)
-            memcpy(tmp + i * w, src + idx[i] * w, w);
-        memcpy(src, tmp, n * w);
+            memcpy(tmp + i * 8, src + idx[i] * 8, 8);
+        memcpy(src, tmp, n * 8);
         free(tmp);
     }
 
     free(idx);
     return TSDB_OK;
+}
+
+/* ---- Streaming bucket accumulators (SAMPLE BY / advanced windows) ------- */
+
+/* One accumulator PER PROJECTION.  The streaming SAMPLE BY and
+ * SESSION/STATE/EVENT window paths used to fold every projection into a
+ * single shared accumulator, which cross-contaminates the aggregates:
+ * 'count(*), sum(p), sum(q), avg(p)' over 10 rows reported count=40 (the
+ * count bumped once per projection per row) and sum(p)==sum(q)==Σ(p+q)
+ * (both columns added into the same sum).  bkt_st[pi] belongs to projs[pi]
+ * alone.  The per-bucket row count is deliberately NOT in here: every
+ * accumulated row feeds every aggregate projection exactly once, so one
+ * shared row counter (cur_rows in exec_select) serves count(*), every
+ * avg() denominator, and the "bucket has data" flush gates. */
+typedef struct {
+    double  sum_f;
+    int64_t sum_i;
+    double  min_f, max_f;
+    int64_t min_i, max_i;
+} bkt_state_t;
+
+/* Runs once per bucket OPEN (a boundary crossing), never per row — the
+ * accumulate paths must stay load-add-store or SAMPLE BY throughput on
+ * long buckets regresses. */
+static void bkt_states_reset(bkt_state_t *st, int n) {
+    for (int i = 0; i < n; i++) {
+        st[i].sum_f = 0.0;        st[i].sum_i = 0;
+        st[i].min_f =  INFINITY;  st[i].max_f = -INFINITY;
+        st[i].min_i = INT64_MAX;  st[i].max_i = INT64_MIN;
+    }
+}
+
+/* Append the cells of one closed bucket/window row (the caller reserves the
+ * row first and bumps r->nrows after).  Single emit shared by all four
+ * flush sites — in-loop SAMPLE BY, ADW_FLUSH, and the two post-scan
+ * flushes — so their cell encodings cannot drift apart.
+ *
+ * Encoding mirrors agg_write: the projection's DECLARED out_type — not the
+ * source column's runtime type — decides whether the 8-byte cell carries a
+ * raw int64 or IEEE-754 double bits, because out_type is what
+ * result_set_col published and therefore how tsdb_result_i64/_f64, the
+ * wire, and fedagg's merge_sample_by will read the cell back.  Coercing an
+ * int64 aggregate through double and storing the double's bit pattern in
+ * an INT64-declared cell hands readers the bits as the value (sum(vol)==70
+ * read back as 4634626229029306368).
+ * Which accumulator arm holds the value follows qcoltype() of the source
+ * column — the same test the accumulate paths use to pick the arm — so a
+ * FLOAT32 column (normalised to FLOAT64 on decode) is read from sum_f,
+ * where accumulation put it. */
+static void bkt_emit_row(tsdb_result_t *r, proj_t *projs, int nprojs,
+                         const tsdb_schema_t *s, const bkt_state_t *st,
+                         uint64_t rows, int64_t bucket_start) {
+    for (int pi = 0; pi < nprojs; pi++) {
+        proj_t *p = &projs[pi];
+        const bkt_state_t *bs = &st[pi];
+        double  out_f = 0.0;
+        int64_t out_i = 0;
+        int is_int = (p->out_type == TSDB_TYPE_INT64 ||
+                      p->out_type == TSDB_TYPE_TIMESTAMP);
+        int src_f  = (p->col >= 0 &&
+                      qcoltype(s->cols[p->col].type) == TSDB_TYPE_FLOAT64);
+        if (p->kind == PROJ_TS_BUCKET) {
+            out_i = bucket_start;
+        } else if (p->kind == PROJ_AGG_COUNT) {
+            out_i = (int64_t)rows;
+        } else if (p->kind == PROJ_AGG_SUM) {
+            if (src_f) out_f = bs->sum_f; else out_i = bs->sum_i;
+        } else if (p->kind == PROJ_AGG_AVG) {
+            if (rows > 0)
+                out_f = src_f ? (bs->sum_f / (double)rows)
+                              : ((double)bs->sum_i / (double)rows);
+        } else if (p->kind == PROJ_AGG_MIN) {
+            if (src_f) out_f = bs->min_f; else out_i = bs->min_i;
+        } else if (p->kind == PROJ_AGG_MAX) {
+            if (src_f) out_f = bs->max_f; else out_i = bs->max_i;
+        } else {
+            /* PROJ_COL and non-streaming agg kinds not supported in bucket
+             * mode — same zero placeholder the old per-site loops wrote. */
+            result_append_cell(r, pi, 0);
+            continue;
+        }
+        uint64_t bits;
+        if (is_int) memcpy(&bits, &out_i, 8);
+        else        memcpy(&bits, &out_f, 8);
+        result_append_cell(r, pi, bits);
+    }
 }
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -6557,24 +6666,24 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* Special case: SAMPLE BY + has_agg: handle bucket-grouped aggregation.
      * Streaming emit: bucket state is flushed to result immediately when a new
-     * bucket boundary is crossed. Only one bkt_state_t is live at any time.
-     * Cross-source merging is correct because cur_state persists across the
-     * outer source loop — a bucket that straddles two scan sources is merged
-     * before emission.
+     * bucket boundary is crossed.  One bucket is live at any time, with one
+     * bkt_state_t per projection (see bkt_state_t for why sharing a single
+     * accumulator across projections cross-contaminates the aggregates).
+     * Cross-source merging is correct because the accumulators persist across
+     * the outer source loop — a bucket that straddles two scan sources is
+     * merged before emission.
      */
 
     int has_sample = q->has_sample_by;
 
-    /* Single bucket accumulator for streaming SAMPLE BY. */
-    typedef struct { int64_t bucket; double sum_f; int64_t sum_i; double min_f, max_f;
-                     int64_t min_i, max_i; uint64_t count; } bkt_state_t;
-
-    /* cur_state holds the bucket currently being aggregated.
-     * cur_bucket == INT64_MIN means no bucket has been opened yet. */
-    bkt_state_t cur_state;
-    memset(&cur_state, 0, sizeof(cur_state));
-    cur_state.min_f = INFINITY;  cur_state.max_f = -INFINITY;
-    cur_state.min_i = INT64_MAX; cur_state.max_i = INT64_MIN;
+    /* bkt_st[pi] accumulates projs[pi] for the bucket currently being
+     * aggregated (allocated after the scratch declarations below, only for
+     * the streaming bucket paths that use it).
+     * cur_bucket == INT64_MIN means no bucket has been opened yet.
+     * cur_rows counts rows folded into the open bucket, bumped ONCE per row
+     * (not per projection — that was the count(*)=4x inflation). */
+    bkt_state_t *bkt_st = NULL;
+    uint64_t cur_rows = 0;
     int64_t cur_bucket = INT64_MIN;  /* sentinel: no active bucket */
 
     /* ---- Advanced window extra state ------------------------------------ */
@@ -6594,6 +6703,13 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     void *serial_agg_scratch = NULL;
     udf_agg_scratch_t serial_udf_scratch;
     memset(&serial_udf_scratch, 0, sizeof(serial_udf_scratch));
+
+    /* One accumulator per projection for the streaming bucket paths. */
+    if (has_agg && (has_sample || q->has_adv_window) && nprojs > 0) {
+        bkt_st = malloc((size_t)nprojs * sizeof(*bkt_st));
+        if (!bkt_st) { rc = TSDB_ERR_NOMEM; goto done; }
+        bkt_states_reset(bkt_st, nprojs);
+    }
 
     /* ---- Parallel aggregate path --------------------------------------- */
     /* Conditions: agg query, no SAMPLE BY, more than 1 source, parallel enabled.
@@ -7044,9 +7160,9 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             }
         } else if (has_agg && has_sample) {
             /* Streaming bucket aggregation: emit each bucket as soon as we
-             * observe a new bucket boundary.  cur_state persists across source
-             * boundaries so that a bucket spanning two scan sources is merged
-             * correctly — no double-emit, no lost rows. */
+             * observe a new bucket boundary.  The accumulators persist across
+             * source boundaries so that a bucket spanning two scan sources is
+             * merged correctly — no double-emit, no lost rows. */
             const int64_t *tscol = (const int64_t *)bufs[s->ts_col_idx];
             int64_t bnum = q->sample_by.ns;
             if (bnum <= 0) bnum = 1;
@@ -7056,7 +7172,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
                 if (b != cur_bucket) {
                     /* Emit the completed bucket that just closed. */
-                    if (cur_bucket != INT64_MIN && cur_state.count > 0) {
+                    if (cur_bucket != INT64_MIN && cur_rows > 0) {
                         rc = result_reserve_rows(r, r->nrows + 1);
                         if (rc != TSDB_OK) {
                             free(bm);
@@ -7064,44 +7180,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                                 if (!src->mem && bufs[c]) free(bufs[c]);
                             free(bufs); free(syms); goto done;
                         }
-                        for (int pi = 0; pi < nprojs; pi++) {
-                            proj_t *p = &projs[pi];
-                            if (p->kind == PROJ_TS_BUCKET) {
-                                uint64_t bits; memcpy(&bits, &cur_state.bucket, 8);
-                                result_append_cell(r, pi, bits);
-                            } else if (p->kind == PROJ_AGG_SUM) {
-                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                           ? cur_state.sum_f : (double)cur_state.sum_i;
-                                uint64_t bits; memcpy(&bits, &v, 8);
-                                result_append_cell(r, pi, bits);
-                            } else if (p->kind == PROJ_AGG_AVG) {
-                                double v = 0;
-                                if (cur_state.count > 0) {
-                                    v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                        ? (cur_state.sum_f / (double)cur_state.count)
-                                        : ((double)cur_state.sum_i / (double)cur_state.count);
-                                }
-                                uint64_t bits; memcpy(&bits, &v, 8);
-                                result_append_cell(r, pi, bits);
-                            } else if (p->kind == PROJ_AGG_MIN) {
-                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                           ? cur_state.min_f : (double)cur_state.min_i;
-                                uint64_t bits; memcpy(&bits, &v, 8);
-                                result_append_cell(r, pi, bits);
-                            } else if (p->kind == PROJ_AGG_MAX) {
-                                double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                           ? cur_state.max_f : (double)cur_state.max_i;
-                                uint64_t bits; memcpy(&bits, &v, 8);
-                                result_append_cell(r, pi, bits);
-                            } else if (p->kind == PROJ_AGG_COUNT) {
-                                int64_t v = (int64_t)cur_state.count;
-                                uint64_t bits; memcpy(&bits, &v, 8);
-                                result_append_cell(r, pi, bits);
-                            } else {
-                                /* PROJ_COL not supported in bucket mode */
-                                result_append_cell(r, pi, 0);
-                            }
-                        }
+                        bkt_emit_row(r, projs, nprojs, s, bkt_st,
+                                     cur_rows, cur_bucket);
                         r->nrows++;
                         rows_emitted++;
                         /* LIMIT pushdown: stop scanning further rows if limit hit */
@@ -7109,34 +7189,33 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                     }
 
                     /* Open fresh bucket state for b. */
-                    memset(&cur_state, 0, sizeof(cur_state));
-                    cur_state.min_f =  INFINITY;
-                    cur_state.max_f = -INFINITY;
-                    cur_state.min_i = INT64_MAX;
-                    cur_state.max_i = INT64_MIN;
-                    cur_state.bucket = b;
+                    bkt_states_reset(bkt_st, nprojs);
+                    cur_rows = 0;
                     cur_bucket = b;
                 }
 
-                /* Accumulate row into current bucket. */
+                /* Accumulate row into current bucket: the shared row counter
+                 * once per row, then each aggregate projection into ITS OWN
+                 * accumulator — never a neighbour's (see bkt_state_t). */
+                cur_rows++;
                 for (int pi = 0; pi < nprojs; pi++) {
                     if (projs[pi].kind < PROJ_AGG_RANGE_BEGIN || projs[pi].kind > PROJ_AGG_COUNT) continue;
+                    if (projs[pi].kind == PROJ_AGG_COUNT) continue; /* row count above */
                     int col = projs[pi].col;
-                    if (projs[pi].kind == PROJ_AGG_COUNT) { cur_state.count++; continue; }
                     if (col < 0) continue;
+                    bkt_state_t *bs = &bkt_st[pi];
                     tsdb_type_t ct = qcoltype(s->cols[col].type);
                     if (ct == TSDB_TYPE_FLOAT64) {
                         double x = ((const double *)bufs[col])[i];
-                        cur_state.sum_f += x;
-                        if (x < cur_state.min_f) cur_state.min_f = x;
-                        if (x > cur_state.max_f) cur_state.max_f = x;
+                        bs->sum_f += x;
+                        if (x < bs->min_f) bs->min_f = x;
+                        if (x > bs->max_f) bs->max_f = x;
                     } else {
                         int64_t x = ((const int64_t *)bufs[col])[i];
-                        cur_state.sum_i += x;
-                        if (x < cur_state.min_i) cur_state.min_i = x;
-                        if (x > cur_state.max_i) cur_state.max_i = x;
+                        bs->sum_i += x;
+                        if (x < bs->min_i) bs->min_i = x;
+                        if (x > bs->max_i) bs->max_i = x;
                     }
-                    cur_state.count++;
                 }
             }
             /* Early-exit the source loop if LIMIT already satisfied */
@@ -7149,14 +7228,15 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             }
         } else if (q->has_adv_window && has_agg) {
             /* ---- Advanced window aggregation (SESSION/STATE_WINDOW/EVENT_WINDOW) ----
-             * Shares bkt_state_t cur_state / cur_bucket declared above.
+             * Shares the per-projection bkt_st accumulators, cur_rows and
+             * cur_bucket declared above.
              */
             const int64_t *adv_ts = (const int64_t *)bufs[s->ts_col_idx];
 
 /* Local macros for advanced window (undef'd at end of block) */
 #define ADW_FLUSH(start_ts_val)                                                    \
     do {                                                                           \
-        if (cur_state.count > 0) {                                                 \
+        if (cur_rows > 0) {                                                        \
             rc = result_reserve_rows(r, r->nrows + 1);                             \
             if (rc != TSDB_OK) {                                                   \
                 free(bm);                                                          \
@@ -7164,48 +7244,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                     if (!src->mem && bufs[_ca]) free(bufs[_ca]);                   \
                 free(bufs); free(syms); goto done;                                 \
             }                                                                      \
-            for (int _p2 = 0; _p2 < nprojs; _p2++) {                             \
-                proj_t *_pp = &projs[_p2];                                        \
-                if (_pp->kind == PROJ_TS_BUCKET) {                                \
-                    int64_t _sv = (start_ts_val);                                 \
-                    uint64_t _bb; memcpy(&_bb, &_sv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else if (_pp->kind == PROJ_AGG_SUM) {                           \
-                    double _vv = (_pp->col >= 0 &&                                \
-                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
-                        ? cur_state.sum_f : (double)cur_state.sum_i;              \
-                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else if (_pp->kind == PROJ_AGG_AVG) {                           \
-                    double _vv = 0;                                                \
-                    if (cur_state.count > 0) {                                    \
-                        _vv = (_pp->col >= 0 &&                                   \
-                            s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)          \
-                            ? (cur_state.sum_f / (double)cur_state.count)         \
-                            : ((double)cur_state.sum_i / (double)cur_state.count); \
-                    }                                                              \
-                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else if (_pp->kind == PROJ_AGG_MIN) {                           \
-                    double _vv = (_pp->col >= 0 &&                                \
-                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
-                        ? cur_state.min_f : (double)cur_state.min_i;              \
-                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else if (_pp->kind == PROJ_AGG_MAX) {                           \
-                    double _vv = (_pp->col >= 0 &&                                \
-                        s->cols[_pp->col].type == TSDB_TYPE_FLOAT64)              \
-                        ? cur_state.max_f : (double)cur_state.max_i;              \
-                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else if (_pp->kind == PROJ_AGG_COUNT) {                         \
-                    int64_t _vv = (int64_t)cur_state.count;                       \
-                    uint64_t _bb; memcpy(&_bb, &_vv, 8);                          \
-                    result_append_cell(r, _p2, _bb);                              \
-                } else {                                                           \
-                    result_append_cell(r, _p2, 0);                                \
-                }                                                                  \
-            }                                                                      \
+            bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows,                    \
+                         (start_ts_val));                                          \
             r->nrows++;                                                            \
             rows_emitted++;                                                        \
         }                                                                          \
@@ -7213,32 +7253,33 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
 #define ADW_OPEN(ts_val)                                                           \
     do {                                                                           \
-        memset(&cur_state, 0, sizeof(cur_state));                                  \
-        cur_state.min_f =  INFINITY; cur_state.max_f = -INFINITY;                 \
-        cur_state.min_i = INT64_MAX; cur_state.max_i = INT64_MIN;                 \
+        bkt_states_reset(bkt_st, nprojs);                                          \
+        cur_rows = 0;                                                              \
         cur_bucket = (ts_val);                                                     \
     } while (0)
 
 #define ADW_ACC(ri)                                                                \
     do {                                                                           \
-        /* Increment row count once per row (not per projection). */              \
-        cur_state.count++;                                                         \
+        /* Row count once per row (not per projection); each aggregate       */   \
+        /* then folds into ITS OWN accumulator (see bkt_state_t).            */   \
+        cur_rows++;                                                                \
         for (int _pa = 0; _pa < nprojs; _pa++) {                                  \
             if (projs[_pa].kind < PROJ_AGG_RANGE_BEGIN ||                         \
                 projs[_pa].kind > PROJ_AGG_COUNT) continue;                       \
             if (projs[_pa].kind == PROJ_AGG_COUNT) continue; /* row count above */ \
             int _caa = projs[_pa].col;                                            \
             if (_caa < 0) continue;                                               \
-            if (qcoltype(s->cols[_caa].type) == TSDB_TYPE_FLOAT64) {                        \
+            bkt_state_t *_bs = &bkt_st[_pa];                                      \
+            if (qcoltype(s->cols[_caa].type) == TSDB_TYPE_FLOAT64) {              \
                 double _xa = ((const double *)bufs[_caa])[(ri)];                  \
-                cur_state.sum_f += _xa;                                           \
-                if (_xa < cur_state.min_f) cur_state.min_f = _xa;                 \
-                if (_xa > cur_state.max_f) cur_state.max_f = _xa;                 \
+                _bs->sum_f += _xa;                                                \
+                if (_xa < _bs->min_f) _bs->min_f = _xa;                           \
+                if (_xa > _bs->max_f) _bs->max_f = _xa;                           \
             } else {                                                               \
                 int64_t _xa = ((const int64_t *)bufs[_caa])[(ri)];                \
-                cur_state.sum_i += _xa;                                           \
-                if (_xa < cur_state.min_i) cur_state.min_i = _xa;                 \
-                if (_xa > cur_state.max_i) cur_state.max_i = _xa;                 \
+                _bs->sum_i += _xa;                                                \
+                if (_xa < _bs->min_i) _bs->min_i = _xa;                           \
+                if (_xa > _bs->max_i) _bs->max_i = _xa;                           \
             }                                                                      \
         }                                                                          \
     } while (0)
@@ -7607,94 +7648,21 @@ post_scan:
     } else if (has_agg && has_sample) {
         /* Flush the last (still-open) bucket, if any rows were seen and
          * the LIMIT has not already been reached. */
-        if (cur_bucket != INT64_MIN && cur_state.count > 0 &&
+        if (cur_bucket != INT64_MIN && cur_rows > 0 &&
             !(q->has_limit && rows_emitted >= limit)) {
             rc = result_reserve_rows(r, r->nrows + 1);
             if (rc != TSDB_OK) goto done;
-            for (int pi = 0; pi < nprojs; pi++) {
-                proj_t *p = &projs[pi];
-                if (p->kind == PROJ_TS_BUCKET) {
-                    uint64_t bits; memcpy(&bits, &cur_state.bucket, 8);
-                    result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_AGG_SUM) {
-                    double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? cur_state.sum_f : (double)cur_state.sum_i;
-                    uint64_t bits; memcpy(&bits, &v, 8);
-                    result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_AGG_AVG) {
-                    double v = 0;
-                    if (cur_state.count > 0) {
-                        v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                            ? (cur_state.sum_f / (double)cur_state.count)
-                            : ((double)cur_state.sum_i / (double)cur_state.count);
-                    }
-                    uint64_t bits; memcpy(&bits, &v, 8);
-                    result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_AGG_MIN) {
-                    double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? cur_state.min_f : (double)cur_state.min_i;
-                    uint64_t bits; memcpy(&bits, &v, 8);
-                    result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_AGG_MAX) {
-                    double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                               ? cur_state.max_f : (double)cur_state.max_i;
-                    uint64_t bits; memcpy(&bits, &v, 8);
-                    result_append_cell(r, pi, bits);
-                } else if (p->kind == PROJ_AGG_COUNT) {
-                    int64_t v = (int64_t)cur_state.count;
-                    uint64_t bits; memcpy(&bits, &v, 8);
-                    result_append_cell(r, pi, bits);
-                } else {
-                    /* PROJ_COL not supported in bucket mode */
-                    result_append_cell(r, pi, 0);
-                }
-            }
+            bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows, cur_bucket);
             r->nrows++;
         }
     } else if (q->has_adv_window && has_agg) {
         /* Flush the last open advanced window bucket if one is still open. */
-        if (cur_bucket != INT64_MIN && cur_state.count > 0 &&
+        if (cur_bucket != INT64_MIN && cur_rows > 0 &&
             !(q->has_limit && rows_emitted >= limit)) {
             rc = result_reserve_rows(r, r->nrows + 1);
             if (rc == TSDB_OK) {
-                int64_t win_start = cur_bucket;
-                for (int pi = 0; pi < nprojs; pi++) {
-                    proj_t *p = &projs[pi];
-                    if (p->kind == PROJ_TS_BUCKET) {
-                        uint64_t bits; memcpy(&bits, &win_start, 8);
-                        result_append_cell(r, pi, bits);
-                    } else if (p->kind == PROJ_AGG_SUM) {
-                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                   ? cur_state.sum_f : (double)cur_state.sum_i;
-                        uint64_t bits; memcpy(&bits, &v, 8);
-                        result_append_cell(r, pi, bits);
-                    } else if (p->kind == PROJ_AGG_AVG) {
-                        double v = 0;
-                        if (cur_state.count > 0) {
-                            v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                ? (cur_state.sum_f / (double)cur_state.count)
-                                : ((double)cur_state.sum_i / (double)cur_state.count);
-                        }
-                        uint64_t bits; memcpy(&bits, &v, 8);
-                        result_append_cell(r, pi, bits);
-                    } else if (p->kind == PROJ_AGG_MIN) {
-                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                   ? cur_state.min_f : (double)cur_state.min_i;
-                        uint64_t bits; memcpy(&bits, &v, 8);
-                        result_append_cell(r, pi, bits);
-                    } else if (p->kind == PROJ_AGG_MAX) {
-                        double v = (p->col >= 0 && s->cols[p->col].type == TSDB_TYPE_FLOAT64)
-                                   ? cur_state.max_f : (double)cur_state.max_i;
-                        uint64_t bits; memcpy(&bits, &v, 8);
-                        result_append_cell(r, pi, bits);
-                    } else if (p->kind == PROJ_AGG_COUNT) {
-                        int64_t v = (int64_t)cur_state.count;
-                        uint64_t bits; memcpy(&bits, &v, 8);
-                        result_append_cell(r, pi, bits);
-                    } else {
-                        result_append_cell(r, pi, 0);
-                    }
-                }
+                bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows,
+                             cur_bucket);
                 r->nrows++;
             }
         }
@@ -7703,6 +7671,7 @@ post_scan:
     (void)cmp_u64;
 done:
     free(serial_agg_scratch);
+    free(bkt_st);
     udf_agg_scratch_free(&serial_udf_scratch);
     if (projs) {
         for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);
