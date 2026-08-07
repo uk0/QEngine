@@ -35,6 +35,14 @@
  * A second case drives the real two-writer path (V4 flush + raw-block apply
  * on the same partition) to assert the consistency fix keeps a V4 partition
  * readable after a replication append.
+ *
+ * A third case covers the OTHER probe answer: an idx that EXISTS but cannot
+ * be parsed (corrupt magic, or a version this binary does not know).  The
+ * probe reports that as -1, distinct from 0 == absent; the applier used to
+ * collapse the two, treat the partition as empty, and rename a fresh ONE-entry
+ * manifest over the N-entry index it merely failed to read.  The apply must
+ * instead fail with TSDB_ERR_CORRUPT and write NOTHING, so the manifest is
+ * still intact once the corruption is repaired.
  */
 
 #include "../include/tsdb.h"
@@ -391,10 +399,150 @@ static void test_v4_then_rawblock_apply(void) {
     rmrf(root);
 }
 
+/* ─── Case 3: unparseable idx must FAIL the apply, not be overwritten ────────
+ *
+ * kind == 0: flip byte 0 of the idx magic (corrupt magic).
+ * kind == 1: stamp version 0x0005 at offset 8 (a future version — the state a
+ *            rolled-back binary sees beside a newer writer).
+ *
+ * Both make tsdb_part_idx_probe return -1 ("exists but unparseable"), NOT 0
+ * ("absent").  The apply must refuse with TSDB_ERR_CORRUPT and leave ts.idx
+ * and ts.col byte-untouched, so restoring the two corrupted bytes brings the
+ * whole 3-entry manifest back.  Pre-fix the apply returned TSDB_OK and had
+ * already renamed a 1-entry manifest over it — unrepairable. */
+static void test_unparseable_idx_refuses_apply(int kind) {
+    printf("\n[case 3%c] %s idx must fail the apply, untouched on disk\n",
+           kind ? 'b' : 'a', kind ? "future-version (V5)" : "corrupt-magic");
+
+    const char *root  = kind ? "/tmp/tsdb_idx_unparse_v5"
+                             : "/tmp/tsdb_idx_unparse_magic";
+    const char *table = "lt_2";
+    rmrf(root);
+    mkdir(root, 0755);
+
+    tsdb_db_t *db = NULL;
+    CHECK(tsdb_open(root, &db) == TSDB_OK, "open db");
+    tsdb_col_t cols[] = {
+        { "ts",  TSDB_TYPE_TIMESTAMP },
+        { "val", TSDB_TYPE_FLOAT64   },
+    };
+    CHECK(tsdb_create_table_local(db, table, cols, 2, "ts") == TSDB_OK, "create table");
+
+    char tdir[4096];
+    snprintf(tdir, sizeof(tdir), "%s/%s", root, table);
+    tsdb_schema_t *s = make_schema(tdir, table);
+    flush_multiblock_v4(s, table, /*max_seq=*/7);
+    CHECK(1, "flushed 3-block V4 partition");
+
+    char pdir[4096];
+    CHECK(find_part_dir(tdir, pdir, sizeof(pdir)), "locate partition dir");
+    char ts_idx[4096], ts_col[4096];
+    snprintf(ts_idx, sizeof(ts_idx), "%s/ts.idx", pdir);
+    snprintf(ts_col, sizeof(ts_col), "%s/ts.col", pdir);
+
+    struct stat idx_before, col_before;
+    CHECK(stat(ts_idx, &idx_before) == 0, "stat ts.idx pre-corruption");
+    CHECK(stat(ts_col, &col_before) == 0, "stat ts.col pre-corruption");
+
+    /* Snapshot the bytes we are about to corrupt (for the restore) and the
+     * zone-map max so the pushed block sorts after the existing data. */
+    uint8_t *idx = NULL; size_t ilen = 0;
+    CHECK(read_file(ts_idx, &idx, &ilen) == 0, "read ts.idx pre-corruption");
+    CHECK(get_u32le(idx + 4) == NBLOCKS, "ts.idx holds 3 entries pre-corruption");
+    int64_t fmax = 0;
+    for (int i = 7; i >= 0; i--) fmax = (fmax << 8) | idx[28 + i];
+    uint8_t orig0 = idx[0], orig8 = idx[8], orig9 = idx[9];
+    free(idx);
+
+    {
+        FILE *f = fopen(ts_idx, "r+b");
+        CHECK(f != NULL, "reopen ts.idx for corruption");
+        if (kind) {
+            uint8_t v[2]; put_u16le(v, 5);
+            fseek(f, 8, SEEK_SET);
+            CHECK(fwrite(v, 1, 2, f) == 2, "stamped version 0x0005 at offset 8");
+        } else {
+            uint8_t b = (uint8_t)(orig0 ^ 0xFF);
+            fseek(f, 0, SEEK_SET);
+            CHECK(fwrite(&b, 1, 1, f) == 1, "flipped byte 0 of idx magic");
+        }
+        fclose(f);
+    }
+
+    /* One new block through the applier — the path that used to overwrite. */
+    {
+        tsdb_rawblock_push_t r;
+        memset(&r, 0, sizeof(r));
+        strncpy(r.table, table, 63);
+        const char *day = strrchr(pdir, '/');
+        r.part_day = (uint32_t)strtoul(day ? day + 1 : "0", NULL, 10);
+        r.col_idx  = 0;                 /* ts column */
+        r.codec    = 0;
+        r.flags    = 0;
+        r.count    = 4;
+        r.ts_min   = fmax + 1000000LL;
+        r.ts_max   = fmax + 4000000LL;
+        static uint8_t blk[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        r.block_bytes     = blk;
+        r.block_bytes_len = sizeof(blk);
+        int arc = tsdb_rawblock_apply_ex(db, &r, 0);
+        printf("  apply rc=%d (want TSDB_ERR_CORRUPT=%d)\n", arc, TSDB_ERR_CORRUPT);
+        CHECK(arc == TSDB_ERR_CORRUPT,
+              "apply against unparseable idx returns TSDB_ERR_CORRUPT [core regression]");
+    }
+
+    /* Nothing may have been written: neither the manifest nor the .col. */
+    {
+        struct stat idx_after, col_after;
+        CHECK(stat(ts_idx, &idx_after) == 0, "stat ts.idx post-apply");
+        printf("  ts.idx size: before=%lld after=%lld\n",
+               (long long)idx_before.st_size, (long long)idx_after.st_size);
+        CHECK(idx_after.st_size == idx_before.st_size,
+              "ts.idx size unchanged (manifest NOT overwritten) [core regression]");
+        CHECK(stat(ts_col, &col_after) == 0, "stat ts.col post-apply");
+        CHECK(col_after.st_size == col_before.st_size,
+              "ts.col size unchanged (no orphan block appended)");
+    }
+
+    /* Repair the two corrupted bytes: the FULL original manifest must still
+     * be there — that is what "nothing was written" buys the operator. */
+    {
+        FILE *f = fopen(ts_idx, "r+b");
+        CHECK(f != NULL, "reopen ts.idx to restore");
+        if (kind) {
+            uint8_t v[2] = { orig8, orig9 };
+            fseek(f, 8, SEEK_SET);
+            CHECK(fwrite(v, 1, 2, f) == 2, "restored original version bytes");
+        } else {
+            fseek(f, 0, SEEK_SET);
+            CHECK(fwrite(&orig0, 1, 1, f) == 1, "restored original magic byte");
+        }
+        fclose(f);
+    }
+    {
+        uint16_t ver = 0; uint32_t cnt = 0, esz = 0;
+        uint64_t tot = 0, mseq = 0;
+        int64_t  fmn = 0, fmx = 0;
+        int hsz = tsdb_part_idx_probe(ts_idx, &ver, &cnt, &esz,
+                                      &tot, &fmn, &fmx, &mseq);
+        printf("  restored probe: hsz=%d ver=%u cnt=%u (want cnt=%d)\n",
+               hsz, ver, cnt, NBLOCKS);
+        CHECK(hsz > 0, "restored ts.idx parses again");
+        CHECK(cnt == NBLOCKS,
+              "restored ts.idx still holds ALL original entries [core regression]");
+    }
+
+    tsdb_schema_free(s);
+    tsdb_close(db);
+    rmrf(root);
+}
+
 int main(void) {
     printf("=== test_idx_version_mongrel ===\n");
     test_mongrel_idx();
     test_v4_then_rawblock_apply();
+    test_unparseable_idx_refuses_apply(0);   /* corrupt magic */
+    test_unparseable_idx_refuses_apply(1);   /* future version 0x0005 */
     printf("\n=== RESULTS: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

@@ -447,16 +447,20 @@ static int mig_seen_take(mig_seen_t *sn, uint32_t day, uint16_t col,
 /* Scan the target's existing blocks for one (day, column) exactly once, so a
  * resumed migration sees what a previous run already landed.  Every column of
  * a partition shares the same (ts_min, count) layout, so the column MUST be
- * part of the key — otherwise column 1 looks like a duplicate of column 0. */
-static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
-                           tsdb_schema_t *s, uint32_t day, uint16_t col)
+ * part of the key — otherwise column 1 looks like a duplicate of column 0.
+ *
+ * Returns TSDB_OK, or TSDB_ERR_CORRUPT when the target's idx EXISTS but
+ * cannot be parsed — that state must never prime as "no blocks seen" (see
+ * the probe-result split at the bottom). */
+static int mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
+                          tsdb_schema_t *s, uint32_t day, uint16_t col)
 {
     uint64_t key = ((uint64_t)day << 16) | col;
-    for (size_t i = 0; i < sn->ln; i++) if (sn->loaded[i] == key) return;
+    for (size_t i = 0; i < sn->ln; i++) if (sn->loaded[i] == key) return TSDB_OK;
     if (sn->ln == sn->lcap) {
         size_t nc = sn->lcap ? sn->lcap * 2 : 32;
         uint64_t *nl = realloc(sn->loaded, nc * sizeof(*nl));
-        if (!nl) return;
+        if (!nl) return TSDB_OK;
         sn->loaded = nl; sn->lcap = nc;
     }
     sn->loaded[sn->ln++] = key;
@@ -475,10 +479,19 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
     uint16_t ver = 0; uint32_t cnt = 0, esz = 0;
     uint64_t tot = 0, mseq = 0; int64_t fmn = 0, fmx = 0;
     int hsz = tsdb_part_idx_probe(idx_path, &ver, &cnt, &esz, &tot, &fmn, &fmx, &mseq);
-    if (hsz <= 0 || cnt == 0 || esz < 32) return;   /* need ts_max at [24..31] */
+    /* The probe's 0 (absent — genuinely nothing landed yet) and -1 (exists
+     * but unparseable: corrupt magic or unknown version) must not collapse:
+     * priming a corrupt idx as "no blocks seen" hands every streamed block to
+     * the applier as if the target were empty, over an index that may well
+     * hold them.  Surface it here and fail the import before any block moves;
+     * the applier (rawblock.c) would only refuse the same idx later anyway.
+     * Un-mark the key so this is detected again rather than remembered as a
+     * successful (empty) prime. */
+    if (hsz < 0) { sn->ln--; return TSDB_ERR_CORRUPT; }
+    if (hsz == 0 || cnt == 0 || esz < 32) return TSDB_OK; /* need ts_max at [24..31] */
 
     FILE *f = fopen(idx_path, "rb");
-    if (!f) return;
+    if (!f) return TSDB_OK;
     uint8_t *e = malloc(esz);
     if (e) {
         for (uint32_t i = 0; i < cnt; i++) {
@@ -497,6 +510,7 @@ static void mig_seen_prime(mig_seen_t *sn, tsdb_db_t *db, const char *table,
         free(e);
     }
     fclose(f);
+    return TSDB_OK;
 }
 
 /* ---- import-side dictionary reconciliation --------------------------------
@@ -733,9 +747,15 @@ sym_fail:
         /* Land under the target's name, which may differ from the source's. */
         snprintf(r.table, sizeof(r.table), "%s", tname);
 
-        /* Already present from an earlier (possibly interrupted) run? */
-        if (tgt_schema)
-            mig_seen_prime(&seen, db, tname, tgt_schema, r.part_day, r.col_idx);
+        /* Already present from an earlier (possibly interrupted) run?  A
+         * prime that cannot READ the target's manifest aborts the import —
+         * continuing would treat the partition as empty and re-land blocks
+         * over an index nobody can parse. */
+        if (tgt_schema) {
+            rc = mig_seen_prime(&seen, db, tname, tgt_schema,
+                                r.part_day, r.col_idx);
+            if (rc != TSDB_OK) break;
+        }
 
         if (!mig_seen_take(&seen, r.part_day, r.col_idx, r.ts_min, r.ts_max,
                            r.count, r.block_bytes_len)) {

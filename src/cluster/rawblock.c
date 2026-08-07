@@ -454,10 +454,42 @@ int tsdb_rawblock_apply_ex(tsdb_db_t *db, const tsdb_rawblock_push_t *r,
         uint16_t pver = 0; uint32_t pcnt = 0, pesz = 0;
         uint64_t ptot = 0, pmseq = 0;
         int64_t  pfmn = INT64_MAX, pfmx = INT64_MIN;
-        /* probe returns >0 only when the magic + version are valid, so a
-         * missing/short/corrupt-magic idx falls through to a fresh write. */
+        /* The probe's two non-positive answers are NOT the same thing
+         * (part.c): 0 means the idx is ABSENT — there is nothing to preserve,
+         * so falling through to a fresh one-entry write is correct.  -1 means
+         * the file EXISTS but cannot be parsed: corrupt magic, torn short
+         * header, or a version this binary does not know (a rolled-back
+         * binary beside a newer writer).  Treating -1 as absence let the
+         * publish below rename a fresh ONE-entry manifest over an N-entry
+         * index it merely failed to read: rc came back OK, the sender was
+         * acked, anti-entropy saw nothing (max(ts) unchanged), and the next
+         * threshold compaction rewrote the .col from the 1-entry idx — the
+         * loss of the other N-1 blocks became permanent.  An unparseable
+         * manifest must fail the apply LOUDLY instead: nothing is written
+         * (this runs before the .col append), the sender keeps retrying, and
+         * the partition stays byte-intact for an operator or anti-entropy to
+         * repair.  Read-only probe sites (db_cluster.c, restore.c,
+         * compaction.c, db.c) may keep reading -1 as "0 blocks" — for a
+         * reader that is conservative; this is the one site that durably
+         * REWRITES the manifest from what it probed. */
         int phsz = tsdb_part_idx_probe(idx_path, &pver, &pcnt, &pesz,
                                        &ptot, &pfmn, &pfmx, &pmseq);
+        /* The refusal turns a previously-"succeeding" push into a persistent
+         * failure (the sender retries forever until the idx is repaired), so
+         * it must be loud and attributable: the line below names the table,
+         * partition day and column.  No counter here on purpose — the metric
+         * registry is a fixed table (metrics.c) and tsdb_metric_inc on an
+         * unregistered name is a silent no-op, which is worse than no counter
+         * because it looks instrumented. */
+        if (phsz < 0) {
+            fprintf(stderr,
+                    "[rawblock] %s/%s: column '%s': existing idx is "
+                    "unparseable (corrupt magic or unknown version); refusing "
+                    "to overwrite a manifest this binary cannot read\n",
+                    r->table, day_str, col_name);
+            rc = TSDB_ERR_CORRUPT;
+            goto out;
+        }
         if (phsz > 0 && pesz > 0) {
             old_count   = pcnt;
             old_total   = ptot;
