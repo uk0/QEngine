@@ -75,6 +75,16 @@ typedef struct {
  *
  * Returns TSDB_OK or negative error.
  */
+
+/* 1 when `name` can only ever name ONE directory entry under the data dir —
+ * no separator, no leading dot, no control byte.  A table name becomes a path
+ * (<data_dir>/<name>, <data_dir>/wal/<name>.log), so anything else escapes.
+ *
+ * CREATE enforces it internally; it is exported because DROP composes the same
+ * two paths and then REMOVES them, which is destructive rather than merely
+ * misplaced, and DROP does not go through schema creation. */
+int tsdb_name_is_one_path_component(const char *name);
+
 int tsdb_schema_create(const char *dir, const char *name,
                        const tsdb_col_t *cols, int ncols,
                        const char *ts_col,

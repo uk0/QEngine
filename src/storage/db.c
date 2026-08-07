@@ -1427,6 +1427,20 @@ static void *trash_gc_main(void *arg) {
 int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return TSDB_ERR_INVAL;
 
+    /* The removal below composes <data_dir>/wal/<name>.log and
+     * <data_dir>/<name> and then remove()s / renames them, and it runs even
+     * when idx stays -1 — the `idx >= 0` guards protect only the in-memory
+     * teardown, not the on-disk one.  So an unregistered escaping name reaches
+     * a destructive syscall on a path outside the data dir with nothing
+     * pre-existing required, unlike the create path where the worst case is a
+     * misplaced new file.  Refuse before anything is touched.
+     *
+     * A table on disk whose name predates this rule therefore becomes
+     * undroppable through the API.  That is the intended direction to fail:
+     * refusing to delete costs a manual cleanup, while deleting the wrong
+     * directory cannot be undone. */
+    if (!tsdb_name_is_one_path_component(name)) return TSDB_ERR_INVAL;
+
     pthread_mutex_lock(&db->lock);
 
     int idx = -1;

@@ -124,6 +124,48 @@ int main(void) {
     tsdb_close(db);
     printf("  reopen: t1 stays dropped, no leftover dir\n");
 
+    /* ---- DROP must not reach outside the data dir --------------------------
+     *
+     * tsdb_drop_table composes <data_dir>/wal/<name>.log and <data_dir>/<name>
+     * and then remove()s / renames them, and it does so even when the name
+     * matches no registered table — the idx >= 0 guards cover only the
+     * in-memory teardown.  So a wire-supplied "../victim" needed nothing
+     * pre-existing to destroy a directory outside the db.  Unlike the create
+     * side, where an escaping name merely misplaces a new file, here the
+     * syscall is destructive.
+     *
+     * The victim is planted with real content so a pass cannot come from the
+     * directory having been empty or absent. */
+    {
+        char victim[512], victim_file[600], data[512];
+        snprintf(data,        sizeof(data),        "%s/data", TMP);
+        snprintf(victim,      sizeof(victim),      "%s/victim", TMP);
+        snprintf(victim_file, sizeof(victim_file), "%s/keepme", victim);
+        mkdir(victim, 0755);
+        FILE *vf = fopen(victim_file, "w");
+        ASSERT(vf != NULL);
+        fputs("do not delete\n", vf);
+        fclose(vf);
+        ASSERT(dir_exists(victim));
+
+        tsdb_db_t *db2 = NULL;
+        OK(tsdb_open(data, &db2));
+        /* <data>/../victim — one level up, exactly what a table name must not
+         * be able to name. */
+        int rc = tsdb_drop_table(db2, "../victim");
+        tsdb_close(db2);
+
+        /* Check the DAMAGE before the return code: without the gate this DROP
+         * renames <TMP>/victim into <TMP>/.trash/victim.N and the GC then
+         * reclaims it, so it is the surviving directory that proves the fix,
+         * not the errno. */
+        ASSERT(dir_exists(victim));
+        struct stat st;
+        ASSERT(stat(victim_file, &st) == 0);   /* content still there, untouched */
+        ASSERT(rc == TSDB_ERR_INVAL);
+        printf("  traversal: DROP '../victim' refused, outside dir intact\n");
+    }
+
     rm_tree(TMP);
     printf("[PASS] DROP trashes storage off the apply path; bg GC reclaims; durable\n");
     return 0;
