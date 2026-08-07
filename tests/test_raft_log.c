@@ -27,7 +27,12 @@
 
 static void rm_rf(const char *path) {
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
+    /* Restore perms first: scenario 8 chmods the raft dir to 0500 to make
+     * a metadata write fail, and an assertion that fires while it is
+     * still 0500 would otherwise leave an undeletable tree that breaks
+     * every later run of this binary. */
+    snprintf(cmd, sizeof(cmd), "chmod -R u+rwx %s 2>/dev/null; rm -rf %s",
+             path, path);
     (void)system(cmd);
 }
 
@@ -335,6 +340,69 @@ static void t_snapshot_compact_empty_tail(const char *dir) {
     PASS("compact-with-empty-tail keeps last_index = snap_index, append picks snap+1");
 }
 
+/* Scenario 8: a term/vote write that FAILS must leave the in-memory
+ * value alone.
+ *
+ * currentTerm and votedFor are the two pieces of state Raft requires to
+ * be durable BEFORE they are acted on (§5.1, Figure 2 "Persistent state
+ * on all servers ... updated on stable storage before responding to
+ * RPCs").  The old code assigned rl->current_term / rl->voted_for and
+ * only then called meta_write/vote_write, discarding the rc — so a full
+ * disk or an unwritable raft dir produced a term the node believed in
+ * and answered RPCs with, but that no restart could recover: the node
+ * votes in term N, restarts into term N-1 with votedFor cleared, and
+ * votes a second time in the same term.  Two leaders, one term.
+ *
+ * Fault injection: chmod the raft dir to 0500.  atomic_meta_write writes
+ * a `.tmp` sibling before renaming, so creating it needs write
+ * permission on the directory — fopen fails with EACCES and the write
+ * path returns -1 without touching the on-disk files. */
+static void t_persist_failure_keeps_durable_value(const char *dir) {
+    printf("\n[8] failed term/vote write leaves the durable value in place\n");
+    rm_rf(dir);
+    tsdb_raft_log_t *rl = tsdb_raft_log_open(dir);
+    assert(rl);
+    assert(tsdb_raft_log_set_term(rl, 3) == 0);
+    assert(tsdb_raft_log_set_voted_for(rl, 5) == 0);
+
+    char raft_dir[4128];
+    snprintf(raft_dir, sizeof(raft_dir), "%s/raft", dir);
+    if (geteuid() == 0) {
+        /* root ignores the mode bits, so the injection cannot fire and
+         * the assertions below would be vacuous.  Say so out loud
+         * instead of printing a PASS that proves nothing. */
+        printf("SKIP: running as root — chmod cannot make the write fail\n");
+        tsdb_raft_log_close(rl);
+        return;
+    }
+    assert(chmod(raft_dir, 0500) == 0);
+
+    int rc = tsdb_raft_log_set_term(rl, 9);
+    printf("  set_term(9) rc=%d current_term=%llu (expect rc=-1, term=3)\n",
+           rc, (unsigned long long)tsdb_raft_log_current_term(rl));
+    assert(rc == -1);
+    assert(tsdb_raft_log_current_term(rl) == 3);   /* pre-fix: 9 */
+    assert(tsdb_raft_log_voted_for(rl) == 5);      /* pre-fix: 0 — vote forgotten */
+
+    int rc2 = tsdb_raft_log_set_voted_for(rl, 77);
+    printf("  set_voted_for(77) rc=%d voted_for=%llu (expect rc!=0, vote=5)\n",
+           rc2, (unsigned long long)tsdb_raft_log_voted_for(rl));
+    assert(rc2 != 0);
+    assert(tsdb_raft_log_voted_for(rl) == 5);      /* pre-fix: 77 */
+
+    assert(chmod(raft_dir, 0700) == 0);
+    tsdb_raft_log_close(rl);
+
+    /* The point of the whole exercise: what we kept in memory is exactly
+     * what a restart recovers. */
+    rl = tsdb_raft_log_open(dir);
+    assert(rl);
+    assert(tsdb_raft_log_current_term(rl) == 3);
+    assert(tsdb_raft_log_voted_for(rl) == 5);
+    tsdb_raft_log_close(rl);
+    PASS("failed persist → in-memory term/vote match what reopen recovers");
+}
+
 int main(void) {
     const char *dir = "/tmp/tsdb-raft-log-test";
     rm_rf(dir);
@@ -346,6 +414,7 @@ int main(void) {
     t_torn_tail(dir);
     t_snapshot_compact(dir);
     t_snapshot_compact_empty_tail(dir);
+    t_persist_failure_keeps_durable_value(dir);
 
     rm_rf(dir);
     printf("\n=== all raft_log tests passed ===\n");

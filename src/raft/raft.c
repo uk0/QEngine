@@ -136,16 +136,6 @@ struct tsdb_raft {
     peer_t             peers[MAX_PEERS];
     int                npeers;
 
-    /* Count of replicate_to() RPCs currently in flight (the wire call
-     * runs with r->lock dropped).  Incremented under the lock right
-     * before the RPC, decremented under the lock once the response is
-     * merged.  tsdb_raft_propose consults it on timeout: it will only
-     * truncate its un-acked tail when NO replication is in flight, so a
-     * peer cannot be silently holding the entry without it being
-     * reflected in match_index — see the propose timeout path for the
-     * Log-Matching safety argument. */
-    int                replicating;
-
     /* Timers, all measured against CLOCK_MONOTONIC. */
     int64_t            election_deadline_ns;
     int64_t            next_heartbeat_ns;
@@ -426,28 +416,49 @@ static void record_removed_locked(tsdb_raft_t *r, uint64_t id) {
 
 /* --- State transitions (all under r->lock) --------------------------- */
 
-static void become_follower_locked(tsdb_raft_t *r, uint64_t new_term,
-                                    uint64_t leader_id)
+/* Returns 0 on success, -1 iff the new term could not be made durable.
+ *
+ * On -1 NOTHING is mutated: the node stays in its old term, old state,
+ * with its old election timer.  That is deliberate.  Adopting a term we
+ * cannot recover after a restart is precisely the double-vote / two-
+ * leaders hazard tsdb_raft_log_set_term now refuses to create, and
+ * adopting HALF of it (new leader_id, old term) would leave the state
+ * machine describing a term it never entered.  Every caller must decide
+ * what to answer the peer with; the ones that reply on the wire answer
+ * in the OLD term so the peer simply retries.
+ *
+ * A stepdown at the CURRENT term (new_term == cur, e.g. CheckQuorum)
+ * touches no persistent state and therefore cannot fail. */
+static int become_follower_locked(tsdb_raft_t *r, uint64_t new_term,
+                                   uint64_t leader_id)
 {
     uint64_t cur = tsdb_raft_log_current_term(r->log);
     if (new_term > cur) {
-        (void)tsdb_raft_log_set_term(r->log, new_term);
+        if (tsdb_raft_log_set_term(r->log, new_term) != 0) return -1;
     }
     r->state     = TSDB_RAFT_FOLLOWER;
     r->leader_id = leader_id;
     r->pending_seed = 0;   /* follower doesn't seed; if we win again later
                               and config is still uninit, we'll set it again. */
     reset_election_timer(r);
+    return 0;
 }
 
-static void become_candidate_locked(tsdb_raft_t *r) {
+/* Returns 0 on success, -1 iff the term bump or the self-vote could not
+ * be made durable — in which case we do NOT enter CANDIDATE.  The
+ * self-vote counts toward the election quorum, so it is subject to the
+ * same rule as any other vote: durable before it is counted.  A campaign
+ * run on a vote that a restart forgets could put a second candidate's
+ * vote in the same term. */
+static int become_candidate_locked(tsdb_raft_t *r) {
     uint64_t new_term = tsdb_raft_log_current_term(r->log) + 1;
-    (void)tsdb_raft_log_set_term(r->log, new_term);
-    (void)tsdb_raft_log_set_voted_for(r->log, r->self_id);
+    if (tsdb_raft_log_set_term(r->log, new_term) != 0) return -1;
+    if (tsdb_raft_log_set_voted_for(r->log, r->self_id) != 0) return -1;
     r->state         = TSDB_RAFT_CANDIDATE;
     r->leader_id     = 0;
     r->votes_granted = 1; /* vote for self */
     reset_election_timer(r);
+    return 0;
 }
 
 static void become_leader_locked(tsdb_raft_t *r) {
@@ -578,9 +589,17 @@ static int on_request_vote(void *ud,
         pthread_mutex_unlock(&r->lock);
         return 0;
     }
-    /* Higher term → step down + forget prior vote. */
+    /* Higher term → step down + forget prior vote.  If the term could
+     * not be persisted we have NOT entered it: answer in our old term
+     * and refuse, so the candidate retries against a node that can
+     * remember the answer it gives. */
     if (req->term > cur_term) {
-        become_follower_locked(r, req->term, 0);
+        if (become_follower_locked(r, req->term, 0) != 0) {
+            resp->term         = cur_term;
+            resp->vote_granted = 0;
+            pthread_mutex_unlock(&r->lock);
+            return 0;
+        }
         cur_term  = req->term;
         voted_for = tsdb_raft_log_voted_for(r->log); /* now 0 */
     }
@@ -598,9 +617,14 @@ static int on_request_vote(void *ud,
     int member_ok = config_has_member_locked(r, req->candidate_id);
     if (log_ok && member_ok &&
         (voted_for == 0 || voted_for == req->candidate_id)) {
-        (void)tsdb_raft_log_set_voted_for(r->log, req->candidate_id);
-        reset_election_timer(r);
-        granted = 1;
+        /* Grant on the wire ONLY if the vote reached stable storage.  A
+         * vote that is granted but not durable is the classic double
+         * vote: we crash, restart with votedFor clear, and grant a
+         * second vote in the same term to a different candidate. */
+        if (tsdb_raft_log_set_voted_for(r->log, req->candidate_id) == 0) {
+            reset_election_timer(r);
+            granted = 1;
+        }
     }
 
     resp->term         = tsdb_raft_log_current_term(r->log);
@@ -619,6 +643,36 @@ static int on_append_entries(void *ud,
 
     uint64_t cur_term = tsdb_raft_log_current_term(r->log);
 
+    /* Membership filter (§6), same gate on_pre_vote and on_request_vote
+     * already apply.  AppendEntries is the RPC that can MUTATE our log,
+     * so leaving it unfiltered meant any host able to reach the RPC port
+     * could hand us a frame with an arbitrary term and (with a
+     * mismatched prev_log_term) delete entries we hold.  Only a node in
+     * the COMMITTED config may do that.
+     *
+     * This is safe for cold start ONLY because config_has_member_locked
+     * returns 1 while the config is uninitialised (see its comment) — a
+     * joiner must still be able to receive the CONFIG_ADD that puts it
+     * in the config.  That fail-open property is load-bearing here and
+     * must not be changed.
+     *
+     * Residual liveness case, accepted deliberately: a member that has
+     * not yet APPLIED the CONFIG_ADD for a freshly-added node will also
+     * refuse that node's AppendEntries if it wins an election in the
+     * meantime, and cannot learn the config from it (the entry that
+     * would teach it arrives over the RPC it is refusing).  It converges
+     * as soon as any node still in its config replicates the CONFIG_ADD,
+     * which is the normal path — the old leader is still doing that
+     * during the whole add.  Refusing a log mutation from an unknown
+     * sender is worth that window. */
+    if (!config_has_member_locked(r, req->leader_id)) {
+        resp->term        = cur_term;
+        resp->success     = 0;
+        resp->match_index = 0;
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+
     /* Reply false if term < currentTerm. */
     if (req->term < cur_term) {
         resp->term        = cur_term;
@@ -633,7 +687,17 @@ static int on_append_entries(void *ud,
      * Also stamp last_leader_contact_ns so subsequent PreVote
      * responders refuse to unseat this leader during its lease. */
     if (req->term > cur_term) {
-        become_follower_locked(r, req->term, req->leader_id);
+        if (become_follower_locked(r, req->term, req->leader_id) != 0) {
+            /* Term not durable → we are not in it, so we must not act on
+             * this leader's entries either (accepting them at our old
+             * term would let a restart re-open the same slots).  Fail in
+             * the OLD term; the leader retries. */
+            resp->term        = cur_term;
+            resp->success     = 0;
+            resp->match_index = tsdb_raft_log_last_index(r->log);
+            pthread_mutex_unlock(&r->lock);
+            return 0;
+        }
         cur_term = req->term;
     } else {
         /* Same term — whoever is sending AppendEntries is the leader.
@@ -659,6 +723,35 @@ static int on_append_entries(void *ud,
         }
         uint64_t our_term = tsdb_raft_log_term_at(r->log, req->prev_log_index);
         if (our_term != req->prev_log_term) {
+            /* Commit floor.  A committed entry lives on a quorum and
+             * Leader Completeness (§5.4.3) puts it in EVERY future
+             * leader's log, so no legitimate leader can ever disagree
+             * with us about an index at or below commit_index.  If one
+             * appears to, the frame is forged or the sender is broken —
+             * and obeying the conflict rule here deletes committed data
+             * that no repair can bring back.  Refuse instead, and say so
+             * loudly: correct Raft never produces this condition, so a
+             * hard failure here is strictly better than a silent
+             * "repair" that loses acknowledged writes. */
+            if (req->prev_log_index <= r->commit_index) {
+                fprintf(stderr, "[raft] REFUSED truncate at committed index "
+                        "%llu (commit_index=%llu, leader=%llu, term=%llu): "
+                        "prev_log_term=%llu but ours=%llu\n",
+                        (unsigned long long)req->prev_log_index,
+                        (unsigned long long)r->commit_index,
+                        (unsigned long long)req->leader_id,
+                        (unsigned long long)req->term,
+                        (unsigned long long)req->prev_log_term,
+                        (unsigned long long)our_term);
+                resp->term        = cur_term;
+                resp->success     = 0;
+                /* Hint our commit_index: every entry through it is
+                 * committed, so it is the furthest point a legitimate
+                 * leader and we are guaranteed to agree on. */
+                resp->match_index = r->commit_index;
+                pthread_mutex_unlock(&r->lock);
+                return 0;
+            }
             /* Conflict — truncate from prev_log_index (inclusive). */
             (void)tsdb_raft_log_truncate(r->log, req->prev_log_index);
             resp->term        = cur_term;
@@ -678,6 +771,25 @@ static int on_append_entries(void *ud,
         if (e->index <= our_last) {
             uint64_t our_term = tsdb_raft_log_term_at(r->log, e->index);
             if (our_term == e->term) continue; /* already have it */
+            /* Same commit floor as the prev_log_index check above: an
+             * entry we have COMMITTED may not be overwritten, whatever
+             * the sender claims its term is. */
+            if (e->index <= r->commit_index) {
+                fprintf(stderr, "[raft] REFUSED overwrite of committed index "
+                        "%llu (commit_index=%llu, leader=%llu, term=%llu): "
+                        "entry term=%llu but ours=%llu\n",
+                        (unsigned long long)e->index,
+                        (unsigned long long)r->commit_index,
+                        (unsigned long long)req->leader_id,
+                        (unsigned long long)req->term,
+                        (unsigned long long)e->term,
+                        (unsigned long long)our_term);
+                resp->term        = cur_term;
+                resp->success     = 0;
+                resp->match_index = r->commit_index;
+                pthread_mutex_unlock(&r->lock);
+                return 0;
+            }
             /* Conflict — truncate from this index. */
             (void)tsdb_raft_log_truncate(r->log, e->index);
         }
@@ -787,6 +899,17 @@ static int on_install_snapshot(void *ud,
 
     uint64_t cur_term = tsdb_raft_log_current_term(r->log);
 
+    /* Same membership filter as on_append_entries — InstallSnapshot
+     * REPLACES our whole state machine and compacts the log, so an
+     * unauthenticated sender must not be able to drive it either.
+     * Fails open on an uninitialised config for the same cold-start
+     * reason. */
+    if (!config_has_member_locked(r, req->leader_id)) {
+        resp->term = cur_term;
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+
     /* Stale leader? ignore. */
     if (req->term < cur_term) {
         resp->term = cur_term;
@@ -794,7 +917,13 @@ static int on_install_snapshot(void *ud,
         return 0;
     }
     if (req->term > cur_term) {
-        become_follower_locked(r, req->term, req->leader_id);
+        if (become_follower_locked(r, req->term, req->leader_id) != 0) {
+            /* Term not durable — answer in the old term and take no
+             * snapshot; the leader retries. */
+            resp->term = cur_term;
+            pthread_mutex_unlock(&r->lock);
+            return 0;
+        }
         cur_term = req->term;
     } else {
         /* Same term — sender is the legit leader; reset election timer. */
@@ -1003,7 +1132,10 @@ static int send_request_vote(tsdb_raft_t *r, uint64_t peer_id,
 
     pthread_mutex_lock(&r->lock);
     if (resp.term > tsdb_raft_log_current_term(r->log)) {
-        become_follower_locked(r, resp.term, 0);
+        /* If the stepdown could not persist the higher term we simply
+         * stay where we are; either way this peer's answer does not
+         * count toward the election, which is all this branch decides. */
+        (void)become_follower_locked(r, resp.term, 0);
         pthread_mutex_unlock(&r->lock);
         return 0;
     }
@@ -1158,7 +1290,9 @@ static void check_quorum_locked(tsdb_raft_t *r) {
      * reset it here for cleanliness on a future re-election (become_leader
      * also zeroes it). */
     r->quorum_miss_streak = 0;
-    become_follower_locked(r, tsdb_raft_log_current_term(r->log), 0);
+    /* Same term in, same term out — no persistent state is touched, so
+     * this stepdown cannot fail. */
+    (void)become_follower_locked(r, tsdb_raft_log_current_term(r->log), 0);
 }
 
 /* --- Commit advance (leader only) ------------------------------------
@@ -1298,7 +1432,10 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
                 /* Stale-leader: abort the whole transfer. */
                 pthread_mutex_lock(&r->lock);
                 if (sresp.term > tsdb_raft_log_current_term(r->log)) {
-                    become_follower_locked(r, sresp.term, 0);
+                    /* Abort the transfer whether or not the stepdown
+                     * persisted — a higher term means these chunks are
+                     * no longer ours to send. */
+                    (void)become_follower_locked(r, sresp.term, 0);
                     pthread_mutex_unlock(&r->lock);
                     aborted = 1; break;
                 }
@@ -1363,12 +1500,6 @@ skip_snap:
             entries[i] = tmp; /* payload malloc'd by log_read */
         }
     }
-    /* Mark an AppendEntries carrying real entries as in flight so a
-     * concurrent propose-timeout won't truncate an index this RPC may
-     * already be delivering to the peer.  Heartbeats (n_send==0) carry
-     * nothing to resurrect, so they don't need the guard. */
-    int counted = 0;
-    if (n_send > 0) { r->replicating++; counted = 1; }
     pthread_mutex_unlock(&r->lock);
 
     tsdb_raft_req_append_t req = {
@@ -1405,7 +1536,9 @@ skip_snap:
 
     pthread_mutex_lock(&r->lock);
     if (resp.term > tsdb_raft_log_current_term(r->log)) {
-        become_follower_locked(r, resp.term, 0);
+        /* Stop replicating to this peer regardless: a failed stepdown
+         * leaves us leader in a stale term, and the next sweep retries. */
+        (void)become_follower_locked(r, resp.term, 0);
         pthread_mutex_unlock(&r->lock);
         goto done;
     }
@@ -1438,11 +1571,6 @@ skip_snap:
     pthread_mutex_unlock(&r->lock);
 
 done:
-    if (counted) {
-        pthread_mutex_lock(&r->lock);
-        if (r->replicating > 0) r->replicating--;
-        pthread_mutex_unlock(&r->lock);
-    }
     if (entries) {
         for (uint32_t i = 0; i < n_send; i++) free(entries[i].payload);
         free(entries);
@@ -1830,9 +1958,16 @@ static void *tick_thread_main(void *arg) {
                 int granted = run_prevote_unlocked(r);
                 if (granted >= quorum) {
                     pthread_mutex_lock(&r->lock);
-                    become_candidate_locked(r);
+                    int crc = become_candidate_locked(r);
+                    /* Could not persist the term bump or the self-vote:
+                     * we are still a follower, so campaigning would ask
+                     * peers to elect a node that cannot remember voting
+                     * for itself.  Re-arm the timer and retry — if the
+                     * disk stays broken we simply never campaign, which
+                     * is the correct outcome for this node. */
+                    if (crc != 0) reset_election_timer(r);
                     pthread_mutex_unlock(&r->lock);
-                    run_election_unlocked(r);
+                    if (crc == 0) run_election_unlocked(r);
                 } else {
                     pthread_mutex_lock(&r->lock);
                     reset_election_timer(r);
@@ -2349,49 +2484,34 @@ int tsdb_raft_propose(tsdb_raft_t *r,
         if (r->state != TSDB_RAFT_LEADER) { rc = TSDB_ERR_PERMISSION; break; }
         int w = pthread_cond_timedwait(&r->commit_cv, &r->lock, &deadline);
         if (w == ETIMEDOUT) {
-            /* BUG-1: the entry never committed within the deadline.  We
-             * must NOT report a plain failure while leaving a possibly-
-             * replicated entry in the log — that "phantom DDL" lies to
-             * the client (it later commits when quorum returns).
+            /* The entry did not commit within the deadline.  The log is
+             * left EXACTLY as it is and the caller is told the outcome
+             * is unknown.  Leader Append-Only (§5.3): a leader never
+             * deletes or overwrites entries in its own log, full stop.
              *
-             * Two cases, both preserving Leader Append-Only:
+             * The tempting local inference — "no peer's match_index
+             * reached my_index and no AppendEntries is in flight, so
+             * nobody has this entry, so I may drop it" — is FALSE, and
+             * was the bug this replaces (the in-flight counter it relied
+             * on is gone with it).  replicate_to released that counter on
+             * every exit path, including the one taken when
+             * tsdb_rpc_call_recv_to times out after 3 s: that path evicts
+             * the conn and jumps to `done:` without ever touching
+             * match_index.  A follower that appended and fsynced the
+             * entry, and whose ack was merely late or lost, therefore
+             * left the leader with match_index < my_index and nothing in
+             * flight — bit-for-bit identical to "nobody took it".
+             * Truncating on that reading deletes an index another log
+             * holds; if that follower is later elected, the entry comes
+             * back at an index this leader has since reused, and two logs
+             * disagree about a committed slot.
              *
-             *  (a) Provably un-replicated.  Still leader (so still our
-             *      term — a term change would have flipped state away
-             *      from LEADER), the entry is still uncommitted, it is
-             *      the very tail (my_index == last_index, so we are not
-             *      stranding any later proposal's entries), NO peer has
-             *      acked it (match_index < my_index for all), AND no
-             *      AppendEntries carrying entries is in flight
-             *      (r->replicating == 0).  Together the last two prove
-             *      no follower holds the entry: a follower only gets it
-             *      via a replicate_to that either finished (→ match_index
-             *      bumped, excluded) or is still mid-RPC (→ replicating
-             *      > 0, excluded).  Truncating our own un-replicated tail
-             *      cannot violate Log Matching (no other log has the
-             *      index) and is the standard safe rollback.  Return a
-             *      definitive failure.
-             *
-             *  (b) Otherwise it MAY have replicated/committed.  Leave the
-             *      log untouched (Leader Append-Only) and return a
-             *      distinct INDETERMINATE status so the caller retries
-             *      idempotently instead of assuming failure. */
-            uint64_t last_idx = tsdb_raft_log_last_index(r->log);
-            int replicated = 0;
-            for (int i = 0; i < r->npeers; i++) {
-                if (r->peers[i].match_index >= my_index) { replicated = 1; break; }
-            }
-            if (r->state == TSDB_RAFT_LEADER &&
-                r->commit_index < my_index &&
-                my_index == last_idx &&
-                !replicated &&
-                r->replicating == 0)
-            {
-                (void)tsdb_raft_log_truncate(r->log, my_index);
-                rc = TSDB_ERR_IO;          /* definitive: write did NOT apply */
-            } else {
-                rc = TSDB_ERR_INDETERMINATE; /* unknown: may commit later */
-            }
+             * There is no local test that separates the two cases, which
+             * is exactly why Raft forbids the question.  Report
+             * INDETERMINATE: the entry may still commit when quorum
+             * returns, and exec.c renders that to the client as
+             * "retry idempotently" (DDL apply is idempotent). */
+            rc = TSDB_ERR_INDETERMINATE;
             break;
         }
     }

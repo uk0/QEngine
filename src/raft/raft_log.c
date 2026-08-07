@@ -132,17 +132,21 @@ static int atomic_meta_write(const char *path, const void *buf, size_t len) {
 
 /* ---- meta / vote persistence --------------------------------------------- */
 
-static int meta_write(tsdb_raft_log_t *rl) {
+/* Both writers take the value to persist rather than reading it out of
+ * *rl, so the caller can push a term / vote to stable storage BEFORE it
+ * exists in memory.  See tsdb_raft_log_set_term for why that order is
+ * the whole point. */
+static int meta_write(tsdb_raft_log_t *rl, uint64_t term) {
     uint32_t m = META_MAGIC, v = LOG_VERSION;
-    uint64_t t = rl->current_term;
+    uint64_t t = term;
     uint8_t buf[16];
     memcpy(buf + 0, &m, 4); memcpy(buf + 4, &v, 4); memcpy(buf + 8, &t, 8);
     return atomic_meta_write(rl->meta_path, buf, sizeof(buf));
 }
 
-static int vote_write(tsdb_raft_log_t *rl) {
+static int vote_write(tsdb_raft_log_t *rl, uint64_t voted_for) {
     uint32_t m = VOTE_MAGIC, v = LOG_VERSION;
-    uint64_t vf = rl->voted_for;
+    uint64_t vf = voted_for;
     uint8_t buf[16];
     memcpy(buf + 0, &m, 4); memcpy(buf + 4, &v, 4); memcpy(buf + 8, &vf, 8);
     return atomic_meta_write(rl->vote_path, buf, sizeof(buf));
@@ -344,13 +348,42 @@ uint64_t tsdb_raft_log_voted_for(tsdb_raft_log_t *rl) {
     return v;
 }
 
+/* currentTerm and votedFor are the two values Raft requires to be on
+ * stable storage BEFORE the node acts on them (§5.1, Figure 2: "Updated
+ * on stable storage before responding to RPCs").  These two setters
+ * therefore write first and publish to memory only if the write landed.
+ *
+ * The inverse order — publish, then write, then throw the rc away — was
+ * a two-leaders-in-one-term bug, not a logging nit: on a full disk or an
+ * unwritable raft dir the node answers RequestVote out of RAM at term N
+ * having voted for A, restarts into the last durable term (< N, votedFor
+ * clear), and grants a SECOND vote in term N to B.  Both candidates can
+ * then collect a majority.  The failure is loud (below) because a raft
+ * node that cannot persist its term is unfit to participate at all, and
+ * every caller now propagates the failure instead of pretending. */
 int tsdb_raft_log_set_term(tsdb_raft_log_t *rl, uint64_t term) {
     if (!rl) return -1;
     pthread_mutex_lock(&rl->lock);
-    rl->current_term = term;
-    rl->voted_for    = 0;   /* a new term invalidates prior vote */
-    int rc_m = meta_write(rl);
-    int rc_v = vote_write(rl);
+    /* Order matters between the two files.  Term first, vote second:
+     * clearing the vote before the higher term is durable would lose a
+     * vote already cast in the CURRENT term if the second write failed —
+     * exactly the double-vote we are closing.  Term-durable-with-a-stale
+     * vote (the reverse partial failure) can only make us refuse a vote
+     * we were entitled to grant, which costs an election round, not
+     * safety.  So a failed meta_write short-circuits vote_write. */
+    int rc_m = meta_write(rl, term);
+    int rc_v = (rc_m == 0) ? vote_write(rl, 0) : -1;
+    if (rc_m == 0 && rc_v == 0) {
+        rl->current_term = term;
+        rl->voted_for    = 0;   /* a new term invalidates prior vote */
+    } else {
+        fprintf(stderr, "[raft] PERSIST FAILURE: term %llu not durable "
+                "(meta rc=%d vote rc=%d) — staying at term %llu; this node "
+                "cannot safely vote or accept a leader until the raft dir "
+                "is writable\n",
+                (unsigned long long)term, rc_m, rc_v,
+                (unsigned long long)rl->current_term);
+    }
     pthread_mutex_unlock(&rl->lock);
     return (rc_m == 0 && rc_v == 0) ? 0 : -1;
 }
@@ -358,8 +391,15 @@ int tsdb_raft_log_set_term(tsdb_raft_log_t *rl, uint64_t term) {
 int tsdb_raft_log_set_voted_for(tsdb_raft_log_t *rl, uint64_t node_id) {
     if (!rl) return -1;
     pthread_mutex_lock(&rl->lock);
-    rl->voted_for = node_id;
-    int rc = vote_write(rl);
+    int rc = vote_write(rl, node_id);
+    if (rc == 0) {
+        rl->voted_for = node_id;
+    } else {
+        fprintf(stderr, "[raft] PERSIST FAILURE: vote for %llu in term %llu "
+                "not durable — vote withheld\n",
+                (unsigned long long)node_id,
+                (unsigned long long)rl->current_term);
+    }
     pthread_mutex_unlock(&rl->lock);
     return rc;
 }
