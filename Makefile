@@ -76,6 +76,11 @@ TEST_SRCS += tests/test_part_blocks_ref.c
 # and the federation symbol dictionary its peer legs depend on.  Single
 # process, no ports beyond one loopback RPC server on port 0.
 TEST_SRCS += tests/test_show_introspection.c
+# Wire WRITE_BATCH length-field bounds: a symbol column whose declared total is
+# a lie must be refused, not walked.  scripts/test-both-modes.sh globs tests/
+# and would have run it either way; `make test` goes through TEST_SRCS, so the
+# regression guard has to be listed here to be part of the default gate.
+TEST_SRCS += tests/test_write_batch_bounds.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
