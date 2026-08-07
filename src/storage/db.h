@@ -350,6 +350,14 @@ void tsdb_batch_set_dedup_id(tsdb_batch_t *b, uint64_t stream, uint64_t seq);
  *
  * `col_arrs` and `col_types` exclude the timestamp column (n-1
  * entries for an n-column schema).
+ *
+ * PRECONDITION for a SYMBOL column (n > 0): col_arrs[d] holds the wire form
+ * [u32 total][u16 len][bytes]… with all 4 + total bytes readable.  That
+ * declared total is the only size in the format, so it is where this function
+ * stops walking; a caller decoding an untrusted frame must therefore prove the
+ * 4-byte header AND the total bytes behind it lie inside the frame before
+ * passing the pointer.  Entries that outrun the total are rejected here
+ * (TSDB_ERR_CORRUPT), so only the total itself has to come from the caller.
  */
 /* ts_arr is `const void *` so wire-protocol callers (RPC WRITE_BATCH
  * receivers, server bulk path) can pass a possibly-misaligned int64

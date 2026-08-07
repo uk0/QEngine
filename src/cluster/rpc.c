@@ -562,20 +562,29 @@ static int rpc_apply_write_batch(tsdb_db_t *db,
          * [u32 total][u16 len][bytes]…  Compute per-column offsets into the
          * single contiguous payload and hand pointers to bulk-append. */
         int ts_ci = -1;
-        int base[TSDB_MAX_COLS];
-        int boff = 0;
+        size_t base[TSDB_MAX_COLS];
+        /* boff is an offset into the columnar BODY, which starts hdr bytes into
+         * the payload — so each bound is hdr + boff against payload_len, the
+         * shape write_batch_incarnation already uses above.  Compared against
+         * payload_len alone the body may overrun by the whole header, whose
+         * length the sender picks with the table name.  size_t throughout:
+         * (int)total is NEGATIVE for a total above INT_MAX, which moved boff
+         * BACKWARDS through the bound instead of past it. */
+        size_t hdr  = (size_t)(col_data[0] - payload);
+        size_t boff = 0;
         int sizing_ok = 1;
         for (int c = 0; c < ncols; c++) {
             base[c] = boff;
             if (col_types[c] == TSDB_TYPE_TIMESTAMP) ts_ci = c;
             if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                if (hdr + boff + 4 > payload_len) { sizing_ok = 0; break; }
                 uint32_t total = 0;
                 memcpy(&total, col_data[0] + boff, 4);
-                boff += 4 + (int)total;
+                boff += 4 + (size_t)total;
             } else {
-                boff += 8 * nrows;
+                boff += (size_t)nrows * 8;
             }
-            if ((uint32_t)boff > payload_len) { sizing_ok = 0; break; }
+            if (hdr + boff > payload_len) { sizing_ok = 0; break; }
         }
         const void *col_arrs[TSDB_MAX_COLS];
         int data_types[TSDB_MAX_COLS];
@@ -865,20 +874,30 @@ static void *connection_handler(void *arg) {
                              * straight to bulk_append (see receiver above
                              * for format details). */
                             int ts_ci = -1;
-                            int base[TSDB_MAX_COLS];
-                            int boff = 0;
+                            size_t base[TSDB_MAX_COLS];
+                            /* Bounds as in the WRITE_BATCH receiver above: the
+                             * offset is into the columnar body, so it is
+                             * measured hdr bytes in, and the arithmetic is
+                             * size_t so a total above INT_MAX cannot turn the
+                             * step negative. */
+                            size_t hdr  = (size_t)(col_data[0] - msg.payload);
+                            size_t boff = 0;
                             int sizing_ok = 1;
                             for (int c = 0; c < ncols; c++) {
                                 base[c] = boff;
                                 if (col_types[c] == TSDB_TYPE_TIMESTAMP) ts_ci = c;
                                 if (col_types[c] == TSDB_TYPE_SYMBOL) {
+                                    if (hdr + boff + 4 > msg.payload_len) {
+                                        sizing_ok = 0;
+                                        break;
+                                    }
                                     uint32_t total = 0;
                                     memcpy(&total, col_data[0] + boff, 4);
-                                    boff += 4 + (int)total;
+                                    boff += 4 + (size_t)total;
                                 } else {
-                                    boff += 8 * nrows;
+                                    boff += (size_t)nrows * 8;
                                 }
-                                if ((uint32_t)boff > msg.payload_len) {
+                                if (hdr + boff > msg.payload_len) {
                                     sizing_ok = 0;
                                     break;
                                 }

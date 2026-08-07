@@ -2379,11 +2379,18 @@ static int redo_replay_apply(const void *rec, size_t n,
     tsdb_schema_t *s = t->schema;
     int ts_ci = s->ts_col_idx;
 
-    /* Per-partition dedup guard: skip this record only if seq is already
-     * durable in EVERY partition its rows land in.  Over-applying an
-     * already-durable sibling is harmless: the read model enumerates via ts and
-     * pairs non-ts blocks by (ts_min,count), so a re-flushed duplicate block is
-     * never double-counted. */
+    /* Per-partition dedup guard.  rec_cutoff is the MIN over the record's rows
+     * of the checkpoint of the partition each row lands in, so seq <= it means
+     * EVERY row is already durable and the record is skipped whole here.
+     *
+     * A record that STRADDLES a partition boundary is the mixed case: rows in a
+     * partition this flush published (durable) alongside rows in one it never
+     * reached (lost).  The MIN keeps the lost ones — but applying the record
+     * whole re-applies the durable ones on top of the partition that already
+     * holds them, and the read model enumerates rows through ts.idx, so the
+     * re-flushed block is COUNTED, not absorbed: acked rows silently duplicate.
+     * The apply loop below therefore re-resolves each row's partition and skips
+     * row by row. */
     int cut_ok = 1;
     uint64_t rec_cutoff = redo_rec_cutoff(ctx, p, n, nrows, &cut_ok);
     if (!cut_ok) rec_cutoff = redo_rec_cutoff_fallback(ctx, p, n, nrows);
@@ -2393,7 +2400,10 @@ static int redo_replay_apply(const void *rec, size_t n,
      * decode a PREFIX of the rows and then fail, leaving a partial record
      * applied — which the next open would replay again, duplicating it.  A redo
      * record is atomic; refuse the whole thing and let the caller decide what
-     * the un-read remainder of the log is worth. */
+     * the un-read remainder of the log is worth.  What this forbids is a
+     * partial DECODE.  The per-row skip below is not one: every row of the
+     * record decodes, and the skipped ones are durable already, so the record
+     * still ends up applied in full. */
     if (!cut_ok) return TSDB_ERR_CORRUPT;
 
     /* A record whose tagged (stream, seq) is ALREADY applied is a duplicate
@@ -2448,6 +2458,29 @@ static int redo_replay_apply(const void *rec, size_t n,
     for (uint32_t r = 0; r < nrows; r++) {
         if (off + 8 > n) return TSDB_ERR_CORRUPT;
         int64_t ts = (int64_t)redo_get_u64le(p + off); off += 8;
+
+        /* This row's own partition already carries this seq, so its copy is
+         * durable and re-applying it would put a duplicate block there.  Skip
+         * the row — but still walk its columns: `off` must advance for every
+         * column of every row or the next row decodes at the wrong offset.
+         * Not interning the skipped SYMBOLs is safe: a published partition's
+         * dictionary was saved before its blocks (flush_and_clear_locked) and
+         * is reloaded at open, so those codes are already back. */
+        if (seq <= redo_part_checkpoint(ctx, ts)) {
+            for (int ci = 0; ci < s->ncols; ci++) {
+                if (ci == ts_ci) continue;
+                if (s->cols[ci].type == TSDB_TYPE_SYMBOL) {
+                    if (off + 4 > n) return TSDB_ERR_CORRUPT;
+                    uint32_t len = redo_get_u32le(p + off); off += 4;
+                    if (off + len > n) return TSDB_ERR_CORRUPT;
+                    off += len;
+                } else {
+                    if (off + 8 > n) return TSDB_ERR_CORRUPT;
+                    off += 8;
+                }
+            }
+            continue;
+        }
 
         int rc = tsdb_memtable_row_begin(t->memtable);
         if (rc != TSDB_OK) return rc;
@@ -2796,7 +2829,17 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
     /* Data-dir failover: an I/O error persisting this table's partitions
      * degrades the striped dir it lives in so NEW tables route elsewhere.
      * The rows below stay in the memtable (only TSDB_OK clears it), so
-     * nothing is lost — retries land once the dir re-probes healthy. */
+     * nothing is lost — retries land once the dir re-probes healthy.
+     *
+     * KNOWN GAP (not fixed here): tsdb_part_flush_ex2 publishes partitions one
+     * at a time, so when a later one fails the earlier ones are already durable
+     * — and because the memtable is retained WHOLE, the retry writes their rows
+     * a second time.  Those rows then exist twice, in both durability modes.
+     * The obvious filter (skip rows whose partition already carries this
+     * flush's seq) cannot be built from here: the choice is per partition, so
+     * it belongs inside the flush's own day-bucketing, and in flush-on-commit
+     * mode there is no checkpoint to filter against at all — commit_seq stays 0,
+     * so hwm is 0 and the idx records none. */
     if (rc == TSDB_ERR_IO && t->db && t->schema && t->schema->dir)
         db_mark_dir_degraded(t->db, t->schema->dir);
     if (rc == TSDB_OK) {
@@ -3147,9 +3190,22 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
      * WRITE_BATCH millions-rows path).  Each cursor starts past the [u32
      * total] header and is advanced once per chunk instead. */
     const uint8_t *sym_cursor[TSDB_MAX_COLS];
-    for (int d = 0; d < ncols_data; d++)
-        sym_cursor[d] = (col_types[d] == TSDB_TYPE_SYMBOL)
-                            ? (const uint8_t *)col_arrs[d] + 4 : NULL;
+    /* Bytes of THIS column's payload the cursor has not reached yet — the end
+     * the walk below stops at.  The column's own [u32 total] is the only size
+     * the wire format carries, so the caller must have proved those 4 + total
+     * bytes readable (see db.h); within them the walk is self-bounded, an entry
+     * that would cross the end being refused rather than followed.  Kept as a
+     * count, not an end pointer, so a bogus total cannot form one. */
+    size_t sym_left[TSDB_MAX_COLS];
+    for (int d = 0; d < ncols_data; d++) {
+        sym_cursor[d] = NULL;
+        sym_left[d]   = 0;
+        if (col_types[d] != TSDB_TYPE_SYMBOL) continue;
+        uint32_t sym_total = 0;
+        memcpy(&sym_total, col_arrs[d], 4);
+        sym_cursor[d] = (const uint8_t *)col_arrs[d] + 4;
+        sym_left[d]   = sym_total;
+    }
 
     /* BATCH ATOMICITY.  The chunk loop below flushes when the memtable fills,
      * so a batch that starts on a partly-full memtable gets SPLIT: a prefix
@@ -3208,6 +3264,7 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
             const uint8_t *p = (const uint8_t *)col_arrs[d];
             if (col_types[d] == TSDB_TYPE_SYMBOL) {
                 const uint8_t *cur = sym_cursor[d];
+                size_t left = sym_left[d];
                 /* Walk the chunk's rows once to find its byte extent,
                  * then hand the payload slice straight to the memtable
                  * (ptr + len, no [u32 total] wrapper copy). */
@@ -3215,11 +3272,15 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
                 size_t chunk_payload = 0;
                 for (size_t k = 0; k < chunk; k++) {
                     uint16_t l16;
+                    if (left < 2) return TSDB_ERR_CORRUPT;
                     memcpy(&l16, cur, 2);
-                    cur += 2 + l16;
-                    chunk_payload += 2 + l16;
+                    if (left - 2 < (size_t)l16) return TSDB_ERR_CORRUPT;
+                    cur  += 2 + (size_t)l16;
+                    left -= 2 + (size_t)l16;
+                    chunk_payload += 2 + (size_t)l16;
                 }
                 sym_cursor[d] = cur;   /* resume point for the next chunk */
+                sym_left[d]   = left;
                 col_arrs_off[d] = chunk_start;
                 sym_lens_off[d] = chunk_payload;
             } else {
