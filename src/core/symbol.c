@@ -35,10 +35,18 @@ typedef struct {
 struct tsdb_symtab {
     pthread_rwlock_t lock;
 
-    /* Heap: null-terminated strings, appended. */
+    /* Heap: null-terminated strings, appended.  NEVER moves once handed
+     * out (see heap_reserve): outgrown generations are retired, not freed. */
     char    *heap;
     size_t   heap_size;
     size_t   heap_cap;
+
+    /* Retired heap generations, freed only in tsdb_symtab_free.  Fixed
+     * size on purpose: capacity at least doubles per retirement from the
+     * 4096-byte seed, and size_t overflows after 52 doublings, so 64 slots
+     * can never be exhausted. */
+    char    *retired[64];
+    uint32_t retired_count;
 
     /* Entries indexed by code. Each entry = offset into heap. */
     uint32_t *offsets;
@@ -84,12 +92,41 @@ static int ht_grow(tsdb_symtab_t *st, uint32_t new_cap) {
     return 0;
 }
 
+/* Grow the string heap WITHOUT moving it.
+ *
+ * tsdb_symtab_str returns an interior pointer into st->heap and drops the
+ * rwlock before the caller ever dereferences it — that is the documented
+ * contract ("valid until table is freed", symbol.h) — and no caller holds
+ * st->lock while using it: ingest interns under only the table's batch_mu
+ * (the intern is deliberately hoisted OUTSIDE the memtable lock), queries
+ * materialize SYMBOL columns holding only scan_refs, and tsdb_result_sym
+ * hands the pointer to user code.  A realloc here, even though it runs
+ * under the write lock, frees bytes such a reader may still be holding:
+ * use-after-free.
+ *
+ * So instead of realloc we malloc the new capacity, copy the live prefix,
+ * and RETIRE the old block — it stays allocated until tsdb_symtab_free.
+ * Retention is safe because the heap is append-only and interned strings
+ * are immutable: a retired generation's bytes remain a correct snapshot of
+ * every string it ever held.  The overhead is bounded: capacity at least
+ * doubles per retirement, so all retired generations together sum to less
+ * than the final heap_cap — peak footprint <= 2x heap_cap.  Bounded memory
+ * traded for pointer stability, the same discipline replica.c applies to
+ * evicted conns.
+ *
+ * This pins the heap only for the SYMTAB's lifetime.  The separate DROP
+ * TABLE window — a streaming result still holding col_symtab pointers when
+ * the schema frees the symtab itself — is NOT covered here. */
 static int heap_reserve(tsdb_symtab_t *st, size_t add) {
     if (st->heap_size + add <= st->heap_cap) return 0;
     size_t ncap = st->heap_cap ? st->heap_cap : 4096;
     while (ncap < st->heap_size + add) ncap *= 2;
-    char *nh = realloc(st->heap, ncap);
+    char *nh = malloc(ncap);
     if (!nh) return -1;
+    if (st->heap) {
+        memcpy(nh, st->heap, st->heap_size);
+        st->retired[st->retired_count++] = st->heap;
+    }
     st->heap = nh;
     st->heap_cap = ncap;
     return 0;
@@ -121,6 +158,7 @@ int tsdb_symtab_new(tsdb_symtab_t **out) {
 void tsdb_symtab_free(tsdb_symtab_t *st) {
     if (!st) return;
     pthread_rwlock_destroy(&st->lock);
+    for (uint32_t i = 0; i < st->retired_count; i++) free(st->retired[i]);
     free(st->heap);
     free(st->offsets);
     free(st->ht);
