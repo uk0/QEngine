@@ -86,6 +86,13 @@ typedef int (*tsdb_sql_exec_fn)(void *userdata,
 void tsdb_metrics_server_set_sql_provider(tsdb_sql_exec_fn fn,
                                            void *userdata);
 
+/* Per-query deadline (nanoseconds) applied to the /sql route.  0 (default)
+ * disables it.  When > 0, the metrics-plane /sql dispatch arms a thread-local
+ * monotonic deadline around the provider call so an unauthenticated SELECT
+ * cannot pin a handler thread forever — the same bound the wire plane applies
+ * via request_timeout_ns.  Set by both server binaries from request_timeout. */
+void tsdb_metrics_server_set_sql_deadline_ns(int64_t ns);
+
 /* ---- /retention/sweep provider hook ------------------------------------- *
  * Synchronous trigger for the retention GC.  Invoked by the
  * /retention/sweep HTTP endpoint.  Returns the number of partitions

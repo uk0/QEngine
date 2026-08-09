@@ -39,6 +39,12 @@ typedef struct {
      * once exceeded.  Bounds the runaway-SELECT case so a single bad
      * query can't pin a connection thread forever. */
     int64_t     request_timeout_ns;
+    /* Result-row ceiling applied to QUERY frames.  0 (default) → unlimited.
+     * When > 0, handle_query stops streaming after this many rows and sets
+     * FIN, so a single unbounded SELECT * cannot materialise the whole table
+     * into memory / onto the wire and OOM-kill the process.  The client sees
+     * a normal (truncated) result rather than an error or a hang. */
+    uint64_t    max_result_rows;
 } tsdb_server_opts_t;
 
 /*

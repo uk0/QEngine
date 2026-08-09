@@ -91,6 +91,9 @@ TEST_SRCS += tests/test_compact_idx_version_guard.c
 # whose dictionary was never persisted.
 TEST_SRCS += tests/test_drop_reserved.c
 TEST_SRCS += tests/test_flush_symtab_rc.c
+# /sql ran with no deadline in both mains; no result-size ceiling; ingest drops
+# uncounted -- request/connection governance for the unauth-by-default HTTP plane.
+TEST_SRCS += tests/test_server_resource_gov.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.

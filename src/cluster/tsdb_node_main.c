@@ -26,6 +26,7 @@
 #include "node.h"
 #include "disk_weight.h"
 #include "../server/config.h"
+#include "../server/log.h"       /* OBS-1: tsdb_log_init for the cluster node */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1158,6 +1159,26 @@ int main(int argc, char **argv) {
      * an ordinary I/O error. */
     signal(SIGPIPE, SIG_IGN);
 
+    /* OBS-1: the cluster node never initialised the logging subsystem, so
+     * every TSDB_LOG_* call inside libtsdb was a no-op and the node produced
+     * only ad-hoc printf/fprintf lines with no level, sink, or format
+     * control — the standalone tsdb-server has always called tsdb_log_init.
+     * Load the same tsd.conf the data_dirs bridge below reads and initialise
+     * logging from it (defaults when no file), so cluster and standalone
+     * share one log configuration path. */
+    {
+        tsdb_config_t lcfg;
+        tsdb_config_defaults(&lcfg);
+        char *lpath = tsdb_config_locate(NULL);
+        if (lpath) {
+            tsdb_config_load(&lcfg, lpath, NULL, 0);
+            free(lpath);
+        }
+        tsdb_config_apply_env(&lcfg);
+        tsdb_log_init(&lcfg);
+        tsdb_config_free(&lcfg);
+    }
+
     /* Bridge tsd.conf data_dirs → engine striping.  The engine only reads
      * extra data dirs from the TSDB_DATA_DIRS env var (db.c); the node
      * binary otherwise never consumes the config-file key.  overwrite=0
@@ -1230,6 +1251,22 @@ int main(int argc, char **argv) {
      *   TSDB_TLS_CA    PEM CA bundle for mTLS       (optional)
      * If CERT or KEY is missing the server falls back to plaintext. */
     tsdb_metrics_init();
+    /* RES-4: per-query deadline + result-row ceiling for the cluster node.
+     * Neither was bridged before, so a runaway SELECT ran forever pinning a
+     * connection thread and a single SELECT * materialised unbounded → OOM.
+     * Env-tunable; defaults match the standalone tsd.conf defaults (30s /
+     * 10M rows) so behaviour is bounded out of the box without truncating
+     * any realistic result. */
+    int64_t req_timeout_ns = 30LL * 1000000000LL;
+    {
+        const char *e = getenv("TSDB_REQUEST_TIMEOUT_NS");
+        if (e && *e) { long long v = atoll(e); if (v >= 0) req_timeout_ns = v; }
+    }
+    uint64_t max_result_rows = 10ULL * 1000ULL * 1000ULL;
+    {
+        const char *e = getenv("TSDB_MAX_RESULT_ROWS");
+        if (e && *e) { long long v = atoll(e); if (v >= 0) max_result_rows = (uint64_t)v; }
+    }
     tsdb_server_opts_t sopts = {
         .bind_addr    = client_bind,
         .max_conns    = 1024,
@@ -1237,6 +1274,8 @@ int main(int argc, char **argv) {
         .tls_cert     = getenv("TSDB_TLS_CERT"),
         .tls_key      = getenv("TSDB_TLS_KEY"),
         .tls_ca       = getenv("TSDB_TLS_CA"),
+        .request_timeout_ns = req_timeout_ns,
+        .max_result_rows    = max_result_rows,
     };
     tsdb_server_t *srv = NULL;
     rc = tsdb_server_start(&sopts, &srv);
@@ -1267,6 +1306,9 @@ int main(int argc, char **argv) {
     tsdb_metrics_server_set_cluster_provider(cluster_json_cb, db);
     tsdb_metrics_server_set_tree_provider(tree_json_cb, db);
     tsdb_metrics_server_set_sql_provider(sql_exec_cb, db);
+    /* RES-4 sibling: arm the same per-query deadline on the metrics-plane
+     * /sql route (a second unauth query entry-point) as the wire plane. */
+    tsdb_metrics_server_set_sql_deadline_ns(req_timeout_ns);
 
     /* Optional Raft consensus for the master set.  Gate:
      *   TSDB_NODE_ROLE == master (default)   AND

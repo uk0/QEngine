@@ -350,6 +350,23 @@ static metric_t g_metrics[] = {
     { "qengine_wal_replay_incomplete_total",
       "WAL replays that stopped at a torn or unreadable record, freezing the table until TRUNCATE", MT_COUNTER, { .c = { 0 } } },
 
+    /* Influx line-protocol ingest accounting.  These count LINES seen and
+     * LINES that failed (parse rejects + per-row commit/create failures),
+     * NOT rows committed — a single data line is one row attempt, and the
+     * ingest layer charges every row of a failed measurement group to
+     * errors, so (lines_total - errors_total) is the net committed lines.
+     * (A group larger than one memtable block whose commit fails mid-flush
+     * charges the whole group, so the difference is a lower bound there —
+     * it never credits a row that did not land.) */
+    { "qengine_influx_lines_total",
+      "InfluxDB line-protocol data lines received across all /write requests (one data line = one row attempt)", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_influx_line_errors_total",
+      "InfluxDB line-protocol lines that failed to ingest: parse rejects plus rows dropped by an auto-create or per-row commit failure. Charged per row, so (lines_total - this) is the net committed lines (a lower bound if a multi-block group's commit fails mid-flush)", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_influx_write_requests_total",
+      "InfluxDB /write HTTP requests handled (any status)", MT_COUNTER, { .c = { 0 } } },
+    { "qengine_influx_write_partial_total",
+      "InfluxDB /write requests that returned 204 while at least one line failed — the caller sees success but lost rows", MT_COUNTER, { .c = { 0 } } },
+
     /* --- histograms --- */
     { "qengine_query_duration_ms",
       "Query execution duration in milliseconds",

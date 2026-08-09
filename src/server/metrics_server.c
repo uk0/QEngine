@@ -20,6 +20,7 @@
 #include "../../include/tsdb_cluster.h"  /* tsdb_cluster_alive_count for the alive gauge */
 #include "../storage/db.h"        /* TSDB_BACKUP_NOT_ON_DISK — /backup's contract
                                    * with the manifest provider */
+#include "../query/exec.h"        /* tsdb_query_set_deadline_ns — /sql deadline */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,20 @@ static void                *g_whoami_ud     = NULL;
 static tsdb_raft_json_fn    g_raft_fn     = NULL;
 static void                *g_raft_ud     = NULL;
 static char                 g_data_dir[4096] = {0};
+
+/* Per-query deadline (ns) applied to the /sql dispatch below.  0 → no
+ * deadline (default, unchanged behaviour).  When > 0, the /sql route arms a
+ * thread-local monotonic deadline around the provider call so the metrics
+ * plane's unauthenticated /sql path gets the same runaway-query bound the
+ * wire plane already had — closing the RES-4 sibling where /sql ran
+ * tsdb_query with no deadline in BOTH server binaries.  The provider runs on
+ * this same handler thread, so the thread-local set here is visible inside
+ * tsdb_query and cleared before the thread returns. */
+static int64_t              g_sql_deadline_ns = 0;
+
+void tsdb_metrics_server_set_sql_deadline_ns(int64_t ns) {
+    g_sql_deadline_ns = (ns > 0) ? ns : 0;
+}
 
 void tsdb_metrics_server_set_cluster_provider(tsdb_cluster_json_fn fn,
                                                void *userdata) {
@@ -1002,8 +1017,26 @@ static void *handle_connection(void *arg) {
             rlen = snprintf(res, RES_CAP,
                             "{\"error\":\"sql provider not installed\"}\n");
         } else {
+            /* Arm the per-query deadline for the duration of the provider
+             * call, then restore the prior thread-local value.  The provider
+             * (sql_exec_cb / server_main_sql_exec_cb) calls tsdb_query on THIS
+             * thread, and the executor aborts at the next block boundary once
+             * the monotonic deadline is exceeded — so an unauthenticated /sql
+             * query can no longer pin a handler thread forever.  Save+restore
+             * so a value a caller may have set for its own reasons survives. */
+            int64_t prev_deadline = 0;
+            int     armed = 0;
+            if (g_sql_deadline_ns > 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                int64_t deadline = (int64_t)now.tv_sec * 1000000000LL
+                                 + now.tv_nsec + g_sql_deadline_ns;
+                prev_deadline = tsdb_query_set_deadline_ns(deadline);
+                armed = 1;
+            }
             rlen = g_sql_fn(g_sql_ud, q_start, q_len,
                             cookie_tok, res, RES_CAP);
+            if (armed) tsdb_query_set_deadline_ns(prev_deadline);
             if (rlen <= 0)
                 rlen = snprintf(res, RES_CAP,
                                 "{\"error\":\"provider returned %d\"}\n", rlen);

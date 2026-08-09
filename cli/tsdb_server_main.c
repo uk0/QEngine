@@ -458,6 +458,11 @@ int main(int argc, char **argv) {
         .tls_key       = cfg.tls_key[0]  ? cfg.tls_key  : NULL,
         .tls_ca        = cfg.tls_ca[0]   ? cfg.tls_ca   : NULL,
         .require_auth  = cfg.require_auth,
+        /* RES-4: bridge the configured per-query deadline and result-row
+         * ceiling into the wire server.  Both were parsed into tsd.conf but
+         * never reached opts, so a runaway or unbounded SELECT had no bound. */
+        .request_timeout_ns = cfg.request_timeout_ns,
+        .max_result_rows    = cfg.max_result_rows,
     };
     rc = tsdb_server_start(&opts, &g_srv);
     if (rc != TSDB_OK) {
@@ -483,6 +488,10 @@ int main(int argc, char **argv) {
          * a backup_restore.sh sidecar) returned "sql provider not
          * installed" for every /sql POST. */
         tsdb_metrics_server_set_sql_provider(server_main_sql_exec_cb, db);
+        /* RES-4 sibling: the metrics-plane /sql route is a second, unauth
+         * query entry-point.  Give it the same deadline the wire plane uses so
+         * a runaway SELECT here can't pin a handler thread either. */
+        tsdb_metrics_server_set_sql_deadline_ns(cfg.request_timeout_ns);
         /* Bring the rest of the management plane (retention sweep, audit,
          * PITR, catalog-check, backup-manifest, dashboard auth) to parity
          * with the cluster node so single-node ships the same dashboard. */

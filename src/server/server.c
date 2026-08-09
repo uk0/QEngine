@@ -1176,6 +1176,14 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     int chunk_rows = 0;
     int any_rows = 0;
     int row_rc;
+    /* RES-4 result-row ceiling: 0 → unlimited (default).  When set, stop
+     * streaming once this many rows have been emitted and let the final
+     * FIN chunk close the stream, so one SELECT * cannot materialise the
+     * whole table into memory / onto the wire and OOM the process.  The
+     * client sees a normal (short) result, exactly as if the table had
+     * that many rows. */
+    uint64_t max_rows = srv->opts.max_result_rows;
+    uint64_t emitted  = 0;
 
     while ((row_rc = tsdb_result_next(res)) == 1) {
         any_rows = 1;
@@ -1209,6 +1217,7 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
         }
         if (row_rc < 0) break;
         chunk_rows++;
+        emitted++;
 
         if (chunk_rows == QUERY_CHUNK_ROWS) {
             rc = emit_query_chunk(io, req_id, /*fin*/0, ncols, coltype,
@@ -1217,6 +1226,12 @@ static int handle_query(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
             chunk_rows = 0;
             for (int c = 0; c < ncols; c++) symused[c] = 0;
         }
+
+        /* Ceiling reached — stop pulling rows; the FIN chunk below flushes
+         * whatever is buffered.  Checked AFTER the flush so a boundary-
+         * aligned cap still ships a full non-FIN chunk here and an empty
+         * FIN chunk after, which the client drains identically. */
+        if (max_rows > 0 && emitted >= max_rows) break;
     }
 
     /* Final chunk carries FIN (covers the partial-chunk and zero-row cases). */

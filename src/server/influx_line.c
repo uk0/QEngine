@@ -10,6 +10,7 @@
 #include "../../include/tsdb.h"
 #include "../storage/db.h"
 #include "../storage/schema.h"
+#include "metrics.h"              /* OBS-3: ingest counters */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -950,13 +951,31 @@ int tsdb_influx_ingest(tsdb_db_t *db, const char *body, size_t n,
         /* Bulk-pack every row matching this measurement into columnar
          * wire format and append in one critical section.  Hot path for
          * Influx ingest — replaces the per-row begin/setter/end loop
-         * that used to dominate single-writer throughput. */
+         * that used to dominate single-writer throughput.
+         *
+         * Error accounting MUST be per-row, not per-group: every other
+         * failure leg above counts each row of the group, and the caller's
+         * committed-row figure is (lines - errors).  A single errors++ on a
+         * write/commit failure of an N-row group credits N-1 phantom
+         * committed rows — the OBS-5 miscount.  Count the group up front
+         * (write_rows_columnar NULLs each row's measurement as it consumes
+         * it, so the size is only knowable before the call) and charge the
+         * whole group on failure.  The batch-atomicity path (db.c) makes a
+         * sub-block group land in one memtable generation, so a failed
+         * commit persists none of it; charging group_n is then exact and, in
+         * the rare partial-flush case, errs toward under-crediting commits
+         * rather than ever crediting a row that did not land. */
+        size_t group_n = 0;
+        for (size_t j = i; j < nrows; j++) {
+            if (rows[j].measurement && strcmp(rows[j].measurement, meas) == 0)
+                group_n++;
+        }
         rc = write_rows_columnar(batch, schema, rows, nrows, meas);
         if (rc != TSDB_OK) {
             tsdb_batch_discard(batch);
-            errors++;
+            errors += group_n;
         } else {
-            if (tsdb_batch_commit(batch) != TSDB_OK) errors++;
+            if (tsdb_batch_commit(batch) != TSDB_OK) errors += group_n;
         }
         tsdb_table_unlock_write(tbl);
     }
@@ -1079,6 +1098,15 @@ static void *http_conn_handler(void *arg) {
     tsdb_influx_ingest(db, body, (size_t)content_length, &nlines, &nerrors);
     free(body);
 
+    /* OBS-3: ingest was previously silent — a 204 could hide partial row
+     * loss with no counter and no log.  Record the outcome so an operator
+     * can alert on qengine_influx_line_errors_total / _write_partial_total,
+     * and emit one summary line per request that lost rows (rate-bounded to
+     * one line per request, not per row, so an unauth client can't flood). */
+    tsdb_metric_inc("qengine_influx_write_requests_total");
+    tsdb_metric_add("qengine_influx_lines_total", (uint64_t)nlines);
+    tsdb_metric_add("qengine_influx_line_errors_total", (uint64_t)nerrors);
+
     /* --- Response --- */
     if (nerrors == nlines && nlines > 0) {
         /* All lines failed. */
@@ -1087,6 +1115,15 @@ static void *http_conn_handler(void *arg) {
             "Content-Length: 18\r\n\r\n"
             "all lines rejected");
     } else {
+        if (nerrors > 0) {
+            /* Partial success: the InfluxDB write API only has 204 to offer
+             * here, so the count is the ONLY signal the caller lost rows. */
+            tsdb_metric_inc("qengine_influx_write_partial_total");
+            fprintf(stderr,
+                "[influx] /write partial: %zu of %zu lines failed — "
+                "returning 204, %zu rows lost\n",
+                nerrors, nlines, nerrors);
+        }
         /* 204 No Content per InfluxDB write API. */
         http_send_str(fd,
             "HTTP/1.1 204 No Content\r\n"
