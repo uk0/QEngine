@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* ---- open-addressing, linear-probing, FNV-1a hash. ---- */
 
@@ -298,6 +299,29 @@ size_t tsdb_symtab_size(tsdb_symtab_t *st) {
  *                  [offsets u32 × count][heap u8 × heap_size] */
 #define SYMTAB_MAGIC TSDB_SYMTAB_MAGIC   /* declared in symbol.h */
 
+/* fsync the directory holding `path` so the rename that publishes a dict
+ * survives a power cut.  rename(2) is ATOMIC but not DURABLE — the entry
+ * lives in the parent directory.  The flush path persists the dict BEFORE
+ * the blocks that carry its codes, and the block publish fsyncs its own
+ * partition dir (part.c); if the dict's rename entry is then lost with the
+ * power, durable SYMBOL blocks decode against the resurrected OLD dict and
+ * silently return WRONG tag values — the exact corruption the tmp+fsync+
+ * rename below exists to prevent.  Best-effort (part_fsync_dir precedent):
+ * EINVAL from a filesystem that refuses directory fsync leaves us no worse
+ * off than before. */
+static void symtab_fsync_parent_dir(const char *path) {
+    char dir[4200];
+    size_t n = strlen(path);
+    if (n >= sizeof(dir)) return;
+    memcpy(dir, path, n + 1);
+    char *slash = strrchr(dir, '/');
+    if (!slash)           { dir[0] = '.'; dir[1] = '\0'; }
+    else if (slash == dir) { dir[1] = '\0'; }   /* "/x.sym" -> "/" */
+    else                   { *slash = '\0'; }
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+}
+
 int tsdb_symtab_save(tsdb_symtab_t *st, const char *path) {
     pthread_rwlock_rdlock(&st->lock);
     uint32_t count = st->count;
@@ -330,6 +354,7 @@ int tsdb_symtab_save(tsdb_symtab_t *st, const char *path) {
     fclose(f);
     if (rc) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    symtab_fsync_parent_dir(path);
     st->saved_count = count;   /* flush-serialised; a stale read only re-saves */
     return TSDB_OK;
 }

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <stdatomic.h>
@@ -103,22 +104,32 @@ int tsdb_mkdir_p(const char *path) {
  * outside the data dir — measured before this guard: a schema.bin plus a whole
  * partition written to <data_dir>/../pwn.
  *
- * Rejected: '/', '\\', a LEADING '.', and bytes below 0x20.  With '/' gone the
- * name cannot carry a subpath at all, so no interior ".." component can exist
- * and the leading-dot rule covers the name that IS "..".  '\\' is not a
- * separator on POSIX, so banning it is defence in depth — it IS one to anything
- * that later resolves these names as Windows paths, e.g. a backup unpacked
- * there.  Control bytes are rejected because the name is emitted verbatim into
- * logs and into the JSON backup manifest (backup.c writes "name":"<name>" with
- * no escaping).
+ * Rejected: '/', '\\', a LEADING '.', bytes below 0x20, and the bytes
+ * '"' ',' ':'.  With '/' gone the name cannot carry a subpath at all, so no
+ * interior ".." component can exist and the leading-dot rule covers the name
+ * that IS "..".  '\\' is not a separator on POSIX, so banning it is defence in
+ * depth — it IS one to anything that later resolves these names as Windows
+ * paths, e.g. a backup unpacked there.  Control bytes, '"', ',' and ':' are
+ * rejected because the name is emitted verbatim into logs and into the JSON
+ * backup manifest (backup.c writes "name":"<name>" with NO escaping): '"'
+ * closes that JSON string — the break-out byte, so a table named  x"  corrupts
+ * every manifest written while it exists, and an unauthenticated Influx
+ * measurement  x",host=a v=1  used to create exactly that — while ',' and ':'
+ * cannot break out on their own but are the structural bytes an injected tail
+ * is assembled from.  This predicate is the single gate shared by every sink
+ * that emits names verbatim, so the whole injection alphabet is rejected, not
+ * just the break-out byte.
  *
  * Everything else stays legal — spaces, interior dots, UTF-8 — and that is
  * deliberate: this runs at CREATE, and the table registry is rebuilt lazily,
  * so every create-on-miss path (influx auto-create, SCHEMA_SYNC, WRITE_BATCH
  * auto-create, idempotent SQL CREATE) re-runs it against tables that ALREADY
- * exist on disk.
- * A rule wider than the escape needs would therefore not merely refuse new
- * names, it would stop ingesting into tables an earlier binary created.
+ * exist on disk, so a rule wider than the escape needs does not merely refuse
+ * new names, it stops ingest into tables an earlier binary created.  For
+ * these three bytes that cost is accepted knowingly: a pre-existing  x"
+ * keeps corrupting every future manifest, and ',' / ':' are banned with it so
+ * the alphabet an injection is built from is closed at the one gate all name
+ * sources share.
  *
  * CREATE is not the only caller.  DROP composes the same two paths and then
  * REMOVES them, and tsdb_drop_table runs that removal even when the name
@@ -142,8 +153,25 @@ int tsdb_name_is_one_path_component(const char *name) {
     if (name[0] == '\0' || name[0] == '.') return 0;
     for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
         if (*p == '/' || *p == '\\' || *p < 0x20) return 0;
+        if (*p == '"' || *p == ',' || *p == ':') return 0;
     }
     return 1;
+}
+
+/* ---- parent-directory durability ---------------------------------------- */
+
+/* fsync a directory so a create/rename inside it survives a power cut.
+ * rename(2) and mkdir(2) are ATOMIC but not DURABLE: the new entry lives in
+ * the parent directory, and it reaches media only after an fsync of the
+ * DIRECTORY itself.  The data path has had this discipline for a while
+ * (part.c part_fsync_dir); the metadata paths lacked it, so a power cut could
+ * lose an acked CREATE TABLE while its WAL records — fsync'd on every commit
+ * — sat unreachable on disk.  Best-effort by the same precedent: a filesystem
+ * that rejects fsync on a directory fd returns EINVAL and we are no worse off
+ * than before. */
+static void schema_fsync_dir(const char *dir) {
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
 }
 
 /* ---- schema_save -------------------------------------------------------- */
@@ -220,6 +248,10 @@ static int schema_save(tsdb_schema_t *s) {
     fclose(f);
     if (rc) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) { unlink(tmp); return TSDB_ERR_IO; }
+    /* Make the rename durable: without this a power cut can roll schema.bin
+     * back to the previous version — or to ABSENT on first create, orphaning
+     * the table and its already-fsync'd WAL rows. */
+    schema_fsync_dir(s->dir);
 
     /* Persist each SYMBOL column's symtab. */
     for (int i = 0; i < s->ncols && !rc; i++) {
@@ -326,6 +358,28 @@ int tsdb_schema_create_ex2(const char *dir, const char *name,
 
     /* Ensure table directory exists. */
     if (mkdir_p(dir, 0755) < 0) return TSDB_ERR_IO;
+
+    /* Make the table dir's ENTRY durable in its parent.  mkdir is atomic, not
+     * durable: without the parent fsync a power cut after the CREATE ack can
+     * drop the whole table dir while the table's WAL under <data>/wal keeps
+     * its fsync'd records — unreachable at replay.  Ancestors of the parent
+     * (the data dir itself) are the db-open path's concern. */
+    {
+        char parent[4096];
+        size_t n = strlen(dir);
+        if (n < sizeof(parent)) {
+            memcpy(parent, dir, n + 1);
+            while (n > 1 && parent[n - 1] == '/') parent[--n] = '\0';
+            char *slash = strrchr(parent, '/');
+            if (!slash) {
+                schema_fsync_dir(".");
+            } else {
+                if (slash == parent) slash++;   /* keep root "/" itself */
+                *slash = '\0';
+                schema_fsync_dir(parent);
+            }
+        }
+    }
 
     /* Allocate schema. */
     tsdb_schema_t *s = calloc(1, sizeof(*s));

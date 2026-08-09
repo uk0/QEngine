@@ -311,6 +311,19 @@ int tsdb_wal_repair(tsdb_wal_t *w, uint64_t *discarded_out) {
 
 /* ---- Public API --------------------------------------------------------- */
 
+/* fsync a directory so entries just created in it survive a power cut.
+ * mkdir(2) and open(O_CREAT) are ATOMIC but not DURABLE: the new entry lives
+ * in the parent directory and reaches media only after an fsync of the
+ * directory itself.  Every record fsync this file performs is worthless if
+ * the dirent chain to the log file is lost with the power — the records are
+ * on disk but replay cannot find the file: acked-write loss.  Best-effort
+ * (part.c part_fsync_dir precedent): EINVAL from a filesystem that refuses
+ * directory fsync leaves us no worse off than before. */
+static void wal_fsync_dir(const char *dir) {
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+}
+
 int tsdb_wal_open(const char *db_dir, const char *table_name, tsdb_wal_t **out) {
     if (!db_dir || !table_name || !out) return TSDB_ERR_INVAL;
 
@@ -326,6 +339,13 @@ int tsdb_wal_open(const char *db_dir, const char *table_name, tsdb_wal_t **out) 
 
     w->fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (w->fd < 0) { free(w); return TSDB_ERR_IO; }
+
+    /* Make the just-created entries durable: <db_dir>/wal/<name>.log in the
+     * wal dir, and the wal dir itself in db_dir.  Unconditional — this is a
+     * per-table-open cold path, and "did O_CREAT create it?" cannot be probed
+     * without a race. */
+    wal_fsync_dir(wal_dir);
+    wal_fsync_dir(db_dir);
 
     /* Repair a power-loss torn tail BEFORE this fd can append past it.  This is
      * the only choke point that hands out an appending handle, so no writer can
