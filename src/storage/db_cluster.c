@@ -38,6 +38,7 @@
 #include "../../include/tsdb_cluster.h"
 #include "../core/types.h"
 #include "../server/metrics.h"
+#include "../server/config.h"   /* OBS-2: tsd.conf cluster keys -> engine readers */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,6 +121,14 @@ static int shard_replica_n_cached(void);
  * on_replicate: called from flush_and_clear (before each local memtable flush).
  * userdata is the tsdb_cluster_t *.
  * We extract columnar data from the memtable and fan-out via tsdb_cluster_write.
+ *
+ * LOCK CONTRACT (consumer side): this hook takes NO storage locks and reads
+ * ONLY the schema/memtable arguments handed to it — the caller owns their
+ * stability for the duration of the call.  db.c today invokes it under the
+ * table's compact_mtx; with the remote-ACK quorum gate the call can now block
+ * up to the fanout deadline, so db.c is free to move the invocation OFF the
+ * compact lock (snapshotting the memtable first) without any change here.
+ * Nothing in this function may ever assume compact_mtx is held.
  */
 /* ---- Sender-side dedup stamp (on by default) ----------------------------
  *
@@ -474,6 +483,51 @@ int tsdb_open_cluster(const char *data_dir,
     }
 
     tsdb_node_id_t node_id = generate_node_id(data_dir, bind_addr);
+
+    /* OBS-2: give the tsd.conf cluster keys their engine readers.  The
+     * parser has always accepted cluster_write_quorum and
+     * cluster_replica_factor, but nothing in the engine ever read the
+     * parsed values — the only live knobs were the env vars.  Bridge them
+     * here (every cluster node passes through this open), same pattern as
+     * tsdb_node_main.c's data_dirs bridge: setenv with overwrite=0 so an
+     * explicitly exported env var stays authoritative.
+     *
+     * Only EXPLICIT file keys are bridged, detected via sentinels planted
+     * after tsdb_config_defaults.  Bridging the parser DEFAULTS would be a
+     * silent behaviour flip: cluster_replica_factor defaults to 3, and
+     * exporting TSDB_SHARD_REPLICA_N=3 turns shard mode ON for every
+     * cluster that merely has a config file.
+     *
+     * Semantics: cluster_write_quorum counts TOTAL acks INCLUDING the local
+     * write (the replica.h convention, default 2); TSDB_REPLICATION_QUORUM
+     * counts REMOTE acks (cluster.c) — hence the -1.  cluster_replica_factor
+     * is the per-table owner-set size, which is exactly TSDB_SHARD_REPLICA_N. */
+    {
+        tsdb_config_t cfg;
+        tsdb_config_defaults(&cfg);
+        cfg.cluster_write_quorum   = INT_MIN;   /* sentinel: not set by file */
+        cfg.cluster_replica_factor = INT_MIN;
+        char *cfg_path = tsdb_config_locate(NULL);
+        if (cfg_path) {
+            tsdb_config_load(&cfg, cfg_path, NULL, 0);
+            free(cfg_path);
+        }
+        if (cfg.cluster_write_quorum != INT_MIN &&
+            cfg.cluster_write_quorum >= 0) {
+            char v[16];
+            int rq = cfg.cluster_write_quorum > 0
+                       ? cfg.cluster_write_quorum - 1 : 0;
+            snprintf(v, sizeof(v), "%d", rq);
+            setenv("TSDB_REPLICATION_QUORUM", v, 0);
+        }
+        if (cfg.cluster_replica_factor != INT_MIN &&
+            cfg.cluster_replica_factor > 0) {
+            char v[16];
+            snprintf(v, sizeof(v), "%d", cfg.cluster_replica_factor);
+            setenv("TSDB_SHARD_REPLICA_N", v, 0);
+        }
+        tsdb_config_free(&cfg);
+    }
 
     /* Pick up the master/data role from the env.  Default is MASTER so
      * every pre-existing data dir keeps accepting DDL via the legacy
@@ -1011,12 +1065,207 @@ int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
                                tsdb_result_t *peer_res,
                                const uint64_t *lset, size_t ln,
                                int *out_inserted);
+/* fedrpc.c; not in fedrpc.h (frozen this round) — FED_QUERY with the socket
+ * deadline ARMED, so one wedged peer cannot park the sweep thread mid-pull. */
+extern int fedrpc_query_to(tsdb_rpc_conn_t *conn, const char *qtl,
+                           int timeout_ms, tsdb_result_t **out);
+
+/* ---- Chunked anti-entropy pull (REPL-4) ----------------------------------
+ *
+ * INVARIANT: anti-entropy repair progress must not depend on the repaired
+ * table fitting in ONE federation result frame.  Both wire ends cap a
+ * FED_QUERY result at 64 MB (the serving peer encodes into a fixed 64 MB
+ * buffer and replies ERR on overflow; the client refuses a truncated frame),
+ * so the old single `SELECT * FROM t WHERE ts > X` could never repair a
+ * table above ~64 MB of selected rows — and an empty local table maps to
+ * X = INT64_MIN, i.e. the WHOLE table in one query.  Every 30 s sweep then
+ * re-ran the same doomed query, re-materializing the full table on the
+ * healthy peer, forever.
+ *
+ * The pull therefore walks the ts range in sub-range chunks:
+ *   - chunk size targets AE_PULL_TARGET_BYTES (half the frame cap) using
+ *     the LOCAL schema's column count for the bytes/row estimate;
+ *   - a range whose peer-side count probe exceeds the chunk budget is split
+ *     at its ts midpoint before any oversized SELECT is attempted;
+ *   - count probes are ADVISORY ONLY.  They run scatter-local on the peer
+ *     (FED_QUERY_LOCAL — no cluster re-scatter amplification), and on a
+ *     divergent peer that path can under-count rows the peer physically
+ *     holds without owning, so a count is never trusted to SKIP a range —
+ *     only to split before pulling.  Correctness rests on the bisection
+ *     net: a leaf SELECT the peer answers with ERR (the over-cap encode
+ *     shape — the peer is alive and answering) is split and retried, down
+ *     to a 1 ns window;
+ *   - each merged chunk commits before the next is fetched, so a failed or
+ *     interrupted repair RESUMES from durable progress instead of
+ *     restarting from zero (the 30 s retry is a cursor, not a do-over).
+ *
+ * A transport failure (TSDB_ERR_IO: timeout, dead socket) aborts the pull
+ * instead of bisecting — splitting cannot revive a dead peer, and 512
+ * blind retries against one would hold the sweep thread for hours. */
+#define AE_PULL_TARGET_BYTES    (32u << 20)  /* half the 64 MB frame cap  */
+#define AE_PULL_MIN_CHUNK_ROWS  1024
+#define AE_PULL_MAX_ATTEMPTS    512          /* popped ranges per pull     */
+#define AE_PULL_STACK_MAX       128          /* >= 64 splits + slack       */
+
+/* Rows per chunk from the LOCAL schema (wire bytes/row = ncols * 8).
+ * 0 = table unknown locally; the caller then pulls a single frame exactly
+ * as the pre-chunk code did (the merge fails the same way it always has). */
+static uint64_t ae_pull_chunk_rows(tsdb_db_t *db, const char *table) {
+    tsdb_table_internal_t *ti = tsdb_db_find_table(db, table);
+    if (!ti) return 0;
+    tsdb_schema_t *s = tsdb_tbl_schema(ti);
+    if (!s || s->ncols <= 0) return 0;
+    uint64_t r = (uint64_t)AE_PULL_TARGET_BYTES / ((uint64_t)s->ncols * 8u);
+    return r < AE_PULL_MIN_CHUNK_ROWS ? AE_PULL_MIN_CHUNK_ROWS : r;
+}
+
+/* QTL for rows with ts in (lo, hi].  hi == INT64_MAX omits the upper bound:
+ * it keeps the small-table query byte-identical to the pre-chunk pull, and
+ * the INT64_MAX literal itself would saturate the lexer's i64 parse. */
+static void ae_range_qtl(char *buf, size_t cap, const char *table,
+                         int64_t lo, int64_t hi, int count_only) {
+    if (hi == INT64_MAX)
+        snprintf(buf, cap, "SELECT %s FROM %s WHERE ts > %lld",
+                 count_only ? "count(*)" : "*", table, (long long)lo);
+    else
+        snprintf(buf, cap, "SELECT %s FROM %s WHERE ts > %lld AND ts <= %lld",
+                 count_only ? "count(*)" : "*", table,
+                 (long long)lo, (long long)hi);
+}
+
+/* Peer-local row count for (lo, hi]; -1 = peer could not answer.  Advisory
+ * only — see the invariant block above. */
+static int64_t ae_peer_range_count(tsdb_rpc_conn_t *conn, const char *table,
+                                   int64_t lo, int64_t hi) {
+    char qtl[320];
+    ae_range_qtl(qtl, sizeof(qtl), table, lo, hi, 1);
+    tsdb_result_t *res = NULL;
+    if (fedrpc_query_local(conn, qtl, 10000, &res) != TSDB_OK || !res) {
+        if (res) tsdb_result_free(res);
+        return -1;
+    }
+    int64_t cnt = -1;
+    if (tsdb_result_next(res)) {
+        int ci = tsdb_result_col_index_by_name(res, "count");
+        if (ci < 0) ci = 0;
+        cnt = tsdb_result_i64(res, ci);
+    }
+    tsdb_result_free(res);
+    return cnt;
+}
+
+/* One leaf: fetch the peer's rows in (lo, hi] and CONTENT-DEDUP merge them.
+ *
+ * The dedup set is built AFTER the network fetch so the anti-duplicate race
+ * window excludes the whole round trip: anti-entropy pulling a gap while the
+ * sender's replication catch-up pushes the very same rows is the normal case
+ * right after a reconnect, and inserting unconditionally double-counted a
+ * measured 250 rows live (count 1250 vs 1000).  The set covers exactly this
+ * chunk's range — chunk ranges are disjoint, so a row merged by an earlier
+ * chunk is never re-offered to a later one.  Trade-off inherited from the
+ * digest primitive: a row byte-identical to one already held locally is not
+ * re-created.
+ *
+ * Returns TSDB_OK (rows added to *out_inserted), TSDB_ERR_INTERNAL when the
+ * peer answered the SELECT with ERR (splittable — the over-cap frame shape),
+ * or another error for transport/local failures (not splittable). */
+static int ae_pull_leaf_merge(tsdb_db_t *db, tsdb_rpc_conn_t *conn,
+                              const char *table, int64_t lo, int64_t hi,
+                              int *out_inserted) {
+    char qtl[320];
+    ae_range_qtl(qtl, sizeof(qtl), table, lo, hi, 0);
+    tsdb_result_t *res = NULL;
+    int rc = fedrpc_query_to(conn, qtl, 60000, &res);
+    if (rc != TSDB_OK || !res) {
+        if (res) tsdb_result_free(res);
+        return rc == TSDB_OK ? TSDB_ERR_INTERNAL : rc;
+    }
+
+    uint64_t *lset = NULL;
+    size_t ln = 0;
+    int hrc = tsdb_ae_local_bucket_hashes(db, table, lo + 1, hi, &lset, &ln);
+    if (hrc != TSDB_OK) {
+        tsdb_result_free(res);
+        /* Local failure — never guess, never split (TSDB_ERR_INTERNAL is
+         * reserved for "the PEER answered ERR", the only splittable shape). */
+        return hrc == TSDB_ERR_INTERNAL ? TSDB_ERR_IO : hrc;
+    }
+
+    int ins = 0;
+    int mrc = tsdb_ae_merge_result_dedup(db, table, res, lset, ln, &ins);
+    tsdb_result_free(res);
+    free(lset);
+    if (mrc != TSDB_OK)
+        return mrc == TSDB_ERR_INTERNAL ? TSDB_ERR_IO : mrc;    /* as above */
+    if (out_inserted) *out_inserted += ins;
+    return TSDB_OK;
+}
+
+/* Merge every peer row with ts in (lo, hi] into the local table, in frames
+ * bounded below the federation cap.  hint_rows: the peer's row estimate for
+ * the range (0 = unknown → try one frame first, exactly the historical
+ * behaviour, and split only if that frame fails).  Splits are pushed right
+ * half first so ranges merge in ascending ts order — durable progress
+ * advances the local max_ts and the next sweep's tail pull resumes past it. */
+static int ae_pull_range_merge(tsdb_db_t *db, tsdb_rpc_conn_t *conn,
+                               const char *table,
+                               int64_t lo, int64_t hi,
+                               uint64_t hint_rows, uint64_t chunk_rows,
+                               int *out_inserted)
+{
+    if (lo >= hi) return TSDB_OK;
+
+    struct { int64_t lo, hi; } stack[AE_PULL_STACK_MAX];
+    int top = 0;
+    stack[top].lo = lo; stack[top].hi = hi; top++;
+
+    int probe_first = (chunk_rows > 0 && hint_rows > chunk_rows);
+    int attempts = 0;
+    while (top > 0) {
+        if (++attempts > AE_PULL_MAX_ATTEMPTS) return TSDB_ERR_IO;
+        int64_t rlo = stack[top - 1].lo, rhi = stack[top - 1].hi;
+        top--;
+        /* Unsigned distance is exact even across the sign boundary the
+         * INT64_MIN-based empty-table pull starts from. */
+        uint64_t width = (uint64_t)rhi - (uint64_t)rlo;
+
+        if (probe_first && chunk_rows > 0 && width > 1) {
+            int64_t cnt = ae_peer_range_count(conn, table, rlo, rhi);
+            if (cnt > (int64_t)chunk_rows) {
+                if (top + 2 > AE_PULL_STACK_MAX) return TSDB_ERR_IO;
+                int64_t mid = (int64_t)((uint64_t)rlo + width / 2);
+                stack[top].lo = mid; stack[top].hi = rhi; top++;
+                stack[top].lo = rlo; stack[top].hi = mid; top++;
+                continue;
+            }
+            /* cnt <= chunk_rows or cnt < 0 (unanswered): fall through and
+             * PULL — a count is never trusted to skip a range. */
+        }
+
+        int lrc = ae_pull_leaf_merge(db, conn, table, rlo, rhi, out_inserted);
+        if (lrc == TSDB_OK) continue;
+        if (lrc != TSDB_ERR_INTERNAL || width <= 1) return lrc;
+        /* The peer is alive and answered ERR.  If it can still COUNT this
+         * range the SELECT was too big to frame — split and retry.  If it
+         * cannot answer anything about the range (table missing, query
+         * rejected), splitting only re-fails 2^depth times — abort. */
+        if (ae_peer_range_count(conn, table, rlo, rhi) < 0)
+            return TSDB_ERR_INTERNAL;
+        probe_first = 1;    /* frames are overflowing: probe from now on */
+        if (top + 2 > AE_PULL_STACK_MAX) return TSDB_ERR_IO;
+        int64_t mid = (int64_t)((uint64_t)rlo + width / 2);
+        stack[top].lo = mid; stack[top].hi = rhi; top++;
+        stack[top].lo = rlo; stack[top].hi = mid; top++;
+    }
+    return TSDB_OK;
+}
 
 static int pull_table_delta(tsdb_db_t *db,
                              tsdb_cluster_t *c,
                              tsdb_node_id_t peer_id,
                              const char *table_name,
-                             int64_t since_ts)
+                             int64_t since_ts,
+                             uint64_t peer_count_hint)
 {
     tsdb_replica_mgr_t *rmgr = tsdb_cluster_replica_mgr(c);
     if (!rmgr) return -1;
@@ -1025,58 +1274,17 @@ static int pull_table_delta(tsdb_db_t *db,
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
     if (!conn) return -1;
 
-    char qtl[256];
-    snprintf(qtl, sizeof(qtl),
-             "SELECT * FROM %s WHERE ts > %lld",
-             table_name, (long long)since_ts);
-
-    tsdb_result_t *res = NULL;
-    int rc = fedrpc_query(conn, qtl, 60000, &res);
-    if (rc != TSDB_OK || !res) {
-        if (res) tsdb_result_free(res);
-        return -1;
-    }
-
-    int ncols = tsdb_result_ncols(res);
-    if (ncols < 1) { tsdb_result_free(res); return 0; }
-
-    /* CONTENT-DEDUP the tail pull.  This used to insert every fetched row
-     * unconditionally, which duplicates rows whenever ANOTHER repair path
-     * delivers the same range concurrently — and that is the normal case right
-     * after a peer reconnects: anti-entropy pulls the gap while the sender's
-     * replication catch-up pushes the very same rows.  Measured live: a node
-     * cut off for 5 batches came back holding those 250 rows TWICE
-     * (count 1250 vs 1000, sum 644375 vs 500500, every v in [451,700] present
-     * exactly twice) — a silent over-count with rc=OK.
-     *
-     * Reuse the digest merge's tested primitive: hash what we already hold in
-     * the pulled range, then insert only rows whose content is absent.  The set
-     * is built AFTER the network fetch so the race window excludes the whole
-     * round trip, and in the common case it is EMPTY (nothing local can be
-     * newer than the max_ts we pulled from) — so this costs nothing and only
-     * bites in exactly the raced overlap.  It also fixes two latent bugs in the
-     * old loop: FLOAT32 columns were silently dropped (`default: break` wrote
-     * no value), and an unknown column type produced a partial row instead of a
-     * loud failure.
-     *
-     * Trade-off, inherited from the same primitive the digest uses: a row whose
-     * content is byte-identical to one we already hold is not inserted, so a
-     * legitimately-duplicated identical row is not re-created.  Preferring that
-     * over silently doubling a reconnect's worth of rows. */
-    uint64_t *lset = NULL;
-    size_t ln = 0;
-    if (tsdb_ae_local_bucket_hashes(db, table_name, since_ts + 1, INT64_MAX,
-                                    &lset, &ln) != TSDB_OK) {
-        tsdb_result_free(res);
-        return -1;
-    }
-
     int inserted = 0;
-    int mrc = tsdb_ae_merge_result_dedup(db, table_name, res, lset, ln,
-                                         &inserted);
-    tsdb_result_free(res);
-    free(lset);
-    return mrc == TSDB_OK ? inserted : -1;
+    int rc = ae_pull_range_merge(db, conn, table_name, since_ts, INT64_MAX,
+                                 peer_count_hint,
+                                 ae_pull_chunk_rows(db, table_name),
+                                 &inserted);
+    if (rc != TSDB_OK)
+        /* Chunks already merged are durable; report them so the driver sees
+         * measured progress, and let the next sweep resume from the new
+         * local max_ts.  No progress at all is the historical -1. */
+        return inserted > 0 ? inserted : -1;
+    return inserted;
 }
 
 /* ---- Row-range digest repair: content-dedup bucket merge ----------------- */
@@ -1245,29 +1453,22 @@ static int pull_bucket_merge(tsdb_db_t *db, tsdb_cluster_t *c,
     if (!rmgr) return -1;
     tsdb_rpc_conn_t *conn = tsdb_replica_mgr_get_conn(rmgr, peer_id);
     if (!conn) return -1;
+    /* (bstart-1, bend] == [bstart, bend] for integer ns; the half-open form
+     * is what the chunked walker splits on.  A bucket start of INT64_MIN is
+     * unreachable (buckets are time_bucket() starts of real rows). */
+    if (bstart == INT64_MIN) return -1;
 
-    uint64_t *lset = NULL;
-    size_t ln = 0;
-    if (tsdb_ae_local_bucket_hashes(db, table_name, bstart, bend,
-                                    &lset, &ln) != TSDB_OK)
-        return -1;
-
-    char qtl[320];
-    snprintf(qtl, sizeof(qtl),
-             "SELECT * FROM %s WHERE ts >= %lld AND ts <= %lld",
-             table_name, (long long)bstart, (long long)bend);
-    tsdb_result_t *res = NULL;
-    if (fedrpc_query(conn, qtl, 60000, &res) != TSDB_OK || !res) {
-        if (res) tsdb_result_free(res);
-        free(lset);
-        return -1;
-    }
-
+    /* Same frame cap, same fix as pull_table_delta (REPL-4): a single
+     * partition-wide bucket can exceed 64 MB too.  hint 0 = try one frame
+     * first — the historical single-query behaviour — and split only if the
+     * peer answers ERR on it. */
     int inserted = 0;
-    int rc = tsdb_ae_merge_result_dedup(db, table_name, res, lset, ln, &inserted);
-    tsdb_result_free(res);
-    free(lset);
-    return rc == TSDB_OK ? inserted : -1;
+    int rc = ae_pull_range_merge(db, conn, table_name, bstart - 1, bend,
+                                 0, ae_pull_chunk_rows(db, table_name),
+                                 &inserted);
+    if (rc != TSDB_OK)
+        return inserted > 0 ? inserted : -1;
+    return inserted;
 }
 
 /* Does ANY alive peer hold a table by this name?
@@ -2573,7 +2774,8 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
 
     switch (act) {
     case TSDB_AE_TAIL_PULL:
-        return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
+        return pull_table_delta(x->db, x->c, peer, x->table, since_ts,
+                                cand->count);
 
     case TSDB_AE_FULL_PULL: {
         /* The ONLY destructive step in anti-entropy.  tsdb_antientropy_decide
@@ -2592,7 +2794,8 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
         int g = ae_full_pull_truncate_guarded(x->db, x->table);
         if (g < 0)  return -1;
         if (g == 0) return 0;   /* raced write preserved; next sweep re-decides */
-        return pull_table_delta(x->db, x->c, peer, x->table, since_ts);
+        return pull_table_delta(x->db, x->c, peer, x->table, since_ts,
+                                cand->count);
     }
 
     case TSDB_AE_SKIP_UNSAFE: {
@@ -2616,13 +2819,15 @@ static int ae_attempt_cb(void *vctx, const tsdb_ae_cand_t *cand,
         }
         /* Would shrink durable data on a peer-count comparison — refuse.
          *
-         * Refusing is right, but the gap it refuses to close is PERMANENT and
-         * until now the only trace of it was this line on stderr.  There is no
-         * periodic row anti-entropy — tsdb_resync_startup_thread runs once, 5 s
-         * after boot — so nothing revisits the decision, and the count(*) the
-         * two nodes answer stays different with no error on either.  Measured
-         * live: cnode-1 12000, cnode-3 9000, identical max(ts).  Count it so an
-         * operator can see divergence exists without reading container logs. */
+         * Refusing is right, and the refusal must stay VISIBLE and stay
+         * RE-CHECKED (REPL-2): the metric below is the scrapeable trace (a
+         * stderr line alone disappears with the container logs), and the
+         * decision is revisited every sweep — tsdb_resync_startup_thread
+         * loops every TSDB_ANTIENTROPY_PERIOD_MS (30 s default; pinned by
+         * tests/test_ae_periodic.c), it is NOT the one-shot boot pass it
+         * once was.  The gap itself stays until the opt-in digest merge or
+         * partition backfill closes it.  Measured live: cnode-1 12000,
+         * cnode-3 9000, identical max(ts). */
         /* The counter is the scrapeable signal — bump it EVERY occurrence.  The
          * human line is throttled: once on the TRANSITION into middle-gap, then
          * at most once per AE_MIDGAP_LOG_EVERY sweeps while it persists.  Before

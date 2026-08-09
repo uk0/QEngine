@@ -405,6 +405,10 @@ static fanout_ctx_t *fanout_ctx_new(tsdb_replica_mgr_t *rmgr,
     atomic_init(&ctx->refcount, 1);  /* caller's ref */
     pthread_mutex_init(&ctx->mu, NULL);
     pthread_cond_init(&ctx->cv, NULL);
+    /* The local write is pre-counted, so `quorum` here INCLUDES it: a caller
+     * that needs R REMOTE ACKs must pass R + 1 (tsdb_cluster_write does; the
+     * wait-for-all broadcasts pass 1 + npeers).  Passing R directly makes
+     * R == 1 vacuously satisfied by this seed — the REPL-1 bug. */
     ctx->ack_count   = 1;  /* local already written */
     ctx->quorum      = quorum;
     ctx->payload     = payload;

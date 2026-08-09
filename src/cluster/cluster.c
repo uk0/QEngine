@@ -222,7 +222,8 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
          * than dropping the write entirely on a routing edge case). */
     }
 
-    /* Quorum tunable.  TSDB_REPLICATION_QUORUM env:
+    /* Quorum tunable.  TSDB_REPLICATION_QUORUM env — REMOTE ACKs required
+     * (also fed from tsd.conf's cluster_write_quorum, see tsdb_open_cluster):
      *   1 (default) — wait for ≥1 remote ACK before commit returns.
      *                 Strongest "one peer has it durable" guarantee.
      *   0           — async fan-out: spawn worker threads, return
@@ -240,15 +241,26 @@ int tsdb_cluster_write(tsdb_cluster_t *c,
         if (cached_quorum < 0) cached_quorum = 0;
     }
     int q = cached_quorum;
+    /* Clamp to what is achievable: there can never be more remote ACKs than
+     * remote peers.  Deliberate availability choice — a degraded cluster
+     * keeps committing at the strongest quorum it can still reach, and
+     * anti-entropy repairs the rest when peers return. */
     if (q > nremote) q = nremote;
 
+    /* INVARIANT (REPL-1): the LOCAL write must never satisfy the configured
+     * quorum.  The fanout seeds ack_count = 1 for the already-written local
+     * copy (replica.c), so a remote quorum of q must go on the wire as
+     * q + 1.  Passing q directly made the default q=1 vacuous — the wait
+     * loop saw 1 >= 1 before any worker dialed a peer, and a 2-node cluster
+     * acked every write while it lived on exactly one node. */
     int raw_acks = 0;
     int rc = tsdb_replica_write(c->replica_mgr,
                                 table_name,
                                 ncols, col_types,
                                 nrows, col_data,
                                 remote_replicas, nremote,
-                                q, &raw_acks, incarnation, bid);
+                                q > 0 ? q + 1 : 0, &raw_acks,
+                                incarnation, bid);
     /* fanout ack_count includes the already-written local copy (starts at 1),
      * so strip it: out_remote_acks is the count of REMOTE replicas that
      * durably ACKed.  The SKIP_LOCAL drop decision needs >=1 of these. */

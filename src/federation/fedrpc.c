@@ -380,6 +380,18 @@ int fedrpc_query(tsdb_rpc_conn_t *conn, const char *qtl,
                              0 /* keep historical blocking semantics */, out);
 }
 
+/* FED_QUERY with the timeout ARMED on the socket.  The anti-entropy chunked
+ * pull (db_cluster.c) issues many sub-range queries per repair; with the
+ * historical blocking semantics of fedrpc_query one wedged peer would park
+ * the single sweep thread forever mid-pull.  Kept separate so existing
+ * fedrpc_query callers keep their exact behaviour. */
+int fedrpc_query_to(tsdb_rpc_conn_t *conn, const char *qtl,
+                    int timeout_ms, tsdb_result_t **out)
+{
+    return fedrpc_query_type(conn, TSDB_RPC_FED_QUERY, qtl, timeout_ms,
+                             1 /* bounded: a chunk leg must not wedge AE */, out);
+}
+
 int fedrpc_query_local(tsdb_rpc_conn_t *conn, const char *qtl,
                        int timeout_ms, tsdb_result_t **out)
 {
