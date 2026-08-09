@@ -484,6 +484,14 @@ static int idx_recover_header_size(int hdr_size, uint32_t entry_size,
  * The raw-block writer uses this to PRESERVE an existing partition's idx
  * version and carry its max_seq forward, instead of silently downgrading a
  * V4 partition to V3 (which would drop the WAL redo checkpoint).
+ *
+ * ENOENT IS THE ONLY "THERE IS NO INDEX HERE" ANSWER.  Every other fopen
+ * failure — EMFILE/ENFILE at the fd limit, EACCES, EIO — means an index may
+ * well exist and simply could not be looked at, and the callers that REWRITE a
+ * manifest from what this reports (rawblock.c's applier, migrate.c's prime)
+ * turn "absent" into a fresh index over an N-entry one.  Report those as -1,
+ * the same answer an unparseable header gets, so a writer refuses rather than
+ * guessing; read-only probes already treat -1 as conservatively as 0.
  */
 int tsdb_part_idx_probe(const char *idx_path,
                         uint16_t *out_version, uint32_t *out_count,
@@ -500,7 +508,7 @@ int tsdb_part_idx_probe(const char *idx_path,
     if (out_max_seq)     *out_max_seq     = 0;
 
     FILE *f = fopen(idx_path, "rb");
-    if (!f) return 0;
+    if (!f) return (errno == ENOENT) ? 0 : -1;   /* see the ENOENT note above */
 
     uint8_t hdr[TSDB_IDX_HEADER_SIZE];
     size_t n = fread(hdr, 1, TSDB_IDX_HEADER_SIZE, f);
@@ -1044,12 +1052,32 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
     w->col_start_offset = w->col_offset;   /* rollback point on failure */
 
     /* Read existing idx header to prime block_count, total_rows, and the
-     * file-level zone map (v2 only). */
+     * file-level zone map (v2 only).
+     *
+     * THESE ARE PRIMED ONCE, HERE, AND THE PUBLISH IN col_writer_close REWRITES
+     * THE WHOLE HEADER FROM THEM — the full-rewrite path re-reads only max_seq,
+     * so a failure to read here is not corrected later.  Priming from zeros
+     * therefore publishes a header that under-declares total_rows AND narrows
+     * the file zone map to this flush's own blocks; a zone that does not cover
+     * a block prunes it out of every range query (the same invariant
+     * col_idx_append_publish states where it merges the two).  So distinguish
+     * "no index yet" from "could not read the index": only ENOENT is the
+     * former.  Anything else fails the flush, which keeps the rows in the
+     * memtable + WAL instead of publishing a header that hides them. */
     w->has_zone    = 0;
     w->file_ts_min = INT64_MAX;
     w->file_ts_max = INT64_MIN;
     {
         FILE *idx_r = fopen(w->idx_path, "rb");
+        if (!idx_r && errno != ENOENT) {
+            fprintf(stderr,
+                    "[part] %s: existing index cannot be opened (errno=%d %s); "
+                    "failing the flush rather than republishing it from zeros\n",
+                    w->idx_path, errno, strerror(errno));
+            fclose(w->col_fp);
+            w->col_fp = NULL;
+            return TSDB_ERR_IO;
+        }
         if (idx_r) {
             /* HDD: prefetch whole idx file async via fadvise. */
             tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(part_dir),
@@ -1064,7 +1092,21 @@ static int col_writer_open(col_writer_t *w, const char *part_dir,
             uint64_t mseq = 0;
             int hsz = read_idx_header_ex(hdr, n, &cnt, &ver, &tot,
                                           &fmn, &fmx, &esz, &mseq);
-            if (hsz > 0 && esz > 0) {
+            if (hsz <= 0) {
+                /* The index EXISTS but this binary cannot parse it (corrupt
+                 * magic, or a version it does not know — a rolled-back binary
+                 * beside a newer writer, or a future V5).  Same refusal the
+                 * raw-block applier makes for the same state. */
+                fprintf(stderr,
+                        "[part] %s: existing index is unparseable (corrupt "
+                        "magic or unknown version); failing the flush rather "
+                        "than republishing it from zeros\n", w->idx_path);
+                fclose(idx_r);
+                fclose(w->col_fp);
+                w->col_fp = NULL;
+                return TSDB_ERR_CORRUPT;
+            }
+            if (esz > 0) {
                 w->block_count = cnt;
                 w->total_rows  = tot;
                 w->max_seq     = mseq;  /* preserve prior checkpoint */
@@ -1774,12 +1816,26 @@ static int col_writer_close(col_writer_t *w) {
         /* Read all existing entries from old idx (if any).  Handles v1 /
          * v2 (40-byte entries) and v3 (88-byte entries) transparently —
          * we widen legacy entries to V3 on write-out so the resulting
-         * file is single-format. */
+         * file is single-format.
+         *
+         * THIS PUBLISH REWRITES THE WHOLE MANIFEST, so every entry it does not
+         * read is an entry it DELETES.  Collapsing a failed read into
+         * old_count == 0 renames a manifest holding only this flush's entries
+         * over the N-entry index: the old .col bytes survive but nothing names
+         * them, the caller then clears the memtable and checkpoints the WAL,
+         * and the next compaction rewrites the column from the short manifest —
+         * at which point the rows are gone from disk, RAM and WAL at once.  So
+         * "there is no index" (ENOENT) and "the index could not be read in
+         * full" are kept apart, and only the first may publish; the second
+         * fails the flush and leaves the partition byte-intact, exactly as the
+         * raw-block applier already refuses the same state. */
         uint8_t *old_entries_v3 = NULL;   /* widened to V3 layout */
         uint32_t old_count      = 0;
+        int      old_idx_rc     = TSDB_OK;   /* != OK: unread, must not publish */
 
         {
             FILE *idx_r = fopen(w->idx_path, "rb");
+            if (!idx_r && errno != ENOENT) old_idx_rc = TSDB_ERR_IO;
             if (idx_r) {
                 /* HDD: prefetch the idx file into page cache async. */
                 tsdb_iopolicy_advise_seq_fd(tsdb_iopolicy_detect(w->idx_path),
@@ -1806,6 +1862,7 @@ static int col_writer_close(col_writer_t *w) {
                                                       (uint64_t)ist.st_size,
                                                       w->idx_path);
                 }
+                if (hsz <= 0) old_idx_rc = TSDB_ERR_CORRUPT;
                 if (hsz > 0 && esz > 0) {
                     old_count = cnt;
                     if (old_count > 0) {
@@ -1832,16 +1889,29 @@ static int col_writer_close(col_writer_t *w) {
                                  * reader will skip the fast-path on these
                                  * legacy blocks, which is the safe answer. */
                             } else {
-                                old_count = 0;
+                                old_idx_rc = TSDB_ERR_NOMEM;
                             }
                         } else {
-                            old_count = 0;
+                            /* Declared N entries, the file does not hold them:
+                             * a torn tail, or the read itself failed. */
+                            old_idx_rc = old_raw ? TSDB_ERR_CORRUPT
+                                                 : TSDB_ERR_NOMEM;
                         }
                         free(old_raw);
                     }
                 }
                 fclose(idx_r);
             }
+        }
+
+        if (old_idx_rc != TSDB_OK) {
+            fprintf(stderr,
+                    "[part] %s: existing index declares entries this flush "
+                    "could not read (rc=%d); refusing to rewrite the manifest "
+                    "without them\n", w->idx_path, old_idx_rc);
+            free(old_entries_v3);
+            rc = old_idx_rc;
+            goto idx_published;   /* old idx untouched; .col rolls back below */
         }
 
         /* Atomic manifest publish via temp + rename.  Pre-fix this used
@@ -3500,7 +3570,26 @@ int tsdb_part_open(tsdb_schema_t *s, const char *partition_dir, tsdb_part_t **ou
                                                 &block_count, &idx_version,
                                                 &total_rows_u, &fmn, &fmx,
                                                 &entry_size, NULL);
-        if (hdr_size < 0 || block_count == 0 || entry_size == 0) {
+        if (hdr_size < 0) {
+            /* The idx EXISTS but this binary cannot parse it.  Skipping the
+             * column reads 0 blocks for it, and 0 blocks is not distinguishable
+             * downstream from "this column was added by a later ALTER": for the
+             * ts column the whole partition answers 0 rows, and for a non-ts
+             * column the alignment pass below zero-fills, FABRICATING a value
+             * for every row at rc=0 — which also hides the loss from
+             * anti-entropy, since it compares count/max(ts).  Fail loudly, like
+             * the torn-.col and resource-exhaustion legs, so the partition can
+             * be repaired instead of silently reading empty. */
+            fprintf(stderr,
+                    "[part] %s/%s.idx: unparseable index header (corrupt magic "
+                    "or unknown version); failing the partition open instead "
+                    "of reading the column as empty\n",
+                    partition_dir, s->cols[ci].name);
+            fclose(idx_f);
+            tsdb_part_close(p);
+            return TSDB_ERR_CORRUPT;
+        }
+        if (block_count == 0 || entry_size == 0) {
             fclose(idx_f); continue;
         }
         if (ci == s->ts_col_idx)
