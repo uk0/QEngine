@@ -2,6 +2,7 @@
 #
 # Usage:
 #   deployment/tls-gen.sh                       # one-time cert generation
+#   export TSDB_RPC_SECRET="$(openssl rand -hex 32)"   # shared inter-node secret
 #   docker-compose \
 #     -f deployment/docker-compose.cluster.yml \
 #     -f deployment/docker-compose.cluster.tls.yml \
@@ -13,6 +14,19 @@
 # the dashboard HTTP port 28094 is unchanged — put it behind a reverse
 # proxy (nginx / traefik) for TLS termination.
 #
+# INTER-NODE RPC (port 28081).  Earlier this overlay protected only the
+# client→server wire; the node→node RPC plane — which serves DDL_FORWARD,
+# CATALOG_DUMP and WRITE_BATCH — stayed plaintext AND unauthenticated even
+# here.  It is now closed on both axes:
+#   * TSDB_RPC_SECRET — a shared secret every node must prove (HMAC-SHA256
+#     challenge/response) before any opcode is dispatched.  Supplied from the
+#     environment (or a gitignored deployment/.env), never baked into this
+#     file; compose fails loudly if it is unset, and ALL nodes must share the
+#     same value or they cannot authenticate each other.
+#   * TSDB_RPC_TLS_* — mutual TLS on the RPC channel, reusing the same certs
+#     mounted for the wire plane (peers are addressed by the cert hostnames
+#     qengine-cnode-{1,2,3}, so the existing SANs cover them).
+#
 # Client connection example:
 #   tsdb-cli --host qengine-cnode-1:29301 --tls --tls-ca /path/to/ca.crt
 
@@ -22,6 +36,11 @@ services:
       TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
       TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
       TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+      TSDB_RPC_SECRET: ${TSDB_RPC_SECRET:?set TSDB_RPC_SECRET (same value on every node) to authenticate the inter-node RPC plane}
+      TSDB_RPC_TLS: "1"
+      TSDB_RPC_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_RPC_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_RPC_TLS_CA:   /etc/tsdb/tls/ca.crt
     volumes:
       - ./tls:/etc/tsdb/tls:ro
 
@@ -30,6 +49,11 @@ services:
       TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
       TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
       TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+      TSDB_RPC_SECRET: ${TSDB_RPC_SECRET:?set TSDB_RPC_SECRET (same value on every node) to authenticate the inter-node RPC plane}
+      TSDB_RPC_TLS: "1"
+      TSDB_RPC_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_RPC_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_RPC_TLS_CA:   /etc/tsdb/tls/ca.crt
     volumes:
       - ./tls:/etc/tsdb/tls:ro
 
@@ -38,5 +62,10 @@ services:
       TSDB_TLS_CERT: /etc/tsdb/tls/server.crt
       TSDB_TLS_KEY:  /etc/tsdb/tls/server.key
       TSDB_TLS_CA:   /etc/tsdb/tls/ca.crt
+      TSDB_RPC_SECRET: ${TSDB_RPC_SECRET:?set TSDB_RPC_SECRET (same value on every node) to authenticate the inter-node RPC plane}
+      TSDB_RPC_TLS: "1"
+      TSDB_RPC_TLS_CERT: /etc/tsdb/tls/server.crt
+      TSDB_RPC_TLS_KEY:  /etc/tsdb/tls/server.key
+      TSDB_RPC_TLS_CA:   /etc/tsdb/tls/ca.crt
     volumes:
       - ./tls:/etc/tsdb/tls:ro

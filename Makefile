@@ -94,6 +94,9 @@ TEST_SRCS += tests/test_flush_symtab_rc.c
 # /sql ran with no deadline in both mains; no result-size ceiling; ingest drops
 # uncounted -- request/connection governance for the unauth-by-default HTTP plane.
 TEST_SRCS += tests/test_server_resource_gov.c
+# Inter-node RPC dispatched every opcode (DDL_FORWARD/CATALOG_DUMP/WRITE_BATCH) with
+# no authentication; a shared-secret HMAC handshake now gates dispatch.
+TEST_SRCS += tests/test_rpc_auth.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.

@@ -35,6 +35,13 @@
 #include <sys/time.h>
 #include <time.h>
 
+/* Crypto for the pre-shared-secret RPC auth handshake.  The same OpenSSL the
+ * RBAC layer already links unconditionally (src/catalog/user.c). */
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+
 /* ---- CRC32 (IEEE polynomial, software) ----------------------------------- */
 
 static uint32_t crc32_table[256];
@@ -380,6 +387,118 @@ static void send_reply(int fd, tsdb_tls_conn_t *tls, tsdb_rpc_type_t type,
     if (buf != small) free(buf);
 }
 
+/* ---- Pre-shared-secret RPC authentication --------------------------------
+ *
+ * INVARIANT: when TSDB_RPC_SECRET is set, connection_handler dispatches NO
+ * opcode on a connection until the peer has proved possession of that secret,
+ * and every outbound tsdb_rpc_connect proves it in turn.  The inter-node RPC
+ * plane carries DDL_FORWARD (arbitrary DDL/SELECT via tsdb_query), CATALOG_DUMP
+ * (the whole catalog) and WRITE_BATCH (ingest), and RPC-level TLS is opt-in and
+ * off by default — so a peer that reaches this port unauthenticated is direct,
+ * unlogged access to customer data.  The handshake is the gate.  Secret UNSET
+ * preserves the legacy plaintext plane byte-for-byte (a one-time warning is
+ * logged) so existing clusters keep working.
+ *
+ * Handshake, run after the optional TLS wrap so the bytes ride inside TLS too:
+ *   server -> peer : AUTH_CHALLENGE, 32 random bytes (the nonce)
+ *   peer -> server : AUTH_RESPONSE,  HMAC-SHA256(secret, nonce)  (32 bytes)
+ *   server verifies with a constant-time compare; a mismatch closes the conn.
+ * A single fixed round-trip, never pooled — it is not part of the req/resp id
+ * matching the dispatch loop does. */
+#define RPC_AUTH_NONCE_LEN 32
+#define RPC_AUTH_TAG_LEN   32   /* SHA-256 digest length */
+
+static const char *rpc_auth_secret(void) {
+    const char *s = getenv("TSDB_RPC_SECRET");
+    return (s && *s) ? s : NULL;
+}
+
+static void rpc_auth_warn_impl(void) {
+    fprintf(stderr,
+        "[rpc] WARNING: TSDB_RPC_SECRET is not set — the inter-node RPC plane "
+        "is UNAUTHENTICATED. Any host that can reach this port can run DDL, "
+        "dump the catalog and write data. Set TSDB_RPC_SECRET on every node "
+        "to require a handshake.\n");
+}
+
+/* HMAC-SHA256(secret, msg) -> out[RPC_AUTH_TAG_LEN].  Returns 0 on success. */
+static int rpc_auth_tag(const char *secret, const uint8_t *msg, size_t msg_len,
+                        uint8_t out[RPC_AUTH_TAG_LEN]) {
+    unsigned int outlen = RPC_AUTH_TAG_LEN;
+    unsigned char *r = HMAC(EVP_sha256(), secret, (int)strlen(secret),
+                            msg, msg_len, out, &outlen);
+    return (r && outlen == RPC_AUTH_TAG_LEN) ? 0 : -1;
+}
+
+/* Server side: challenge the freshly-accepted peer and verify its answer.
+ * Returns 0 to admit the connection (authenticated, or no secret configured —
+ * the legacy plane, warned once), -1 to refuse and close.  connection_handler
+ * dispatches no opcode until this returns 0. */
+static int rpc_auth_server_handshake(int fd, tsdb_tls_conn_t *tls) {
+    static pthread_once_t warn_once = PTHREAD_ONCE_INIT;
+    const char *secret = rpc_auth_secret();
+    if (!secret) {
+        pthread_once(&warn_once, rpc_auth_warn_impl);
+        return 0;   /* legacy: admit unauthenticated, wire byte-identical */
+    }
+
+    uint8_t nonce[RPC_AUTH_NONCE_LEN];
+    if (RAND_bytes(nonce, sizeof(nonce)) != 1) return -1;
+    send_reply(fd, tls, TSDB_RPC_AUTH_CHALLENGE, 0, nonce, sizeof(nonce));
+
+    uint8_t hdr_buf[TSDB_RPC_HDR_SIZE];
+    uint8_t *combined = NULL;
+    uint32_t plen = 0;
+    tsdb_rpc_msg_t msg = {0};
+    if (recv_frame(fd, tls, hdr_buf, &combined, &plen, &msg) < 0) return -1;
+
+    /* Short-circuit order matters: expect[] is only read once rpc_auth_tag has
+     * filled it, and CRYPTO_memcmp is constant-time so a wrong tag leaks no
+     * timing about which byte differed. */
+    uint8_t expect[RPC_AUTH_TAG_LEN];
+    int ok = (msg.type == TSDB_RPC_AUTH_RESPONSE &&
+              msg.payload_len == RPC_AUTH_TAG_LEN &&
+              rpc_auth_tag(secret, nonce, sizeof(nonce), expect) == 0 &&
+              CRYPTO_memcmp(expect, msg.payload, RPC_AUTH_TAG_LEN) == 0);
+    uint32_t req_id = msg.req_id;
+    free(combined);
+
+    if (!ok) {
+        send_reply(fd, tls, TSDB_RPC_ERR, req_id, NULL, 0);
+        return -1;
+    }
+    return 0;
+}
+
+/* Client side: answer the server's challenge.  Returns 0 on success (or when
+ * no secret is configured — the legacy plane), -1 to abandon the connection.
+ * Runs inside tsdb_rpc_connect after the optional TLS wrap, before the conn is
+ * handed back, so EVERY outbound caller (raft, replica, db_cluster,
+ * federation, dr_forwarder) authenticates without touching their code. */
+static int rpc_auth_client_handshake(int fd, tsdb_tls_conn_t *tls) {
+    const char *secret = rpc_auth_secret();
+    if (!secret) return 0;   /* legacy plane */
+
+    uint8_t hdr_buf[TSDB_RPC_HDR_SIZE];
+    uint8_t *combined = NULL;
+    uint32_t plen = 0;
+    tsdb_rpc_msg_t msg = {0};
+    if (recv_frame(fd, tls, hdr_buf, &combined, &plen, &msg) < 0) return -1;
+
+    int rc = -1;
+    if (msg.type == TSDB_RPC_AUTH_CHALLENGE &&
+        msg.payload_len == RPC_AUTH_NONCE_LEN) {
+        uint8_t tag[RPC_AUTH_TAG_LEN];
+        if (rpc_auth_tag(secret, msg.payload, msg.payload_len, tag) == 0) {
+            send_reply(fd, tls, TSDB_RPC_AUTH_RESPONSE, msg.req_id,
+                       tag, sizeof(tag));
+            rc = 0;
+        }
+    }
+    free(combined);
+    return rc;
+}
+
 /* Server handler args. */
 typedef struct {
     int                  fd;
@@ -713,6 +832,16 @@ static void *connection_handler(void *arg) {
     struct tsdb_rpc_server *srv = ha->srv;
     free(ha);
     rpc_conn_track_add(srv, fd);
+
+    /* Gate: no opcode below is reached until the peer is authenticated (a
+     * no-op when TSDB_RPC_SECRET is unset).  This is the whole reason the
+     * dispatch switch can trust its input. */
+    if (rpc_auth_server_handshake(fd, tls) != 0) {
+        rpc_conn_track_remove(srv, fd);
+        if (tls) tsdb_tls_close(tls);
+        else     close(fd);
+        return NULL;
+    }
 
     uint8_t hdr_buf[TSDB_RPC_HDR_SIZE];
     for (;;) {
@@ -1719,6 +1848,15 @@ tsdb_rpc_conn_t *tsdb_rpc_connect(const char *addr, int timeout_ms) {
         if (!cc || tsdb_tls_client_wrap(cc, fd, host, &tls) != 0) {
             close(fd); return NULL;
         }
+    }
+
+    /* Prove possession of the shared secret before the conn is usable — a
+     * no-op when TSDB_RPC_SECRET is unset.  Every outbound RPC caller funnels
+     * through here, so this one site authenticates raft, replica, db_cluster,
+     * federation and dr_forwarder alike. */
+    if (rpc_auth_client_handshake(fd, tls) != 0) {
+        if (tls) tsdb_tls_close(tls); else close(fd);
+        return NULL;
     }
 
     tsdb_rpc_conn_t *conn = calloc(1, sizeof(*conn));

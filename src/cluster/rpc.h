@@ -183,7 +183,20 @@ typedef enum {
                                          TSDB_ERR_UNSUPPORTED), and the caller
                                          degrades to the count/max_ts-only
                                          decision — a mixed-version cluster keeps
-                                         working. */
+                                         working. */,
+
+    TSDB_RPC_AUTH_CHALLENGE     = 26, /* server → peer: 32 random nonce bytes.
+                                         Sent as the FIRST frame on every
+                                         accepted connection when
+                                         TSDB_RPC_SECRET is set, before ANY
+                                         opcode is dispatched.  The peer must
+                                         answer AUTH_RESPONSE. */
+    TSDB_RPC_AUTH_RESPONSE      = 27   /* peer → server: HMAC-SHA256(secret,
+                                         nonce), 32 bytes.  The server verifies
+                                         it with a constant-time compare and
+                                         dispatches nothing until it matches.
+                                         Absent (legacy plaintext plane) when
+                                         TSDB_RPC_SECRET is unset. */
 } tsdb_rpc_type_t;
 
 /* Parsed RPC message (received side). */
