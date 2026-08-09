@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 
 /* Forward declaration of mkdir_p from schema.c. */
@@ -687,7 +688,16 @@ void tsdb_close(tsdb_db_t *db) {
                     char sym_path[4096];
                     snprintf(sym_path, sizeof(sym_path), "%s/%s.sym",
                              t->schema->dir, t->schema->cols[ci].name);
-                    tsdb_symtab_save(t->schema->cols[ci].symtab, sym_path);
+                    /* Best-effort final save; unlike the flush path this cannot
+                     * strand blocks (the flush above already aborted on a save
+                     * failure, leaving the rows in the WAL — a reopen rebuilds
+                     * the dict from replay).  Still surface a failure so a full
+                     * disk at shutdown is not silent. */
+                    int src = tsdb_symtab_save(t->schema->cols[ci].symtab, sym_path);
+                    if (src != TSDB_OK)
+                        fprintf(stderr, "[close] %s: SYMBOL dict '%s' save failed "
+                                "rc=%d — rebuilt from WAL on next open\n",
+                                t->name, t->schema->cols[ci].name, src);
                 }
             }
             tsdb_schema_free(t->schema);
@@ -1424,6 +1434,29 @@ static void *trash_gc_main(void *arg) {
     return NULL;
 }
 
+/* Names that resolve — via table_dir_db / the <data_dir>/wal/<name>.log
+ * composition below — to the node's own top-level plumbing rather than to a
+ * table dir.  tsdb_name_is_one_path_component only rejects names that ESCAPE
+ * the data dir (`..`, `/`, leading `.`); a bare `wal` / `catalog` / `raft`
+ * stays inside it and passes, yet table_dir_db maps it onto the live WAL dir,
+ * the catalog, or the raft state.  DROP TABLE wal would then trash_or_rm that
+ * directory and destroy the node while returning TSDB_OK — unauthenticated-
+ * reachable through the RPC DDL_FORWARD path.  These names can never name a
+ * real table (create collides with the live plumbing), so refusing to drop
+ * them costs nothing legitimate.  .trash is already covered by the leading-dot
+ * rejection in tsdb_name_is_one_path_component. */
+static int db_name_is_reserved(const char *name) {
+    static const char *const reserved[] = {
+        "wal", "catalog", "raft",          /* top-level plumbing directories */
+        "node_id", "node_id.tmp",          /* node-identity file + its tmp */
+        "retention.conf",                  /* retention config file */
+        "_backup_manifest.json",           /* backup manifest file */
+    };
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++)
+        if (strcmp(name, reserved[i]) == 0) return 1;
+    return 0;
+}
+
 int tsdb_drop_table(tsdb_db_t *db, const char *name) {
     if (!db || !name) return TSDB_ERR_INVAL;
 
@@ -1440,6 +1473,11 @@ int tsdb_drop_table(tsdb_db_t *db, const char *name) {
      * refusing to delete costs a manual cleanup, while deleting the wrong
      * directory cannot be undone. */
     if (!tsdb_name_is_one_path_component(name)) return TSDB_ERR_INVAL;
+
+    /* Reserved plumbing name → refuse before any destructive syscall.  Same
+     * fail-closed direction as the shape check above: refusing a drop costs a
+     * manual cleanup, destroying the wrong directory cannot be undone. */
+    if (db_name_is_reserved(name)) return TSDB_ERR_INVAL;
 
     pthread_mutex_lock(&db->lock);
 
@@ -1851,7 +1889,19 @@ static void delwm_bump(tsdb_db_t *db, const char *name, int64_t w) {
     if (ok && fsync(fileno(f)) != 0)  ok = 0;
     if (fclose(f) != 0)               ok = 0;
     if (!ok)                       { unlink(tmp); return; }
-    if (rename(tmp, p) != 0)         unlink(tmp);
+    if (rename(tmp, p) != 0)       { unlink(tmp); return; }
+    /* rename(2) is atomic but not durable: the new _delwm dirent (and the
+     * removal of the tmp entry) reach media only after the PARENT directory is
+     * fsync'd.  The tmp+fsync above makes the FILE CONTENT durable; without this
+     * a power cut right after the rename can still lose the dirent, leaving the
+     * table dir with the old _delwm or none — a 0/absent watermark, the exact
+     * anti-entropy-stops-re-asserting failure this function exists to prevent.
+     * Best-effort, same precedent as schema.bin / *.sym publishes: a dir that
+     * rejects fsync just leaves us no worse off than before. */
+    char tdir[4096];
+    table_dir_db(db, name, tdir, sizeof(tdir));
+    int dfd = open(tdir, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
 }
 
 int tsdb_delete_range(tsdb_db_t *db, const char *name,
@@ -1971,6 +2021,10 @@ int tsdb_pitr_trim_to(tsdb_db_t *db, int64_t target_ns,
     pthread_mutex_lock(&db->lock);
     int n = db->ntables;
     const char **names = n > 0 ? calloc((size_t)n, sizeof(*names)) : NULL;
+    if (n > 0 && !names) {          /* OOM: the fill loop below would deref NULL */
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
     int k = 0;
     for (int i = 0; i < n; i++) {
         if (db->tables[i] && db->tables[i]->name[0])
@@ -2000,11 +2054,19 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
 {
     if (!db || !table_name || !col_name) return TSDB_ERR_INVAL;
 
-    /* Find the table, mark it `altering`, and drain in-flight scans to 0 — all
-     * under db->lock.  `altering` makes new tsdb_db_scan_acquire callers wait,
-     * and draining scan_refs waits out existing queries, so no reader is
-     * iterating schema->cols when tsdb_schema_add_column reallocs it below.
-     * DDL is serialised on the cluster, so the table can't be dropped here. */
+    /* Find the table, mark it `altering`, and drain in-flight scans AND any
+     * in-flight compaction pass to 0 — all under db->lock.  `altering` makes new
+     * tsdb_db_scan_acquire callers wait, and draining scan_refs waits out
+     * existing queries, so no reader is iterating schema->cols when
+     * tsdb_schema_add_column reallocs it below.  Draining `compacting` too is
+     * what closes the compaction residual documented in compaction.c: a pass
+     * freezes a schema COPY under compact_mtx, so the realloc is memory-safe, but
+     * a pass that has already frozen its copy when ALTER commits writes the one
+     * partition it is rewriting without the new column (mispaired until the next
+     * pass).  Waiting for compacting==0 before mutating the schema removes that
+     * window.  `compacting` is set/cleared under db->lock (tsdb_db_compact_
+     * acquire/release), so this loop observes it.  DDL is serialised on the
+     * cluster, so the table can't be dropped here. */
     pthread_mutex_lock(&db->lock);
     tsdb_table_internal_t *t = NULL;
     for (int i = 0; i < db->ntables; i++) {
@@ -2014,7 +2076,7 @@ int tsdb_alter_table_add_column(tsdb_db_t *db, const char *table_name,
     }
     if (!t) { pthread_mutex_unlock(&db->lock); return TSDB_ERR_NOTFOUND; }
     t->altering = 1;
-    while (t->scan_refs > 0) {
+    while (t->scan_refs > 0 || t->compacting) {
         pthread_mutex_unlock(&db->lock);
         usleep(1000);
         pthread_mutex_lock(&db->lock);
@@ -2829,7 +2891,26 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
                 char sp[4096];
                 snprintf(sp, sizeof(sp), "%s/%s.sym", t->schema->dir,
                          t->schema->cols[ci].name);
-                (void)tsdb_symtab_save(t->schema->cols[ci].symtab, sp);
+                /* Discarding this rc breaks the "dict durable before its blocks"
+                 * invariant: on failure the flush would still publish the coded
+                 * blocks and then clear the memtable + truncate the WAL below,
+                 * stranding durable blocks against a dict a reopen rebuilds
+                 * DIFFERENTLY — silent WRONG tag values, with the last
+                 * recoverable copy (the WAL) gone.  Abort with the rows still in
+                 * the memtable + WAL, exactly like the part-flush I/O path below;
+                 * a retry re-attempts once the target is writable. */
+                int src = tsdb_symtab_save(t->schema->cols[ci].symtab, sp);
+                if (src != TSDB_OK) {
+                    if (t->db && t->schema->dir)
+                        db_mark_dir_degraded(t->db, t->schema->dir);
+                    /* Log unconditionally (db_mark_dir_degraded is silent on a
+                     * single-volume node): a failed dict save must be visible in
+                     * the log even where there is no stripe to route away from. */
+                    fprintf(stderr, "[flush] %s: SYMBOL dict '%s' save failed "
+                            "rc=%d — flush aborted, rows retained\n",
+                            t->name, t->schema->cols[ci].name, src);
+                    return src;
+                }
             }
         }
     }
@@ -2854,8 +2935,19 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
      * it belongs inside the flush's own day-bucketing, and in flush-on-commit
      * mode there is no checkpoint to filter against at all — commit_seq stays 0,
      * so hwm is 0 and the idx records none. */
-    if (rc == TSDB_ERR_IO && t->db && t->schema && t->schema->dir)
-        db_mark_dir_degraded(t->db, t->schema->dir);
+    if (rc != TSDB_OK) {
+        if (rc == TSDB_ERR_IO && t->db && t->schema && t->schema->dir)
+            db_mark_dir_degraded(t->db, t->schema->dir);
+        /* db_mark_dir_degraded is silent on a single-volume node (n_data_dirs<=1
+         * — nowhere to route away to), and the idle-flush caller discards this
+         * rc, so without this line a failed flush is invisible from both logs
+         * and /metrics: the success-only qengine_flushes_total simply stops
+         * advancing.  A full disk is the common cause; log it unconditionally so
+         * it is not merely inferable.  Every flush caller (commit, flush_all,
+         * idle-flush, alter/truncate/pitr) routes through here. */
+        fprintf(stderr, "[flush] %s: partition flush failed rc=%d — rows retained\n",
+                t->name[0] ? t->name : "?", rc);
+    }
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_flushes_total");
         if (t->db) __atomic_fetch_add(&t->db->flush_seq, 1, __ATOMIC_RELAXED);
@@ -3090,6 +3182,9 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
              * keep the retain-and-drain-on-close behaviour.  Same split as the
              * default flush-on-commit path, which also retains on failure and
              * rolls back only via discard. */
+            fprintf(stderr, "[commit] %s: WAL redo append/fsync failed rc=%d "
+                    "— batch not acked, rows retained\n",
+                    t->name[0] ? t->name : "?", rc);
             return rc;   /* caller either discards (-> rollback) or retains */
         }
         free(b);
@@ -3115,7 +3210,14 @@ int tsdb_batch_commit(tsdb_batch_t *b) {
         } else {
             sync_rc = tsdb_wal_sync(t->wal);
         }
-        if (sync_rc != TSDB_OK) return sync_rc;
+        if (sync_rc != TSDB_OK) {
+            /* WAL fsync is the commit's durability point; a failure here (a full
+             * disk being the usual cause) is returned to the caller but was
+             * otherwise unlogged — surface it so it is visible in the log. */
+            fprintf(stderr, "[commit] %s: WAL sync failed rc=%d — batch not acked\n",
+                    t->name[0] ? t->name : "?", sync_rc);
+            return sync_rc;
+        }
     }
 
     free(b);

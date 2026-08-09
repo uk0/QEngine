@@ -86,6 +86,11 @@ TEST_SRCS += tests/test_write_batch_bounds.c
 # V4 header size with no range check.  Both are in the default gate now.
 TEST_SRCS += tests/test_compact_alter_race.c
 TEST_SRCS += tests/test_compact_idx_version_guard.c
+# DROP TABLE of a reserved plumbing name (wal/catalog/raft) destroyed the node and
+# returned OK; flush discarded a failed SYMBOL-dict save and published coded blocks
+# whose dictionary was never persisted.
+TEST_SRCS += tests/test_drop_reserved.c
+TEST_SRCS += tests/test_flush_symtab_rc.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
