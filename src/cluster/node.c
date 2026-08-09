@@ -39,6 +39,17 @@ struct tsdb_node_manager {
 
     tsdb_hashring_t  *ring;
 
+    /* Ids barred from data ownership because a committed Raft CONFIG
+     * REMOVE evicted them (tsdb_node_manager_set_config_member).  The
+     * hashring used to be driven by gossip alone, so a REMOVEd master
+     * that kept gossiping ALIVE stayed a shard owner forever — the two
+     * membership views diverged by construction.  Gossip still tracks
+     * such nodes (nodes[]); only ownership (ring entry) is gated.  The
+     * set stays tiny: distinct masters ever removed over a cluster's
+     * life, same bound as raft's removed-id memo. */
+    tsdb_node_id_t    cfg_removed[TSDB_CLUSTER_MAX_NODES];
+    int               ncfg_removed;
+
     uint64_t          rng_state;
 };
 
@@ -108,6 +119,16 @@ static int find_node(tsdb_node_manager_t *mgr, tsdb_node_id_t id) {
     return -1;
 }
 
+/* 1 iff a committed CONFIG REMOVE bars `id` from ring ownership.
+ * Must hold mgr->lock. */
+static int cfg_removed_locked(const tsdb_node_manager_t *mgr,
+                               tsdb_node_id_t id) {
+    for (int i = 0; i < mgr->ncfg_removed; i++) {
+        if (mgr->cfg_removed[i] == id) return 1;
+    }
+    return 0;
+}
+
 /* ---- Public membership ops ----------------------------------------------- */
 
 void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
@@ -126,8 +147,10 @@ void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
         mgr->nodes[idx] = *info;
         /* first_seen_ns is local-only: stamp it now. */
         mgr->nodes[idx].first_seen_ns = now_ns();
-        /* Add to hashring only if ALIVE. */
-        if (info->state == TSDB_NODE_ALIVE || info->state == TSDB_NODE_JOINING) {
+        /* Add to hashring only if ALIVE — and not barred by a committed
+         * CONFIG REMOVE (gossip must not re-seat an evicted owner). */
+        if ((info->state == TSDB_NODE_ALIVE || info->state == TSDB_NODE_JOINING) &&
+            !cfg_removed_locked(mgr, info->id)) {
             tsdb_hashring_add(mgr->ring, info->id);
         }
     } else {
@@ -162,11 +185,13 @@ void tsdb_node_manager_upsert(tsdb_node_manager_t *mgr,
                 mgr->nodes[idx].suspect_count = 0;
             }
 
-            /* Sync ring membership. */
+            /* Sync ring membership (subject to the committed-config bar:
+             * a gossip resurrection must not re-seat a REMOVEd owner). */
             int was_in_ring = (old_state == TSDB_NODE_ALIVE || old_state == TSDB_NODE_JOINING);
             int now_in_ring = (info->state == TSDB_NODE_ALIVE || info->state == TSDB_NODE_JOINING);
             if (!was_in_ring && now_in_ring) {
-                tsdb_hashring_add(mgr->ring, info->id);
+                if (!cfg_removed_locked(mgr, info->id))
+                    tsdb_hashring_add(mgr->ring, info->id);
             } else if (was_in_ring && !now_in_ring) {
                 tsdb_hashring_remove(mgr->ring, info->id);
             }
@@ -215,7 +240,45 @@ void tsdb_node_manager_alive(tsdb_node_manager_t *mgr, tsdb_node_id_t id,
             mgr->nodes[idx].version = new_version;
         }
         mgr->nodes[idx].last_heartbeat_ns = now_ns();
-        if (old_state != TSDB_NODE_ALIVE) {
+        if (old_state != TSDB_NODE_ALIVE &&
+            !cfg_removed_locked(mgr, id)) {   /* committed-config bar */
+            tsdb_hashring_add(mgr->ring, id);
+        }
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+/* Committed-config → data-plane ownership coupling (called from the
+ * raft apply thread when a CONFIG entry commits; declared extern in
+ * raft.c rather than node.h because raft is its only caller).
+ *
+ * is_member=0: a committed REMOVE evicted `id` — take it out of the
+ * hashring NOW and bar every gossip-driven re-add until a committed
+ * ADD/SEED re-admits it.  Without the bar the eviction lasted exactly
+ * until the node's next gossip heartbeat.
+ * is_member=1: lift the bar; if gossip currently holds the node
+ * ALIVE/JOINING, seat it in the ring again immediately (its next
+ * heartbeat would otherwise be a no-op — the state is already ALIVE,
+ * so no transition would re-add it). */
+void tsdb_node_manager_set_config_member(tsdb_node_manager_t *mgr,
+                                          tsdb_node_id_t id, int is_member)
+{
+    if (!mgr) return;
+    pthread_mutex_lock(&mgr->lock);
+    int b = -1;
+    for (int i = 0; i < mgr->ncfg_removed; i++) {
+        if (mgr->cfg_removed[i] == id) { b = i; break; }
+    }
+    if (!is_member) {
+        if (b < 0 && mgr->ncfg_removed < TSDB_CLUSTER_MAX_NODES) {
+            mgr->cfg_removed[mgr->ncfg_removed++] = id;
+        }
+        tsdb_hashring_remove(mgr->ring, id);
+    } else if (b >= 0) {
+        mgr->cfg_removed[b] = mgr->cfg_removed[--mgr->ncfg_removed];
+        int idx = find_node(mgr, id);
+        if (idx >= 0 && (mgr->nodes[idx].state == TSDB_NODE_ALIVE ||
+                         mgr->nodes[idx].state == TSDB_NODE_JOINING)) {
             tsdb_hashring_add(mgr->ring, id);
         }
     }

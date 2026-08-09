@@ -45,6 +45,16 @@
 #include "../cluster/rpc.h"
 #include "../../include/tsdb.h"
 
+/* Defined in cluster/node.c (deliberately not in node.h — raft is its
+ * only caller): tells the data-plane node manager whether `id` is a
+ * member of the COMMITTED Raft config.  is_member=0 evicts the node
+ * from the ownership hashring and bars gossip from re-seating it;
+ * is_member=1 lifts the bar.  Called from the apply thread whenever a
+ * CONFIG entry (SEED / ADD / REMOVE) commits, so data ownership follows
+ * committed membership instead of diverging with bare gossip. */
+void tsdb_node_manager_set_config_member(tsdb_node_manager_t *mgr,
+                                          tsdb_node_id_t id, int is_member);
+
 /* --- Tunables --------------------------------------------------------- */
 
 /* Election timeout window (ms).  Randomised per-node to avoid split
@@ -94,6 +104,22 @@ typedef struct {
      * gets a full election timeout before the first quorum check fires.
      * Left at 0 for a peer we have never heard back from. */
     int64_t  last_ack_ns;
+    /* 1 = member of the committed config (or of the pre-SEED gossip
+     * bootstrap set): counts toward quorum, election, CheckQuorum and
+     * commit advancement.  0 = LEARNER — a gossip-visible master not
+     * yet in the committed config.  Learners receive AppendEntries /
+     * InstallSnapshot like any peer so they can catch up, but MUST NOT
+     * enter any quorum arithmetic (§4.2.2): counting an empty-logged
+     * node was exactly the auto-promote-at-match-0 defect. */
+    int      voting;
+    /* Async replication (see replicate_all): repl_inflight is 1 while
+     * a detached worker owns this peer's outbound stream — at most one
+     * worker per peer, which preserves the in-order AppendEntries
+     * stream the next_index/match_index protocol assumes.  repl_again
+     * queues exactly one more sweep for entries appended while the
+     * worker was on the wire. */
+    int      repl_inflight;
+    int      repl_again;
 } peer_t;
 
 struct tsdb_raft {
@@ -168,6 +194,11 @@ struct tsdb_raft {
     pthread_t          tick_thread;
     pthread_t          apply_thread;
     int                tick_running;
+
+    /* Number of live detached replication workers (see replicate_all).
+     * They hold `r`, so tsdb_raft_close must wait for this to reach 0
+     * (signalled on commit_cv) before tearing the object down. */
+    int                repl_active;
 
     /* RNG for election timeout randomisation. */
     unsigned int       rng_seed;
@@ -325,6 +356,30 @@ static void bump_heartbeat_deadline(tsdb_raft_t *r) {
  * flipping this over is safe: a returning partitioned node can't
  * hijack leadership with its inflated term, and an ex-member can't
  * count toward a quorum once its REMOVE commits. */
+static int was_removed_locked(const tsdb_raft_t *r, uint64_t id);
+
+/* (Re)seat r->peers[k] for `id`, carrying replication state over from
+ * the previous peer table when the id was already tracked, and stamping
+ * its voting class.  Carrying repl_inflight/repl_again over is what
+ * keeps the one-worker-per-peer invariant across table rebuilds. */
+static void seat_peer_locked(tsdb_raft_t *r, int k, uint64_t id, int voting) {
+    int found = -1;
+    for (int j = 0; j < r->npeers; j++) {
+        if (r->peers[j].id == id) { found = j; break; }
+    }
+    if (found >= 0) {
+        r->peers[k] = r->peers[found];
+    } else {
+        r->peers[k].id            = id;
+        r->peers[k].next_index    = tsdb_raft_log_last_index(r->log) + 1;
+        r->peers[k].match_index   = 0;
+        r->peers[k].last_ack_ns   = 0;
+        r->peers[k].repl_inflight = 0;
+        r->peers[k].repl_again    = 0;
+    }
+    r->peers[k].voting = voting;
+}
+
 static void rebuild_peers_locked(tsdb_raft_t *r) {
     int k = 0;
 
@@ -334,19 +389,35 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
                                             TSDB_RAFT_CFG_MAX_MASTERS);
         for (int i = 0; i < nm && k < MAX_PEERS; i++) {
             if (mems[i].id == r->self_id) continue;
-            int found = -1;
-            for (int j = 0; j < r->npeers; j++) {
-                if (r->peers[j].id == mems[i].id) { found = j; break; }
+            seat_peer_locked(r, k, mems[i].id, 1);
+            k++;
+        }
+        /* LEARNERS (§4.2.1): gossip-alive masters that are NOT yet in
+         * the committed config.  They are seated as non-voting peers so
+         * the leader's replication sweep catches their log up BEFORE
+         * drive_pending_add may propose their CONFIG_ADD — promoting a
+         * peer straight into the voting set at match_index 0 widened
+         * the quorum onto a node with an empty log and stalled every
+         * commit until it caught up (or forever, if it never did).
+         * Operator-REMOVEd ids are skipped for the same reason
+         * drive_pending_add skips them: removal does not evict a node
+         * from gossip, and replicating to an ex-member would keep it a
+         * shadow participant indefinitely. */
+        tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
+        int n = tsdb_node_manager_snapshot(r->node_mgr, snap,
+                                            TSDB_CLUSTER_MAX_NODES);
+        for (int i = 0; i < n && k < MAX_PEERS; i++) {
+            if (snap[i].id == r->self_id) continue;
+            if (snap[i].role != TSDB_ROLE_MASTER) continue;
+            if (snap[i].state == TSDB_NODE_DEAD) continue;
+            if (was_removed_locked(r, snap[i].id)) continue;
+            int in_cfg = 0;
+            for (int j = 0; j < nm; j++) {
+                if (mems[j].id == snap[i].id) { in_cfg = 1; break; }
             }
-            if (found >= 0) {
-                r->peers[k++] = r->peers[found];
-            } else {
-                r->peers[k].id          = mems[i].id;
-                r->peers[k].next_index  = tsdb_raft_log_last_index(r->log) + 1;
-                r->peers[k].match_index = 0;
-                r->peers[k].last_ack_ns = 0;
-                k++;
-            }
+            if (in_cfg) continue;
+            seat_peer_locked(r, k, snap[i].id, 0);
+            k++;
         }
         r->npeers = k;
         return;
@@ -358,26 +429,22 @@ static void rebuild_peers_locked(tsdb_raft_t *r) {
         if (snap[i].id == r->self_id) continue;
         if (snap[i].role != TSDB_ROLE_MASTER) continue;
         if (snap[i].state == TSDB_NODE_DEAD) continue;
-        int found = -1;
-        for (int j = 0; j < r->npeers; j++) {
-            if (r->peers[j].id == snap[i].id) { found = j; break; }
-        }
-        if (found >= 0) {
-            r->peers[k++] = r->peers[found];
-        } else {
-            r->peers[k].id          = snap[i].id;
-            r->peers[k].next_index  = tsdb_raft_log_last_index(r->log) + 1;
-            r->peers[k].match_index = 0;
-            r->peers[k].last_ack_ns = 0;
-            k++;
-        }
+        /* Pre-SEED bootstrap window: every gossip master is a voter,
+         * or the SEED itself could never gather a quorum. */
+        seat_peer_locked(r, k, snap[i].id, 1);
+        k++;
     }
     r->npeers = k;
 }
 
 static int quorum_needed(const tsdb_raft_t *r) {
-    int total = r->npeers + 1;
-    return total / 2 + 1;
+    /* VOTING members only (§4.2.2).  Learners replicate but must not
+     * change the quorum arithmetic. */
+    int voters = 1; /* self */
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].voting) voters++;
+    }
+    return voters / 2 + 1;
 }
 
 /* Returns 1 if `id` is in the committed member set, 0 otherwise.
@@ -1192,8 +1259,12 @@ static int run_prevote_unlocked(tsdb_raft_t *r) {
     uint64_t last_idx = tsdb_raft_log_last_index(r->log);
     uint64_t last_trm = tsdb_raft_log_last_term(r->log);
     uint64_t peers[MAX_PEERS];
-    int np = r->npeers;
-    for (int i = 0; i < np; i++) peers[i] = r->peers[i].id;
+    int np = 0;
+    /* Voting members only: a learner's grant must not count toward the
+     * pre-vote tally any more than toward the election itself. */
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].voting) peers[np++] = r->peers[i].id;
+    }
     pthread_mutex_unlock(&r->lock);
 
     int granted = 1; /* self */
@@ -1217,8 +1288,13 @@ static void run_election_unlocked(tsdb_raft_t *r) {
     uint64_t last_idx = tsdb_raft_log_last_index(r->log);
     uint64_t last_trm = tsdb_raft_log_last_term(r->log);
     uint64_t peers[MAX_PEERS];
-    int np = r->npeers;
-    for (int i = 0; i < np; i++) peers[i] = r->peers[i].id;
+    int np = 0;
+    /* Only voting members are asked: a learner is not in the committed
+     * config, so its vote could not legally count (§4.2.2) — and the
+     * quorum below is computed over voting members alone. */
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].voting) peers[np++] = r->peers[i].id;
+    }
     pthread_mutex_unlock(&r->lock);
 
     int granted = 1; /* self-vote already counted */
@@ -1267,6 +1343,7 @@ static void check_quorum_locked(tsdb_raft_t *r) {
     int64_t horizon = ms_to_ns(r->election_timeout_ms);
     int alive = 1; /* self always counts */
     for (int i = 0; i < r->npeers; i++) {
+        if (!r->peers[i].voting) continue; /* learners are not quorum */
         if (r->peers[i].last_ack_ns != 0 &&
             now - r->peers[i].last_ack_ns <= horizon) {
             alive++;
@@ -1311,6 +1388,7 @@ static void maybe_advance_commit_locked(tsdb_raft_t *r) {
         if (tsdb_raft_log_term_at(r->log, N) != current) continue;
         int count = 1; /* self */
         for (int i = 0; i < r->npeers; i++) {
+            if (!r->peers[i].voting) continue; /* learner match is not quorum */
             if (r->peers[i].match_index >= N) count++;
         }
         if (count >= quorum) {
@@ -1389,6 +1467,11 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
             int aborted = 0;
             uint32_t off = 0;
             do {
+                /* Shutdown check between chunks: close() waits for this
+                 * worker, so a long multi-chunk transfer must not pin
+                 * teardown for chunks × 5 s.  Racy read, same as the
+                 * tick loop's — worst case one extra chunk. */
+                if (!r->tick_running) { aborted = 1; break; }
                 uint32_t remain = body_len - off;
                 uint32_t take   = remain > CHUNK_MAX ? CHUNK_MAX : remain;
                 uint8_t done    = (take == remain);
@@ -1577,13 +1660,104 @@ done:
     }
 }
 
+/* Detached per-peer replication worker.  replicate_to blocks on the
+ * wire for up to the AppendEntries receive deadline (3 s) — or a whole
+ * chunked InstallSnapshot — so it must never run on the tick thread:
+ * with HEARTBEAT_MS=150 and a 600–1200 ms election window, ONE
+ * unresponsive peer handled inline starved heartbeats to every OTHER
+ * follower past their election deadline and churned leadership.  The
+ * worker re-sweeps while repl_again is set so entries proposed during
+ * an in-flight RPC are picked up without waiting a full heartbeat. */
+typedef struct {
+    tsdb_raft_t *r;
+    uint64_t     peer_id;
+} repl_task_t;
+
+static void *repl_worker_main(void *arg) {
+    repl_task_t task = *(repl_task_t *)arg;
+    free(arg);
+    tsdb_raft_t *r = task.r;
+    for (;;) {
+        replicate_to(r, task.peer_id);
+        pthread_mutex_lock(&r->lock);
+        int again = 0;
+        for (int i = 0; i < r->npeers; i++) {
+            if (r->peers[i].id != task.peer_id) continue;
+            if (r->peers[i].repl_again && r->tick_running &&
+                r->state == TSDB_RAFT_LEADER) {
+                r->peers[i].repl_again = 0;
+                again = 1;
+            } else {
+                /* No queued work (or stepping down / shutting down):
+                 * release single-flight ownership of this peer. */
+                r->peers[i].repl_inflight = 0;
+                r->peers[i].repl_again    = 0;
+            }
+            break;
+        }
+        /* A peer dropped from the table mid-flight leaves the loop
+         * without a hit: there are no flags left to clear, only the
+         * worker count to release below. */
+        if (!again) {
+            r->repl_active--;
+            pthread_cond_broadcast(&r->commit_cv); /* wake close() drain */
+            pthread_mutex_unlock(&r->lock);
+            return NULL;
+        }
+        pthread_mutex_unlock(&r->lock);
+    }
+}
+
+/* Kick one replication sweep toward every peer WITHOUT blocking the
+ * caller (tick thread or proposer) on the wire.  Per-peer single-flight:
+ * a peer whose worker is still out gets repl_again instead of a second
+ * worker, preserving the in-order AE stream per peer. */
 static void replicate_all(tsdb_raft_t *r) {
+    uint64_t inline_ids[MAX_PEERS];
+    int n_inline = 0;
+
     pthread_mutex_lock(&r->lock);
-    uint64_t peers[MAX_PEERS];
-    int np = r->npeers;
-    for (int i = 0; i < np; i++) peers[i] = r->peers[i].id;
+    if (!r->tick_running) {  /* shutting down: no new workers */
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
+    for (int i = 0; i < r->npeers; i++) {
+        if (r->peers[i].repl_inflight) {
+            r->peers[i].repl_again = 1;
+            continue;
+        }
+        repl_task_t *task = malloc(sizeof(*task));
+        int prc = -1;
+        if (task) {
+            task->r       = r;
+            task->peer_id = r->peers[i].id;
+            r->peers[i].repl_inflight = 1;
+            r->peers[i].repl_again    = 0;
+            r->repl_active++;
+            pthread_t th;
+            pthread_attr_t attr;
+            prc = pthread_attr_init(&attr);
+            if (prc == 0) {
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                prc = pthread_create(&th, &attr, repl_worker_main, task);
+                pthread_attr_destroy(&attr);
+            }
+            if (prc != 0) {
+                r->peers[i].repl_inflight = 0;
+                r->repl_active--;
+                free(task);
+            }
+        }
+        if (prc != 0) {
+            /* Thread exhaustion: fall back to the old inline (blocking)
+             * sweep after the lock drops, rather than silently skipping
+             * this peer's heartbeat. */
+            inline_ids[n_inline++] = r->peers[i].id;
+        }
+    }
     pthread_mutex_unlock(&r->lock);
-    for (int i = 0; i < np; i++) replicate_to(r, peers[i]);
+
+    for (int i = 0; i < n_inline; i++) replicate_to(r, inline_ids[i]);
 }
 
 /* Forward decl — propose is defined later; the tick thread needs it
@@ -1743,12 +1917,31 @@ static void drive_pending_add(tsdb_raft_t *r) {
     tsdb_node_info_t snap[TSDB_CLUSTER_MAX_NODES];
     int ns = tsdb_node_manager_snapshot(r->node_mgr, snap,
                                          TSDB_CLUSTER_MAX_NODES);
+    uint64_t last_idx = tsdb_raft_log_last_index(r->log);
     for (int i = 0; i < ns; i++) {
         if (snap[i].id == r->self_id) continue;
         if (snap[i].role != TSDB_ROLE_MASTER) continue;
         if (snap[i].state == TSDB_NODE_DEAD) continue;
         if (config_has_member_locked(r, snap[i].id)) continue; /* already in */
         if (was_removed_locked(r, snap[i].id)) continue;       /* operator-removed */
+        /* LEARNER catch-up gate (§4.2.1): only promote a peer into the
+         * voting set once its replicated log has caught up to our
+         * current last index.  rebuild_peers_locked seats every such
+         * candidate as a non-voting learner, so the heartbeat sweep is
+         * already feeding it entries (or a snapshot); until match_index
+         * reaches last_idx it stays a learner.  Promoting at
+         * match_index 0 widened the quorum onto an empty-logged node
+         * and stalled every subsequent commit behind its full catch-up
+         * — or forever, when the peer was gossip-visible but not
+         * actually reachable. */
+        int caught_up = 0;
+        for (int j = 0; j < r->npeers; j++) {
+            if (r->peers[j].id != snap[i].id) continue;
+            if (!r->peers[j].voting && r->peers[j].match_index >= last_idx)
+                caught_up = 1;
+            break;
+        }
+        if (!caught_up) continue;   /* keep replicating; retry next tick */
         add_id = snap[i].id;
         snprintf(add_addr, sizeof(add_addr), "%s", snap[i].addr);
         break;  /* ONE per tick — §6 single-server change */
@@ -2088,6 +2281,13 @@ void tsdb_raft_close(tsdb_raft_t *r) {
     pthread_mutex_unlock(&r->lock);
     pthread_join(r->tick_thread, NULL);
     pthread_join(r->apply_thread, NULL);
+    /* Detached replication workers hold `r`; tick_running=0 stops new
+     * spawns and re-sweeps, so this drains: each in-flight worker exits
+     * after at most one bounded RPC (workers signal commit_cv on exit). */
+    pthread_mutex_lock(&r->lock);
+    while (r->repl_active > 0)
+        pthread_cond_wait(&r->commit_cv, &r->lock);
+    pthread_mutex_unlock(&r->lock);
     tsdb_raft_rpc_set_handlers(NULL, NULL, NULL, NULL, NULL);
     tsdb_raft_config_close(r->config);
     tsdb_raft_log_close(r->log);
@@ -2149,6 +2349,19 @@ uint64_t tsdb_raft_last_index(tsdb_raft_t *r) {
 }
 uint64_t tsdb_raft_snapshot_index(tsdb_raft_t *r) {
     return r ? tsdb_raft_log_snapshot_index(r->log) : 0;
+}
+
+/* Test-only introspection (declared extern by the raft unit tests, not
+ * part of raft.h): 1 while this node is leader and its current-term
+ * NOOP has not yet committed+applied — i.e. the window in which
+ * configuration changes are refused (§5.4.2 gate). */
+int tsdb_raft_noop_pending(tsdb_raft_t *r);
+int tsdb_raft_noop_pending(tsdb_raft_t *r) {
+    if (!r) return 0;
+    pthread_mutex_lock(&r->lock);
+    int v = (r->state == TSDB_RAFT_LEADER && r->pending_noop) ? 1 : 0;
+    pthread_mutex_unlock(&r->lock);
+    return v;
 }
 
 int tsdb_raft_config_members(tsdb_raft_t *r,
@@ -2318,6 +2531,16 @@ static void *apply_thread_main(void *arg) {
                             else
                                 (void)tsdb_raft_config_remove(r->config, id);
 
+                            /* Couple data ownership to the COMMITTED
+                             * config: gossip alone used to drive the
+                             * hashring, so a REMOVEd master that kept
+                             * gossiping stayed a shard owner forever.
+                             * Runs on live apply AND on restart log
+                             * replay, like the memo below. */
+                            tsdb_node_manager_set_config_member(
+                                r->node_mgr, id,
+                                op == TSDB_RAFT_CFG_OP_ADD ? 1 : 0);
+
                             /* Remember this removal so the leader's
                              * auto-add (drive_pending_add) never resurrects
                              * a member an operator removed — removal does
@@ -2383,6 +2606,14 @@ static void *apply_thread_main(void *arg) {
                             if (valid && nm >= 1) {
                                 (void)tsdb_raft_config_set(r->config,
                                                             members, nm);
+                                /* Seed members are committed owners —
+                                 * clear any ownership bar (relevant on
+                                 * a restart replay where a later ADD
+                                 * follows an earlier REMOVE). */
+                                for (int m = 0; m < nm; m++) {
+                                    tsdb_node_manager_set_config_member(
+                                        r->node_mgr, members[m].id, 1);
+                                }
                             }
                         }
                     }
@@ -2438,6 +2669,22 @@ int tsdb_raft_propose(tsdb_raft_t *r,
     if (r->state != TSDB_RAFT_LEADER) {
         pthread_mutex_unlock(&r->lock);
         return TSDB_ERR_PERMISSION;
+    }
+
+    /* Membership-change safety gate: no CONFIG entry may be proposed
+     * until this leader has committed an entry in its CURRENT term
+     * (the published correction to single-server membership change —
+     * two changes issued by leaders that disagree about the committed
+     * config can otherwise both commit on disjoint quorums).  Until
+     * the term's NOOP commits, this leader cannot know that its local
+     * view of the config is the latest committed one, so all CONFIG
+     * proposals — SEED, ADD, REMOVE — wait behind it.  pending_noop is
+     * set at election and cleared only once the NOOP has committed and
+     * applied, which is exactly that predicate; BUSY tells the caller
+     * to retry, and the tick-driven callers do so on their next pass. */
+    if (type == TSDB_RAFT_ENTRY_CONFIG && r->pending_noop) {
+        pthread_mutex_unlock(&r->lock);
+        return TSDB_ERR_BUSY;
     }
 
     /* Append entry at (last_index + 1) in the current term. */
