@@ -82,6 +82,11 @@ static inline void put_i64le(uint8_t *p, int64_t v)  { put_u64le(p, (uint64_t)v)
 #define IDX_HDR_SZ_V1   20u
 #define IDX_HDR_SZ_V2   36u
 #define IDX_HDR_SZ      40u   /* V3 */
+#define IDX_HDR_SZ_V4   48u   /* V4 — pinned here, NOT TSDB_IDX_HEADER_SIZE:
+                               * that constant tracks the newest writer format,
+                               * so a future V5 bump would silently re-size V4
+                               * files under this reader.  The sizes in this
+                               * table are per-version facts and never move. */
 #define IDX_ENTRY_SZ_V2 40u
 #define IDX_ENTRY_SZ    88u   /* V3 (prefix 40 + stats 48) */
 
@@ -355,6 +360,26 @@ static int compact_column_file(const char *part_dir,
     uint16_t idx_ver     = get_u16le(hdr_buf + 8);
     uint64_t total_rows  = get_u64le(hdr_buf + 12);
 
+    /* Refuse ANY idx version this reader was not written for.  Every read
+     * below (block_count/total_rows early-outs included) keys field offsets
+     * off the version, and this mapper used to size unknown versions as V4 —
+     * the same silent-guess class as the V4-read-as-V3 bug that shredded 95%
+     * of a partition's rows: a future V5 file would be sliced at V4 offsets
+     * and merged into garbage.  part.c's shared parser (read_idx_header_ex)
+     * already returns -1 for unknown versions; this hand-rolled copy must be
+     * exactly as strict.  The ceiling is a literal 4 on purpose — bumping the
+     * writer version constant must not auto-widen this reader's gate.
+     * An ERROR, not a skip: compact_partition must veto the whole partition,
+     * because swapping only the siblings of an unreadable column would split
+     * the partition's single shared block layout. */
+    if (idx_ver < 1 || idx_ver > 4) {
+        fprintf(stderr, "[compact] %s: unknown idx version %u; refusing to "
+                "compact this partition\n", idx_path, idx_ver);
+        fclose(idx_f);
+        munmap(col_map, map_len);
+        return TSDB_ERR_CORRUPT;
+    }
+
     /* Not enough blocks to bother compacting. */
     if (!force && (int)block_count < threshold) {
         fclose(idx_f);
@@ -398,7 +423,7 @@ static int compact_column_file(const char *part_dir,
     int    hdr_sz   = (idx_ver == 1) ? (int)IDX_HDR_SZ_V1
                     : (idx_ver == 2) ? (int)IDX_HDR_SZ_V2
                     : (idx_ver == 3) ? (int)IDX_HDR_SZ
-                                     : (int)TSDB_IDX_HEADER_SIZE;
+                                     : (int)IDX_HDR_SZ_V4;  /* == 4: gated above */
     size_t entry_sz = (idx_ver >= 3 && hdr_n >= IDX_HDR_SZ)
                      ? (size_t)get_u16le(hdr_buf + 36)
                      : (size_t)IDX_ENTRY_SZ_V2;
@@ -407,7 +432,7 @@ static int compact_column_file(const char *part_dir,
     /* Carry the redo checkpoint across the rewrite.  Dropping it (writing a V3
      * header over a V4 partition) resets the partition's recovery cutoff to 0,
      * so the next replay re-applies the whole WAL against already-durable rows. */
-    uint64_t src_max_seq = (idx_ver >= 4 && hdr_n >= TSDB_IDX_HEADER_SIZE)
+    uint64_t src_max_seq = (idx_ver >= 4 && hdr_n >= IDX_HDR_SZ_V4)
                          ? get_u64le(hdr_buf + 40)
                          : 0;
 
@@ -901,6 +926,13 @@ static int read_col_manifest(const char *part_dir, const char *col,
 
 /*
  * Compact one partition directory for the given table (schema + lock).
+ *
+ * `schema` MUST be stable for the whole call: every loop below re-reads
+ * ncols/cols and indexes arrays sized from the first read, so a schema that
+ * mutates mid-call is an OOB index and a UAF, not just a wrong answer.  The
+ * caller (compactor_scan_dir) guarantees this by passing a frozen copy taken
+ * under the table's compact_mtx — never the live schema, which ALTER ADD
+ * COLUMN reallocs in place.
  */
 static int compact_partition(tsdb_schema_t   *schema,
                              const char      *part_dir,
@@ -1016,6 +1048,22 @@ static int compact_partition(tsdb_schema_t   *schema,
          * hand-rolled max is a second thing to keep in step. */
         uint32_t nx = tsdb_part_next_ordinal(schema, part_dir);
         if (nx > ord_base) ord_base = nx;
+    }
+
+    /* Test-only: park between the pre-pass and Phase 1 so a concurrent-DDL
+     * test can deterministically land an ALTER (or rewrite an idx header) in
+     * the window where the per-column arrays are already sized but the column
+     * files have not been re-read.  Same pattern as
+     * TSDB_TEST_COMPACT_RENAME_DELAY_MS below.  Never set in production. */
+    {
+        const char *pd = getenv("TSDB_TEST_COMPACT_PHASE1_DELAY_MS");
+        if (pd && *pd) {
+            int ms = atoi(pd);
+            if (ms > 0) {
+                struct timespec dts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+                nanosleep(&dts, NULL);
+            }
+        }
     }
 
     /* Phase 1 — re-encode each eligible column to .col.tmp/.idx.tmp.  No lock:
@@ -1383,9 +1431,44 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
         /* Retrieve the per-table compact mutex. */
         pthread_mutex_t *cmtx = tsdb_tbl_compact_mtx(tbl);
 
+        /* Freeze the schema for the whole pass.  ALTER TABLE ADD COLUMN
+         * reallocs schema->cols and bumps ncols IN PLACE (db.c, under
+         * compact_mtx), and compact_partition sizes its per-column arrays
+         * (produced/src_blocks/pad_rows) from one read of ncols while its
+         * later loops re-read the live ncols/cols — an ALTER landing mid-pass
+         * therefore indexed those arrays past their allocation (OOB write)
+         * and chased the freed cols array (UAF).  Copy name/type under
+         * compact_mtx — the lock ALTER holds for the mutation, so the copy
+         * can never be torn — and run the entire pass against the copy.  That
+         * closes the memory-safety bug: the copy and the realloc are ordered
+         * by the same lock, so the pass never reads a freed cols array or
+         * writes past an array sized to a different ncols.
+         *
+         * It does NOT stop an ALTER from COMMITTING mid-pass — the ALTER drain
+         * keys on scan_refs, not on `compacting` (db.c) — so a column added
+         * after the freeze has on-disk files this pass does not know about; the
+         * worst case is that one seconds-old column is mispaired in the single
+         * partition being rewritten, corrected on the next pass.  That is a
+         * bounded correctness residual, strictly better than the heap
+         * corruption it replaces, and it closes entirely once the ALTER drain
+         * also keys on `compacting`.  Phase 2's live-block-count staleness
+         * check still guards the pure flush-append race as before. */
+        tsdb_schema_t frozen = { 0 };
+        if (cmtx) pthread_mutex_lock(cmtx);
+        frozen = *schema;
+        frozen.cols = NULL;
+        if (frozen.ncols > 0) {
+            frozen.cols = malloc((size_t)frozen.ncols * sizeof(*frozen.cols));
+            if (frozen.cols)
+                memcpy(frozen.cols, schema->cols,
+                       (size_t)frozen.ncols * sizeof(*frozen.cols));
+        }
+        if (cmtx) pthread_mutex_unlock(cmtx);
+        if (!frozen.cols) { tsdb_db_compact_release(db, tbl); continue; }
+
         /* Enumerate partition subdirs under the table dir. */
         DIR *td = opendir(tbl_dir);
-        if (!td) { tsdb_db_compact_release(db, tbl); continue; }
+        if (!td) { free(frozen.cols); tsdb_db_compact_release(db, tbl); continue; }
 
         struct dirent *pe;
         while ((pe = readdir(td)) != NULL) {
@@ -1406,7 +1489,7 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
             tsdb_compactor_stats_t local_stats;
             memset(&local_stats, 0, sizeof(local_stats));
 
-            compact_partition(schema, part_dir,
+            compact_partition(&frozen, part_dir,
                               c->threshold,
                               cpt_lock, cpt_unlock, (void *)cmtx,
                               &local_stats);
@@ -1424,6 +1507,7 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
             if (c->quit) break;
         }
         closedir(td);
+        free(frozen.cols);
         tsdb_db_compact_release(db, tbl);
 
         /* Memo: record the max partition mtime we observed pre-walk so the next

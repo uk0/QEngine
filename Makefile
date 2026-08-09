@@ -81,6 +81,11 @@ TEST_SRCS += tests/test_show_introspection.c
 # and would have run it either way; `make test` goes through TEST_SRCS, so the
 # regression guard has to be listed here to be part of the default gate.
 TEST_SRCS += tests/test_write_batch_bounds.c
+# ALTER TABLE racing the background compactor was a UAF read of schema->cols plus
+# an OOB write to the per-column arrays; and an unknown idx version mapped to the
+# V4 header size with no range check.  Both are in the default gate now.
+TEST_SRCS += tests/test_compact_alter_race.c
+TEST_SRCS += tests/test_compact_idx_version_guard.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
