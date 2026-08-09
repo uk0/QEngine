@@ -2743,7 +2743,7 @@ static int exec_latest_on(tsdb_table_internal_t *tbl, qast_query_t *q,
     size_t cap = 256;
     uint64_t *seen = calloc(cap, sizeof(uint64_t));
     size_t seen_n = 0;
-    size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+    size_t limit = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
 
     for (ssize_t si = (ssize_t)plan.nsrcs - 1; si >= 0 && r->nrows < limit; si--) {
         scan_src_t *src = &plan.srcs[si];
@@ -3371,7 +3371,7 @@ static int exec_asof_join(tsdb_db_t *db, tsdb_table_internal_t *ltbl,
         if (!rpos) { rc = TSDB_ERR_NOMEM; goto done; }
     }
 
-    size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+    size_t limit = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
 
     for (size_t si = 0; si < lplan.nsrcs && r->nrows < limit; si++) {
         scan_src_t *src = &lplan.srcs[si];
@@ -4486,7 +4486,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         }
 
         /* Emit result from the merged table (tasks[0]). */
-        size_t limit_p = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+        size_t limit_p = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
         if (grc == TSDB_OK) {
             for (size_t i = 0; i < tasks[0].ht_cap && r->nrows < limit_p; i++) {
                 gb_slot_t *slot = &tasks[0].ht[i];
@@ -4557,7 +4557,7 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
         free(agg_scratch); free(ht); scan_plan_free(&plan); return TSDB_ERR_NOMEM;
     }
 
-    size_t limit_rows = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+    size_t limit_rows = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
 
     /* Scan all sources. */
     for (size_t si = 0; si < plan.nsrcs; si++) {
@@ -5028,7 +5028,7 @@ static int exec_interp(tsdb_db_t *db, tsdb_table_internal_t *tbl,
     /* Phase 3: walk aligned grid and emit interpolated rows. */
     int64_t grid_start = (pts[0].ts / interval_ns) * interval_ns;
     int64_t grid_end   = ((pts[pts_n - 1].ts + interval_ns - 1) / interval_ns) * interval_ns;
-    size_t limit_rows  = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+    size_t limit_rows  = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
 
     /* ts_col projection index (may or may not be in projs[0]). */
     int ts_proj = -1;
@@ -6353,9 +6353,10 @@ int tsdb_query_deadline_expired(void) {
  * is safe because tsdb_query is single-threaded per call — parallel
  * scans merge into the same result before we sort. */
 typedef struct {
-    const void  *col_data;
-    tsdb_type_t  type;
-    int          desc;
+    const void    *col_data;
+    tsdb_type_t    type;
+    int            desc;
+    tsdb_symtab_t *symtab;   /* SYMBOL column: resolve codes to strings to sort */
 } ord_ctx_t;
 
 static __thread ord_ctx_t g_ord_ctx;
@@ -6379,9 +6380,25 @@ static int order_cmp_idx(const void *pa, const void *pb) {
         break;
     }
     case TSDB_TYPE_SYMBOL: {
-        uint32_t va = ((const uint32_t *)g_ord_ctx.col_data)[ia];
-        uint32_t vb = ((const uint32_t *)g_ord_ctx.col_data)[ib];
-        c = (va > vb) - (va < vb);
+        /* Result cells are uniform 8-byte slots: the u32 symbol code is
+         * zero-extended into a uint64 (result_append_cell), so read the code
+         * from the LOW 32 bits at an 8-byte stride, NOT as a uint32 array —
+         * a 4-byte stride reads every other cell's half and mis-pairs the sort.
+         * And sort by the STRING the code names, not the code itself: dictionary
+         * codes are assignment-order, so ORDER BY on them is meaningless to a
+         * user asking for alphabetical order. */
+        uint32_t ca = (uint32_t)((const uint64_t *)g_ord_ctx.col_data)[ia];
+        uint32_t cb = (uint32_t)((const uint64_t *)g_ord_ctx.col_data)[ib];
+        if (g_ord_ctx.symtab) {
+            const char *sa = tsdb_symtab_str(g_ord_ctx.symtab, ca);
+            const char *sb = tsdb_symtab_str(g_ord_ctx.symtab, cb);
+            if (sa && sb)      c = (strcmp(sa, sb) > 0) - (strcmp(sa, sb) < 0);
+            else if (sa)       c = 1;   /* a resolved, b did not: a sorts after */
+            else if (sb)       c = -1;
+            else               c = (ca > cb) - (ca < cb);
+        } else {
+            c = (ca > cb) - (ca < cb);  /* no dictionary: stable code order */
+        }
         break;
     }
     default:
@@ -6416,6 +6433,8 @@ static int result_apply_order_by(tsdb_result_t *r, qast_query_t *q,
     g_ord_ctx.col_data = r->col_data[oc];
     g_ord_ctx.type     = r->col_types[oc];
     g_ord_ctx.desc     = (q->order_dir == QAST_ORDER_DESC);
+    g_ord_ctx.symtab   = (r->col_types[oc] == TSDB_TYPE_SYMBOL && r->col_symtab)
+                         ? r->col_symtab[oc] : NULL;
     qsort(idx, n, sizeof(size_t), order_cmp_idx);
 
     /* Permute each column by the index array.  Result cells are uniformly
@@ -6697,7 +6716,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         adv_state_col_idx = resolve_col(s, q->state_col);
 
     size_t rows_emitted = 0;
-    size_t limit = q->has_limit ? (size_t)q->limit : SIZE_MAX;
+    size_t limit = (q->has_limit && !q->has_order) ? (size_t)q->limit : SIZE_MAX;
 
     /* Scratch declared up front so all goto-done paths can free it. */
     void *serial_agg_scratch = NULL;
@@ -8713,6 +8732,16 @@ int tsdb_query(tsdb_db_t *db, const char *qtl, tsdb_result_t **out) {
          * q->order_col is arena-allocated. */
         if (rc == TSDB_OK)
             rc = result_apply_order_by(r, &stmt.u.query, err, sizeof(err));
+        /* LIMIT is applied HERE, after the sort — not during the scan — when an
+         * ORDER BY is present.  The scan-time limit was suppressed (see the
+         * `!q->has_order` guards on each `limit` above) precisely so the sort
+         * sees every candidate row; truncating now yields the true top-N.
+         * Without an ORDER BY the scan already stopped at LIMIT, so nrows is
+         * already <= limit and this is a no-op. */
+        if (rc == TSDB_OK && stmt.u.query.has_order && stmt.u.query.has_limit &&
+            r->nrows > (size_t)stmt.u.query.limit) {
+            r->nrows = (size_t)stmt.u.query.limit;
+        }
         if (qtbl2) tsdb_db_scan_release(db, qtbl2);
         if (qtbl) tsdb_db_scan_release(db, qtbl);
         tsdb_arena_free(&a);

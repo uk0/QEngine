@@ -97,6 +97,9 @@ TEST_SRCS += tests/test_server_resource_gov.c
 # Inter-node RPC dispatched every opcode (DDL_FORWARD/CATALOG_DUMP/WRITE_BATCH) with
 # no authentication; a shared-secret HMAC handshake now gates dispatch.
 TEST_SRCS += tests/test_rpc_auth.c
+# ORDER BY applied LIMIT during the scan then sorted the truncated set (arbitrary
+# top-N), and sorted SYMBOL columns by dictionary code at a 4-byte stride.
+TEST_SRCS += tests/test_orderby_topn.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
