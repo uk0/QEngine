@@ -3790,6 +3790,23 @@ static int gb_merge_into(gb_slot_t **dst_tbl, size_t *dst_cap, size_t *dst_nused
                 if (dp->tdigest && sp->tdigest)
                     tsdb_tdigest_merge(dp->tdigest, sp->tdigest);
                 break;
+            /* UNREACHABLE TODAY, AND BROKEN IF IT EVER BECOMES REACHABLE.
+             * The ts-aggregate arms below are dead: exec_group_by refuses to
+             * run in parallel when any ts-aggregate is projected, so no merge
+             * of these kinds ever happens.  They are left in place because the
+             * gate is the fix, not this code -- but anyone who relaxes that
+             * gate must repair them FIRST:
+             *   - FIRST/LAST copy the float and int payloads but NOT
+             *     ts_first_u32 / ts_last_u32, which is what agg_write emits for
+             *     a SYMBOL column, so first(sym) of a merged group returns
+             *     code 0.
+             *   - TWA only sums the weighted totals and credits nothing for the
+             *     interval BRIDGING two slices, while the divisor still spans
+             *     the whole range, so the result comes out low.  Making it
+             *     exact needs each worker to carry its slice's first
+             *     (ts, value) AND the slices to be totally ordered and disjoint
+             *     in time -- which plan.srcs does not guarantee, since it ends
+             *     with a memtable source that can hold out-of-order rows. */
             case PROJ_AGG_TS_FIRST:
                 if (sp->ts_first < dp->ts_first) {
                     dp->ts_first   = sp->ts_first;

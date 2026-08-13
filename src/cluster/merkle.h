@@ -179,10 +179,23 @@ int tsdb_ae_local_bucket_hashes(tsdb_db_t *db, const char *table,
                                 int64_t bstart, int64_t bend,
                                 uint64_t **out, size_t *out_n);
 
-/* Insert (local_only) every row of `peer_res` whose canonical content hash is
- * NOT in the sorted set lset[0..ln).  Never deletes a local row, never inserts
- * a content-duplicate.  *out_inserted (may be NULL) = rows added.  Returns
- * TSDB_OK or TSDB_ERR_*. */
+/* Insert (local_only) the rows of `peer_res` this node is SHORT of, matching by
+ * canonical content hash against the sorted MULTISET lset[0..ln): each peer row
+ * consumes one local copy, and only peer rows left without one are inserted.
+ * So a hash the peer holds twice and this node holds once inserts exactly one
+ * row -- peer_multiplicity - local_multiplicity overall.  Never deletes a local
+ * row.  Idempotent once converged.
+ *
+ * It DOES insert a content-duplicate when the peer genuinely holds more copies
+ * than this node; an earlier version of this comment promised it never would,
+ * which was the bug: rows carry no primary key, so a repeated (ts, values) is
+ * ordinary data, and the digest in this file fingerprints a multiset
+ * (count/hsum/hxor).  A membership-only merge therefore inserted nothing for a
+ * bucket differing solely by a duplicated row, leaving counts unequal and the
+ * bucket re-pulled from the peer on every sweep, forever.  Suppressing a
+ * double-APPLIED batch is the dedup ledger's job (dedup.c), upstream of this.
+ *
+ * *out_inserted (may be NULL) = rows added.  Returns TSDB_OK or TSDB_ERR_*. */
 int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
                                tsdb_result_t *peer_res,
                                const uint64_t *lset, size_t ln,
