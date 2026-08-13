@@ -326,6 +326,19 @@ static void encode_header(uint8_t hdr[TSDB_RPC_HDR_SIZE],
 /* ---- Per-connection handler ---------------------------------------------- */
 
 /* Recv a complete frame into caller-allocated buffer. */
+/* How long the remainder of an already-started frame may take.  Generous by
+ * design: it must exceed the slowest legitimate body transfer (a 64 MiB
+ * federation result over a congested link), so it is a stall detector, not a
+ * throughput limit.  Zero clears the timeout and restores blocking reads. */
+#define TSDB_RPC_BODY_TIMEOUT_MS 60000
+
+static void rpc_set_recv_timeout(int fd, int ms) {
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 static int recv_frame(int fd, tsdb_tls_conn_t *tls, uint8_t *hdr_buf,
                       uint8_t **payload_out,
                       uint32_t *payload_len_out, tsdb_rpc_msg_t *msg)
@@ -336,8 +349,23 @@ static int recv_frame(int fd, tsdb_tls_conn_t *tls, uint8_t *hdr_buf,
     memcpy(&magic, hdr_buf, 4);
     if (magic != TSDB_RPC_MAGIC) return -1;
 
+    /* Refuse a version this build cannot parse instead of parsing it anyway.
+     * The byte was previously read and discarded, so a future wire revision
+     * would have been misinterpreted field-by-field rather than cleanly
+     * rejected.  This closes the connection rather than replying
+     * TSDB_RPC_ERR_UNSUPPORTED: recv_frame is shared by both directions, so a
+     * reply from here could be emitted on a client socket where the peer is
+     * not expecting one. */
+    if (hdr_buf[4] != TSDB_RPC_VER) return -1;
+
     uint32_t plen;
     memcpy(&plen, hdr_buf + 10, 4);
+
+    /* The length is attacker-controlled and this runs BEFORE any credential
+     * check, so bound it before it becomes an allocation size — see
+     * TSDB_RPC_MAX_PAYLOAD.  Rejecting here costs a forged peer its
+     * connection; trusting it costs the node a ~4 GiB malloc. */
+    if (plen > TSDB_RPC_MAX_PAYLOAD) return -1;
 
     /* One contiguous allocation for header+payload; read the body straight
      * in after the header so tsdb_rpc_decode sees a single buffer without a
@@ -346,9 +374,20 @@ static int recv_frame(int fd, tsdb_tls_conn_t *tls, uint8_t *hdr_buf,
     uint8_t *combined = malloc(total);
     if (!combined) return -1;
     memcpy(combined, hdr_buf, TSDB_RPC_HDR_SIZE);
-    if (plen > 0 && read_full(fd, tls, combined + TSDB_RPC_HDR_SIZE, plen) < 0) {
-        free(combined);
-        return -1;
+    if (plen > 0) {
+        /* Bound the BODY read only.  A receive timeout on the whole socket
+         * would kill idle pooled connections, which legitimately sit for
+         * minutes between requests; but once a header has arrived the rest of
+         * that frame is in flight and a peer that then stalls is pinning this
+         * handler thread for nothing.  Armed here, cleared below, so the
+         * idle-wait for the NEXT header stays blocking as before. */
+        rpc_set_recv_timeout(fd, TSDB_RPC_BODY_TIMEOUT_MS);
+        int body_rc = read_full(fd, tls, combined + TSDB_RPC_HDR_SIZE, plen);
+        rpc_set_recv_timeout(fd, 0);
+        if (body_rc < 0) {
+            free(combined);
+            return -1;
+        }
     }
 
     int consumed = tsdb_rpc_decode(combined, total, msg);

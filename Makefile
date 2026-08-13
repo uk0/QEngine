@@ -100,6 +100,10 @@ TEST_SRCS += tests/test_rpc_auth.c
 # ORDER BY applied LIMIT during the scan then sorted the truncated set (arbitrary
 # top-N), and sorted SYMBOL columns by dictionary code at a 4-byte stride.
 TEST_SRCS += tests/test_orderby_topn.c
+# The RPC read path runs BEFORE the auth handshake: a forged payload_len was
+# trusted straight into malloc, so any host that could reach the port could park
+# arbitrary memory on the node.
+TEST_SRCS += tests/test_rpc_hardening.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.

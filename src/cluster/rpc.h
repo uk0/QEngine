@@ -38,6 +38,19 @@ extern "C" {
 #define TSDB_RPC_VER    1
 #define TSDB_RPC_HDR_SIZE 18u
 
+/* Hard ceiling on a single frame's payload, enforced before the receive buffer
+ * is allocated.  The length field is attacker-controlled on an unauthenticated
+ * socket — the auth handshake gates DISPATCH, not the read below it — so
+ * without a cap one forged 18-byte header makes the node attempt a ~4 GiB
+ * malloc, and a handful of them take it out.
+ *
+ * Sized above the largest frame this build can legitimately produce: the
+ * federation query response encodes into a 64 MiB buffer (see rbufcap in
+ * fedrpc handling), and the anti-entropy pull is chunked under the same
+ * ceiling, so 64 MiB is the real maximum; the extra megabyte covers framing
+ * and leaves the cap comfortably clear of legitimate traffic. */
+#define TSDB_RPC_MAX_PAYLOAD (65u * 1024u * 1024u)
+
 /* RPC type IDs. */
 typedef enum {
     TSDB_RPC_WRITE_BATCH  = 1,
