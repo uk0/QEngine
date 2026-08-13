@@ -24,7 +24,9 @@ IMG="qengine/tsdb:dev"
 
 _cluster_size=3
 
-# Colorised log so scenario output is easy to eyeball in CI.
+# Colorised log so scenario output is easy to eyeball.  These scenarios are
+# NOT part of the CI gate in .github/workflows/ci.yml — they need docker and a
+# built qengine/tsdb:dev image, so they are run by hand.
 say()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 pass() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; exit 1; }

@@ -16,8 +16,17 @@
 #   scripts/test-both-modes.sh --no-build # reuse existing binaries
 #
 # Exit status is non-zero if EITHER mode has a failure.
+#
+# A green run leaves a stamp at $TSDB_GATE_STAMP (default build/gate-passed)
+# holding a token for the tree that was tested; deployment/deploy.sh refuses
+# to ship unless that token still matches.  A red run deletes the stamp, so a
+# pass cannot outlive the run that produced it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# shellcheck source=scripts/gate-token.sh
+. scripts/gate-token.sh
+GATE_STAMP="${TSDB_GATE_STAMP:-build/gate-passed}"
 
 BUILD=1
 [ "${1:-}" = "--no-build" ] && BUILD=0
@@ -73,7 +82,12 @@ run_mode "deferred-flush"  "TSDB_WAL_ONLY_COMMIT=1"; rc_deferred=$?
 echo
 if [ "$rc_default" -eq 0 ] && [ "$rc_deferred" -eq 0 ]; then
     echo "BOTH MODES GREEN"
+    mkdir -p "$(dirname "$GATE_STAMP")"
+    gate_token > "$GATE_STAMP"
     exit 0
 fi
+# Drop any stamp an earlier run left: this tree has just been shown red, and
+# a stamp that survives a failure is worse than none.
+rm -f "$GATE_STAMP"
 echo "FAILURES: flush-on-commit=$rc_default  deferred-flush=$rc_deferred"
 exit 1

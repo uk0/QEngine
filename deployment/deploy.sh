@@ -25,6 +25,7 @@
 #   REMOTE_SRC    — repo path on remote (default /home/nas/tsdb/src)
 #   SKIP_BUILD=1  — reuse out/tsdb_node + dashboard/dist instead of rebuilding
 #   SKIP_DEPLOY=1 — stop after local build (dry-run)
+#   TSDB_GATE_STAMP — gate stamp to consult (default build/gate-passed)
 
 set -euo pipefail
 
@@ -38,6 +39,37 @@ SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "notgit")
 
 say() { printf "\e[36m[deploy]\e[0m %s\n" "$*"; }
 die() { printf "\e[31m[deploy] %s\e[0m\n" "$*" >&2; exit 1; }
+
+# ────────────────────────────────────────────────────────────────────
+# 0. Test gate — must run before anything is built or shipped
+# ────────────────────────────────────────────────────────────────────
+# Step 3b docker-cp's these binaries straight into four running production
+# containers, so this script is the last point at which an untested build can
+# be stopped.  scripts/test-both-modes.sh writes the stamp when both
+# durability modes are green; the token inside it is a digest of the source
+# that was tested, so editing any file after the gate run invalidates it.
+# Exit 3 marks a gate refusal specifically, keeping it distinguishable from a
+# build failure.
+# shellcheck source=../scripts/gate-token.sh
+. scripts/gate-token.sh
+GATE_STAMP="${TSDB_GATE_STAMP:-build/gate-passed}"
+gate_refuse() {
+    printf "\e[31m[deploy] the test gate has not passed for this tree: %s\e[0m\n" "$1" >&2
+    printf "\e[31m[deploy] run: scripts/test-both-modes.sh\e[0m\n" >&2
+    exit 3
+}
+if [[ ! -f "$GATE_STAMP" ]]; then
+    gate_refuse "no stamp at $GATE_STAMP"
+fi
+want=$(gate_token)
+have=$(cat "$GATE_STAMP")
+if [[ "$want" == "nogit" ]]; then
+    gate_refuse "not a git checkout, so no gate pass can be tied to this source"
+fi
+if [[ "$have" != "$want" ]]; then
+    gate_refuse "stamp is for a different tree ($have, this tree is $want)"
+fi
+say "test gate: passed for this tree ($want)"
 
 # ────────────────────────────────────────────────────────────────────
 # 1. Local build

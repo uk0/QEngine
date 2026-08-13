@@ -1,0 +1,123 @@
+name: gate
+
+# Pushing to main must NOT start a build — release artefacts are driven by
+# tags and nothing else (see release.yml).  `branches-ignore: [main]` leaves
+# every other branch running the gate, and because the push trigger carries a
+# branch filter and no tag filter, tag pushes do not reach this workflow
+# either; they belong to release.yml.
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+
+concurrency:
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap and first: the workflow, the TSan harness and the deploy gate check
+  # themselves.  Costs seconds, and catches the "CI file that does not
+  # execute" failure before three platforms spend minutes compiling.
+  selfcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/ci-selfcheck.sh
+
+  gate-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libssl-dev
+      - name: 193-test gate, both durability modes
+        run: bash scripts/test-both-modes.sh
+
+  # macOS arm.  Matrix-driven per the project's runner convention.
+  gate-macos-arm:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The Makefile picks its TLS backend from `pkg-config --libs openssl`
+      # (Makefile:44-45 — the --libs probe decides, --cflags only supplies the
+      # include path).  When that comes back empty it tries mbedtls, and only
+      # if that is missing too does it build with TLS compiled out — a green
+      # run that never touched the TLS paths.  Either fall-through silently
+      # tests something other than the shipped configuration.
+      # Naming the keg makes the probe independent of what the runner image
+      # happens to have linked or exported.
+      #
+      # The failure has to be forced.  `echo "X=$(brew --prefix ...)" >> $GITHUB_ENV`
+      # exits with echo's status, so a missing keg would leave PKG_CONFIG_PATH
+      # pointing at "/lib/pkgconfig" and the build would quietly fall through to
+      # mbedtls or to no TLS at all — green, having tested none of it.  Check the
+      # prefix explicitly instead.
+      - name: point pkg-config at openssl@3
+        run: |
+          set -euo pipefail
+          prefix=$(brew --prefix openssl@3)
+          test -d "$prefix/lib/pkgconfig" \
+            || { echo "openssl@3 pkgconfig not found at $prefix" >&2; exit 1; }
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: 193-test gate, both durability modes
+        run: bash scripts/test-both-modes.sh
+
+  gate-macos-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      # Same forced check as the arm job above: an unchecked command
+      # substitution here would silently build without TLS.
+      - name: point pkg-config at openssl@3
+        run: |
+          set -euo pipefail
+          prefix=$(brew --prefix openssl@3)
+          test -d "$prefix/lib/pkgconfig" \
+            || { echo "openssl@3 pkgconfig not found at $prefix" >&2; exit 1; }
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: 193-test gate, both durability modes
+        run: bash scripts/test-both-modes.sh
+
+  # ThreadSanitizer over the tests whose names are concurrency claims.
+  #
+  # Reporting only, on purpose: the races these tests surface have not been
+  # triaged, fixing engine races is separate work with its own review, and
+  # suppressing them would state that someone decided they are benign.  So
+  # this job runs, publishes its logs, and does not block a merge.  Flip
+  # continue-on-error off once the reports are triaged.
+  tsan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libssl-dev
+      - name: build race tests under tsan
+        run: |
+          scripts/tsan-build.sh \
+            build/test/test_flush_append_race \
+            build/test/test_drop_race \
+            build/test/test_concurrent_writers \
+            build/test/test_continuous_rw \
+            build/test/test_mpmc_ring
+      - name: run race tests under tsan
+        run: |
+          scripts/tsan-run.sh \
+            test_flush_append_race test_drop_race test_concurrent_writers \
+            test_continuous_rw test_mpmc_ring
+      - name: collect tsan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-logs
+          path: /tmp/tsan_*.log
+          if-no-files-found: warn
