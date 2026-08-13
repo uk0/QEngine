@@ -124,11 +124,12 @@ static int shard_replica_n_cached(void);
  *
  * LOCK CONTRACT (consumer side): this hook takes NO storage locks and reads
  * ONLY the schema/memtable arguments handed to it — the caller owns their
- * stability for the duration of the call.  db.c today invokes it under the
- * table's compact_mtx; with the remote-ACK quorum gate the call can now block
- * up to the fanout deadline, so db.c is free to move the invocation OFF the
- * compact lock (snapshotting the memtable first) without any change here.
- * Nothing in this function may ever assume compact_mtx is held.
+ * stability for the duration of the call.  db.c invokes it OUTSIDE the table's
+ * compact_mtx, snapshotting what the hook needs first: with the remote-ACK
+ * quorum gate this call blocks up to the fanout deadline, and compact_mtx also
+ * gates every partition open on the read path, so holding it across the call
+ * stalled reads and writes of the table behind one slow peer.  Nothing in this
+ * function may ever assume compact_mtx is held.
  */
 /* ---- Sender-side dedup stamp (on by default) ----------------------------
  *

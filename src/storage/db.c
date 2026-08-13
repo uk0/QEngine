@@ -44,6 +44,10 @@ static void  trash_or_rm(tsdb_db_t *db, const char *tbl_dir);
  * public entry point that takes/releases the lock for callers without it. */
 static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate);
 static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate);
+/* Waits out an in-flight flush_and_clear_ex; caller holds t->compact_mtx.
+ * Needed by every _locked caller that does NOT hold batch_mu — see the
+ * definition next to flush_and_clear_ex. */
+static void flush_wait_locked(tsdb_table_internal_t *t);
 
 /* ---- Table handle ------------------------------------------------------- */
 
@@ -80,6 +84,17 @@ typedef struct tsdb_table_internal {
      * the cols array during the realloc; ALTER also drains scan_refs to 0
      * first, closing the schema-realloc-vs-lockless-reader race. */
     volatile int         altering;
+    /* Set (under compact_mtx) by flush_and_clear_ex for the whole of one flush,
+     * INCLUDING the stretch where it releases compact_mtx so the cross-node
+     * replication hook can run without stalling readers (they take the same
+     * lock around every tsdb_part_open).  It is what keeps that stretch
+     * serialised: compact_mtx used to do it by being held throughout, and
+     * without a replacement two flushers would both pass the rows>0 check, both
+     * fire on_replicate (DOUBLE replication) and both call part_flush (DOUBLE
+     * on-disk write).  Anything that clears or re-sizes the memtable under
+     * compact_mtx without also holding batch_mu must flush_wait_locked() first
+     * or it pulls the memtable out from under a hook still reading it. */
+    volatile int         flushing;
 
     /* ---- WAL redo log (TSDB_WAL_ONLY_COMMIT crash-durability) ----
      * Only meaningful when db->wal_only_commit is set; zero/untouched in the
@@ -668,9 +683,16 @@ void tsdb_close(tsdb_db_t *db) {
          * compact_mtx and then db->lock (the compactor acquires/releases the
          * table under db->lock strictly outside its compact_mtx swap window),
          * so there is no inversion.  skip_replicate=1 keeps today's semantics:
-         * a bare part_flush fired no replication hook. */
+         * a bare part_flush fired no replication hook.
+         *
+         * flush_wait_locked because close takes no batch_mu: a flush whose
+         * replication hook is still running has released compact_mtx, and
+         * clearing (then freeing, below) the memtable it is reading would be a
+         * use-after-free.  Waiting here is the same wait close already did when
+         * that hook ran under compact_mtx. */
         if (t->memtable) {
             pthread_mutex_lock(&t->compact_mtx);
+            flush_wait_locked(t);
             (void)flush_and_clear_locked(t, /*skip_replicate=*/1);
             pthread_mutex_unlock(&t->compact_mtx);
         }
@@ -1924,6 +1946,12 @@ int tsdb_delete_range(tsdb_db_t *db, const char *name,
     tsdb_partition_unit_t unit = t->schema->partition_unit;
 
     pthread_mutex_lock(&t->compact_mtx);
+    /* DELETE holds no batch_mu, so compact_mtx is its only exclusion against a
+     * concurrent flush — and a flush running its replication hook has released
+     * compact_mtx (see flush_and_clear_ex).  Both the memtable probe below and
+     * the flush it triggers would then race that hook's read of the same
+     * memtable, so wait the flush out first. */
+    flush_wait_locked(t);
 
     /* Rows still in the memtable are invisible to the partition scan below.
      * With TSDB_WAL_ONLY_COMMIT (deferred flush — the cluster's configuration,
@@ -2823,6 +2851,13 @@ static void wal_truncate_if_safe(tsdb_table_internal_t *t) {
  * wrapper.  Splitting the lock acquisition out of the body avoids a
  * deadlock when the caller already needs the lock for related work
  * (schema mutation, etc).
+ *
+ * The ROW-LEVEL replication hook is deliberately NOT here — it lives in
+ * flush_and_clear_ex, which fires it with compact_mtx released (see there).
+ * Every direct caller of this function passes skip_replicate=1, so hoisting it
+ * changed nothing for them.  `skip_replicate` still reaches tsdb_part_flush_ex2
+ * as a NULL db, which suppresses the separate RAW-BLOCK hook; that one fires
+ * per encoded block from inside the flush and stays under the lock.
  */
 static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) {
     if (tsdb_memtable_rows(t->memtable) == 0) return TSDB_OK;
@@ -2840,34 +2875,6 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
      * therefore truncates — so without it the first clean shutdown after a
      * frozen open would delete the tail the freeze exists to protect. */
     if (t->wal_incomplete) return TSDB_ERR_BUSY;
-
-    /* Row-level cluster replication: fires BEFORE flush so data still in
-     * memtable.  Skipped when raw-block mode is active (on_raw_block != NULL)
-     * to avoid double-replication.
-     *
-     * Phase β.2: when shard mode is on and self is a non-owner, the hook
-     * returns TSDB_SKIP_LOCAL after the owners ACK.  We then drop the
-     * local copy entirely (clear memtable, truncate WAL) rather than
-     * persisting a redundant on-disk shard. */
-    int hook_rc = TSDB_OK;
-    if (!skip_replicate && t->db && t->db->on_replicate &&
-        !t->db->on_raw_block) {
-        hook_rc = t->db->on_replicate(t->db->hook_ud, t->db, t->name,
-                                       t->schema, t->memtable);
-        /* Errors other than the skip signal are logged by the hook but
-         * do not abort the local write — falls through to local persist
-         * so the row isn't lost on a flaky owner. */
-    }
-    if (hook_rc == TSDB_SKIP_LOCAL) {
-        tsdb_memtable_clear(t->memtable);
-        wal_truncate_if_safe(t);
-        t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
-        __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
-        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
-        t->mem_has_received = 0;
-        tsdb_metric_inc("qengine_shard_local_skipped_total");
-        return TSDB_OK;
-    }
 
     /* WAL redo checkpoint: the rows about to be flushed are covered by redo
      * records up to commit_seq, so stamp that seq into every partition idx
@@ -2995,16 +3002,100 @@ int tsdb_db_raise_commit_seq(tsdb_db_t *db, const char *table, uint64_t seq) {
     return TSDB_OK;
 }
 
-/* Public wrapper: serialises concurrent batch_commit calls on the same
- * table by wrapping the full flush body (replicate + part_flush + clear)
- * in compact_mtx.  Without this, two callers both pass the rows>0 check,
- * both fire on_replicate (DOUBLE replication), and both call part_flush_ex
- * (DOUBLE on-disk write).  The server-side per-table write lock used to
- * mask this; making the memtable layer self-serialising means the
- * server-side lock is redundant on the WRITE_BATCH wire path. */
+/* Caller holds t->compact_mtx; blocks until no flush_and_clear_ex is in its
+ * hook window, releasing and re-taking the lock while it waits (the same
+ * unlock/usleep/lock shape tsdb_db_scan_acquire uses for `altering`).
+ * Uncontended it does not sleep and does not touch the lock at all: t->flushing
+ * is 0 and it returns on the first test. */
+static void flush_wait_locked(tsdb_table_internal_t *t) {
+    while (t->flushing) {
+        pthread_mutex_unlock(&t->compact_mtx);
+        usleep(1000);
+        pthread_mutex_lock(&t->compact_mtx);
+    }
+}
+
+/*
+ * Public wrapper: the only entry point that fires the row-level replication
+ * hook, and the one that serialises concurrent flushes of the same table.
+ * Without that serialisation two callers both pass the rows>0 check, both fire
+ * on_replicate (DOUBLE replication), and both call part_flush_ex (DOUBLE
+ * on-disk write) — the server-side per-table write lock used to mask that.
+ *
+ * on_replicate is a SYNCHRONOUS cross-node fanout that waits for a remote
+ * quorum ack (seconds when a peer is slow or dead).  compact_mtx is also taken
+ * around every tsdb_part_open on the READ path (src/query/exec.c
+ * scan_plan_build_ex — compaction swaps a partition's .col then .idx under it,
+ * so a reader must not land mid-swap), so firing the hook under compact_mtx
+ * made one unresponsive peer stall every SELECT of that table.  The hook is
+ * therefore fired with the lock RELEASED.
+ *
+ * What each step preserves:
+ *   - flush_wait_locked + t->flushing keep the flush serialised for the whole
+ *     operation, taking over the role compact_mtx played by being held
+ *     throughout.
+ *   - the hook still observes the rows BEFORE they are cleared: nothing clears
+ *     the memtable until the compact_mtx section below, after the hook returns.
+ *   - the memtable stays stable under the hook.  compact_mtx never held a row
+ *     APPEND out — tsdb_batch_row_* / tsdb_batch_append_bulk take only
+ *     batch_mu, which is why tsdb_db_flush_all documents batch_mu as required
+ *     across a flush — so releasing it costs the hook nothing there.  The paths
+ *     that CLEAR or truncate the memtable under compact_mtx are TRUNCATE TABLE
+ *     and ALTER ADD COLUMN (both take batch_mu first) and tsdb_batch_discard
+ *     (inside its caller's batch_mu bracket), plus tsdb_close and
+ *     tsdb_delete_range, which hold no batch_mu and so now flush_wait_locked.
+ *   - no reader sees a half-published partition: publishing is still done
+ *     entirely inside flush_and_clear_locked, under compact_mtx, unchanged.
+ *
+ * With no hook to fire (standalone, raw-block mode, or a replica-received
+ * write) the lock is never dropped and this is the original single
+ * lock/flush/unlock.
+ */
 static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
     pthread_mutex_lock(&t->compact_mtx);
-    int rc = flush_and_clear_locked(t, skip_replicate);
+    flush_wait_locked(t);
+
+    /* Fire only where flush_and_clear_locked would go on to publish: it returns
+     * early on an empty memtable and refuses a frozen log (TSDB_ERR_BUSY), and
+     * replicating rows this call then does not drain would ship them again on
+     * the next flush.  Re-checked inside flush_and_clear_locked below; nothing
+     * can change either condition in between, since batch_mu excludes writers
+     * and t->flushing excludes the other flush paths. */
+    int fire = (!skip_replicate && t->db && t->db->on_replicate &&
+                !t->db->on_raw_block && !t->wal_incomplete &&
+                tsdb_memtable_rows(t->memtable) > 0);
+    if (!fire) {
+        int rc = flush_and_clear_locked(t, skip_replicate);
+        pthread_mutex_unlock(&t->compact_mtx);
+        return rc;
+    }
+    t->flushing = 1;
+    pthread_mutex_unlock(&t->compact_mtx);
+
+    /* Phase β.2: when shard mode is on and self is a non-owner, the hook
+     * returns TSDB_SKIP_LOCAL after the owners ACK.  We then drop the local
+     * copy entirely rather than persisting a redundant on-disk shard.  Errors
+     * other than that skip signal are logged by the hook but do not abort the
+     * local write — we fall through to the local persist so the row isn't lost
+     * on a flaky owner. */
+    int hook_rc = t->db->on_replicate(t->db->hook_ud, t->db, t->name,
+                                       t->schema, t->memtable);
+
+    pthread_mutex_lock(&t->compact_mtx);
+    int rc;
+    if (hook_rc == TSDB_SKIP_LOCAL) {
+        tsdb_memtable_clear(t->memtable);
+        wal_truncate_if_safe(t);
+        t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
+        __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
+        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
+        t->mem_has_received = 0;
+        tsdb_metric_inc("qengine_shard_local_skipped_total");
+        rc = TSDB_OK;
+    } else {
+        rc = flush_and_clear_locked(t, skip_replicate);
+    }
+    t->flushing = 0;
     pthread_mutex_unlock(&t->compact_mtx);
     return rc;
 }
@@ -3566,8 +3657,8 @@ void tsdb_db_scan_release(tsdb_db_t *db, tsdb_table_internal_t *t) {
  * single table's flush failure logs but doesn't abort the whole
  * sweep.
  *
- * skip_replicate=0: replication (row-level on_replicate and the
- * raw-block hook) fires from flush_and_clear_locked, and a memtable
+ * skip_replicate=0: replication (row-level on_replicate from
+ * flush_and_clear_ex, raw-block from the flush itself), and a memtable
  * flushes exactly once — clearing it destroys the only opportunity to
  * ship those rows.  Under flush-on-commit the memtable is already empty
  * here, so this sweep replicates nothing new; under TSDB_WAL_ONLY_COMMIT

@@ -114,6 +114,11 @@ TEST_SRCS += tests/test_bucket_groupby_reject.c
 TEST_SRCS += tests/test_query_silent_partial.c
 TEST_SRCS += tests/test_wb_nrows_bound.c
 TEST_SRCS += tests/test_ae_dup_converge.c
+# Negative timestamps bucketed by truncation and the pow2/general paths
+# disagreed; the replication hook ran under compact_mtx, which also gates every
+# partition open on the read path.
+TEST_SRCS += tests/test_bucket_negative_ts.c
+TEST_SRCS += tests/test_flush_hook_lock.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
