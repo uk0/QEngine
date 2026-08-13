@@ -42,7 +42,17 @@ run_mode() {
         local n; n=$(basename "$b")
         # Skip the integration tests: they need live nodes and their own ports,
         # and are driven by `make test-cluster` / `make test-federation`.
-        case "$n" in test_federation|test_cluster*) continue;; esac
+        #
+        # Named EXPLICITLY, not matched as test_cluster* — that prefix also
+        # swallowed test_cluster_route, a self-contained hashring unit test that
+        # spins up no gossip or RPC at all, so it silently never ran in either
+        # mode while looking like part of the suite.  Keep this list in step
+        # with CLUSTER_TEST_SRCS in the Makefile; a new self-contained test
+        # whose name happens to start with test_cluster now runs by default.
+        case "$n" in
+            test_federation|test_cluster|test_cluster_count_repro|test_cluster_show)
+                continue;;
+        esac
         if env $env_assign timeout 300 "$b" > "/tmp/tbm_${label}_$n.log" 2>&1; then
             pass=$((pass + 1))
         else
