@@ -161,7 +161,15 @@ struct tsdb_memtable {
     tsdb_schema_t   *schema;
     pthread_mutex_t  lock;
 
-    size_t           nrows;       /* committed rows */
+    /* Committed rows.  Mutated only under m->lock, but tsdb_memtable_rows_relaxed
+     * loads it lock-free for the aggregate memtable-budget sweep, so every STORE
+     * goes through __atomic_store_n with RELAXED order: a plain store racing that
+     * load is a data race no matter what order the load uses.  The lock-held
+     * reads stay plain — the lock excludes every writer, and two reads cannot
+     * conflict.  RELAXED is sufficient because nrows publishes no other memory to
+     * the lock-free reader; it only feeds a flush heuristic that tolerates a
+     * count one tick stale. */
+    size_t           nrows;
 
     /* Per-column flat value buffers (malloc'd).
      * Size = block_points * tsdb_type_width(type).
@@ -392,7 +400,7 @@ int tsdb_memtable_row_end(tsdb_memtable_t *m) {
         }
     }
 
-    m->nrows++;
+    __atomic_store_n(&m->nrows, m->nrows + 1, __ATOMIC_RELAXED);
     m->in_row = 0;
     pthread_mutex_unlock(&m->lock);
     return TSDB_OK;
@@ -409,10 +417,21 @@ size_t tsdb_memtable_rows(tsdb_memtable_t *m) {
 size_t tsdb_memtable_rows_relaxed(tsdb_memtable_t *m) {
     if (!m) return 0;
     /* Lock-free relaxed read of the committed-row counter.  nrows is only
-     * mutated under m->lock (row_end, append_bulk), so a relaxed load can
-     * lag a concurrent increment — acceptable for the budget heuristic that
-     * is the sole caller.  Avoids an O(ntables) mutex-acquire storm under
-     * db->lock in trash_gc_main. */
+     * mutated under m->lock (row_end, clear, truncate_to, append_bulk_raw) and
+     * every one of those mutations is a relaxed atomic STORE, which is what
+     * makes this unlocked load race-free rather than merely untorn.  The load
+     * can still lag a concurrent increment, which every caller tolerates —
+     * and there are three, not one:
+     *   db.c trash_gc_main      — sums rows for the over-budget heuristic;
+     *                             a stale count defers a flush by one tick.
+     *   db.c idle_flush_thread  — compares against the previous tick to spot a
+     *                             table that has gone quiet; a stale count at
+     *                             worst delays the idle flush by a tick.
+     *   exec.c stable_has_local — uses the count ONLY as a routing boolean
+     *                             (> 0), never to size or index a buffer.
+     * None of them derives a length or an offset from it, which is what would
+     * make a lagging load unsafe rather than merely approximate.  Avoids an
+     * O(ntables) mutex-acquire storm under db->lock in trash_gc_main. */
     return __atomic_load_n(&m->nrows, __ATOMIC_RELAXED);
 }
 
@@ -430,7 +449,7 @@ int tsdb_memtable_is_full(tsdb_memtable_t *m) {
 void tsdb_memtable_clear(tsdb_memtable_t *m) {
     if (!m) return;
     pthread_mutex_lock(&m->lock);
-    m->nrows  = 0;
+    __atomic_store_n(&m->nrows, 0, __ATOMIC_RELAXED);
     m->in_row = 0;
     m->ts_set = 0;
     if (m->sl_ok) sl_reset(&m->sl);
@@ -458,7 +477,7 @@ int tsdb_memtable_truncate_to(tsdb_memtable_t *m, size_t target_nrows) {
         return TSDB_OK;
     }
 
-    m->nrows = target_nrows;
+    __atomic_store_n(&m->nrows, target_nrows, __ATOMIC_RELAXED);
 
     /* Rebuild the ts skip-list + sortedness state from the surviving prefix.
      * col_bufs are append-only, so rows [0, target_nrows) still hold their
@@ -683,7 +702,7 @@ int tsdb_memtable_append_bulk_raw(tsdb_memtable_t *m,
         }
     }
 
-    m->nrows += n;
+    __atomic_store_n(&m->nrows, m->nrows + n, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&m->lock);
 
     for (int i = 0; i < ncols_data; i++) free(sym_resolved[i]);

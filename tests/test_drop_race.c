@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -38,7 +39,12 @@ static void rm_rf(const char *p) {
 }
 
 static tsdb_db_t *g_db;
-static volatile int g_stop;
+/* Atomic, not volatile: volatile orders nothing between threads, so the plain
+ * read below racing main's write was itself a TSan report — harness noise in a
+ * run whose entire purpose is reading TSan reports about the engine.  relaxed
+ * is sufficient because the flag carries no payload; the pthread_join after the
+ * store is what orders the mutators' last query before tsdb_close. */
+static _Atomic int g_stop;
 #define ITERS 4000
 
 /* Loops DELETE (and occasionally TRUNCATE) on the table — both route through
@@ -46,7 +52,7 @@ static volatile int g_stop;
 static void *mutate_thread(void *ud) {
     (void)ud;
     int i = 0;
-    while (!g_stop) {
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
         tsdb_result_t *r = NULL;
         const char *q = (i++ & 7) == 0
             ? "TRUNCATE TABLE raceT"
@@ -73,7 +79,7 @@ int main(void) {
         (void)tsdb_drop_table(g_db, TBL);
         (void)tsdb_create_table(g_db, TBL, COLS, 2, "ts");
     }
-    g_stop = 1;
+    atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
     pthread_join(m1, NULL);
     pthread_join(m2, NULL);
 

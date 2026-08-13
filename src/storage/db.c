@@ -121,10 +121,10 @@ typedef struct tsdb_table_internal {
      * batch back (the "straddle" case) — detected so we can fail loudly instead
      * of silently pretending a clean rollback. */
     uint64_t             flush_gen;
-    /* idle-flush (tsdb_idle_flush_thread) state — touched only by that thread
-     * under db->lock, except mem_has_local which the write path also sets.
+    /* idle-flush (tsdb_idle_flush_thread) state.
      *  idle_prev_rows : memtable row count at the previous idle tick; a table
      *               whose count is unchanged (and non-zero) has gone quiet.
+     *               Touched only by the idle-flush thread, under db->lock.
      *  mem_has_local : the memtable holds locally-INGESTED rows (a client write
      *               with local_only=0) that have NOT yet been flushed/replicated
      *               to the shard owners.  Set on a local append, cleared on
@@ -139,7 +139,25 @@ typedef struct tsdb_table_internal {
      * such a memtable even when it also holds local rows (a node that both
      * ingests and owns a table): re-sending the received portion to the other
      * replica would duplicate it (the memtable has no ts-dedup).  The local tail
-     * stays visible + WAL-durable locally and drains via the size path. */
+     * stays visible + WAL-durable locally and drains via the size path.
+     *
+     * Access discipline for both flags: __atomic_* with RELAXED order, NOT an
+     * added lock.  Mutual exclusion for the set/clear pairing is already
+     * batch_mu — every append that sets a flag (tsdb_batch_row_ts,
+     * tsdb_batch_append_bulk) and every flush that clears it runs inside the
+     * caller's tsdb_table_lock_write bracket, so db.c cannot take that lock
+     * itself without deadlocking its own callers.  What batch_mu does not cover
+     * is the idle-flush thread's snapshot pass, which reads both flags under
+     * db->lock alone.  Widening that pass to take each table's batch_mu is the
+     * wrong trade: a writer holds batch_mu for its whole begin→commit bracket,
+     * which on a cluster includes the synchronous cross-node fanout that waits
+     * for a remote quorum ack (see flush_and_clear_ex — seconds when a peer is
+     * slow), and the pass would hold db->lock across all of them, stalling
+     * every open/create/drop in the process.  The snapshot read is advisory
+     * anyway: the decision is re-made under batch_mu before anything is
+     * flushed.  RELAXED therefore buys exactly what is missing — a defined,
+     * non-torn load for the advisory read — and neither flag publishes memory,
+     * the rows they describe being ordered by batch_mu and compact_mtx. */
     int                  mem_has_received;
 
     /* ---- WAL redo replay state (compact_mtx-guarded) ----
@@ -206,6 +224,24 @@ struct tsdb_db {
      * last_applied for tens of seconds and stalled all DDL.  A bg thread
      * reclaims .trash (and drains crash leftovers on open). */
     pthread_t        trash_gc_thread;
+    /* Shutdown flag: raised before pthread_create, cleared by tsdb_close,
+     * polled by trash_gc_main.  Accessed only through __atomic_* with RELAXED
+     * order — the clear in tsdb_close and the polls in the GC thread run
+     * concurrently under no common lock, so a plain access pair there is a data
+     * race.  RELAXED suffices because the flag publishes NO MEMORY: it carries
+     * no data of its own, and nothing the GC thread reads is ordered by it —
+     * the pthread_join immediately after the clear is what orders that thread's
+     * work before teardown, and it is the only ordering this shutdown path
+     * relies on.
+     *
+     * Deliberately NOT claimed here: that every other read the GC thread makes
+     * is itself synchronised.  It is not.  db->dir_ok[] is read and written by
+     * trash_gc_main outside db->lock (see the re-probe below) while
+     * db_mark_dir_degraded writes it from the flush path under batch_mu, which
+     * is a separate unsynchronised pair — reachable only when n_data_dirs > 1,
+     * which is why the single-dir test suite never surfaces it under TSan.
+     * Recorded so the next reader does not mistake this flag's correctness for
+     * a general guarantee about the thread. */
     volatile int     trash_gc_running;
     uint64_t         trash_seq;
 
@@ -216,7 +252,14 @@ struct tsdb_db {
      * this flag when over budget; maybe_flush_b then flushes the table being
      * written (on the writer's own thread — no cross-thread flush) so aggregate
      * memory stays bounded and fast writers get natural backpressure.
-     * memtable_budget_rows == 0 disables it (unbounded, legacy behaviour). */
+     * memtable_budget_rows == 0 disables it (unbounded, legacy behaviour).
+     * Accessed only through __atomic_* with RELAXED order: the maintenance
+     * thread stores it after dropping db->lock and every writer loads it
+     * holding just its own table's batch_mu, so the two share no lock.  RELAXED
+     * suffices because the flag orders no other memory — it is a hint whose
+     * only effect is to make the next append on the reader's own thread flush
+     * its own table, and observing a value one maintenance tick stale merely
+     * defers that flush to the next append. */
     volatile int     memtable_over_budget;
     uint64_t         memtable_budget_rows;
 
@@ -313,6 +356,13 @@ struct tsdb_db {
      * on a cluster via an explicit TSDB_WAL_ONLY_COMMIT=1. */
     int                  wal_only_auto;
 };
+
+/* Poll the trash-GC shutdown flag.  Every read of trash_gc_running goes through
+ * here so the atomic access discipline documented at the field is applied in
+ * one place instead of being restated at each of the loop conditions. */
+static inline int db_trash_gc_running(const tsdb_db_t *db) {
+    return __atomic_load_n(&db->trash_gc_running, __ATOMIC_RELAXED);
+}
 
 /* ---- Batch struct ------------------------------------------------------- */
 
@@ -644,9 +694,9 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
 
     /* Background reclaim of trashed (dropped) table dirs; also drains any
      * leftovers from a crash mid-reclaim. */
-    db->trash_gc_running = 1;
+    __atomic_store_n(&db->trash_gc_running, 1, __ATOMIC_RELAXED);
     if (pthread_create(&db->trash_gc_thread, NULL, trash_gc_main, db) != 0)
-        db->trash_gc_running = 0;
+        __atomic_store_n(&db->trash_gc_running, 0, __ATOMIC_RELAXED);
 
     *out = db;
     return TSDB_OK;
@@ -656,8 +706,8 @@ void tsdb_close(tsdb_db_t *db) {
     if (!db) return;
 
     /* Stop the trash GC before tearing the db down. */
-    if (db->trash_gc_running) {
-        db->trash_gc_running = 0;
+    if (db_trash_gc_running(db)) {
+        __atomic_store_n(&db->trash_gc_running, 0, __ATOMIC_RELAXED);
         pthread_join(db->trash_gc_thread, NULL);
     }
 
@@ -1388,9 +1438,9 @@ static void trash_or_rm(tsdb_db_t *db, const char *tbl_dir) {
  * pass after open. */
 static void *trash_gc_main(void *arg) {
     tsdb_db_t *db = (tsdb_db_t *)arg;
-    while (db->trash_gc_running) {
+    while (db_trash_gc_running(db)) {
         int ndirs = db->n_data_dirs > 0 ? db->n_data_dirs : 1;
-        for (int i = 0; i < ndirs && db->trash_gc_running; i++) {
+        for (int i = 0; i < ndirs && db_trash_gc_running(db); i++) {
             const char *dd = db->n_data_dirs > 0 ? db->data_dirs[i] : db->data_dir;
             /* Auto-recovery re-adopt: a dir degraded at open (mkdir/probe
              * failure) or by a flush I/O error is re-probed every pass and
@@ -1418,12 +1468,12 @@ static void *trash_gc_main(void *arg) {
                 }
                 closedir(d);
                 if (nb == 0) break;
-                for (int b = 0; b < nb && db->trash_gc_running; b++) {
+                for (int b = 0; b < nb && db_trash_gc_running(db); b++) {
                     char p[4500];
                     snprintf(p, sizeof(p), "%s/%s", trash_dir, batch[b]);
                     rm_rf(p);
                 }
-                if (!db->trash_gc_running) break;
+                if (!db_trash_gc_running(db)) break;
             }
         }
 
@@ -1439,16 +1489,18 @@ static void *trash_gc_main(void *arg) {
         if (db->memtable_budget_rows > 0) {
             uint64_t total = 0;
             pthread_mutex_lock(&db->lock);
-            for (int ti = 0; ti < db->ntables && db->trash_gc_running; ti++) {
+            for (int ti = 0; ti < db->ntables && db_trash_gc_running(db); ti++) {
                 tsdb_table_internal_t *t = db->tables[ti];
                 if (t && t->memtable) total += tsdb_memtable_rows_relaxed(t->memtable);
             }
             pthread_mutex_unlock(&db->lock);
-            db->memtable_over_budget = (total > db->memtable_budget_rows) ? 1 : 0;
+            __atomic_store_n(&db->memtable_over_budget,
+                             (total > db->memtable_budget_rows) ? 1 : 0,
+                             __ATOMIC_RELAXED);
         }
 
         /* Sleep ~2s, waking often to honour shutdown. */
-        for (int s = 0; s < 20 && db->trash_gc_running; s++) {
+        for (int s = 0; s < 20 && db_trash_gc_running(db); s++) {
             struct timespec ts = { 0, 100 * 1000 * 1000 };
             nanosleep(&ts, NULL);
         }
@@ -2961,8 +3013,9 @@ static int flush_and_clear_locked(tsdb_table_internal_t *t, int skip_replicate) 
         tsdb_memtable_clear(t->memtable);
         t->mem_logged = 0;        /* memtable drained: nothing logged yet */
         __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
-        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
-        t->mem_has_received = 0;
+        /* memtable drained: reset content provenance */
+        __atomic_store_n(&t->mem_has_local, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->mem_has_received, 0, __ATOMIC_RELAXED);
         /* Truncate WAL after the partition (with its checkpoint) is durably
          * published.  Correctness does NOT depend on this — the seq>checkpoint
          * skip dedups even if truncate is skipped — it only bounds WAL size. */
@@ -3088,8 +3141,9 @@ static int flush_and_clear_ex(tsdb_table_internal_t *t, int skip_replicate) {
         wal_truncate_if_safe(t);
         t->mem_logged = 0;        /* dropped rows: their redo (if any) is gone */
         __atomic_fetch_add(&t->flush_gen, 1, __ATOMIC_RELAXED); /* memtable drained */
-        t->mem_has_local = 0;     /* memtable drained: reset content provenance */
-        t->mem_has_received = 0;
+        /* memtable drained: reset content provenance */
+        __atomic_store_n(&t->mem_has_local, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->mem_has_received, 0, __ATOMIC_RELAXED);
         tsdb_metric_inc("qengine_shard_local_skipped_total");
         rc = TSDB_OK;
     } else {
@@ -3143,8 +3197,10 @@ void *tsdb_idle_flush_thread(void *ud) {
             tsdb_table_internal_t *t = db->tables[i];
             if (!t || !t->memtable) continue;
             size_t r = tsdb_memtable_rows_relaxed(t->memtable);
-            if (r > 0 && r == t->idle_prev_rows && t->mem_has_local &&
-                !t->mem_has_received && nflush < TSDB_DB_MAX_TABLES)
+            if (r > 0 && r == t->idle_prev_rows &&
+                __atomic_load_n(&t->mem_has_local, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&t->mem_has_received, __ATOMIC_RELAXED) &&
+                nflush < TSDB_DB_MAX_TABLES)
                 snprintf(names[nflush++], 64, "%s", t->name);
             t->idle_prev_rows = r;
         }
@@ -3157,7 +3213,9 @@ void *tsdb_idle_flush_thread(void *ud) {
             /* Re-check under the write lock: mem_has_local may have cleared (a
              * size-flush drained it) or fresh rows arrived — only replicate a
              * still-local, still-non-empty tail. */
-            if (t->memtable && t->mem_has_local && !t->mem_has_received &&
+            if (t->memtable &&
+                __atomic_load_n(&t->mem_has_local, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&t->mem_has_received, __ATOMIC_RELAXED) &&
                 tsdb_memtable_rows(t->memtable) > 0)
                 (void)flush_and_clear_ex(t, 0);     /* skip_replicate=0 → replicate */
             tsdb_table_unlock_write((tsdb_table_t *)t);
@@ -3182,7 +3240,8 @@ static int maybe_flush_b(tsdb_table_internal_t *t, int skip_replicate) {
      * writer's thread, so no risky cross-thread flush.  The 2048-row floor
      * avoids tiny fragmenting flushes; substantial tables relieve the pressure
      * and the next maintenance pass clears the flag. */
-    if (t->db && t->db->memtable_over_budget &&
+    if (t->db &&
+        __atomic_load_n(&t->db->memtable_over_budget, __ATOMIC_RELAXED) &&
         tsdb_memtable_rows(t->memtable) >= 2048) {
         return flush_and_clear_ex(t, skip_replicate);
     }
@@ -3204,8 +3263,8 @@ int tsdb_batch_row_ts(tsdb_batch_t *b, tsdb_ts_t ts) {
         /* Record memtable-content provenance for the idle-flush: locally
          * ingested (replicate the tail) vs received (never re-replicate).  Set
          * AFTER maybe_flush_b, which clears both on a size-flush. */
-        if (b->local_only) t->mem_has_received = 1;
-        else               t->mem_has_local    = 1;
+        if (b->local_only) __atomic_store_n(&t->mem_has_received, 1, __ATOMIC_RELAXED);
+        else               __atomic_store_n(&t->mem_has_local,    1, __ATOMIC_RELAXED);
     }
     return tsdb_memtable_row_ts(t->memtable, ts);
 }
@@ -3507,8 +3566,8 @@ int tsdb_batch_append_bulk(tsdb_batch_t *b,
      * the memtable (the columnar bulk path — used by influx /write — bypasses
      * the per-row tsdb_batch_row_ts where this is otherwise set). */
     if (tsdb_memtable_rows(b->tbl->memtable) > 0) {
-        if (b->local_only) b->tbl->mem_has_received = 1;
-        else               b->tbl->mem_has_local    = 1;
+        if (b->local_only) __atomic_store_n(&b->tbl->mem_has_received, 1, __ATOMIC_RELAXED);
+        else               __atomic_store_n(&b->tbl->mem_has_local,    1, __ATOMIC_RELAXED);
     }
     return TSDB_OK;
 }

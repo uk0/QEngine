@@ -46,6 +46,7 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <fcntl.h>    /* open() — fsync the partition dir after the backfill swap */
@@ -3560,14 +3561,54 @@ void *tsdb_delwm_reassert_thread(void *ud) {
  */
 __thread int tsdb_g_inside_shard_forward = 0;
 
+/* TSDB_SHARD_REPLICA_N is parsed once per process and reused.  That is a
+ * deliberate choice, not an accident of lazy init: the caller below is on the
+ * SELECT path, and re-reading the environment there would be a getenv() racing
+ * the setenv() that tsdb_open_cluster performs on this very variable when
+ * tsd.conf carries cluster_replica_factor (see the config bridge above).
+ *
+ * The read-once therefore has a precondition worth stating: whoever exports
+ * TSDB_SHARD_REPLICA_N must do so before the first SELECT, because the first
+ * SELECT with a FROM clause is what fills this cache — tsdb_query calls
+ * tsdb_cluster_maybe_forward_select for every db handle, cluster or not, and
+ * the parse below happens before the cluster_get() that would rule a plain
+ * handle out.
+ *
+ * Atomic because two query threads hit this concurrently (TSan: read at the
+ * load below vs write at the store, both from tsdb_cluster_maybe_forward_select
+ * in test_continuous_rw).  relaxed is sufficient on both sides: the cached int
+ * IS the whole payload, so no reader orders any other memory against this load,
+ * and the only ordering that matters — reader sees either the sentinel or a
+ * fully-clamped value — is guaranteed by the single store of an already-clamped
+ * local rather than by a fence.  Losing the init race is harmless: getenv+atoi
+ * is idempotent, so both threads store the same value.
+ *
+ * -1 is the "not parsed yet" sentinel, which is why a configured negative is
+ * clamped to 0 (shard mode off) BEFORE the store and never through the cache. */
+/* THIS PATTERN IS REPO-WIDE AND THE REST OF IT IS STILL PLAIN `int`.
+ * ThreadSanitizer flagged this one because a query path reaches it from two
+ * threads at once, but the same lazy-getenv-into-a-function-static shape sits
+ * unsynchronised at least at: cluster.c:198 (cached_shard_n), cluster.c:237
+ * (cached_quorum), rpc.c:1853 (io_tmo_ms), replica.c:700 (wait_tmo_ms),
+ * replica.c:823 (compress_enabled) and metrics_server.c:505 (g_auth_enabled).
+ * Each is a race wherever two threads can first-touch it concurrently; TSan
+ * simply has not driven those paths in parallel yet.  Fixing one of them is
+ * not fixing the class — that is follow-up work, recorded here rather than
+ * left to be rediscovered.
+ *
+ * This codebase has already been bitten by this shape in a way that had
+ * nothing to do with threads: a cached first-use getenv made a dedup gate
+ * order-dependent, and a test silently verified nothing as a result. */
 static int shard_replica_n_cached(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int n = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (n < 0) {
         const char *s = getenv("TSDB_SHARD_REPLICA_N");
-        cached = s && *s ? atoi(s) : 0;
-        if (cached < 0) cached = 0;
+        n = s && *s ? atoi(s) : 0;
+        if (n < 0) n = 0;
+        atomic_store_explicit(&cached, n, memory_order_relaxed);
     }
-    return cached;
+    return n;
 }
 
 int tsdb_cluster_maybe_forward_select(tsdb_db_t *db,

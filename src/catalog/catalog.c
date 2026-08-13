@@ -32,6 +32,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <stdatomic.h>
 
 /* ---- mkdir_p (forward from schema.c / reimplemented locally) ------------ */
 
@@ -264,7 +265,16 @@ struct tsdb_catalog {
      * from accumulating bloat between restarts.  Stopped on
      * tsdb_catalog_close. */
     pthread_t       compact_thread;
-    volatile int    compact_running;
+    /* Stop flag for the compactor.  Only the thread owning the compactor's
+     * lifetime writes it — open sets 1 (or back to 0 if pthread_create
+     * failed), adopt and close set 0 and then join.  The compactor only
+     * polls it.  Atomic rather than volatile: volatile orders nothing
+     * between threads, and TSan reported close's store against that poll as
+     * a race.  memory_order_relaxed on every access is sufficient because
+     * the flag carries no payload — no other memory is published through
+     * it, and what orders the compactor's last action before the caller
+     * frees the log handles and hmaps is the pthread_join, not this flag. */
+    _Atomic int     compact_running;
     /* Stored paths so the bg thread can call the same compactors
      * the startup path uses. */
     char            db_path[4096];
@@ -492,7 +502,7 @@ static void *catalog_compact_thread(void *arg) {
         }
     }
     int slept = 0;
-    while (c->compact_running) {
+    while (atomic_load_explicit(&c->compact_running, memory_order_relaxed)) {
         /* Sleep the same one second per iteration, but in short slices with the
          * stop flag re-checked between them.  A single 1 s nanosleep made
          * tsdb_catalog_close's pthread_join block for up to a full second on
@@ -500,11 +510,12 @@ static void *catalog_compact_thread(void *arg) {
          * inflated every bench_ingest figure, since that bench times a region
          * that includes tsdb_close (measured: a fixed ~1.00 s regardless of row
          * count, i.e. up to 2x understated throughput). */
-        for (int i = 0; i < 20 && c->compact_running; i++) {
+        for (int i = 0; i < 20 &&
+             atomic_load_explicit(&c->compact_running, memory_order_relaxed); i++) {
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
             nanosleep(&ts, NULL);
         }
-        if (!c->compact_running) break;
+        if (!atomic_load_explicit(&c->compact_running, memory_order_relaxed)) break;
         if (++slept < interval_s) continue;
         slept = 0;
 
@@ -1013,9 +1024,9 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
 
     /* Spawn the background compaction sweeper.  Default interval
      * 5 minutes; tunable via TSDB_CATALOG_COMPACT_INTERVAL_S. */
-    c->compact_running = 1;
+    atomic_store_explicit(&c->compact_running, 1, memory_order_relaxed);
     if (pthread_create(&c->compact_thread, NULL, catalog_compact_thread, c) != 0)
-        c->compact_running = 0;
+        atomic_store_explicit(&c->compact_running, 0, memory_order_relaxed);
 
     shadow_v2_resync(c);   /* no-op unless TSDB_CATALOG_V2 is set */
 
@@ -1044,8 +1055,8 @@ int tsdb_catalog_open(const char *data_dir, tsdb_catalog_t **out) {
 void tsdb_catalog_adopt(tsdb_catalog_t *dst, tsdb_catalog_t *src) {
     if (!dst || !src || dst == src) return;
 
-    if (src->compact_running) {
-        src->compact_running = 0;
+    if (atomic_load_explicit(&src->compact_running, memory_order_relaxed)) {
+        atomic_store_explicit(&src->compact_running, 0, memory_order_relaxed);
         pthread_join(src->compact_thread, NULL);
     }
 
@@ -1111,8 +1122,8 @@ void tsdb_catalog_close(tsdb_catalog_t *c) {
     if (!c) return;
 
     /* Stop the background compactor before tearing down log handles. */
-    if (c->compact_running) {
-        c->compact_running = 0;
+    if (atomic_load_explicit(&c->compact_running, memory_order_relaxed)) {
+        atomic_store_explicit(&c->compact_running, 0, memory_order_relaxed);
         pthread_join(c->compact_thread, NULL);
     }
 
