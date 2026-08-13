@@ -923,8 +923,32 @@ static int apply_filter_expr(eval_ctx_t *ctx, qast_expr_t *e, uint64_t *bm) {
     switch (ct) {
     case TSDB_TYPE_TIMESTAMP:
     case TSDB_TYPE_INT64: {
-        int64_t v = (rhs.k == V_I64) ? rhs.i : (int64_t)rhs.f;
-        rc = tsdb_filter_i64((const int64_t *)ctx->col_bufs[col], ctx->nrows, op, v, tmp);
+        int64_t v;
+        int decided = 0;   /* predicate is constant over the integers */
+        if (rhs.k == V_F64 && rhs.f != floor(rhs.f)) {
+            /* A fractional literal against an integer column.  Casting it to
+             * int64 truncates toward zero and silently moves the boundary:
+             * `v >= 2.5` became `v >= 2` and wrongly admitted 2.  No integer
+             * lies strictly between floor(f) and floor(f)+1, so for a
+             * NON-integral f every ordering test is exactly equivalent to one
+             * against floor(f) — `>= f` and `> f` both mean `> floor(f)`,
+             * `<= f` and `< f` both mean `<= floor(f)` — and equality can
+             * never hold (so `=` is empty and `!=` is total).  floor() is
+             * used for both signs, which is why -1.5 yields > -2, not > -1. */
+            v = (int64_t)floor(rhs.f);
+            switch (op) {
+            case TSDB_CMP_GE: case TSDB_CMP_GT: op = TSDB_CMP_GT; break;
+            case TSDB_CMP_LE: case TSDB_CMP_LT: op = TSDB_CMP_LE; break;
+            case TSDB_CMP_EQ:
+                memset(tmp, 0x00, nw * sizeof(uint64_t)); decided = 1; break;
+            default: /* TSDB_CMP_NE */
+                memset(tmp, 0xFF, nw * sizeof(uint64_t)); decided = 1; break;
+            }
+        } else {
+            v = (rhs.k == V_I64) ? rhs.i : (int64_t)rhs.f;
+        }
+        if (!decided)
+            rc = tsdb_filter_i64((const int64_t *)ctx->col_bufs[col], ctx->nrows, op, v, tmp);
         break;
     }
     case TSDB_TYPE_FLOAT64: {
@@ -2110,13 +2134,31 @@ static void agg_write(proj_t *p, tsdb_schema_t *s, tsdb_result_t *r, int col_idx
         else if (src_t == TSDB_TYPE_FLOAT64) out_f = p->agg_sum_f / (double)p->agg_count;
         else out_f = (double)p->agg_sum_i / (double)p->agg_count;
         break;
+    /* min/max over an EMPTY selection must not hand back the accumulator's
+     * identity element (INT64_MAX / INT64_MIN / +-INF) as if it were a column
+     * value.  "Empty" is agg_count == 0 AND the identity still intact:
+     * agg_count alone is NOT sufficient, because neither merge path
+     * (exec_group_by's gb merge, nor the parallel worker merge) folds
+     * agg_count for MIN/MAX — they merge only the extremum — so a real,
+     * non-empty parallel or grouped min/max arrives here with agg_count == 0.
+     * Requiring both signals leaves every non-empty result bit-identical.
+     * The empty encoding matches what PROJ_AGG_SPREAD below already emits:
+     * NaN for float, 0 for int (results carry no NULL bit). */
     case PROJ_AGG_MIN:
-        if (src_t == TSDB_TYPE_FLOAT64) out_f = p->agg_min_f;
-        else                            out_i = p->agg_min_i;
+        if (src_t == TSDB_TYPE_FLOAT64)
+            out_f = (p->agg_count == 0 && p->agg_min_f == INFINITY)
+                    ? 0.0 / 0.0 : p->agg_min_f;
+        else
+            out_i = (p->agg_count == 0 && p->agg_min_i == INT64_MAX)
+                    ? 0 : p->agg_min_i;
         break;
     case PROJ_AGG_MAX:
-        if (src_t == TSDB_TYPE_FLOAT64) out_f = p->agg_max_f;
-        else                            out_i = p->agg_max_i;
+        if (src_t == TSDB_TYPE_FLOAT64)
+            out_f = (p->agg_count == 0 && p->agg_max_f == -INFINITY)
+                    ? 0.0 / 0.0 : p->agg_max_f;
+        else
+            out_i = (p->agg_count == 0 && p->agg_max_i == INT64_MIN)
+                    ? 0 : p->agg_max_i;
         break;
     case PROJ_AGG_SPREAD:
         if (src_t == TSDB_TYPE_FLOAT64) {
@@ -6476,6 +6518,13 @@ typedef struct {
     int64_t sum_i;
     double  min_f, max_f;
     int64_t min_i, max_i;
+    /* first()/last() payload: the value carried by the row with the smallest /
+     * largest ts folded into this bucket.  ts_first == INT64_MAX and
+     * ts_last == INT64_MIN mean "no row folded yet", so the emit path can tell
+     * an empty accumulator from one holding a genuine value. */
+    int64_t ts_first, ts_last;
+    double  first_f, last_f;
+    int64_t first_i, last_i;
 } bkt_state_t;
 
 /* Runs once per bucket OPEN (a boundary crossing), never per row — the
@@ -6486,11 +6535,117 @@ static void bkt_states_reset(bkt_state_t *st, int n) {
         st[i].sum_f = 0.0;        st[i].sum_i = 0;
         st[i].min_f =  INFINITY;  st[i].max_f = -INFINITY;
         st[i].min_i = INT64_MAX;  st[i].max_i = INT64_MIN;
+        st[i].ts_first = INT64_MAX; st[i].ts_last = INT64_MIN;
+        st[i].first_f = 0.0;      st[i].last_f = 0.0;
+        st[i].first_i = 0;        st[i].last_i = 0;
     }
 }
 
-/* Append the cells of one closed bucket/window row (the caller reserves the
- * row first and bumps r->nrows after).  Single emit shared by all four
+/* ---- Closed-bucket ledger (streaming SAMPLE BY) -------------------------
+ *
+ * The streaming aggregator closes a bucket the moment the scan reports a
+ * different bucket id.  That is sound only while bucket ids arrive
+ * non-decreasing.  A backfilled row — one whose ts falls inside a bucket the
+ * scan already left — used to reset the accumulators and append a SECOND row
+ * for that same bucket, so one logical bucket came back split across two
+ * result rows.  The ledger remembers, for every bucket closed so far, the
+ * result row it was written to and the accumulator state it was written from,
+ * so a regressing row RESUMES the bucket and rewrites that same row.
+ *
+ * Cost is O(distinct buckets): 24 bytes of slot plus, only when some
+ * projection actually keeps per-bucket accumulators (count(*) and
+ * time_bucket() do not — the row count lives in the slot), nprojs
+ * accumulators.  The result the query already materialises is the same order.
+ * Lookup is a bucket-id hash so a heavily out-of-order scan stays linear. */
+typedef struct {
+    int64_t  bucket;   /* bucket start ts — the key                        */
+    size_t   row;      /* index of this bucket's row in the result         */
+    uint64_t rows;     /* rows folded into it when it was last written     */
+} bkt_slot_t;
+
+typedef struct {
+    bkt_slot_t  *slot;    /* n used, cap allocated                          */
+    bkt_state_t *state;   /* cap * nprojs; slot i owns [i*nprojs, +nprojs)  */
+    size_t      *hash;    /* hcap entries; SIZE_MAX means empty             */
+    size_t       n, cap, hcap;
+    int          nprojs;  /* 0 when no projection needs per-bucket state    */
+} bkt_ledger_t;
+
+static uint64_t bkt_key_hash(int64_t b) {
+    uint64_t x = (uint64_t)b;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static size_t bkt_ledger_find(const bkt_ledger_t *L, int64_t bucket) {
+    if (!L->hash) return SIZE_MAX;
+    size_t mask = L->hcap - 1;
+    size_t h = (size_t)(bkt_key_hash(bucket) & mask);
+    for (;;) {
+        size_t si = L->hash[h];
+        if (si == SIZE_MAX) return SIZE_MAX;
+        if (L->slot[si].bucket == bucket) return si;
+        h = (h + 1) & mask;
+    }
+}
+
+/* Insert slot index si (already filled in L->slot) into the open-addressed
+ * index.  The table is kept at most half full, so the probe always ends. */
+static void bkt_ledger_index(bkt_ledger_t *L, size_t si) {
+    size_t mask = L->hcap - 1;
+    size_t h = (size_t)(bkt_key_hash(L->slot[si].bucket) & mask);
+    while (L->hash[h] != SIZE_MAX) h = (h + 1) & mask;
+    L->hash[h] = si;
+}
+
+static int bkt_ledger_grow(bkt_ledger_t *L) {
+    size_t ncap = L->cap ? L->cap * 2 : 64;
+    bkt_slot_t *ns = realloc(L->slot, ncap * sizeof(*ns));
+    if (!ns) return TSDB_ERR_NOMEM;
+    L->slot = ns;
+    if (L->nprojs > 0) {
+        bkt_state_t *nst = realloc(L->state,
+                                   ncap * (size_t)L->nprojs * sizeof(*nst));
+        if (!nst) return TSDB_ERR_NOMEM;
+        L->state = nst;
+    }
+    L->cap = ncap;
+
+    size_t nh = ncap * 2;
+    size_t *nhash = malloc(nh * sizeof(*nhash));
+    if (!nhash) return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < nh; i++) nhash[i] = SIZE_MAX;
+    free(L->hash);
+    L->hash = nhash;
+    L->hcap = nh;
+    for (size_t i = 0; i < L->n; i++) bkt_ledger_index(L, i);
+    return TSDB_OK;
+}
+
+/* Append a slot for `bucket`, whose result row is `row`.  Returns the slot
+ * index, or SIZE_MAX if the ledger could not grow. */
+static size_t bkt_ledger_add(bkt_ledger_t *L, int64_t bucket, size_t row) {
+    if (L->n == L->cap && bkt_ledger_grow(L) != TSDB_OK) return SIZE_MAX;
+    size_t si = L->n++;
+    L->slot[si].bucket = bucket;
+    L->slot[si].row    = row;
+    L->slot[si].rows   = 0;
+    bkt_ledger_index(L, si);
+    return si;
+}
+
+static void bkt_ledger_free(bkt_ledger_t *L) {
+    free(L->slot); free(L->state); free(L->hash);
+    L->slot = NULL; L->state = NULL; L->hash = NULL;
+    L->n = L->cap = L->hcap = 0;
+}
+
+/* Write the cells of one closed bucket/window into result row `row`; the
+ * caller has already reserved capacity for it.  The row index is explicit
+ * rather than r->nrows because a SAMPLE BY bucket the scan regresses back
+ * into is rewritten in place (see bkt_close).  Single emit shared by all
  * flush sites — in-loop SAMPLE BY, ADW_FLUSH, and the two post-scan
  * flushes — so their cell encodings cannot drift apart.
  *
@@ -6508,7 +6663,7 @@ static void bkt_states_reset(bkt_state_t *st, int n) {
  * where accumulation put it. */
 static void bkt_emit_row(tsdb_result_t *r, proj_t *projs, int nprojs,
                          const tsdb_schema_t *s, const bkt_state_t *st,
-                         uint64_t rows, int64_t bucket_start) {
+                         uint64_t rows, int64_t bucket_start, size_t row) {
     for (int pi = 0; pi < nprojs; pi++) {
         proj_t *p = &projs[pi];
         const bkt_state_t *bs = &st[pi];
@@ -6532,17 +6687,141 @@ static void bkt_emit_row(tsdb_result_t *r, proj_t *projs, int nprojs,
             if (src_f) out_f = bs->min_f; else out_i = bs->min_i;
         } else if (p->kind == PROJ_AGG_MAX) {
             if (src_f) out_f = bs->max_f; else out_i = bs->max_i;
+        } else if (p->kind == PROJ_AGG_SPREAD) {
+            /* max-min from the bounds min/max already keep.  The identity test
+             * is the same one agg_write's SPREAD arm uses, and it is load-
+             * bearing here: a bucket can hold rows yet leave the accumulator
+             * untouched (an input bkt_acc_row does not fold, e.g. a SYMBOL
+             * column or an agg over a UDF), and INT64_MIN - INT64_MAX would
+             * overflow.  Empty encodes as NaN for float, 0 for int. */
+            if (src_f)
+                out_f = (rows == 0 || bs->max_f == -INFINITY ||
+                         bs->min_f == INFINITY)
+                        ? 0.0 / 0.0 : bs->max_f - bs->min_f;
+            else
+                out_i = (rows == 0 || bs->max_i == INT64_MIN ||
+                         bs->min_i == INT64_MAX)
+                        ? 0 : bs->max_i - bs->min_i;
+        } else if (p->kind == PROJ_AGG_TS_FIRST) {
+            if (bs->ts_first == INT64_MAX) out_f = 0.0 / 0.0;
+            else if (src_f) out_f = bs->first_f;
+            else out_i = bs->first_i;
+        } else if (p->kind == PROJ_AGG_TS_LAST ||
+                   p->kind == PROJ_AGG_TS_LAST_ROW) {
+            if (bs->ts_last == INT64_MIN) out_f = 0.0 / 0.0;
+            else if (src_f) out_f = bs->last_f;
+            else out_i = bs->last_i;
         } else {
-            /* PROJ_COL and non-streaming agg kinds not supported in bucket
-             * mode — same zero placeholder the old per-site loops wrote. */
-            result_append_cell(r, pi, 0);
+            /* PROJ_COL only.  Every aggregate kind that reaches the streaming
+             * bucket paths is handled above; the ones that are not
+             * (twa/stddev/percentile/p50/p90/p99) are refused up front by
+             * bucket_agg_unsupported() rather than reaching this zero. */
+            ((uint64_t *)r->col_data[pi])[row] = 0;
             continue;
         }
         uint64_t bits;
         if (is_int) memcpy(&bits, &out_i, 8);
         else        memcpy(&bits, &out_f, 8);
-        result_append_cell(r, pi, bits);
+        ((uint64_t *)r->col_data[pi])[row] = bits;
     }
+}
+
+/* Close the open SAMPLE BY bucket: write its row and record its state in the
+ * ledger.  The bucket's FIRST close appends a result row; a later close (the
+ * scan regressed into it and resumed it) rewrites that same row, which is what
+ * keeps one logical bucket to one result row.  rows_emitted therefore counts
+ * distinct buckets, so the LIMIT gates above it keep their meaning. */
+static int bkt_close(tsdb_result_t *r, proj_t *projs, int nprojs,
+                     const tsdb_schema_t *s, const bkt_state_t *st,
+                     uint64_t rows, int64_t bucket, bkt_ledger_t *L,
+                     size_t *rows_emitted) {
+    size_t si = bkt_ledger_find(L, bucket);
+    if (si == SIZE_MAX) {
+        int rc = result_reserve_rows(r, r->nrows + 1);
+        if (rc != TSDB_OK) return rc;
+        si = bkt_ledger_add(L, bucket, r->nrows);
+        if (si == SIZE_MAX) return TSDB_ERR_NOMEM;
+        bkt_emit_row(r, projs, nprojs, s, st, rows, bucket, r->nrows);
+        r->nrows++;
+        (*rows_emitted)++;
+    } else {
+        bkt_emit_row(r, projs, nprojs, s, st, rows, bucket, L->slot[si].row);
+    }
+    L->slot[si].rows = rows;
+    if (L->nprojs > 0)
+        memcpy(&L->state[si * (size_t)L->nprojs], st,
+               (size_t)L->nprojs * sizeof(*st));
+    return TSDB_OK;
+}
+
+/* Fold scan row `i` into every streaming-bucket accumulator.  Shared by the
+ * SAMPLE BY loop and the advanced-window ADW_ACC macro for the same reason
+ * bkt_emit_row is shared by the flush sites: the two must not drift apart.
+ * The caller bumps the per-bucket row counter; this touches only the
+ * per-projection state.  Only FLOAT64 and INT64/TIMESTAMP inputs are folded —
+ * the other stored types have a narrower element than the 8-byte load these
+ * accumulators do, so reading them through this path would run off the buffer. */
+static void bkt_acc_row(bkt_state_t *st, const proj_t *projs, int nprojs,
+                        const tsdb_schema_t *s, void **bufs,
+                        const int64_t *tscol, size_t i) {
+    for (int pi = 0; pi < nprojs; pi++) {
+        proj_kind_t k = projs[pi].kind;
+        /* SUM/AVG/MIN/MAX/SPREAD are the kinds served by sum+min+max; COUNT is
+         * the caller's row counter and needs no per-projection state. */
+        int numeric   = (k >= PROJ_AGG_RANGE_BEGIN && k < PROJ_AGG_COUNT);
+        int firstlast = (k == PROJ_AGG_TS_FIRST || k == PROJ_AGG_TS_LAST ||
+                         k == PROJ_AGG_TS_LAST_ROW);
+        if (!numeric && !firstlast) continue;
+        int col = projs[pi].col;
+        if (col < 0) continue;
+        bkt_state_t *bs = &st[pi];
+        tsdb_type_t ct = qcoltype(s->cols[col].type);
+        /* Strict < / > on the ts, so on a ts tie the earliest-scanned row wins
+         * first()/last() — the same tie-break agg_update_vals applies. */
+        int64_t ts = tscol ? tscol[i] : 0;
+        if (ct == TSDB_TYPE_FLOAT64) {
+            double x = ((const double *)bufs[col])[i];
+            if (numeric) {
+                bs->sum_f += x;
+                if (x < bs->min_f) bs->min_f = x;
+                if (x > bs->max_f) bs->max_f = x;
+            } else {
+                if (ts < bs->ts_first) { bs->ts_first = ts; bs->first_f = x; }
+                if (ts > bs->ts_last)  { bs->ts_last  = ts; bs->last_f  = x; }
+            }
+        } else if (ct == TSDB_TYPE_INT64 || ct == TSDB_TYPE_TIMESTAMP) {
+            int64_t x = ((const int64_t *)bufs[col])[i];
+            if (numeric) {
+                bs->sum_i += x;
+                if (x < bs->min_i) bs->min_i = x;
+                if (x > bs->max_i) bs->max_i = x;
+            } else {
+                if (ts < bs->ts_first) { bs->ts_first = ts; bs->first_i = x; }
+                if (ts > bs->ts_last)  { bs->ts_last  = ts; bs->last_i  = x; }
+            }
+        }
+    }
+}
+
+/* Name of an aggregate the streaming bucket paths cannot compute, or NULL if
+ * every projection is serviceable.  The t-digest kinds need a digest per open
+ * bucket and twa() needs a per-bucket weighted integral; neither accumulator
+ * exists in bkt_state_t, and bkt_emit_row used to answer them with a literal
+ * 0.0 — a wrong number no caller could distinguish from a real one.  Refusing
+ * the query is the honest alternative to inventing a value. */
+static const char *bucket_agg_unsupported(const proj_t *projs, int nprojs) {
+    for (int pi = 0; pi < nprojs; pi++) {
+        switch (projs[pi].kind) {
+        case PROJ_AGG_P50:        return "p50";
+        case PROJ_AGG_P90:        return "p90";
+        case PROJ_AGG_P99:        return "p99";
+        case PROJ_AGG_PERCENTILE: return "percentile";
+        case PROJ_AGG_STDDEV:     return "stddev";
+        case PROJ_AGG_TS_TWA:     return "twa";
+        default:                  break;
+        }
+    }
+    return NULL;
 }
 
 static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
@@ -6704,6 +6983,8 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
     bkt_state_t *bkt_st = NULL;
     uint64_t cur_rows = 0;
     int64_t cur_bucket = INT64_MIN;  /* sentinel: no active bucket */
+    bkt_ledger_t ledger;             /* SAMPLE BY only; see bkt_ledger_t */
+    memset(&ledger, 0, sizeof(ledger));
 
     /* ---- Advanced window extra state ------------------------------------ */
     int64_t adv_prev_ts = INT64_MIN;
@@ -6725,9 +7006,27 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
 
     /* One accumulator per projection for the streaming bucket paths. */
     if (has_agg && (has_sample || q->has_adv_window) && nprojs > 0) {
+        const char *bad = bucket_agg_unsupported(projs, nprojs);
+        if (bad) {
+            eset(err, errcap,
+                 "%s() is not supported with SAMPLE BY or a SESSION/STATE/EVENT "
+                 "window", bad);
+            rc = TSDB_ERR_UNSUPPORTED; goto done;
+        }
         bkt_st = malloc((size_t)nprojs * sizeof(*bkt_st));
         if (!bkt_st) { rc = TSDB_ERR_NOMEM; goto done; }
         bkt_states_reset(bkt_st, nprojs);
+        /* The ledger only has to carry accumulators when some projection keeps
+         * them; count(*) and time_bucket() are answered from the slot's row
+         * count and key alone, which is the shape of the big rollup queries. */
+        if (has_sample) {
+            for (int pi = 0; pi < nprojs; pi++) {
+                proj_kind_t k = projs[pi].kind;
+                if ((k >= PROJ_AGG_RANGE_BEGIN && k < PROJ_AGG_COUNT) ||
+                    k == PROJ_AGG_TS_FIRST || k == PROJ_AGG_TS_LAST ||
+                    k == PROJ_AGG_TS_LAST_ROW) { ledger.nprojs = nprojs; break; }
+            }
+        }
     }
 
     /* ---- Parallel aggregate path --------------------------------------- */
@@ -7190,26 +7489,35 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 int64_t b = tscol[i] - (tscol[i] % bnum);
 
                 if (b != cur_bucket) {
-                    /* Emit the completed bucket that just closed. */
+                    /* Close the bucket that just ended. */
                     if (cur_bucket != INT64_MIN && cur_rows > 0) {
-                        rc = result_reserve_rows(r, r->nrows + 1);
+                        rc = bkt_close(r, projs, nprojs, s, bkt_st, cur_rows,
+                                       cur_bucket, &ledger, &rows_emitted);
                         if (rc != TSDB_OK) {
                             free(bm);
                             for (int c = 0; c < s->ncols; c++)
                                 if (!src->mem && bufs[c]) free(bufs[c]);
                             free(bufs); free(syms); goto done;
                         }
-                        bkt_emit_row(r, projs, nprojs, s, bkt_st,
-                                     cur_rows, cur_bucket);
-                        r->nrows++;
-                        rows_emitted++;
                         /* LIMIT pushdown: stop scanning further rows if limit hit */
                         if (q->has_limit && rows_emitted >= limit) break;
                     }
 
-                    /* Open fresh bucket state for b. */
-                    bkt_states_reset(bkt_st, nprojs);
-                    cur_rows = 0;
+                    /* Open b.  A bucket the scan already closed is RESUMED from
+                     * the ledger — a backfilled row belongs to the row that
+                     * bucket already owns, not to a second one. */
+                    size_t si = bkt_ledger_find(&ledger, b);
+                    if (si != SIZE_MAX) {
+                        if (ledger.nprojs > 0)
+                            memcpy(bkt_st, &ledger.state[si * (size_t)ledger.nprojs],
+                                   (size_t)ledger.nprojs * sizeof(*bkt_st));
+                        else
+                            bkt_states_reset(bkt_st, nprojs);
+                        cur_rows = ledger.slot[si].rows;
+                    } else {
+                        bkt_states_reset(bkt_st, nprojs);
+                        cur_rows = 0;
+                    }
                     cur_bucket = b;
                 }
 
@@ -7217,25 +7525,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                  * once per row, then each aggregate projection into ITS OWN
                  * accumulator — never a neighbour's (see bkt_state_t). */
                 cur_rows++;
-                for (int pi = 0; pi < nprojs; pi++) {
-                    if (projs[pi].kind < PROJ_AGG_RANGE_BEGIN || projs[pi].kind > PROJ_AGG_COUNT) continue;
-                    if (projs[pi].kind == PROJ_AGG_COUNT) continue; /* row count above */
-                    int col = projs[pi].col;
-                    if (col < 0) continue;
-                    bkt_state_t *bs = &bkt_st[pi];
-                    tsdb_type_t ct = qcoltype(s->cols[col].type);
-                    if (ct == TSDB_TYPE_FLOAT64) {
-                        double x = ((const double *)bufs[col])[i];
-                        bs->sum_f += x;
-                        if (x < bs->min_f) bs->min_f = x;
-                        if (x > bs->max_f) bs->max_f = x;
-                    } else {
-                        int64_t x = ((const int64_t *)bufs[col])[i];
-                        bs->sum_i += x;
-                        if (x < bs->min_i) bs->min_i = x;
-                        if (x > bs->max_i) bs->max_i = x;
-                    }
-                }
+                bkt_acc_row(bkt_st, projs, nprojs, s, bufs, tscol, i);
             }
             /* Early-exit the source loop if LIMIT already satisfied */
             if (q->has_limit && rows_emitted >= limit) {
@@ -7264,7 +7554,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                 free(bufs); free(syms); goto done;                                 \
             }                                                                      \
             bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows,                    \
-                         (start_ts_val));                                          \
+                         (start_ts_val), r->nrows);                                \
             r->nrows++;                                                            \
             rows_emitted++;                                                        \
         }                                                                          \
@@ -7282,25 +7572,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
         /* Row count once per row (not per projection); each aggregate       */   \
         /* then folds into ITS OWN accumulator (see bkt_state_t).            */   \
         cur_rows++;                                                                \
-        for (int _pa = 0; _pa < nprojs; _pa++) {                                  \
-            if (projs[_pa].kind < PROJ_AGG_RANGE_BEGIN ||                         \
-                projs[_pa].kind > PROJ_AGG_COUNT) continue;                       \
-            if (projs[_pa].kind == PROJ_AGG_COUNT) continue; /* row count above */ \
-            int _caa = projs[_pa].col;                                            \
-            if (_caa < 0) continue;                                               \
-            bkt_state_t *_bs = &bkt_st[_pa];                                      \
-            if (qcoltype(s->cols[_caa].type) == TSDB_TYPE_FLOAT64) {              \
-                double _xa = ((const double *)bufs[_caa])[(ri)];                  \
-                _bs->sum_f += _xa;                                                \
-                if (_xa < _bs->min_f) _bs->min_f = _xa;                           \
-                if (_xa > _bs->max_f) _bs->max_f = _xa;                           \
-            } else {                                                               \
-                int64_t _xa = ((const int64_t *)bufs[_caa])[(ri)];                \
-                _bs->sum_i += _xa;                                                \
-                if (_xa < _bs->min_i) _bs->min_i = _xa;                           \
-                if (_xa > _bs->max_i) _bs->max_i = _xa;                           \
-            }                                                                      \
-        }                                                                          \
+        bkt_acc_row(bkt_st, projs, nprojs, s, bufs, adv_ts, (ri));                \
     } while (0)
 
             if (q->adv_window_kind == QAST_WIN_SESSION) {
@@ -7669,10 +7941,9 @@ post_scan:
          * the LIMIT has not already been reached. */
         if (cur_bucket != INT64_MIN && cur_rows > 0 &&
             !(q->has_limit && rows_emitted >= limit)) {
-            rc = result_reserve_rows(r, r->nrows + 1);
+            rc = bkt_close(r, projs, nprojs, s, bkt_st, cur_rows, cur_bucket,
+                           &ledger, &rows_emitted);
             if (rc != TSDB_OK) goto done;
-            bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows, cur_bucket);
-            r->nrows++;
         }
     } else if (q->has_adv_window && has_agg) {
         /* Flush the last open advanced window bucket if one is still open. */
@@ -7681,7 +7952,7 @@ post_scan:
             rc = result_reserve_rows(r, r->nrows + 1);
             if (rc == TSDB_OK) {
                 bkt_emit_row(r, projs, nprojs, s, bkt_st, cur_rows,
-                             cur_bucket);
+                             cur_bucket, r->nrows);
                 r->nrows++;
             }
         }
@@ -7691,6 +7962,7 @@ post_scan:
 done:
     free(serial_agg_scratch);
     free(bkt_st);
+    bkt_ledger_free(&ledger);
     udf_agg_scratch_free(&serial_udf_scratch);
     if (projs) {
         for (int pi = 0; pi < nprojs; pi++) proj_tdigest_free(&projs[pi]);

@@ -411,6 +411,12 @@ TEST_SRCS += tests/test_migrate_unflushed.c
 # kept across a plain reopen, carried additively on the WRITE_BATCH + SCHEMA_SYNC
 # wires (older peers ignore the trailer, 0 = UNKNOWN = apply-as-before).
 TEST_SRCS += tests/test_table_incarnation.c
+# Four silent wrong answers in the executor: SAMPLE BY zero-filled the
+# aggregates its streaming path never implemented, a backfilled row re-opened a
+# closed SAMPLE BY bucket and emitted it twice, min()/max() over an empty
+# selection handed back the accumulator identity as data, and a fractional
+# literal against an INT64 column was truncated, moving the predicate boundary.
+TEST_SRCS += tests/test_query_semantics.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Federation integration test.
