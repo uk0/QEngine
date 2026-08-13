@@ -446,9 +446,12 @@ static void test_bucket_assign(void) {
     /* With origin */
     CHECK(tsdb_bucket_assign(ts, n, 2, 3, bid) == TSDB_OK,
           "bucket_assign origin ret");
-    /* ts[0]=0: (0-2)/3 = -1 (C99 truncation toward zero) */
-    CHECK(bid[0] == (0 - 2) / 3, "bucket_assign origin [0]");
-    CHECK(bid[2] == (2 - 2) / 3, "bucket_assign origin [2]");
+    /* Bucketing FLOORS, so these are floor((ts-origin)/3), not C's `/`.
+     * ts[0]=0: floor(-2/3) = -1 — 0 sits in bucket [-1, 2), one below the
+     * bucket the origin opens.  Written as literals because C's `/` gives the
+     * other answer (0) and would restate the truncation this pins against. */
+    CHECK(bid[0] == -1, "bucket_assign origin [0]");
+    CHECK(bid[2] ==  0, "bucket_assign origin [2]");
 }
 
 /* -----------------------------------------------------------------------

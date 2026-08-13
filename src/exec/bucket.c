@@ -22,6 +22,22 @@ static inline int is_pow2(int64_t x) {
     return x > 0 && (x & (x - 1)) == 0;
 }
 
+/* Floor division by a POSITIVE divisor.
+ *
+ * C's `/` truncates toward zero, so -1/4 is 0 while the bucket containing
+ * -1 is bucket -1.  A bucket is the half-open interval [k*d, (k+1)*d), which
+ * is floor division; the power-of-two path below reaches it with an
+ * arithmetic right shift, and this is the same answer for any d.
+ *
+ * d > 0 is a precondition (tsdb_bucket_assign rejects bucket_ns <= 0), so the
+ * remainder's sign is the dividend's: a negative dividend that does not divide
+ * exactly truncated UP by one, and is corrected back down here. */
+static inline int64_t floor_div_pos(int64_t a, int64_t d) {
+    int64_t q = a / d;
+    if (a % d != 0 && a < 0) q--;
+    return q;
+}
+
 /* Count trailing zeros for 64-bit (portable) */
 static inline unsigned ctz64(uint64_t x) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -42,7 +58,11 @@ int tsdb_bucket_assign(const int64_t *ts, size_t n,
                        int64_t *bucket_id) {
     if (!ts || !bucket_id || bucket_ns <= 0) return TSDB_ERR_INVAL;
 
-    /* Fast path: origin == 0 and bucket_ns is a power of two → right shift */
+    /* Fast path: origin == 0 and bucket_ns is a power of two → right shift.
+     * >> on a negative signed value is implementation-defined in C11; clang
+     * and gcc — the only compilers this project builds with — define it as an
+     * arithmetic shift, which rounds toward negative infinity.  That is the
+     * same floor the general path below computes. */
     if (origin == 0 && is_pow2(bucket_ns)) {
         unsigned shift = ctz64((uint64_t)bucket_ns);
 
@@ -51,9 +71,10 @@ int tsdb_bucket_assign(const int64_t *ts, size_t n,
         return TSDB_OK;
     }
 
-    /* General path: division */
+    /* General path: floor division, so a pre-1970 timestamp gets the same
+     * bucket here as it would on the shift path above. */
     for (size_t i = 0; i < n; i++)
-        bucket_id[i] = (ts[i] - origin) / bucket_ns;
+        bucket_id[i] = floor_div_pos(ts[i] - origin, bucket_ns);
 
     return TSDB_OK;
 }

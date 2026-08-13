@@ -17,10 +17,17 @@ extern "C" {
 
 /* Assign bucket IDs for an array of timestamps.
  *
- *   bucket_id[i] = (ts[i] - origin) / bucket_ns
+ *   bucket_id[i] = floor((ts[i] - origin) / bucket_ns)
+ *
+ * FLOOR, not C division.  A bucket is the half-open interval
+ * [k*bucket_ns, (k+1)*bucket_ns), and C's `/` truncates toward zero, so a
+ * negative operand would land one bucket too high — putting -0.5s and +0.5s in
+ * the same 1s bucket.  Pre-1970 timestamps are ordinary here (backfilled
+ * history), and the two paths below must agree for the same input.
  *
  * Fast path: when origin == 0 and bucket_ns is a power of two,
- * computes bucket_id via right-shift.
+ * computes bucket_id via right-shift — an arithmetic shift on the signed
+ * value, which already rounds toward negative infinity and so IS the floor.
  *
  * Requires: bucket_ns > 0.
  * Returns TSDB_OK or TSDB_ERR_INVAL.

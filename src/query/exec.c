@@ -6583,6 +6583,20 @@ static int result_apply_order_by(tsdb_result_t *r, qast_query_t *q,
 
 /* ---- Streaming bucket accumulators (SAMPLE BY / advanced windows) ------- */
 
+/* Start of the bucket of width w that contains ts, i.e. the largest multiple
+ * of w that is <= ts.  Requires w > 0, exactly as the `%` it replaces did.
+ *
+ * `ts - ts % w` does NOT compute that: C's % truncates toward zero, so a
+ * negative ts that is not an exact multiple rounds UP, one whole bucket too
+ * high.  With 1s buckets that put -0.5s in bucket 0 alongside +0.5s, leaving
+ * two buckets for three points at -1.5s / -0.5s / +0.5s.  Shifting the
+ * remainder into [0, w) before subtracting is the floor. */
+static inline int64_t bucket_floor(int64_t ts, int64_t w) {
+    int64_t m = ts % w;
+    if (m < 0) m += w;
+    return ts - m;
+}
+
 /* One accumulator PER PROJECTION.  The streaming SAMPLE BY and
  * SESSION/STATE/EVENT window paths used to fold every projection into a
  * single shared accumulator, which cross-contaminates the aggregates:
@@ -7566,7 +7580,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
             if (bnum <= 0) bnum = 1;
             for (size_t i = 0; i < n; i++) {
                 if (!(bm[i / 64] & ((uint64_t)1 << (i % 64)))) continue;
-                int64_t b = tscol[i] - (tscol[i] % bnum);
+                int64_t b = bucket_floor(tscol[i], bnum);
 
                 if (b != cur_bucket) {
                     /* Close the bucket that just ended. */
@@ -7867,7 +7881,7 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
                         result_append_cell(r, pi, bits);
                     } else if (p->kind == PROJ_TS_BUCKET) {
                         int64_t ts = ((int64_t *)bufs[p->col])[i];
-                        int64_t b  = ts - (ts % p->bucket_ns);
+                        int64_t b  = bucket_floor(ts, p->bucket_ns);
                         uint64_t bits;
                         memcpy(&bits, &b, 8);
                         result_append_cell(r, pi, bits);
