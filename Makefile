@@ -104,6 +104,10 @@ TEST_SRCS += tests/test_orderby_topn.c
 # trusted straight into malloc, so any host that could reach the port could park
 # arbitrary memory on the node.
 TEST_SRCS += tests/test_rpc_hardening.c
+# twa() under parallel GROUP BY disagreed with serial; time_bucket() with a tag
+# GROUP BY returned an unwritten (realloc-dirty) cell as a timestamp.
+TEST_SRCS += tests/test_twa_parallel_groupby.c
+TEST_SRCS += tests/test_bucket_groupby_reject.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.
