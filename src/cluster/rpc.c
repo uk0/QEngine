@@ -2419,13 +2419,42 @@ int tsdb_rpc_decode_write_batch(const uint8_t *buf, uint32_t len,
     uint32_t nrows; memcpy(&nrows, p, 4); p += 4;
     uint8_t ncols = *p++;
 
-    *out_nrows = (int)nrows;
     *out_ncols = (int)ncols;
 
     NEED(ncols);
+    size_t min_row = 0;                 /* smallest body cost of ONE row */
     for (int c = 0; c < ncols; c++) {
         out_col_types[c] = *p++;
+        min_row += (out_col_types[c] == TSDB_TYPE_SYMBOL) ? 2u : 8u;
     }
+
+    /* nrows must be BACKED by payload bytes.  It arrives as 4 raw wire bytes
+     * with no relation to what follows, and the apply path's per-column sizing
+     * only proves where each column starts and ends — never that a column holds
+     * nrows entries.  A frame can therefore declare a million rows behind 20000
+     * SYMBOL entries: tsdb_batch_append_bulk walks it a block at a time and
+     * FLUSHES the memtable it fills before the entries run out, so the batch is
+     * refused with its already-flushed chunks persisted ("batch discarded AFTER
+     * a mid-batch flush; rows already persisted to a partition cannot be rolled
+     * back") — a peer injecting fabricated rows under a write we report failed.
+     *
+     * Minimum bytes one row costs in the columnar body: 8 for a fixed-width
+     * column (the encoder writes nrows*8 for every non-SYMBOL type), 2 for a
+     * SYMBOL column's shortest entry ([u16 len] == 0).  What is left after this
+     * header must cover nrows of them.  A well-formed frame always does, so only
+     * a row count the body cannot possibly hold is refused.  With no columns at
+     * all a row costs nothing and no count is provable — a column-less batch
+     * carries none.
+     *
+     * min_row >= 2 also caps nrows at (len - header)/2, and len is a uint32, so
+     * what survives is below 2^31 and the (int) cast below cannot go negative. */
+    if (min_row == 0) {
+        if (nrows != 0) return -1;
+    } else if ((uint64_t)nrows * (uint64_t)min_row > (uint64_t)(end - p)) {
+        return -1;
+    }
+
+    *out_nrows = (int)nrows;
 
     /* col_data points directly into payload buffer (no copy). */
     *out_col_data = (uint8_t *)p;

@@ -108,6 +108,12 @@ TEST_SRCS += tests/test_rpc_hardening.c
 # GROUP BY returned an unwritten (realloc-dirty) cell as a timestamp.
 TEST_SRCS += tests/test_twa_parallel_groupby.c
 TEST_SRCS += tests/test_bucket_groupby_reject.c
+# A partition that could not be opened vanished from the scan plan at rc=0; a
+# forged WRITE_BATCH row count left flushed rows behind under a refused write;
+# the anti-entropy digest could not converge a bucket differing by a duplicate.
+TEST_SRCS += tests/test_query_silent_partial.c
+TEST_SRCS += tests/test_wb_nrows_bound.c
+TEST_SRCS += tests/test_ae_dup_converge.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.

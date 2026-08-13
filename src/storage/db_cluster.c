@@ -1293,8 +1293,45 @@ static int rd_u64_cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return (x > y) - (x < y);
 }
-static int rd_u64_member(const uint64_t *sorted, size_t n, uint64_t key) {
-    return n && bsearch(&key, sorted, n, sizeof(uint64_t), rd_u64_cmp) != NULL;
+/* First index of the run of `key` in the sorted set, and one past its last. */
+static size_t rd_u64_lower(const uint64_t *sorted, size_t n, uint64_t key) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) { size_t m = lo + (hi - lo) / 2;
+                      if (sorted[m] < key) lo = m + 1; else hi = m; }
+    return lo;
+}
+static size_t rd_u64_upper(const uint64_t *sorted, size_t n, uint64_t key) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) { size_t m = lo + (hi - lo) / 2;
+                      if (sorted[m] <= key) lo = m + 1; else hi = m; }
+    return lo;
+}
+
+/* Match ONE peer row against a local copy this merge has not used yet.
+ * taken[i] counts the peer rows already matched to the run of equal hashes that
+ * starts at sorted[i] (only a run's first slot is ever used).  Returns 1 when a
+ * copy was still available — skip the row — and 0 when this node is one short.
+ *
+ * Membership alone cannot converge.  merkle.c fingerprints a MULTISET: every
+ * row is folded into the bucket's (count, hsum, hxor) and tsdb_rowdigest_diff
+ * calls the bucket divergent when any of the three differs.  A membership merge
+ * inserts nothing for a bucket that differs only by a DUPLICATED row, so the
+ * counts stay unequal, the digest keeps naming the bucket, and every sweep
+ * re-pulls it — permanently.  Consuming one local copy per peer row inserts
+ * exactly peer_multiplicity - local_multiplicity rows, which is the fixed point
+ * that fingerprint compares against, and it is idempotent once reached.
+ *
+ * Rows here carry no primary key, so a repeated (ts, values) is ordinary data —
+ * the replica holding fewer copies really is a row short.  Suppressing a
+ * double-APPLIED batch is the dedup ledger's job (dedup.c), upstream of this. */
+static int rd_u64_take(const uint64_t *sorted, size_t *taken, size_t n,
+                       uint64_t key) {
+    if (!n || !taken) return 0;
+    size_t lo = rd_u64_lower(sorted, n, key);
+    if (lo >= n || sorted[lo] != key) return 0;      /* not held at all */
+    if (taken[lo] >= rd_u64_upper(sorted, n, key) - lo) return 0;
+    taken[lo]++;
+    return 1;
 }
 
 /* Sorted content-hash set of the rows THIS node holds in [bstart, bend], read
@@ -1355,11 +1392,16 @@ int tsdb_ae_local_bucket_hashes(tsdb_db_t *db, const char *table,
     return TSDB_OK;
 }
 
-/* Insert (local_only) every row of `peer_res` whose canonical content hash is
- * NOT already in the sorted set lset[0..ln).  Never deletes a local row; never
- * inserts a content-duplicate — so pulling a whole bucket adds only the rows
- * this node was missing, and a replica legitimately AHEAD in the bucket keeps
- * its extra rows.  *out_inserted (may be NULL) = rows added. */
+/* Insert (local_only) the peer rows this node is short of, matching lset by
+ * MULTIPLICITY rather than membership (see rd_u64_take): a peer row is skipped
+ * only while an unmatched local copy of that exact content remains, so a bucket
+ * gains exactly peer_multiplicity - local_multiplicity rows.  Never deletes a
+ * local row, so a replica legitimately AHEAD in the bucket keeps its extra
+ * rows.  *out_inserted (may be NULL) = rows added.
+ *
+ * NOTE for the header: merkle.h still describes this as "never inserts a
+ * content-duplicate", which was the membership rule that could not close a
+ * bucket differing only by a duplicated row. */
 int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
                                tsdb_result_t *peer_res,
                                const uint64_t *lset, size_t ln,
@@ -1375,20 +1417,33 @@ int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
         if (tsdb_result_col_type(peer_res, i) == TSDB_TYPE_TIMESTAMP) { ts_ci = i; break; }
     if (ts_ci < 0) return TSDB_ERR_INVAL;
 
+    /* One consumption counter per lset slot, so a local copy is matched by at
+     * most one peer row.  ln == 0 (this node holds nothing here) needs none. */
+    size_t *taken = NULL;
+    if (ln) {
+        taken = (size_t *)calloc(ln, sizeof(size_t));
+        if (!taken) return TSDB_ERR_NOMEM;
+    }
+
     tsdb_table_t *tbl = NULL;
-    if (tsdb_open_table(db, table, &tbl) != TSDB_OK || !tbl) return TSDB_ERR_INTERNAL;
+    if (tsdb_open_table(db, table, &tbl) != TSDB_OK || !tbl) {
+        free(taken);
+        return TSDB_ERR_INTERNAL;
+    }
     tsdb_table_lock_write(tbl);
     tsdb_batch_t *batch = NULL;
     if (tsdb_batch_begin(tbl, &batch) != TSDB_OK) {
         tsdb_table_unlock_write(tbl);
+        free(taken);
         return TSDB_ERR_INTERNAL;
     }
     tsdb_batch_set_local_only(batch);
 
     int inserted = 0;
     while (tsdb_result_next(peer_res)) {
-        /* Skip content this node already holds — the merge never duplicates. */
-        if (rd_u64_member(lset, ln, tsdb_rowdigest_row_hash(peer_res, ncols)))
+        /* Skip this peer row only while an unmatched local copy of that exact
+         * content is left — matching by count, not by mere presence. */
+        if (rd_u64_take(lset, taken, ln, tsdb_rowdigest_row_hash(peer_res, ncols)))
             continue;
         tsdb_batch_row_ts(batch, tsdb_result_ts(peer_res, ts_ci));
         int reproducible = 1;
@@ -1424,6 +1479,7 @@ int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
         if (!reproducible) {
             tsdb_batch_discard(batch);
             tsdb_table_unlock_write(tbl);
+            free(taken);
             return TSDB_ERR_UNSUPPORTED;
         }
         tsdb_batch_row_end(batch);
@@ -1432,6 +1488,7 @@ int tsdb_ae_merge_result_dedup(tsdb_db_t *db, const char *table,
 
     int crc = tsdb_batch_commit(batch);
     tsdb_table_unlock_write(tbl);
+    free(taken);
     if (crc != TSDB_OK) return TSDB_ERR_IO;
     if (out_inserted) *out_inserted = inserted;
     return TSDB_OK;

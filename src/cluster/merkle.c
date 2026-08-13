@@ -381,6 +381,12 @@ int tsdb_rowdigest_diff(const tsdb_rowdigest_bucket_t *a, size_t na,
         } else if (j < nb && (i >= na || b[j].bstart < a[i].bstart)) {
             bs = b[j].bstart; emit = 1; j++;                   /* only in b */
         } else {                                               /* in both   */
+            /* count/hsum fold EVERY row, so this compares MULTISETS: a bucket
+             * holding one row twice differs from the same bucket holding it
+             * once.  The repair must therefore be multiset-aware too, or a
+             * bucket reported here can never be closed and every sweep re-pulls
+             * it — tsdb_ae_merge_result_dedup consumes local copies by
+             * multiplicity for exactly that reason. */
             bs = a[i].bstart;
             emit = (a[i].count != b[j].count) ||
                    (a[i].hsum  != b[j].hsum)  ||
