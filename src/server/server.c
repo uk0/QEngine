@@ -389,7 +389,15 @@ struct tsdb_server {
     tsdb_server_opts_t  opts;
 
     pthread_t           accept_threads[TSDB_WIRE_MAX_ACCEPT];
-    volatile int        running;
+    /* Accept-loop stop flag.  _Atomic, not volatile: volatile orders nothing
+     * between threads, so tsdb_server_stop's clear on the main thread racing
+     * each accept loop's poll of it was a real data race (ThreadSanitizer,
+     * server.c:1807 vs server.c:1576).  RELAXED is sufficient because the flag
+     * publishes no memory: the loops are woken by shutting the listen fds, and
+     * the pthread_join in tsdb_server_stop is what orders their work before the
+     * struct is freed.  Same shape as db->trash_gc_running and the catalog's
+     * compact_running. */
+    _Atomic int         running;
 
     tsdb_sub_list_t     subs;
     write_lock_pool_t   write_locks;
@@ -1573,7 +1581,7 @@ static void *accept_loop(void *arg) {
     int my_fd = aa->fd;
     free(aa);
 
-    while (srv->running) {
+    while (atomic_load_explicit(&srv->running, memory_order_relaxed)) {
         struct pollfd pfd = { my_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200 /* ms */);
         if (r <= 0) continue;
@@ -1723,7 +1731,7 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
     srv->port        = ntohs(bound.sin_port);
     srv->db          = opts->db;
     srv->opts        = *opts;
-    srv->running     = 1;
+    atomic_store_explicit(&srv->running, 1, memory_order_relaxed);
 
     atomic_init(&srv->stat_conns, 0);
     atomic_init(&srv->stat_rows_written, 0);
@@ -1789,7 +1797,7 @@ int tsdb_server_start(const tsdb_server_opts_t *opts, tsdb_server_t **out) {
     return TSDB_OK;
 
 fail_spawn:
-    srv->running = 0;
+    atomic_store_explicit(&srv->running, 0, memory_order_relaxed);
     for (int i = 0; i < spawned; i++) {
         shutdown(srv->listen_fds[i], SHUT_RDWR);
         pthread_join(srv->accept_threads[i], NULL);
@@ -1804,7 +1812,7 @@ fail_spawn:
 
 void tsdb_server_stop(tsdb_server_t *s) {
     if (!s) return;
-    s->running = 0;
+    atomic_store_explicit(&s->running, 0, memory_order_relaxed);
     /* Interrupt the poll()s by shutting down the listen fds.
      * Each accept loop will see POLLERR/POLLHUP and exit. */
     for (int i = 0; i < s->n_listeners; i++)

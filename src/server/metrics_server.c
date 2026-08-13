@@ -22,6 +22,7 @@
                                    * with the manifest provider */
 #include "../query/exec.h"        /* tsdb_query_set_deadline_ns — /sql deadline */
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -332,7 +333,14 @@ static int build_standalone_cluster_json(char *buf, size_t cap) {
 struct tsdb_metrics_server {
     int          listen_fd;
     int          port;
-    volatile int running;
+    /* Stop flag: _Atomic, not volatile.  volatile orders nothing between threads,
+     * so the stop path's store racing the worker's poll was a real data race
+     * (ThreadSanitizer).  RELAXED is sufficient because the flag publishes no
+     * memory of its own -- the pthread_join / fd shutdown on the stop path is what
+     * orders the worker's work before teardown.  Same shape as db->trash_gc_running,
+     * the catalog's compact_running, the compactor's quit and the wire server's
+     * running. */
+    _Atomic int running;
     pthread_t    accept_thread;
 };
 
@@ -2773,7 +2781,7 @@ done:
 static void *accept_loop(void *arg) {
     struct tsdb_metrics_server *ms = (struct tsdb_metrics_server *)arg;
 
-    while (ms->running) {
+    while (atomic_load_explicit(&ms->running, memory_order_relaxed)) {
         struct pollfd pfd = { ms->listen_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200);
         if (r <= 0) continue;
@@ -2790,7 +2798,7 @@ static void *accept_loop(void *arg) {
              * completing handshakes.  Break only on proof the listen fd is
              * dead; Darwin reports fd exhaustion as EBADF, so EBADF is
              * fatal only when fcntl confirms the fd is gone.  Stop stays
-             * safe: tsdb_metrics_server_stop clears ms->running before
+             * safe: tsdb_metrics_server_stop clears atomic_load_explicit(&ms->running, memory_order_relaxed) before
              * closing the fd and the loop re-checks it every 200 ms poll. */
             int e = errno;
             if (e == EINVAL || e == ENOTSOCK) break;
@@ -2878,7 +2886,7 @@ int tsdb_metrics_server_start(const char *bind_addr, tsdb_metrics_server_t **out
 
     ms->listen_fd = fd;
     ms->port      = actual_port;
-    ms->running   = 1;
+    atomic_store_explicit(&ms->running, 1, memory_order_relaxed);
 
     if (pthread_create(&ms->accept_thread, NULL, accept_loop, ms) != 0) {
         close(fd);
@@ -2892,7 +2900,7 @@ int tsdb_metrics_server_start(const char *bind_addr, tsdb_metrics_server_t **out
 
 void tsdb_metrics_server_stop(tsdb_metrics_server_t *ms) {
     if (!ms) return;
-    ms->running = 0;
+    atomic_store_explicit(&ms->running, 0, memory_order_relaxed);
     close(ms->listen_fd);
     pthread_join(ms->accept_thread, NULL);
     free(ms);

@@ -1,6 +1,7 @@
 /* gossip.c — SWIM-lite UDP gossip engine. */
 
 #include "gossip.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,7 +108,14 @@ struct tsdb_gossip {
 
     pthread_t            recv_thread;
     pthread_t            tick_thread;
-    volatile int         running;
+    /* Stop flag: _Atomic, not volatile.  volatile orders nothing between threads,
+     * so the stop path's store racing the worker's poll was a real data race
+     * (ThreadSanitizer).  RELAXED is sufficient because the flag publishes no
+     * memory of its own -- the pthread_join / fd shutdown on the stop path is what
+     * orders the worker's work before teardown.  Same shape as db->trash_gc_running,
+     * the catalog's compact_running, the compactor's quit and the wire server's
+     * running. */
+    _Atomic int          running;
 
     /* Seed addresses (for initial bootstrap before gossip converges). */
     char                 seeds[MAX_SEEDS][TSDB_ADDR_MAX];
@@ -262,7 +270,7 @@ static void *recv_loop(void *arg) {
     struct sockaddr_in src;
     socklen_t srclen;
 
-    while (g->running) {
+    while (atomic_load_explicit(&g->running, memory_order_relaxed)) {
         struct pollfd pfd = { g->udp_fd, POLLIN, 0 };
         if (poll(&pfd, 1, 100) <= 0) continue;
 
@@ -379,13 +387,13 @@ static void *tick_loop(void *arg) {
     struct tsdb_gossip *g = (struct tsdb_gossip *)arg;
     uint32_t tick_counter = 0;
 
-    while (g->running) {
+    while (atomic_load_explicit(&g->running, memory_order_relaxed)) {
         /* Sleep GOSSIP_INTERVAL_MS ms in 10ms increments so we can exit cleanly. */
-        for (int i = 0; i < GOSSIP_INTERVAL_MS / 10 && g->running; i++) {
+        for (int i = 0; i < GOSSIP_INTERVAL_MS / 10 && atomic_load_explicit(&g->running, memory_order_relaxed); i++) {
             struct timespec sl = { 0, 10000000L };
             nanosleep(&sl, NULL);
         }
-        if (!g->running) break;
+        if (!atomic_load_explicit(&g->running, memory_order_relaxed)) break;
 
         tsdb_node_manager_heartbeat(g->node_mgr);
         tick_counter++;
@@ -594,7 +602,7 @@ tsdb_gossip_t *tsdb_gossip_new(const char *bind_addr,
     g->udp_fd   = fd;
     g->port     = ntohs(bound.sin_port);
     g->node_mgr = node_mgr;
-    g->running  = 1;
+    atomic_store_explicit(&g->running, 1, memory_order_relaxed);
     pthread_mutex_init(&g->seed_lock, NULL);
     pthread_mutex_init(&g->probe_lock, NULL);
 
@@ -606,7 +614,7 @@ tsdb_gossip_t *tsdb_gossip_new(const char *bind_addr,
 
 void tsdb_gossip_stop(tsdb_gossip_t *g) {
     if (!g) return;
-    g->running = 0;
+    atomic_store_explicit(&g->running, 0, memory_order_relaxed);
     pthread_join(g->recv_thread, NULL);
     pthread_join(g->tick_thread, NULL);
     close(g->udp_fd);

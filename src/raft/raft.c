@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,7 +194,14 @@ struct tsdb_raft {
     /* Tick thread control. */
     pthread_t          tick_thread;
     pthread_t          apply_thread;
-    int                tick_running;
+    /* Stop flag: _Atomic, not volatile.  volatile orders nothing between threads,
+     * so the stop path's store racing the worker's poll was a real data race
+     * (ThreadSanitizer).  RELAXED is sufficient because the flag publishes no
+     * memory of its own -- the pthread_join / fd shutdown on the stop path is what
+     * orders the worker's work before teardown.  Same shape as db->trash_gc_running,
+     * the catalog's compact_running, the compactor's quit and the wire server's
+     * running. */
+    _Atomic int        tick_running;
 
     /* Number of live detached replication workers (see replicate_all).
      * They hold `r`, so tsdb_raft_close must wait for this to reach 0
@@ -1471,7 +1479,7 @@ static void replicate_to(tsdb_raft_t *r, uint64_t peer_id) {
                  * worker, so a long multi-chunk transfer must not pin
                  * teardown for chunks × 5 s.  Racy read, same as the
                  * tick loop's — worst case one extra chunk. */
-                if (!r->tick_running) { aborted = 1; break; }
+                if (!atomic_load_explicit(&r->tick_running, memory_order_relaxed)) { aborted = 1; break; }
                 uint32_t remain = body_len - off;
                 uint32_t take   = remain > CHUNK_MAX ? CHUNK_MAX : remain;
                 uint8_t done    = (take == remain);
@@ -1683,7 +1691,7 @@ static void *repl_worker_main(void *arg) {
         int again = 0;
         for (int i = 0; i < r->npeers; i++) {
             if (r->peers[i].id != task.peer_id) continue;
-            if (r->peers[i].repl_again && r->tick_running &&
+            if (r->peers[i].repl_again && atomic_load_explicit(&r->tick_running, memory_order_relaxed) &&
                 r->state == TSDB_RAFT_LEADER) {
                 r->peers[i].repl_again = 0;
                 again = 1;
@@ -1717,7 +1725,7 @@ static void replicate_all(tsdb_raft_t *r) {
     int n_inline = 0;
 
     pthread_mutex_lock(&r->lock);
-    if (!r->tick_running) {  /* shutting down: no new workers */
+    if (!atomic_load_explicit(&r->tick_running, memory_order_relaxed)) {  /* shutting down: no new workers */
         pthread_mutex_unlock(&r->lock);
         return;
     }
@@ -2037,7 +2045,7 @@ static void raft_elevate_tick_priority(void) {
 static void *tick_thread_main(void *arg) {
     tsdb_raft_t *r = (tsdb_raft_t *)arg;
     raft_elevate_tick_priority();
-    while (r->tick_running) {
+    while (atomic_load_explicit(&r->tick_running, memory_order_relaxed)) {
         /* Rebuild peer set from the latest gossip view. */
         pthread_mutex_lock(&r->lock);
         rebuild_peers_locked(r);
@@ -2257,14 +2265,14 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
     tsdb_raft_rpc_set_handlers(on_request_vote, on_append_entries,
                                on_install_snapshot, on_pre_vote, r);
 
-    r->tick_running = 1;
+    atomic_store_explicit(&r->tick_running, 1, memory_order_relaxed);
     if (pthread_create(&r->tick_thread, NULL, tick_thread_main, r) != 0) {
         tsdb_raft_log_close(r->log);
         free(r);
         return NULL;
     }
     if (pthread_create(&r->apply_thread, NULL, apply_thread_main, r) != 0) {
-        r->tick_running = 0;
+        atomic_store_explicit(&r->tick_running, 0, memory_order_relaxed);
         pthread_join(r->tick_thread, NULL);
         tsdb_raft_log_close(r->log);
         free(r);
@@ -2276,7 +2284,7 @@ tsdb_raft_t *tsdb_raft_open(const char *data_dir,
 void tsdb_raft_close(tsdb_raft_t *r) {
     if (!r) return;
     pthread_mutex_lock(&r->lock);
-    r->tick_running = 0;
+    atomic_store_explicit(&r->tick_running, 0, memory_order_relaxed);
     pthread_cond_broadcast(&r->commit_cv); /* unstick apply thread */
     pthread_mutex_unlock(&r->lock);
     pthread_join(r->tick_thread, NULL);
@@ -2460,16 +2468,16 @@ void tsdb_raft_set_snapshot_handlers(tsdb_raft_t *r,
  * catalog log replay) can't stall heartbeats. */
 static void *apply_thread_main(void *arg) {
     tsdb_raft_t *r = (tsdb_raft_t *)arg;
-    while (r->tick_running) {
+    while (atomic_load_explicit(&r->tick_running, memory_order_relaxed)) {
         pthread_mutex_lock(&r->lock);
-        while (r->tick_running && r->last_applied >= r->commit_index) {
+        while (atomic_load_explicit(&r->tick_running, memory_order_relaxed) && r->last_applied >= r->commit_index) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 1;  /* wake up at least every second to check
                                 tick_running during shutdown */
             pthread_cond_timedwait(&r->commit_cv, &r->lock, &ts);
         }
-        if (!r->tick_running) { pthread_mutex_unlock(&r->lock); break; }
+        if (!atomic_load_explicit(&r->tick_running, memory_order_relaxed)) { pthread_mutex_unlock(&r->lock); break; }
         uint64_t to_apply = r->last_applied + 1;
         uint64_t commit   = r->commit_index;
         pthread_mutex_unlock(&r->lock);

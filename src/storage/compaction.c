@@ -31,6 +31,7 @@
 #include "../server/metrics.h"
 #include "../server/proto.h"   /* tsdb_crc32c — block trailer parity with flush path */
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,14 +111,22 @@ static inline void put_i64le(uint8_t *p, int64_t v)  { put_u64le(p, (uint64_t)v)
  * column alignment and corrupt reads.  Raising the block-size ceiling is a
  * separate, correctness-gated change. */
 static int l2_min_gain(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
+    /* Lazy getenv cache, atomic for the same reason as
+     * shard_replica_n_cached in db_cluster.c: compactor workers call this
+     * concurrently, so a plain static is a read/write race (ThreadSanitizer,
+     * compaction.c:114).  RELAXED is sufficient because every racing
+     * initialiser computes the same value from the same environment, so a lost
+     * store costs one redundant getenv and nothing else. */
+    static _Atomic int cached = -1;
+    int c0 = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (c0 >= 0) return c0;
     const char *en = getenv("TSDB_L2_COMPRESS");
-    if (en && en[0] == '0') { cached = 16; return cached; }
+    if (en && en[0] == '0') { atomic_store_explicit(&cached, 16, memory_order_relaxed); return 16; }
     const char *mg = getenv("TSDB_L2_MIN_GAIN");
-    if (mg && mg[0]) { int v = atoi(mg); cached = v > 0 ? v : 1; return cached; }
-    cached = 1;
-    return cached;
+    if (mg && mg[0]) { int v = atoi(mg); v = v > 0 ? v : 1;
+                       atomic_store_explicit(&cached, v, memory_order_relaxed); return v; }
+    atomic_store_explicit(&cached, 1, memory_order_relaxed);
+    return 1;
 }
 
 /* ---- Partition directory name classification ------------------------------ */
@@ -1246,7 +1255,15 @@ struct tsdb_compactor {
 
     /* Workers. */
     pthread_t      *workers;
-    volatile int    quit;
+    /* Worker stop flag.  _Atomic, not volatile: volatile orders nothing
+     * between threads, so tsdb_compactor_stop's store racing every worker's
+     * poll was a real data race (ThreadSanitizer, compaction.c:1689 vs
+     * :1507/:1518/:1549/:1581).  RELAXED is sufficient because the flag
+     * publishes no memory of its own — the pthread_join in stop() is what
+     * orders each worker's compaction work before teardown.  Same shape as
+     * db->trash_gc_running, the catalog's compact_running and the wire
+     * server's running. */
+    _Atomic int     quit;
 
     /* Adaptive backoff — skip this cycle if recent flush rate exceeds the
      * threshold so the writer's I/O isn't fighting compactor I/O for the
@@ -1504,7 +1521,7 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
                 pthread_mutex_unlock(&c->stats_mtx);
             }
 
-            if (c->quit) break;
+            if (atomic_load_explicit(&c->quit, memory_order_relaxed)) break;
         }
         closedir(td);
         free(frozen.cols);
@@ -1515,7 +1532,7 @@ static int compactor_scan_dir(tsdb_compactor_t *c, tsdb_db_t *db, const char *da
          * Recorded even when no compaction happened — equally valid signal. */
         if (c->memo_enabled) compactor_memo_set(c, de->d_name, part_mtime);
 
-        if (c->quit) break;
+        if (atomic_load_explicit(&c->quit, memory_order_relaxed)) break;
     }
     closedir(dd);
     return TSDB_OK;
@@ -1546,7 +1563,7 @@ static int compactor_run_once_impl(tsdb_compactor_t *c) {
             if (!data_dir) continue;
         }
         if (compactor_scan_dir(c, db, data_dir) == TSDB_OK) rc = TSDB_OK;
-        if (c->quit) break;
+        if (atomic_load_explicit(&c->quit, memory_order_relaxed)) break;
     }
     return rc;
 }
@@ -1578,13 +1595,13 @@ static void *compactor_worker(void *arg) {
 
     compactor_demote_io_priority();
 
-    while (!c->quit) {
+    while (!atomic_load_explicit(&c->quit, memory_order_relaxed)) {
         compactor_run_once_impl(c);
-        if (c->quit) break;
+        if (atomic_load_explicit(&c->quit, memory_order_relaxed)) break;
 
         /* Sleep interval_ns in small increments so quit is checked promptly. */
         int64_t remaining = c->interval_ns;
-        while (remaining > 0 && !c->quit) {
+        while (remaining > 0 && !atomic_load_explicit(&c->quit, memory_order_relaxed)) {
             int64_t slice = remaining > 100000000LL ? 100000000LL : remaining; /* 100ms */
             struct timespec ts = {
                 .tv_sec  = (time_t)(slice / 1000000000LL),
@@ -1612,7 +1629,7 @@ int tsdb_compactor_start(tsdb_db_t *db,
     c->threshold  = COMPACT_THRESHOLD_DEFAULT;
     c->interval_ns= 5000000000LL;  /* 5 s */
     c->nworkers   = 1;
-    c->quit       = 0;
+    atomic_store_explicit(&c->quit, 0, memory_order_relaxed);
 
     if (opts) {
         if (opts->min_blocks_to_compact > 0)
@@ -1670,7 +1687,7 @@ int tsdb_compactor_start(tsdb_db_t *db,
     for (int i = 0; i < c->nworkers; i++) {
         if (pthread_create(&c->workers[i], NULL, compactor_worker, c) != 0) {
             /* Stop already-started workers. */
-            c->quit = 1;
+            atomic_store_explicit(&c->quit, 1, memory_order_relaxed);
             for (int j = 0; j < i; j++) pthread_join(c->workers[j], NULL);
             free(c->workers);
             pthread_mutex_destroy(&c->stats_mtx);
@@ -1686,7 +1703,7 @@ int tsdb_compactor_start(tsdb_db_t *db,
 void tsdb_compactor_stop(tsdb_compactor_t *c) {
     if (!c) return;
 
-    c->quit = 1;
+    atomic_store_explicit(&c->quit, 1, memory_order_relaxed);
     if (c->workers) {
         for (int i = 0; i < c->nworkers; i++) {
             pthread_join(c->workers[i], NULL);

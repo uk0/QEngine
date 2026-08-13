@@ -16,6 +16,7 @@
 #include "../server/metrics.h"
 #include "../server/tls.h"
 #include "../compress/lzlite.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +46,17 @@
 /* ---- CRC32 (IEEE polynomial, software) ----------------------------------- */
 
 static uint32_t crc32_table[256];
-static int crc32_init_done = 0;
+static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
 
+/* pthread_once, not a plain `if (!done)` flag.  Every RPC thread computes CRCs,
+ * and the previous lazy init was not merely a benign double-initialisation:
+ * a thread could observe crc32_init_done == 1 published by another thread whose
+ * table STORES were not yet visible to it, then checksum a frame against a
+ * half-built table.  The peer rejects that frame as corrupt, and the same hazard
+ * runs the other way on verify — a wire-protocol failure that would look like
+ * network corruption.  pthread_once supplies the happens-before that makes the
+ * completed table visible to every later caller; ThreadSanitizer reported the
+ * old form at rpc.c:61 and rpc.c:64. */
 static void crc32_init(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
@@ -54,11 +64,10 @@ static void crc32_init(void) {
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         crc32_table[i] = c;
     }
-    crc32_init_done = 1;
 }
 
 static uint32_t crc32(const uint8_t *data, size_t len) {
-    if (!crc32_init_done) crc32_init();
+    pthread_once(&crc32_once, crc32_init);
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++)
         c = crc32_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
@@ -1519,7 +1528,14 @@ struct tsdb_rpc_server {
     tsdb_db_t           *db;
     tsdb_node_manager_t *node_mgr;
     pthread_t            accept_thread;
-    volatile int         running;
+    /* Stop flag: _Atomic, not volatile.  volatile orders nothing between threads,
+     * so the stop path's store racing the worker's poll was a real data race
+     * (ThreadSanitizer).  RELAXED is sufficient because the flag publishes no
+     * memory of its own -- the pthread_join / fd shutdown on the stop path is what
+     * orders the worker's work before teardown.  Same shape as db->trash_gc_running,
+     * the catalog's compact_running, the compactor's quit and the wire server's
+     * running. */
+    _Atomic int          running;
 
     /* Live-connection registry — mirrors the wire server's drain: stop()
      * kicks every blocked recv (shutdown) and waits for the detached
@@ -1598,7 +1614,7 @@ static void set_tcp_keepalive(int fd) {
 static void *accept_loop(void *arg) {
     tsdb_rpc_server_t *srv = (tsdb_rpc_server_t *)arg;
 
-    while (srv->running) {
+    while (atomic_load_explicit(&srv->running, memory_order_relaxed)) {
         struct pollfd pfd = { srv->listen_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200);
         if (r <= 0) continue;
@@ -1697,7 +1713,7 @@ tsdb_rpc_server_t *tsdb_rpc_server_new(const char *bind_addr,
     srv->port      = ntohs(bound.sin_port);
     srv->db        = db;
     srv->node_mgr  = node_mgr;
-    srv->running   = 1;
+    atomic_store_explicit(&srv->running, 1, memory_order_relaxed);
     pthread_mutex_init(&srv->conn_mu, NULL);
     pthread_cond_init(&srv->conn_cv, NULL);
 
@@ -1707,7 +1723,7 @@ tsdb_rpc_server_t *tsdb_rpc_server_new(const char *bind_addr,
 
 void tsdb_rpc_server_stop(tsdb_rpc_server_t *srv) {
     if (!srv) return;
-    srv->running = 0;
+    atomic_store_explicit(&srv->running, 0, memory_order_relaxed);
     pthread_join(srv->accept_thread, NULL);
     close(srv->listen_fd);
 
