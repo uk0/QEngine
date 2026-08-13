@@ -4406,6 +4406,24 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
                 return TSDB_ERR_SCHEMA;
             }
         }
+        /* time_bucket() is a non-aggregate too, and it has no answer here: a
+         * group keyed by a tag spans arbitrarily many buckets, so there is no
+         * single bucket value to report for it.  The legitimate form —
+         * time_bucket in GROUP BY — never reaches this executor; the parser
+         * routes it to the SAMPLE BY bucketing path and already refuses to mix
+         * it with a tag key.  So anything arriving here is the unanswerable
+         * shape, and it must be REFUSED rather than emitted: agg_write has no
+         * case for PROJ_TS_BUCKET and returns without storing the cell, while
+         * result columns are grown with realloc and never zeroed, so the query
+         * used to succeed and hand back whatever heap bytes happened to be at
+         * that offset, charted as timestamps. */
+        if (projs[i].kind == PROJ_TS_BUCKET) {
+            eset(err, errcap,
+                 "time_bucket() in SELECT requires grouping by it: use "
+                 "GROUP BY time_bucket(...) (or SAMPLE BY) instead of grouping "
+                 "by a column");
+            return TSDB_ERR_SCHEMA;
+        }
     }
 
     /* Validate HAVING references up front so a zero-group result still
@@ -4430,7 +4448,25 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
      * Each worker gets its own private hash table; main thread merges them. */
     pthread_once(&g_pool_once, init_pool);
 
+    /* twa() cannot be computed from disjoint slices.  Each worker accumulates a
+     * weighted sum over its own sources and the merge just adds them
+     * (PROJ_AGG_TS_TWA in the merge above), which silently omits the weight of
+     * every interval that BRIDGES two slices, while the divisor still spans the
+     * full ts range -- so the answer comes out systematically low, by orders of
+     * magnitude for a series split across many partitions, and disagrees with
+     * the serial path for the same query.  The whole-query parallel gate
+     * already refuses ts-aggregates for the same reason.
+     *
+     * Only twa is excluded here: first/last/last_row merge by comparing
+     * ts_first/ts_last and pick the true extreme, so they are exact under the
+     * partition-parallel split and stay parallel. */
+    int has_twa = 0;
+    for (int i = 0; i < nprojs; i++) {
+        if (projs[i].kind == PROJ_AGG_TS_TWA) { has_twa = 1; break; }
+    }
+
     int use_gb_parallel = plan.nsrcs > 1
+                          && !has_twa
                           && g_parallel_on
                           && g_query_pool != NULL
                           && tsdb_pool_size(g_query_pool) > 1;
