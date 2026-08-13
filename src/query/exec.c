@@ -593,26 +593,25 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
         rc = tsdb_part_open(s, dirs[i], &part);
         if (cmtx) pthread_mutex_unlock(cmtx);
         if (rc != TSDB_OK) {
-            /* TSDB_ERR_IO / TSDB_ERR_NOMEM mean the partition's data EXISTS
-             * but could not be reached — tsdb_part_open promotes fd / memory
-             * / map exhaustion to these (part_open_rsrc_exhausted in part.c).
-             * Swallowing them here is how a wide scan under the default
-             * ulimit used to answer with a fraction of the true rows and
-             * rc=0: every partition that failed to open simply vanished from
-             * the plan.  Fail the whole scan loudly instead — skipping stays
-             * correct only for "nothing to read here" outcomes (e.g.
-             * TSDB_ERR_NOTFOUND).  Close the sources already opened: under
+            /* EVERY error here means the partition's data EXISTS but could not
+             * be reached.  tsdb_part_open has no "nothing to read here" error
+             * at all — an absent or empty column returns TSDB_OK with zero
+             * blocks — and its complete error set is TSDB_ERR_IO (fd / memory
+             * / map exhaustion, via part_open_rsrc_exhausted in part.c),
+             * TSDB_ERR_CORRUPT (an idx header this binary cannot parse),
+             * TSDB_ERR_NOMEM, and TSDB_ERR_INVAL for a malformed call.
+             * Swallowing any of them is how a wide scan under the default
+             * ulimit, or one over a single damaged index, used to answer with
+             * a fraction of the true rows and rc=0: every partition that
+             * failed to open simply vanished from the plan.  Fail the whole
+             * scan loudly instead.  Close the sources already opened: under
              * exhaustion they hold the very fds a retrying caller needs
              * back, and no caller frees the plan on a build error. */
-            if (rc == TSDB_ERR_IO || rc == TSDB_ERR_NOMEM) {
-                for (size_t j = i; j < nd; j++) free(dirs[j]);
-                free(dirs);
-                scan_plan_free(p);
-                memset(p, 0, sizeof(*p));
-                return rc;
-            }
-            free(dirs[i]);
-            continue;
+            for (size_t j = i; j < nd; j++) free(dirs[j]);
+            free(dirs);
+            scan_plan_free(p);
+            memset(p, 0, sizeof(*p));
+            return rc;
         }
 
         /* File-level zone-map prune: if the whole partition's [ts_min, ts_max]
@@ -630,7 +629,20 @@ static int scan_plan_build_ex(scan_plan_t *p, tsdb_table_internal_t *t,
 
         tsdb_block_meta_t *metas = NULL; size_t nb = 0;
         rc = tsdb_part_col_blocks(part, ts_col, &metas, &nb);
-        if (rc != TSDB_OK) { tsdb_part_close(part); free(dirs[i]); continue; }
+        if (rc != TSDB_OK) {
+            /* Same rule as the open above.  An empty ts column is TSDB_OK with
+             * nb == 0, so a non-OK rc here is only ever a failed malloc of the
+             * meta copy or an out-of-range column index — never "this
+             * partition holds nothing".  Dropping it would be the identical
+             * silent-partial answer, just triggered by memory pressure
+             * instead of a bad index. */
+            tsdb_part_close(part);
+            for (size_t j = i; j < nd; j++) free(dirs[j]);
+            free(dirs);
+            scan_plan_free(p);
+            memset(p, 0, sizeof(*p));
+            return rc;
+        }
         scan_plan_push_part(p, part);
         for (size_t b = 0; b < nb; b++) {
             scan_src_t sc = {0};
@@ -4395,6 +4407,22 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
 
     /* Validate SELECT items: every non-aggregate must be a GROUP BY column. */
     for (int i = 0; i < nprojs; i++) {
+        if (projs[i].kind == PROJ_TS_BUCKET) {
+            /* Bucketing belongs to the SAMPLE BY executor; this path groups on
+             * a tag tuple and has no bucket to report for a group whose rows
+             * span many of them.  agg_write has no PROJ_TS_BUCKET arm, so
+             * letting it through left the cell exactly as realloc handed it
+             * over — result_reserve_rows_grow never zeroes — and the caller
+             * read uninitialised heap back as a timestamp at rc=0.  The parser
+             * already refuses the mirror image (GROUP BY time_bucket()
+             * together with a tag key); refuse this one here, where the
+             * projection list is what makes it visible. */
+            eset(err, errcap,
+                 "time_bucket() in SELECT requires SAMPLE BY or "
+                 "GROUP BY time_bucket(); it cannot be combined with a "
+                 "GROUP BY column key");
+            return TSDB_ERR_UNSUPPORTED;
+        }
         if (projs[i].kind == PROJ_COL) {
             int ok = 0;
             for (int g = 0; g < q->ngroup_by; g++)
@@ -4448,25 +4476,24 @@ static int exec_group_by(tsdb_db_t *db, tsdb_table_internal_t *tbl,
      * Each worker gets its own private hash table; main thread merges them. */
     pthread_once(&g_pool_once, init_pool);
 
-    /* twa() cannot be computed from disjoint slices.  Each worker accumulates a
-     * weighted sum over its own sources and the merge just adds them
-     * (PROJ_AGG_TS_TWA in the merge above), which silently omits the weight of
-     * every interval that BRIDGES two slices, while the divisor still spans the
-     * full ts range -- so the answer comes out systematically low, by orders of
-     * magnitude for a series split across many partitions, and disagrees with
-     * the serial path for the same query.  The whole-query parallel gate
-     * already refuses ts-aggregates for the same reason.
-     *
-     * Only twa is excluded here: first/last/last_row merge by comparing
-     * ts_first/ts_last and pick the true extreme, so they are exact under the
-     * partition-parallel split and stay parallel. */
-    int has_twa = 0;
-    for (int i = 0; i < nprojs; i++) {
-        if (projs[i].kind == PROJ_AGG_TS_TWA) { has_twa = 1; break; }
-    }
+    /* The aggregates that pair each value with its timestamp — first / last /
+     * last_row / twa — have no exact merge across worker slices, so they must
+     * stay serial.  This is the same exclusion the whole-query parallel gate
+     * already applies; both defects below were measured against gb_merge_into:
+     *   twa   — the merge only ADDS the weighted sums, dropping every interval
+     *           that spans a slice boundary, while the denominator stays
+     *           ts_last - ts_first over the whole query.  A group with one row
+     *           per partition merged to twa == 0 against a serial 1.0.
+     *   first/last — the merge copies the float and int payloads but not
+     *           ts_first_u32 / ts_last_u32, so first(sym) of a group the merge
+     *           had to INSERT came back as symbol code 0. */
+    int has_ts_agg = 0;
+    for (int i = 0; i < nprojs; i++)
+        if (projs[i].kind >= PROJ_AGG_TS_KIND_FIRST &&
+            projs[i].kind <= PROJ_AGG_RANGE_END) { has_ts_agg = 1; break; }
 
     int use_gb_parallel = plan.nsrcs > 1
-                          && !has_twa
+                          && !has_ts_agg
                           && g_parallel_on
                           && g_query_pool != NULL
                           && tsdb_pool_size(g_query_pool) > 1;
