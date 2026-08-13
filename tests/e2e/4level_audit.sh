@@ -2,11 +2,37 @@
 curl -s -c /tmp/bck -X POST "http://127.0.0.1:29311/login" -d "user=root&pass=123456" -o /dev/null
 SQL() { curl -sb /tmp/bck -X POST "http://127.0.0.1:29311/sql" -H "Content-Type: application/json" --data-binary "$1"; echo; }
 PVAL() { python3 -c "import json,sys; d=json.load(sys.stdin); rows=d.get('rows',[]); print(rows[0][0] if rows else '')" 2>/dev/null; }
+# A failed EXPECT must reach the exit status, or this script "verifies" nothing:
+# it previously only printed a red cross and the script's status came from
+# whatever ran last (a docker exec ... ls pipeline), so every run reported
+# success no matter how many assertions failed.
+FAILURES=0
+
 EXPECT() {
   local label="$1"; local got="$2"; local want="$3"
   if [[ "$got" == "$want" ]]; then printf "  \033[32m✓\033[0m %s\n" "$label"
-  else printf "  \033[31m✗\033[0m %s   got:[%s] want:[%s]\n" "$label" "$got" "$want"; fi
+  else
+    printf "  \033[31m✗\033[0m %s   got:[%s] want:[%s]\n" "$label" "$got" "$want"
+    FAILURES=$((FAILURES + 1))
+  fi
 }
+
+# Report the tally and exit non-zero on any failure, however the script ends.
+finish() {
+  local rc=$?
+  if [[ $FAILURES -gt 0 ]]; then
+    printf "\n\033[31m%d assertion(s) failed\033[0m\n" "$FAILURES"
+    exit 1
+  fi
+  # Preserve an abort: a script that died before its checks ran has not passed.
+  if [[ $rc -ne 0 ]]; then
+    printf "\n\033[31mscript aborted before finishing (status %d)\033[0m\n" "$rc"
+    exit "$rc"
+  fi
+  printf "\n\033[32mall assertions passed\033[0m\n"
+  exit 0
+}
+trap finish EXIT
 
 # Cleanup
 SQL "{\"q\":\"DROP DATABASE iotfleet\"}" >/dev/null 2>&1

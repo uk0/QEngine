@@ -2,8 +2,31 @@
 set -uo pipefail
 
 N1=http://127.0.0.1:29311
+# fail() must reach the exit status.  It previously only printed, and the script
+# ends on `[[ $TC == 1 ]] && ok ... || fail ...` whose status is the printf's, so
+# even the last assertion failing still exited 0.
+FAILURES=0
+
 ok()   { printf '\e[32mPASS\e[0m  %s\n' "$1"; }
-fail() { printf '\e[31mFAIL\e[0m  %s :: %s\n' "$1" "$2"; }
+fail() { printf '\e[31mFAIL\e[0m  %s :: %s\n' "$1" "${2:-}"; FAILURES=$((FAILURES + 1)); }
+
+finish() {
+  local rc=$?
+  if [[ $FAILURES -gt 0 ]]; then
+    printf '\n\e[31m%d check(s) failed\e[0m\n' "$FAILURES"
+    exit 1
+  fi
+  # Preserve an abort (set -e / set -u killed us mid-run): reporting "passed"
+  # for a script that died before reaching its checks is the same lie this fix
+  # exists to remove.
+  if [[ $rc -ne 0 ]]; then
+    printf '\n\e[31mscript aborted before finishing (status %d)\e[0m\n' "$rc"
+    exit "$rc"
+  fi
+  printf '\n\e[32mall checks passed\e[0m\n'
+  exit 0
+}
+trap finish EXIT
 q() { curl -sS --max-time 30 -X POST "$1/sql" -H 'Content-Type: application/json' --data "{\"q\":\"$2\"}"; }
 fv() { echo "$1" | sed -n 's/.*rows..\[\[\([0-9]*\).*/\1/p'; }
 

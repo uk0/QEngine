@@ -4,8 +4,31 @@ set -uo pipefail
 N1=http://127.0.0.1:29311
 N4=http://127.0.0.1:29314
 
+# fail() must reach the exit status.  It previously only printed, and the script
+# ended on a `curl | grep` pipeline, so a node that never converged still exited
+# 0 and the run was recorded as a pass.
+FAILURES=0
+
 ok()   { printf '\e[32mPASS\e[0m  %s\n' "$1"; }
-fail() { printf '\e[31mFAIL\e[0m  %s :: %s\n' "$1" "$2"; }
+fail() { printf '\e[31mFAIL\e[0m  %s :: %s\n' "$1" "${2:-}"; FAILURES=$((FAILURES + 1)); }
+
+finish() {
+  local rc=$?
+  if [[ $FAILURES -gt 0 ]]; then
+    printf '\n\e[31m%d check(s) failed\e[0m\n' "$FAILURES"
+    exit 1
+  fi
+  # Preserve an abort (set -e / set -u killed us mid-run): reporting "passed"
+  # for a script that died before reaching its checks is the same lie this fix
+  # exists to remove.
+  if [[ $rc -ne 0 ]]; then
+    printf '\n\e[31mscript aborted before finishing (status %d)\e[0m\n' "$rc"
+    exit "$rc"
+  fi
+  printf '\n\e[32mall checks passed\e[0m\n'
+  exit 0
+}
+trap finish EXIT
 
 q() {
   local url=$1 sql=$2
