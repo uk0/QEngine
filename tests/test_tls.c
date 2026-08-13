@@ -28,6 +28,7 @@
  *
  * Simpler approach: do NOT include tsdb_wire.h; declare what we need manually.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -467,7 +468,14 @@ static int test_untrusted_cert_skip_verify(void) {
 #define THROUGHPUT_PAYLOAD 1024
 
 typedef struct {
-    int port;
+    /* Atomic: the server thread publishes the bound port here and main reads
+     * it after a 20 ms nanosleep.  A sleep synchronises nothing — TSan says so
+     * in as many words ("as if synchronized via sleep") — so the plain int was
+     * a genuine read/write race, and on a loaded machine the sleep can also
+     * simply be too short.  release/acquire, not relaxed: the port value is
+     * exactly the payload being published, so main must see the getsockname
+     * result that produced it. */
+    _Atomic int port;
     int n_frames;
     int payload_sz;
 } throughput_srv_args_t;
@@ -485,7 +493,7 @@ static void *throughput_server_thread(void *arg) {
     /* Signal ready */
     struct sockaddr_in bound; socklen_t bl = sizeof(bound);
     getsockname(lfd, (struct sockaddr *)&bound, &bl);
-    a->port = ntohs(bound.sin_port);
+    atomic_store_explicit(&a->port, ntohs(bound.sin_port), memory_order_release);
     /* Quick hack: write port to a global. This test is informational only. */
     int cfd = accept(lfd, NULL, NULL);
     close(lfd);
@@ -519,7 +527,7 @@ static void benchmark_throughput(void) {
     struct timespec ts = { 0, 20 * 1000 * 1000 };
     nanosleep(&ts, NULL);
 
-    int pfd = plain_tcp_connect(plain_args.port);
+    int pfd = plain_tcp_connect(atomic_load_explicit(&plain_args.port, memory_order_acquire));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     tsdb_conn_t pc = {0}; pc.fd = pfd; pc.timeout_ms = 5000;

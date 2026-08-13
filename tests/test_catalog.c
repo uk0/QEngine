@@ -5,6 +5,7 @@
 #include "../src/catalog/device.h"
 #include "../src/catalog/database.h"
 #include "../src/catalog/stable.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -467,7 +468,13 @@ tsdb_catalog_t *tsdb_db_catalog(tsdb_db_t *db);
  *   after  reload: catalog reports the overwritten log contents
  */
 
-static volatile int g_reload_reader_stop = 0;
+/* Atomic, not volatile — same reason as tests/test_drop_race.c's g_stop:
+ * volatile orders nothing between threads, so the reader's plain load racing
+ * main's store was itself a ThreadSanitizer report, i.e. harness noise inside a
+ * run whose whole purpose is reading TSan reports about the engine.  relaxed is
+ * sufficient because the flag carries no payload; the pthread_join after the
+ * store is what orders the reader's work before teardown. */
+static _Atomic int g_reload_reader_stop = 0;
 
 static void *reload_reader_thread(void *ud) {
     tsdb_db_t *db = (tsdb_db_t *)ud;
@@ -475,7 +482,7 @@ static void *reload_reader_thread(void *ud) {
      * catalog.  Purely a "doesn't crash" check — we don't assert on the
      * pointer contents because they legitimately change mid-loop. */
     int loops = 0;
-    while (!g_reload_reader_stop) {
+    while (!atomic_load_explicit(&g_reload_reader_stop, memory_order_relaxed)) {
         tsdb_catalog_t *c = tsdb_db_catalog(db);
         (void)c;
         loops++;
@@ -515,7 +522,7 @@ static void test_reload_catalog(void) {
 
     /* Prepare a "snapshot body" in a staging dir — a fresh DB set — and
      * spawn a reader thread that pounds tsdb_db_catalog() concurrently. */
-    g_reload_reader_stop = 0;
+    atomic_store_explicit(&g_reload_reader_stop, 0, memory_order_relaxed);
     pthread_t racer;
     pthread_create(&racer, NULL, reload_reader_thread, db);
 
@@ -555,7 +562,7 @@ static void test_reload_catalog(void) {
     /* Reload — this is the whole point of the test. */
     CHECK_OK(tsdb_db_reload_catalog(db), "reload_catalog");
 
-    g_reload_reader_stop = 1;
+    atomic_store_explicit(&g_reload_reader_stop, 1, memory_order_relaxed);
     pthread_join(racer, NULL);
 
     /* Post-reload, the databases must match what's on disk under

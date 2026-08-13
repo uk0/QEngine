@@ -15,6 +15,7 @@
 
 #include <assert.h>
 #include <dirent.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,10 +47,15 @@ static void run_sql_ok(tsdb_db_t *db, const char *sql) {
 
 /* Reader thread for the concurrent ALTER + SELECT test ([8]). */
 static tsdb_db_t   *g_cc_db;
-static volatile int g_cc_stop;
+/* Atomic: main sets this while four reader threads poll it.  volatile orders
+ * nothing between threads, so the plain pair was a TSan report from the harness
+ * inside a suite whose purpose is reading TSan reports about the engine.
+ * relaxed suffices; the flag carries no payload and the pthread_join below is
+ * what orders the readers' queries before teardown. */
+static _Atomic int g_cc_stop;
 static void *cc_reader_thread(void *ud) {
     (void)ud;
-    while (!g_cc_stop) {
+    while (!atomic_load_explicit(&g_cc_stop, memory_order_relaxed)) {
         tsdb_result_t *r = NULL;
         if (tsdb_query(g_cc_db, "SELECT count(*), sum(v) FROM cc", &r) == TSDB_OK && r) {
             while (tsdb_result_next(r)) { /* drain — touches schema->cols */ }
@@ -191,7 +197,7 @@ int main(void) {
         OK(tsdb_batch_commit(cb));
 
         g_cc_db = db;
-        g_cc_stop = 0;
+        atomic_store_explicit(&g_cc_stop, 0, memory_order_relaxed);
         pthread_t rd[4];
         for (int i = 0; i < 4; i++) pthread_create(&rd[i], NULL, cc_reader_thread, NULL);
 
@@ -203,7 +209,7 @@ int main(void) {
             ASSERT(rc == TSDB_OK);
             usleep(5000);
         }
-        g_cc_stop = 1;
+        atomic_store_explicit(&g_cc_stop, 1, memory_order_relaxed);
         for (int i = 0; i < 4; i++) pthread_join(rd[i], NULL);
         printf("  PASS: 8 ALTERs + 4 concurrent readers, no use-after-free\n");
     }

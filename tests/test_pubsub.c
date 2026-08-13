@@ -14,6 +14,7 @@
 #include "../src/server/proto.h"
 #include "../include/tsdb.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -409,7 +410,11 @@ static void test_filter(void) {
 /* ---- Test 5: Slow subscriber does not block write ------------------------ */
 typedef struct {
     int  port;
-    int  done;
+    /* Atomic: the worker signals readiness here while main polls it, so a
+     * plain int is a data race — ThreadSanitizer flags it inside a suite whose
+     * purpose is reading TSan reports about the engine.  relaxed suffices; the
+     * flag carries no payload and the pthread_join orders the worker's work. */
+    _Atomic int  done;
     int  received_event;
 } slow_sub_ctx_t;
 
@@ -417,7 +422,7 @@ static void *slow_subscriber_thread(void *arg) {
     slow_sub_ctx_t *ctx = (slow_sub_ctx_t *)arg;
 
     int fd = client_connect(ctx->port);
-    if (fd < 0) { ctx->done = 1; return NULL; }
+    if (fd < 0) { atomic_store_explicit(&ctx->done, 1, memory_order_relaxed); return NULL; }
     hello(fd, 1);
 
     uint8_t sbuf[128];
@@ -427,7 +432,7 @@ static void *slow_subscriber_thread(void *arg) {
     tsdb_proto_recv(fd, &hdr, &pl); free(pl); pl = NULL;
 
     /* Signal ready, then do NOT read — simulate slow subscriber. */
-    ctx->done = 1;
+    atomic_store_explicit(&ctx->done, 1, memory_order_relaxed);
     /* Sleep 2 seconds (much longer than the write should take). */
     usleep(2000000);
 
@@ -454,7 +459,7 @@ static void test_slow_subscriber(void) {
 
     /* Wait for subscriber to register. */
     int waited = 0;
-    while (!ctx.done && waited < 2000) { usleep(10000); waited += 10; }
+    while (!atomic_load_explicit(&ctx.done, memory_order_relaxed) && waited < 2000) { usleep(10000); waited += 10; }
     usleep(10000);
 
     /* Write must complete quickly even though subscriber is slow. */

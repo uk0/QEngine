@@ -16,6 +16,7 @@
 #include "../src/storage/part.h"
 #include "../src/storage/compaction.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,13 +195,17 @@ typedef struct {
     int64_t    expect_count;
     int64_t    expect_tag_sum;
     int        iters;
-    volatile int stop;
+    /* Atomic: main sets this while the reader polls it, so a plain int is a
+     * data race — noise from the harness inside a run whose purpose is reading
+     * TSan reports about the engine.  relaxed suffices; the flag carries no
+     * payload and the pthread_join orders the reader's queries. */
+    _Atomic int  stop;
     int        errors;   /* wrong-result or query-error count */
 } reader_arg_t;
 
 static void *reader_thread(void *ud) {
     reader_arg_t *a = (reader_arg_t *)ud;
-    for (int i = 0; i < a->iters && !a->stop; i++) {
+    for (int i = 0; i < a->iters && !atomic_load_explicit(&a->stop, memory_order_relaxed); i++) {
         tsdb_result_t *r = NULL;
         int rc = tsdb_query(a->db,
             "SELECT count(ts), sum(tag) FROM ccmetrics WHERE tag >= 128", &r);
@@ -270,7 +275,7 @@ static void test_concurrent_read_during_compaction(void) {
     ASSERT_OK(tsdb_compactor_run_once(cpt));   /* the swap (with delay) */
     tsdb_compactor_stop(cpt);
 
-    ra.stop = 1;
+    atomic_store_explicit(&ra.stop, 1, memory_order_relaxed);
     for (int i = 0; i < 4; i++) pthread_join(readers[i], NULL);
 
     unsetenv("TSDB_TEST_COMPACT_RENAME_DELAY_MS");
