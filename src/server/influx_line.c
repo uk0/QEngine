@@ -12,12 +12,14 @@
 #include "../storage/schema.h"
 #include "metrics.h"              /* OBS-3: ingest counters */
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -626,10 +628,24 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
     /* Walk rows once.  Layout-matching rows use the hoisted res[] slots
      * directly; mismatching rows scan the row's tag_keys[] then
      * field_keys[] for the matching name (same lookup write_row_to_batch
-     * did per-cell, just inlined).  Unset cols get default values: 0 for
-     * numeric, empty string for SYMBOL — matches the row-end "all cols
-     * set" check on the per-row path which was actually never enforced
-     * here either (schema_find_col returning -1 was silently skipped). */
+     * did per-cell, just inlined).
+     *
+     * A column this line did not set is MISSING, and line protocol makes
+     * that routine: a sparse line is how a sensor reports "I have nothing
+     * for that field right now".  Missing is encoded per type:
+     *
+     *   FLOAT64/FLOAT32  NaN.  A quiet NaN is a normal 8-byte double, so
+     *                    nothing about the memtable or the on-disk block
+     *                    format changes; the query side treats NaN in a
+     *                    float column as NULL and excludes it from every
+     *                    aggregate (see agg_update_vals in query/exec.c).
+     *   INT64 / BOOL     0, unchanged — a 64-bit integer has no spare bit
+     *                    pattern, so representing NULL there needs a
+     *                    validity bitmap in the block format.
+     *   SYMBOL           empty string, unchanged, for the same reason.
+     *
+     * Writing 0 for a missing float is what made a quiet sensor drag
+     * avg() toward zero instead of dropping out of it. */
     size_t r = 0;
     for (size_t j = 0; j < nrows_total; j++) {
         if (!rows[j].measurement || strcmp(rows[j].measurement, meas) != 0)
@@ -712,26 +728,55 @@ static int write_rows_columnar(tsdb_batch_t *batch, tsdb_schema_t *schema,
                         }
                     }
                 }
+                int missing = 1;
                 if (fmatch >= 0) {
                     switch (row->field_types[fmatch]) {
                     case TSDB_INFLUX_FLOAT:
                         fv = row->field_vals[fmatch].f64;
                         memcpy(cs[d].fixed_buf + r * 8, &fv, 8);
+                        missing = 0;
                         break;
                     case TSDB_INFLUX_INT:
                     case TSDB_INFLUX_BOOL:
                         v = row->field_vals[fmatch].i64;
                         memcpy(cs[d].fixed_buf + r * 8, &v, 8);
+                        missing = 0;
                         break;
                     case TSDB_INFLUX_STRING:
-                        /* Type mismatch — keep default 0. */
+                        /* A string field landing on a numeric column has no
+                         * value this column can hold — that is missing, not
+                         * zero, and it takes the same path as an absent
+                         * field below. */
                         break;
                     }
-                } else {
-                    /* Default 0 already from calloc — explicit memset
-                     * just to make the intent obvious for non-Influx
-                     * schemas where col was added later. */
-                    memset(cs[d].fixed_buf + r * 8, 0, 8);
+                }
+                if (missing) {
+                    /* Float columns hold NaN in memory whether they are
+                     * declared FLOAT64 or FLOAT32 (a FLOAT32 column is a
+                     * double everywhere except on disk), so one 8-byte
+                     * store covers both.  Integer columns keep the calloc
+                     * zero: no NULL representation exists for them without
+                     * a block-format change.
+                     *
+                     * ROLLBACK CONSEQUENCE, measured, not theorised: the block
+                     * FORMAT is unchanged — a quiet NaN is an ordinary 8-byte
+                     * double — so a binary from before this change still READS
+                     * these partitions.  It just has no idea NaN means "absent"
+                     * and propagates it, so sum(), avg() and last() over a
+                     * column with any missing point come back NaN there, where
+                     * this binary excludes the point.  min()/max()/spread()/
+                     * first() survive, because the SIMD comparisons drop NaN.
+                     * That is a louder failure than what it replaces — the old
+                     * behaviour was to average in a fabricated 0.0 and report a
+                     * confidently wrong number — but an operator rolling back
+                     * needs to expect NaN rather than the previous answer. */
+                    if (cs[d].col_type == TSDB_TYPE_FLOAT64 ||
+                        cs[d].col_type == TSDB_TYPE_FLOAT32) {
+                        double nullv = (double)NAN;
+                        memcpy(cs[d].fixed_buf + r * 8, &nullv, 8);
+                    } else {
+                        memset(cs[d].fixed_buf + r * 8, 0, 8);
+                    }
                 }
             }
         }
@@ -1148,7 +1193,14 @@ done:
  * hashing, so the extra listeners just share the queue — harmless
  * but not faster.  Either way the API is stable. */
 #define TSDB_HTTP_MAX_ACCEPT 32
-static volatile int g_http_running = 0;
+/* Stop flag: _Atomic, not volatile.  volatile orders nothing between threads,
+ * so the stop path's store racing the worker's poll was a real data race
+ * (ThreadSanitizer).  RELAXED is sufficient because the flag publishes no
+ * memory of its own -- the pthread_join / fd shutdown on the stop path is what
+ * orders the worker's work before teardown.  Same shape as db->trash_gc_running,
+ * the catalog's compact_running, the compactor's quit and the wire server's
+ * running. */
+static _Atomic int  g_http_running = 0;
 static int          g_http_listen_fds[TSDB_HTTP_MAX_ACCEPT];
 static int          g_http_n_listeners = 0;
 static pthread_t    g_http_threads[TSDB_HTTP_MAX_ACCEPT];
@@ -1156,7 +1208,7 @@ static tsdb_db_t   *g_http_db = NULL;
 
 static void *http_accept_loop(void *arg) {
     int my_fd = (int)(intptr_t)arg;
-    while (g_http_running) {
+    while (atomic_load_explicit(&g_http_running, memory_order_relaxed)) {
         struct pollfd pfd = { my_fd, POLLIN, 0 };
         int r = poll(&pfd, 1, 200);
         if (r <= 0) continue;
@@ -1173,7 +1225,7 @@ static void *http_accept_loop(void *arg) {
              * handshakes.  Break only on proof the listen fd is dead;
              * Darwin reports fd exhaustion as EBADF, so EBADF is fatal only
              * when fcntl confirms the fd is gone.  Stop stays safe:
-             * tsdb_influx_http_stop clears g_http_running before closing
+             * tsdb_influx_http_stop clears atomic_load_explicit(&g_http_running, memory_order_relaxed) before closing
              * the fds and the loop re-checks it every 200 ms poll. */
             int e = errno;
             if (e == EINVAL || e == ENOTSOCK) break;
@@ -1237,7 +1289,7 @@ int tsdb_influx_http_start(const char *bind_addr, tsdb_db_t *db) {
     if (inet_aton(host, &sa.sin_addr) == 0) return -1;
 
     g_http_db        = db;
-    g_http_running   = 1;
+    atomic_store_explicit(&g_http_running, 1, memory_order_relaxed);
     g_http_n_listeners = 0;
 
     for (int i = 0; i < n_listeners; i++) {
@@ -1274,7 +1326,7 @@ int tsdb_influx_http_start(const char *bind_addr, tsdb_db_t *db) {
     return 0;
 
 fail:
-    g_http_running = 0;
+    atomic_store_explicit(&g_http_running, 0, memory_order_relaxed);
     for (int i = 0; i < g_http_n_listeners; i++) {
         shutdown(g_http_listen_fds[i], SHUT_RDWR);
         close(g_http_listen_fds[i]);
@@ -1285,8 +1337,8 @@ fail:
 }
 
 void tsdb_influx_http_stop(void) {
-    if (!g_http_running) return;
-    g_http_running = 0;
+    if (!atomic_load_explicit(&g_http_running, memory_order_relaxed)) return;
+    atomic_store_explicit(&g_http_running, 0, memory_order_relaxed);
     for (int i = 0; i < g_http_n_listeners; i++) {
         if (g_http_listen_fds[i] >= 0) {
             shutdown(g_http_listen_fds[i], SHUT_RDWR);

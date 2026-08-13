@@ -41,6 +41,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* Forward declaration for the mkdir -p helper exposed by schema.c. */
 extern int tsdb_mkdir_p(const char *path);
@@ -135,9 +136,22 @@ static __thread const char *g_cur_select_qtl = NULL;
 
 /* Counts blocks skipped by Bloom filter in the most recent query.
  * Reset to 0 at the start of each serial SELECT scan.
- * Thread-local per-query; works correctly for single-threaded serial path. */
-static uint64_t g_bloom_blocks_skipped = 0;
-static uint64_t g_bloom_blocks_total   = 0;
+ *
+ * __thread, i.e. genuinely per-query rather than process-global.  These were
+ * plain statics, which two concurrent exec_select calls both reset and both
+ * incremented — a write/write race (TSan: exec.c:7354 and :7355) and, worse,
+ * a meaningless number: one query's reset zeroes another query's in-flight
+ * tally.  Making them atomic would silence the race but not fix the
+ * arithmetic, so per-query scoping is the right answer and __thread is the
+ * cheapest way to get it: every write to these counters happens in
+ * exec_select's serial source loop, which runs entirely on the thread that
+ * called tsdb_query (the parallel worker path never touches them), so no
+ * synchronisation is needed at all.
+ *
+ * Contract for callers: read the accessors from the thread that ran the
+ * query.  Every caller in-tree does. */
+static __thread uint64_t g_bloom_blocks_skipped = 0;
+static __thread uint64_t g_bloom_blocks_total   = 0;
 
 /* Test-visible accessor. */
 uint64_t tsdb_bloom_stats_skipped(void) { return g_bloom_blocks_skipped; }
@@ -1702,6 +1716,74 @@ static int build_projections(qast_query_t *q, tsdb_schema_t *s,
 
 /* ---- Aggregation helpers over a block --------------------------------- */
 
+/* ---- NULL semantics -----------------------------------------------------
+ *
+ * A missing FLOAT64/FLOAT32 value is stored as NaN — see write_rows_columnar
+ * in server/influx_line.c, which produces it, for the full type-by-type
+ * contract.  Nothing about the block format changes: a quiet NaN is an
+ * ordinary double.
+ *
+ * The SIMD kernels in exec/agg.c are deliberately branch-free, so instead of
+ * teaching each of them about NULLs the executor removes NULLs from the dense
+ * run the kernels consume.  Doing it here, in the single function every
+ * aggregate flows through, makes count/sum/avg/min/max/spread, the t-digest
+ * quantiles and first/last/twa NULL-aware at one site.
+ *
+ * INT64, TIMESTAMP and SYMBOL columns have no NULL representation and are
+ * untouched by everything below.
+ *
+ * `v[i] == v[i]` is false for exactly one class of double, NaN, so it is the
+ * whole NULL test.  This file is not compiled with -ffast-math. */
+
+/* Selected values that are not NULL.  Walks set bits only, so a selective
+ * WHERE costs popcount(bm) probes rather than n. */
+static size_t f64_count_nonnull(const uint64_t *bm, const double *v, size_t n) {
+    size_t nw = (n + 63) / 64, c = 0;
+    for (size_t w = 0; w < nw; w++) {
+        uint64_t word = bm[w];
+        /* Bits past n are not guaranteed clear by every caller — mask the
+         * tail exactly as tsdb_bitmap_popcount does. */
+        if (w + 1 == nw) {
+            size_t rem = n & 63;
+            if (rem) word &= ((uint64_t)1 << rem) - 1;
+        }
+        while (word) {
+            size_t i = w * 64 + (size_t)__builtin_ctzll(word);
+            word &= word - 1;
+            if (v[i] == v[i]) c++;
+        }
+    }
+    return c;
+}
+
+/* Dense, NULL-free run of the selected FLOAT64 values; length in *out_n.
+ *
+ * When every row is selected and none is NULL the block column is returned
+ * unchanged and `scratch` is never written, so the NULL-free case — which is
+ * every table that has no sparse ingest — costs one extra linear pass over
+ * the block and no copy.  `scratch` must hold n doubles, which is what the
+ * callers already size it for as a gather destination. */
+static const double *f64_dense_nonnull(const double *v, size_t n,
+                                       const uint64_t *bm, uint64_t popcnt,
+                                       double *scratch, size_t *out_n) {
+    size_t k = 0;
+    if (popcnt == n) {
+        /* Branch-free detection so the common no-NULL pass vectorises. */
+        int any_null = 0;
+        for (size_t i = 0; i < n; i++) any_null |= (v[i] != v[i]);
+        if (!any_null) { *out_n = n; return v; }
+        for (size_t i = 0; i < n; i++)
+            if (v[i] == v[i]) scratch[k++] = v[i];
+        *out_n = k;
+        return scratch;
+    }
+    size_t cn = tsdb_bitmap_gather_f64(bm, v, n, scratch);
+    for (size_t i = 0; i < cn; i++)
+        if (scratch[i] == scratch[i]) scratch[k++] = scratch[i];
+    *out_n = k;
+    return scratch;
+}
+
 /* scratch must point to a buffer of at least TSDB_BLOCK_POINTS*8 bytes,
  * alignment 32 preferred. Used as gather destination when bm is not all-set.
  * Passing the scratch in from the caller avoids per-block malloc/free and
@@ -1717,7 +1799,14 @@ static void agg_update_vals(proj_t *p, tsdb_type_t t, const void *vals,
                             const int64_t *tscol, size_t n,
                             const uint64_t *bm, void *scratch) {
     if (p->kind == PROJ_AGG_COUNT) {
-        p->agg_count += tsdb_bitmap_popcount(bm, n);
+        /* count(col) counts values that are present; count(*) counts rows.
+         * The two differ only on a float column, and only once something
+         * has actually stored a NULL there — vals is NULL for count(*).
+         * `t` has been through qcoltype, so FLOAT32 arrives as FLOAT64. */
+        if (vals && t == TSDB_TYPE_FLOAT64)
+            p->agg_count += f64_count_nonnull(bm, (const double *)vals, n);
+        else
+            p->agg_count += tsdb_bitmap_popcount(bm, n);
         return;
     }
     if (!vals) return;
@@ -1733,14 +1822,8 @@ static void agg_update_vals(proj_t *p, tsdb_type_t t, const void *vals,
         size_t cn;
         /* For non-f64 columns: gather into scratch as f64 via cast. */
         if (t == TSDB_TYPE_FLOAT64) {
-            const double *v = (const double *)vals;
-            if (popcnt == n) {
-                src = v; cn = n;
-            } else {
-                double *tmp = (double *)scratch;
-                cn = tsdb_bitmap_gather_f64(bm, v, n, tmp);
-                src = tmp;
-            }
+            src = f64_dense_nonnull((const double *)vals, n, bm, popcnt,
+                                    (double *)scratch, &cn);
         } else {
             /* int64 / timestamp → cast to double */
             const int64_t *iv = (const int64_t *)vals;
@@ -1760,16 +1843,13 @@ static void agg_update_vals(proj_t *p, tsdb_type_t t, const void *vals,
     }
 
     if (t == TSDB_TYPE_FLOAT64) {
-        const double *v = (const double *)vals;
-        const double *src;
+        /* cn is the non-NULL count, which is what agg_count must carry:
+         * avg divides agg_sum_f by it, and min/max over an all-NULL block
+         * fold nothing (the kernels return their identity for cn == 0 and
+         * the identity never beats the running extremum). */
         size_t cn;
-        if (popcnt == n) {
-            src = v; cn = n;
-        } else {
-            double *tmp = (double *)scratch;
-            cn = tsdb_bitmap_gather_f64(bm, v, n, tmp);
-            src = tmp;
-        }
+        const double *src = f64_dense_nonnull((const double *)vals, n, bm,
+                                              popcnt, (double *)scratch, &cn);
         switch (p->kind) {
         case PROJ_AGG_SUM:
         case PROJ_AGG_AVG: {
@@ -1875,6 +1955,11 @@ static void agg_update_vals(proj_t *p, tsdb_type_t t, const void *vals,
             if (is_f64)      vf = ((const double *)  vals)[i];
             else if (is_sym) vu = ((const uint32_t *) vals)[i];
             else             vi = ((const int64_t *)  vals)[i];
+
+            /* first()/last() must report the first/last value that EXISTS,
+             * and twa must not weight a gap by a missing sample, so a NULL
+             * row is skipped entirely rather than carried at 0. */
+            if (is_f64 && !(vf == vf)) continue;
 
             /* FIRST / LAST / LAST_ROW */
             if (p->kind != PROJ_AGG_TS_TWA) {
@@ -2253,8 +2338,12 @@ typedef struct {
 
 /* Classify a projection kind for the stats-fast-path gate.
  *   bits: bit0=HAS_MIN_MAX, bit1=HAS_SUM, bit2=HAS_FIRST_LAST
- *   eligible: 1 if this kind can be served from stats at all. */
-static int agg_stats_requires(const proj_t *p, uint16_t *bits, int *eligible) {
+ *   eligible: 1 if this kind can be served from stats at all.
+ *
+ * `s` is the schema the projection's column belongs to; it decides the NULL
+ * rule below.  Pass NULL only for a projection with no stored column. */
+static int agg_stats_requires(const proj_t *p, tsdb_schema_t *s,
+                              uint16_t *bits, int *eligible) {
     *bits = 0;
     *eligible = 1;
     /* Precomputed min/max/sum/first/last describe the STORED column.  An
@@ -2263,16 +2352,36 @@ static int agg_stats_requires(const proj_t *p, uint16_t *bits, int *eligible) {
      * row count, which the UDF does not change. */
     if (p->udf_agg && p->kind != PROJ_AGG_COUNT) { *eligible = 0; return 0; }
     switch (p->kind) {
-        case PROJ_AGG_COUNT:                                    return 0;
+        case PROJ_AGG_COUNT:                                    break;
         case PROJ_AGG_MIN: case PROJ_AGG_MAX: case PROJ_AGG_SPREAD:
-            *bits = TSDB_STATS_HAS_MIN_MAX;                     return 0;
+            *bits = TSDB_STATS_HAS_MIN_MAX;                     break;
         case PROJ_AGG_SUM: case PROJ_AGG_AVG:
-            *bits = TSDB_STATS_HAS_SUM;                         return 0;
+            *bits = TSDB_STATS_HAS_SUM;                         break;
         case PROJ_AGG_TS_FIRST: case PROJ_AGG_TS_LAST:
-            *bits = TSDB_STATS_HAS_FIRST_LAST;                  return 0;
+            *bits = TSDB_STATS_HAS_FIRST_LAST;                  break;
         default:
             *eligible = 0;                                      return 0;
     }
+
+    /* NULL rule for float columns.  Block stats describe every row in the
+     * block, including the NaN-encoded NULLs the scan path now excludes, so
+     * the two paths would disagree: agg_apply_stats credits row_count to
+     * agg_count (over-counting count() and under-stating avg), and
+     * stats_first/stats_last are simply v[0]/v[n-1], NULL or not.
+     *
+     * TSDB_STATS_HAS_MIN_MAX is exactly the witness needed: storage clears
+     * that bit for a FLOAT64/FLOAT32 block if and ONLY if the block contains
+     * a NaN (compute_block_stats, storage/part.c — mnmx_ok starts as
+     * "v[0] is not NaN" and is cleared on the first later NaN, and nothing
+     * else clears it).  So requiring it means "this block provably holds no
+     * NULL", and a NULL-bearing block falls through to the scan path that
+     * knows how to exclude them.  MIN/MAX/SPREAD already require it; adding
+     * it for the rest costs nothing on a column that has no NULLs, which is
+     * every column that never took a sparse write. */
+    if (p->col >= 0 && s &&
+        qcoltype(s->cols[p->col].type) == TSDB_TYPE_FLOAT64)
+        *bits |= TSDB_STATS_HAS_MIN_MAX;
+    return 0;
 }
 
 /* Apply pre-computed block stats to a single projection.
@@ -2381,7 +2490,7 @@ static int try_stats_fastpath(scan_src_t *src,
         if (p->kind < PROJ_AGG_RANGE_BEGIN || p->kind > PROJ_AGG_RANGE_END)
             return 0;
         uint16_t bits = 0; int eligible = 0;
-        agg_stats_requires(p, &bits, &eligible);
+        agg_stats_requires(p, s, &bits, &eligible);
         if (!eligible) return 0;
     }
 
@@ -2422,7 +2531,7 @@ static int try_stats_fastpath(scan_src_t *src,
         for (int pi = 0; pi < nprojs && ok; pi++) {
             proj_t *p = &projs[pi];
             uint16_t bits = 0; int eligible = 0;
-            agg_stats_requires(p, &bits, &eligible);
+            agg_stats_requires(p, s, &bits, &eligible);
             if (bits == 0) continue;              /* COUNT(*): no stats */
             if (p->col < 0) { ok = 0; break; }
             const tsdb_block_meta_t *hit = col_hits[p->col];
@@ -2598,17 +2707,28 @@ void tsdb_par_scan_task(void *arg) {
     }
 
     /* Kill switch — TSDB_DISABLE_STATS_FASTPATH=1 forces the scan path for
-     * every aggregate, so we can A/B against precomputed stats. */
-    static int fastpath_disabled = -1;
-    if (fastpath_disabled < 0) {
+     * every aggregate, so we can A/B against precomputed stats.
+     *
+     * Atomic because every pool worker runs this function concurrently, and
+     * a plain int here was a real read/write race (TSan: read exec.c:2603 vs
+     * write exec.c:2605, both under worker_loop).  memory_order_relaxed is
+     * sufficient: the cached value is a pure function of the environment, so
+     * every racing initialiser stores the same value, and no other memory is
+     * published through this flag — only the int's own atomicity is needed. */
+    static _Atomic int fastpath_disabled = -1;
+    int fp_disabled = atomic_load_explicit(&fastpath_disabled,
+                                           memory_order_relaxed);
+    if (fp_disabled < 0) {
         const char *e = getenv("TSDB_DISABLE_STATS_FASTPATH");
-        fastpath_disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        fp_disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        atomic_store_explicit(&fastpath_disabled, fp_disabled,
+                              memory_order_relaxed);
     }
 
     /* Structural gate: every projection must be stats-serviceable and
      * there must be no non-ts WHERE.  If so, `stats_gate_ok` stays 1 and
      * we can try the fast path per-source. */
-    int stats_gate_ok = !fastpath_disabled && (t->where == NULL);
+    int stats_gate_ok = !fp_disabled && (t->where == NULL);
     if (stats_gate_ok) {
         for (int pi = 0; pi < t->nprojs; pi++) {
             proj_t *p = &t->projs[pi];
@@ -2616,7 +2736,7 @@ void tsdb_par_scan_task(void *arg) {
                 stats_gate_ok = 0; break;
             }
             uint16_t bits = 0; int eligible = 0;
-            agg_stats_requires(p, &bits, &eligible);
+            agg_stats_requires(p, t->schema, &bits, &eligible);
             if (!eligible) { stats_gate_ok = 0; break; }
         }
     }
@@ -7421,16 +7541,24 @@ static int exec_select(tsdb_db_t *db, qast_query_t *q, tsdb_result_t *r,
          * no windowing, no grouping — anything more complex falls to
          * the full scan where the existing code already handles it. */
         {
-            static int fp_off = -1;
-            if (fp_off < 0) {
+            /* Same lazy getenv cache as tsdb_par_scan_task's, and racy for
+             * the same reason: exec_select runs on whatever thread called
+             * tsdb_query, so two concurrent queries read and write this.
+             * Relaxed is sufficient — the value is a pure function of the
+             * environment, so racing initialisers store the same thing and
+             * nothing else is published through it. */
+            static _Atomic int fp_off = -1;
+            int fp_off_v = atomic_load_explicit(&fp_off, memory_order_relaxed);
+            if (fp_off_v < 0) {
                 const char *e = getenv("TSDB_DISABLE_STATS_FASTPATH");
-                fp_off = (e && e[0] && e[0] != '0') ? 1 : 0;
+                fp_off_v = (e && e[0] && e[0] != '0') ? 1 : 0;
+                atomic_store_explicit(&fp_off, fp_off_v, memory_order_relaxed);
             }
             int eligible_query = has_agg && !q->where
                                && !q->has_sample_by
                                && !q->has_adv_window
                                && q->ngroup_by == 0;
-            if (eligible_query && !fp_off && !src->mem) {
+            if (eligible_query && !fp_off_v && !src->mem) {
                 if (try_stats_fastpath(src, projs, nprojs, s, &ts_r, 1)) {
                     tsdb_metric_inc("qengine_agg_stats_hit_total");
                     continue;
@@ -10798,7 +10926,22 @@ const char *tsdb_result_sym(tsdb_result_t *r, int col) {
 }
 
 bool tsdb_result_is_null(tsdb_result_t *r, int col) {
-    (void)r; (void)col; return false; /* Nulls not yet tracked */
+    if (!r || col < 0 || col >= r->ncols || r->cur < 0) return false;
+    /* Only float columns carry a NULL: a missing FLOAT64/FLOAT32 is stored
+     * as NaN (see write_rows_columnar in server/influx_line.c).  INT64,
+     * TIMESTAMP and SYMBOL have no NULL representation, so a missing value
+     * there is still indistinguishable from 0 / "" and this reports false.
+     *
+     * An aggregate over an empty selection also lands here as NaN — avg of
+     * no rows, min/max of no rows — and NULL is the right answer for those
+     * too, which is the reading agg_write already documents. */
+    tsdb_type_t t = r->col_types ? r->col_types[col] : TSDB_TYPE_INT64;
+    if (t != TSDB_TYPE_FLOAT64 && t != TSDB_TYPE_FLOAT32) return false;
+    if (!r->col_data || !r->col_data[col]) return false;
+    uint64_t bits = ((uint64_t *)r->col_data[col])[r->cur];
+    double v;
+    memcpy(&v, &bits, 8);
+    return !(v == v);
 }
 
 /* Bulk (columnar) access — see the contract in include/tsdb.h.  Both are
