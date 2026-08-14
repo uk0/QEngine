@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp: TSDB_RPC_TLS_SKIP_VERIFY value match */
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
@@ -194,7 +195,9 @@ static int parse_addr(const char *addr, char *host_out, size_t host_cap, int *po
  *   TSDB_RPC_TLS_CERT=<pem>        this node's certificate (chain)
  *   TSDB_RPC_TLS_KEY=<pem>         matching private key
  *   TSDB_RPC_TLS_CA=<pem>          CA that signed peer certs (mutual verify)
- *   TSDB_RPC_TLS_SKIP_VERIFY=1     client skips cert verification (bootstrap)
+ *   TSDB_RPC_TLS_SKIP_VERIFY=1     client skips cert verification (bootstrap).
+ *                                  Honoured only for 1/true/yes/on, and the
+ *                                  resolved policy is always logged.
  */
 static int rpc_tls_enabled(void) {
     const char *e = getenv("TSDB_RPC_TLS");
@@ -219,12 +222,33 @@ static void rpc_tls_srv_init(void) {
         rpc_tls_srv_ctx = NULL;
 }
 
+/* TSDB_RPC_TLS_SKIP_VERIFY switches off peer authentication, so it is honoured
+ * only for an affirmative spelling.  The previous test — set, and not starting
+ * with '0' — also matched =false, =no and =off, i.e. it disabled verification
+ * for an operator who had written the opposite, and said nothing either way.
+ * Both resolutions are now logged: this variable is never allowed to be quiet.
+ * The honoured case additionally raises the banner in src/server/tls.c, which
+ * is the site that actually installs SSL_VERIFY_NONE. */
+static int rpc_tls_skip_verify(void) {
+    const char *v = getenv("TSDB_RPC_TLS_SKIP_VERIFY");
+    if (!v || !*v) return 0;
+    int on = !strcmp(v, "1")      || !strcasecmp(v, "true") ||
+             !strcasecmp(v, "yes") || !strcasecmp(v, "on");
+    if (on)
+        fprintf(stderr, "[rpc] TSDB_RPC_TLS_SKIP_VERIFY=%s: outbound RPC will "
+                        "NOT verify peer certificates\n", v);
+    else
+        fprintf(stderr, "[rpc] TSDB_RPC_TLS_SKIP_VERIFY=%s is not an affirmative "
+                        "value (1/true/yes/on); peer certificate verification "
+                        "stays ENABLED\n", v);
+    return on;
+}
+
 static void rpc_tls_cli_init(void) {
     const char *cert = getenv("TSDB_RPC_TLS_CERT");
     const char *key  = getenv("TSDB_RPC_TLS_KEY");
     const char *ca   = getenv("TSDB_RPC_TLS_CA");
-    const char *sv   = getenv("TSDB_RPC_TLS_SKIP_VERIFY");
-    int skip = (sv && *sv && sv[0] != '0') ? 1 : 0;
+    int skip = rpc_tls_skip_verify();
     if (tsdb_tls_client_ctx(ca, skip, cert, key, &rpc_tls_cli_ctx) != 0)
         rpc_tls_cli_ctx = NULL;
 }

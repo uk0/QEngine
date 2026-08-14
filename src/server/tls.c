@@ -12,6 +12,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "tls.h"
+#include "metrics.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -156,6 +157,26 @@ int tsdb_tls_client_ctx(const char *ca_path,
     }
 
     if (skip_verify) {
+        /* LOUD BY POLICY.  SSL_VERIFY_NONE makes this client accept whatever
+         * certificate the peer sends, so the peer is not authenticated at all
+         * and a man in the middle is indistinguishable from the real server.
+         * The hatch is kept — a bootstrap legitimately needs it — but no
+         * process may run this way without saying so, or a cluster stays
+         * unverified for months and only an incident reveals it.  Announced
+         * at the one site that installs SSL_VERIFY_NONE, so every caller is
+         * covered; src/cluster/rpc.c (TSDB_RPC_TLS_SKIP_VERIFY) is the only
+         * caller in src/ today and it builds its client context once per
+         * process, so this is one banner per process, not per connection. */
+        fprintf(stderr,
+            "[tls] ==========================================================\n"
+            "[tls] == PEER CERTIFICATE VERIFICATION IS DISABLED            ==\n"
+            "[tls] == This client accepts ANY certificate.  Traffic is     ==\n"
+            "[tls] == encrypted but the peer is NOT authenticated, so a    ==\n"
+            "[tls] == man in the middle can read and rewrite it unseen.    ==\n"
+            "[tls] ==========================================================\n");
+        /* Same fact, scrapeable.  See the registration in metrics.c for why a
+         * banner alone is not enough. */
+        tsdb_metric_gauge_set("qengine_tls_peer_verification_disabled", 1.0);
         SSL_CTX_set_verify(cx, SSL_VERIFY_NONE, NULL);
     } else {
         /* Load CA bundle: custom path or system default. */

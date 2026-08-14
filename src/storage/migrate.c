@@ -602,7 +602,19 @@ int tsdb_migrate_import(tsdb_db_t *db, int fd,
     int rc = read_all(fd, hdr, sizeof(hdr), NULL);
     if (rc != TSDB_OK) return rc;
     if (get_u32(hdr) != TSDB_MIG_MAGIC) return TSDB_ERR_CORRUPT;
-    if (get_u32(hdr + 4) != TSDB_MIG_VERSION) return TSDB_ERR_CORRUPT;
+    /* A version this build does not implement is NOT damage: the magic matched,
+     * so these bytes are a well-formed stream written by a different build.
+     * Reporting it as corruption sends the operator hunting a bad disk instead
+     * of a version skew, so keep the two distinguishable and name both numbers.
+     * TSDB_MIG_VERSION is bumped whenever the layout changes, so this covers
+     * older streams (v1, which carries no symbol dictionary) as well as newer. */
+    uint32_t ver = get_u32(hdr + 4);
+    if (ver != TSDB_MIG_VERSION) {
+        fprintf(stderr, "[migrate] stream is format version %u; this build "
+                        "understands version %u\n",
+                ver, (unsigned)TSDB_MIG_VERSION);
+        return TSDB_ERR_UNSUPPORTED;
+    }
 
     char src_name[MIG_NAME_BYTES + 1];
     memcpy(src_name, hdr + 8, MIG_NAME_BYTES);

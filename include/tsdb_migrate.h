@@ -41,7 +41,12 @@ extern "C" {
 /* v2 adds the SYMBOL dictionary section.  v1 streams are rejected: they carry
  * dictionary CODES with no dictionary, so a SYMBOL column imported from one
  * decodes against the target's own (empty) table and every tag reads back
- * wrong — measured as 0 rows for every tag value. */
+ * wrong — measured as 0 rows for every tag value.
+ *
+ * A stream whose magic matches but whose version does not is reported as
+ * TSDB_ERR_UNSUPPORTED, never TSDB_ERR_CORRUPT: the bytes are intact, the
+ * binary is simply the wrong build, and the two send an operator to opposite
+ * places.  tsdb_migrate_import logs both version numbers when it refuses. */
 #define TSDB_MIG_VERSION  2u
 
 /* What to do when the target already holds the table. */
@@ -107,7 +112,9 @@ int tsdb_migrate_export(tsdb_db_t *db, const char *table, int fd,
  * process has it open.
  *
  * Returns TSDB_OK, TSDB_ERR_CORRUPT on a malformed/truncated stream,
- * TSDB_ERR_SCHEMA when the target's existing schema disagrees with the
+ * TSDB_ERR_UNSUPPORTED when the header's version is not TSDB_MIG_VERSION (the
+ * stream is intact, this build cannot read it), TSDB_ERR_SCHEMA when the
+ * target's existing schema disagrees with the
  * stream's — or when a SYMBOL column's dictionary does (the codes in the
  * blocks would then name different strings; an identical dictionary, which is
  * what a resumed migration finds, is fine) — TSDB_ERR_EXISTS under

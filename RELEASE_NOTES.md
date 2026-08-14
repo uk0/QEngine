@@ -1,8 +1,14 @@
-# tsdb v0.1.0-beta — release notes
+# tsdb v0.2.0 — release notes
+
+**Version authority**: `include/tsdb.h` is the single source of truth
+for the release identity — `TSDB_VERSION_MAJOR` / `_MINOR` / `_PATCH`.
+This file follows it; when they disagree, the header is right and this
+file is stale.  `tests/test_tls_defaults_and_versions.c` compares the
+two and fails if they drift apart again.
 
 **Status**: public beta / preview.  Single-cluster deployments are
 considered production-ready for internal systems.  Operator-facing
-APIs and SQL grammar are frozen for 0.1.x; bug-fix releases within
+APIs and SQL grammar are frozen for 0.2.x; bug-fix releases within
 the series will not break them.
 
 ---
@@ -69,7 +75,7 @@ bash tests/e2e/coldpath_smoke.sh` against a live cluster.
 
 ---
 
-## Known limitations (will not block 0.1.x GA, scoped for 0.2.x)
+## Known limitations (will not block 0.2.x GA, scoped for 0.3.x)
 
 1. **Cross-DC replication is in-memory only.**
    A process exit drops the unsent backlog.  RPO is 0 for happy-path,
