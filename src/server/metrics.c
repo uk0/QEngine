@@ -321,8 +321,38 @@ static metric_t g_metrics[] = {
     { "qengine_cluster_nodes_alive",
       "Number of cluster nodes currently considered alive", MT_GAUGE, { .g = { 0 } } },
 
+    /* Replication backlog.  The sent/ack/fail counters below are cumulative and
+     * therefore cannot answer "is a peer falling behind RIGHT NOW"; this is the
+     * queue depth that answers it.  Published from fanout_slot_reserve/release (shared by all five
+     * fanout RPC kinds, not WRITE_BATCH alone)
+     * in src/cluster/replica.c — the single place a fanout worker's payload is
+     * charged and discharged — so it rises when peers stop finishing and falls
+     * as they drain. */
+    { "qengine_replicate_inflight_bytes",
+      "Replication payload bytes currently queued in this node's fanout (reserved by a worker, not yet released). Covers every kind that goes through the fanout: WRITE_BATCH, WRITE_BATCH_LZ, SCHEMA_SYNC, APPLY_TRUNCATE and APPLY_CATALOG_QTL",
+      MT_GAUGE, { .g = { 0 } } },
+
+    /* Live subscription count.  This was registered but never written, so every
+     * scrape read an unmeasured value as a confident zero — the same defect as
+     * the dashboard's memtable/disk tiles.  It is fixed by WIRING it rather
+     * than deleting it, because the number already existed: server.c keeps
+     * stat_subs_active, incremented on SUBSCRIBE and decremented on drop, and
+     * already reports it through the stats struct.  It is now published at
+     * those same two transitions. */
+    /* 1 while this process has a TLS client context with peer verification
+     * switched off (TSDB_RPC_TLS_SKIP_VERIFY).  The startup banner in tls.c is
+     * loud, but a banner is only read by whoever happened to watch the log that
+     * day; SEC-6 is precisely the case where a cluster runs unverified for
+     * months and an incident is what reveals it.  A scrapeable gauge can be
+     * alerted on, so the condition has to be actively accepted rather than
+     * merely survived. */
+    { "qengine_tls_peer_verification_disabled",
+      "1 when this process built a TLS client context that does not verify the peer certificate",
+      MT_GAUGE, { .g = { 0 } } },
+
     { "qengine_subscriptions_active",
-      "Number of active SUBSCRIBE sessions", MT_GAUGE, { .g = { 0 } } },
+      "Subscriptions currently registered on this node's wire server",
+      MT_GAUGE, { .g = { 0 } } },
 
     /* --- counters that code increments but the registry had omitted, so
      *     tsdb_metric_inc was a silent no-op and they never appeared on
@@ -375,6 +405,19 @@ static metric_t g_metrics[] = {
 
     { "qengine_ingest_batch_size",
       "Number of rows per ingested write batch",
+      MT_HISTOGRAM,
+      { .h = { {0,0,0,0,0,0,0,0,0}, 0, 0, PTHREAD_MUTEX_INITIALIZER } } },
+
+    /* How long a peer takes to ACK, which is the lag the sent/ack counters
+     * cannot show.  Observed in fanout_worker (src/cluster/replica.c) only on
+     * the TSDB_OK path, so the distribution is the latency of replication that
+     * WORKED; a worker that exhausted its retries is counted by
+     * qengine_replicate_fail_total instead and never lands here, which keeps
+     * the send-deadline (TSDB_REPL_SEND_TIMEOUT_MS x attempts) out of the
+     * buckets.  Measured from fanout submit, so pool queueing counts as lag —
+     * a batch waiting for a worker thread is late for the peer either way. */
+    { "qengine_replicate_ack_duration_ms",
+      "Milliseconds from fanout submit to a peer ACK, for every kind that goes through the replication fanout — not WRITE_BATCH alone (successful sends only)",
       MT_HISTOGRAM,
       { .h = { {0,0,0,0,0,0,0,0,0}, 0, 0, PTHREAD_MUTEX_INITIALIZER } } },
 };

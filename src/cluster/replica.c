@@ -394,7 +394,18 @@ typedef struct {
 typedef struct {
     fanout_ctx_t  *ctx;
     tsdb_node_id_t node_id;
+    double         submit_ms;   /* fanout_mono_ms() at submit; ACK-latency base */
 } worker_arg_t;
+
+/* Monotonic milliseconds for the ACK-latency histogram.  CLOCK_MONOTONIC and
+ * not CLOCK_REALTIME (which the quorum deadline below needs, because
+ * pthread_cond_timedwait is specified against it): an NTP step must not read
+ * as a replication-lag spike, or as a negative one. */
+static double fanout_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 static fanout_ctx_t *fanout_ctx_new(tsdb_replica_mgr_t *rmgr,
                                      uint8_t *payload, uint32_t plen,
@@ -481,6 +492,19 @@ static int fanout_slot_reserve(tsdb_replica_mgr_t *rmgr, uint32_t bytes) {
     }
     rmgr->fanout_inflight++;
     rmgr->fanout_inflight_bytes += bytes;
+    /* Publish INSIDE the lock.  Each value published outside it is a state the
+     * queue really passed through, but the ORDER can inspect wrong: a release
+     * that happens after a reserve can still call gauge_set first, leaving the
+     * gauge asserting a backlog on a queue that has fully drained — and a
+     * resting gauge is exactly what an operator reads.  Serialising the store
+     * with the counter update makes the last publication the last state.
+     * gauge_set is a table lookup plus an atomic store (see metrics.c), so it
+     * takes no lock of its own and cannot invert an ordering against this one.
+     * tsdb_replica_mgr_new is called once per node (src/cluster/cluster.c), so
+     * on a live node this gauge is that node's whole replication backlog; a
+     * process holding several managers — only tests do — has them share it. */
+    tsdb_metric_gauge_set("qengine_replicate_inflight_bytes",
+                          (double)rmgr->fanout_inflight_bytes);
     pthread_mutex_unlock(&rmgr->lock);
     return 1;
 }
@@ -497,6 +521,10 @@ static void fanout_slot_release(tsdb_replica_mgr_t *rmgr, uint32_t bytes) {
         rmgr->fanout_inflight_bytes = 0;   /* no owners left; no residue */
         pthread_cond_broadcast(&rmgr->infl_cv);
     }
+    /* Published under the lock, for the ordering reason given in
+     * fanout_slot_reserve. */
+    tsdb_metric_gauge_set("qengine_replicate_inflight_bytes",
+                          (double)rmgr->fanout_inflight_bytes);
     pthread_mutex_unlock(&rmgr->lock);
 }
 
@@ -508,6 +536,7 @@ static void *fanout_worker(void *arg) {
      * inflight slot before submit, so rmgr outlives this function. */
     tsdb_replica_mgr_t *rmgr_local = ctx->rmgr;
     uint32_t plen_local = ctx->payload_len;
+    double submit_ms = wa->submit_ms;
     free(wa);
 
     /* Retry fanout against a single peer up to MAX_ATTEMPTS times
@@ -579,6 +608,14 @@ static void *fanout_worker(void *arg) {
 done:
     if (rc == TSDB_OK) {
         tsdb_metric_inc("qengine_replicate_ack_total");
+        /* Only the successful path is observed: a worker that exhausted its
+         * retries spent MAX_ATTEMPTS x the send deadline and would bury the
+         * real latency distribution under timeouts.  Its outcome is on
+         * qengine_replicate_fail_total.  Recorded before ctx->ack_count is
+         * bumped below, so a submitter woken by this very ACK already sees
+         * the sample. */
+        tsdb_metric_observe("qengine_replicate_ack_duration_ms",
+                            fanout_mono_ms() - submit_ms);
     } else {
         tsdb_metric_inc("qengine_replicate_fail_total");
     }
@@ -658,8 +695,9 @@ static int fanout_wait_quorum_ex(tsdb_replica_mgr_t *rmgr,
             fanout_ctx_unref(ctx);
             continue;
         }
-        wa->ctx     = ctx;
-        wa->node_id = replicas[i];
+        wa->ctx       = ctx;
+        wa->node_id   = replicas[i];
+        wa->submit_ms = fanout_mono_ms();
 
         /* Iter 6: prefer the shared pool over a per-batch pthread_create.
          * Lazily materialise the pool on first fanout. */

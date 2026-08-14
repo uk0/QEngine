@@ -122,6 +122,14 @@ TEST_SRCS += tests/test_flush_hook_lock.c
 # Missing Influx fields were stored as literal 0 and counted as real readings,
 # poisoning count/avg/min/max; float columns now carry NaN for absent values.
 TEST_SRCS += tests/test_null_semantics.c
+# Dashboard gauges nothing wrote, hidden interval-fsync failures, a dedup
+# checkpoint no production code ever called, an unsynchronised dir_ok[], and
+# TLS peer verification that could be disabled without saying so.
+TEST_SRCS += tests/test_obs_metrics.c
+TEST_SRCS += tests/test_wal_fsync_fail.c
+TEST_SRCS += tests/test_dedup_ckpt_restart.c
+TEST_SRCS += tests/test_multidir_dirok_race.c
+TEST_SRCS += tests/test_tls_defaults_and_versions.c
 TEST_BINS := $(patsubst tests/%.c,build/test/%,$(TEST_SRCS))
 
 # Cluster integration test: built by default but run separately.

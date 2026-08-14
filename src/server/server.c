@@ -1314,6 +1314,12 @@ static int handle_subscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id,
     if (sub_id == 0)
         return send_error(io, req_id, TSDB_ERR_FULL, "too many subscriptions");
     atomic_fetch_add(&srv->stat_subs_active, 1);
+    /* Publish at the transition, not on a timer: the gauge was registered but
+     * never written, so /metrics reported a confident 0 for a node that had
+     * subscribers.  fetch_add returns the PREVIOUS value, so re-read to
+     * publish the count that now holds. */
+    tsdb_metric_gauge_set("qengine_subscriptions_active",
+                          (double)atomic_load(&srv->stat_subs_active));
 
     /* Acknowledge with sub_id (8 bytes LE). */
     uint8_t ack[8];
@@ -1338,6 +1344,8 @@ static int handle_unsubscribe(tsdb_server_t *srv, tsdb_io_t *io, uint64_t req_id
         if (sub_list_remove_by_req(&srv->subs, fd, sub_req_id)) {
             uint64_t cur = atomic_load(&srv->stat_subs_active);
             if (cur > 0) atomic_fetch_sub(&srv->stat_subs_active, 1);
+            tsdb_metric_gauge_set("qengine_subscriptions_active",
+                                  (double)atomic_load(&srv->stat_subs_active));
         }
     }
     return tsdb_proto_send_io(io, TSDB_MT_HELLO_OK, TSDB_FLAG_FIN, req_id, NULL, 0);

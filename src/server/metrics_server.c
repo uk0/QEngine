@@ -1575,12 +1575,15 @@ static void *handle_connection(void *arg) {
 "</div>"
 "</div></section>"
 
+/* No "Memtable rows" / "On-disk bytes" tiles: qengine_memtable_rows and
+ * qengine_disk_bytes are registered but no production code writes either, so
+ * both rendered a permanent 0 that reads as a measurement ("the memtable is
+ * empty") instead of an absence.  Every tile below is fed by a metric with a
+ * real emit site — flushes/compactions from the storage layer, bloom counters
+ * from the read path, nodes-alive refreshed from live membership on each
+ * /metrics scrape. */
 "<section><div class=secttl data-i18n=sec.perf>Performance</div>"
 "<div class=\"grid cards\">"
-"<div class=card><div class=k data-i18n=perf.mem>Memtable rows</div>"
-"<div class=v id=pm>-</div></div>"
-"<div class=card><div class=k data-i18n=perf.disk>On-disk bytes</div>"
-"<div class=v id=pd>-</div></div>"
 "<div class=card><div class=k data-i18n=perf.flush>Flushes / min</div>"
 "<div class=v id=pf>-</div></div>"
 "<div class=card><div class=k data-i18n=perf.compact>Compactions / min</div>"
@@ -1665,7 +1668,6 @@ static void *handle_connection(void *arg) {
  "'sec.events':'Events (last 50)',"
  "'sec.ident':'Server identification',"
  "'card.qps':'Queries / sec','card.rps':'Rows written / sec',"
- "'perf.mem':'Memtable rows','perf.disk':'On-disk bytes',"
  "'perf.flush':'Flushes / min','perf.compact':'Compactions / min',"
  "'perf.bloom':'Bloom skip rate','perf.alive':'Cluster nodes alive',"
  "'cnt.active':'Active conns','cnt.qtot':'Queries total',"
@@ -1761,7 +1763,6 @@ static void *handle_connection(void *arg) {
  "'sec.events':'事件（最近 50 条）',"
  "'sec.ident':'服务器信息',"
  "'card.qps':'每秒查询','card.rps':'每秒写入行',"
- "'perf.mem':'内存表行数','perf.disk':'磁盘字节',"
  "'perf.flush':'每分钟 Flush','perf.compact':'每分钟 Compaction',"
  "'perf.bloom':'Bloom 跳过率','perf.alive':'存活节点数',"
  "'cnt.active':'活跃连接','cnt.qtot':'查询总数',"
@@ -1890,7 +1891,7 @@ static void *handle_connection(void *arg) {
 "'qengine_compactions_total','qengine_bloom_skips_total','qengine_bloom_lookups_total',"
 "'qengine_auth_logins_total','qengine_auth_denied_total','qengine_connections_total',"
 "'qengine_replicate_sent_total','qengine_replicate_ack_total','qengine_replicate_fail_total',"
-"'qengine_replica_dial_total','qengine_memtable_rows','qengine_disk_bytes',"
+"'qengine_replica_dial_total',"
 "'qengine_cluster_nodes_alive','qengine_ingest_batch_size_count','qengine_ingest_batch_size_sum'"
 "]);"
 /* We also consume query_duration_ms histogram buckets + count/sum.
@@ -2007,8 +2008,6 @@ static void *handle_connection(void *arg) {
 "  const dDial=(m.qengine_replica_dial_total||0)-(pm.qengine_replica_dial_total||0);"
 "  if(dDial>0)pushEv('info',`+${dDial} `+t('ev.dial_add'));}"
 " state.prev={ts:now,m};state.lastM=m;"
-" document.getElementById('pm').textContent=fmt(m.qengine_memtable_rows||0,'');"
-" document.getElementById('pd').textContent=fmtBytes(m.qengine_disk_bytes||0);"
 " document.getElementById('pa').textContent="
 "   (m.qengine_cluster_nodes_alive!=null?m.qengine_cluster_nodes_alive:'-');"
 " renderCounters(m);"
