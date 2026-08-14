@@ -209,10 +209,29 @@ struct tsdb_db {
     /* Per-dir health flag (auto-recovery).  1 = healthy, 0 = degraded
      * (mkdir failed at open, statvfs/W_OK probe failed, or a partition
      * flush hit TSDB_ERR_IO).  A degraded dir keeps its SLOT — n_data_dirs
-     * never shrinks, so hash placement of every other dir is stable — and
-     * only stops receiving NEW tables until trash_gc_main re-probes it
-     * healthy (e.g. after a remount).  All-zero via calloc; unused when
-     * n_data_dirs <= 1 (single-dir setups never consult it). */
+     * never shrinks, so hash placement of every other dir is stable.  The flag
+     * does NOT steer placement: db_pick_data_dir hashes the table name and
+     * never consults it, so a create that hashes to a degraded dir simply
+     * fails, exactly as it did before the flag existed.  Its only jobs are
+     * observability and letting trash_gc_main re-adopt the dir once a fresh
+     * probe says it is healthy again (e.g. after a remount).  All-zero via
+     * calloc; unused when n_data_dirs <= 1 (single-dir setups never consult
+     * it).
+     *
+     * Accessed through __atomic_* with RELAXED order everywhere the trash-GC
+     * thread is alive: db_mark_dir_degraded reads and writes a slot from the
+     * flush path (under the table's batch_mu) while trash_gc_main's re-adopt
+     * pass reads AND writes it under no lock at all, so a plain access pair
+     * there is a data race.  RELAXED suffices because a slot publishes NO
+     * MEMORY: its only readers are db_mark_dir_degraded's own "already
+     * degraded?" test, the open-time listing below, and the re-adopt condition
+     * — and that condition does not trust the flag for anything, it re-derives
+     * health from a fresh db_dir_healthy() probe before flipping.  New-table
+     * placement deliberately does not read it at all (see db_pick_data_dir),
+     * so a value one GC pass stale only delays a degrade or a re-adopt by that
+     * pass; no other state is ordered by it.
+     * The initialisation in tsdb_open stays plain: it runs before the
+     * pthread_create that starts the GC thread, which orders it. */
     uint8_t          dir_ok[TSDB_MAX_DATA_DIRS];
     int              n_data_dirs;
     pthread_mutex_t  lock;
@@ -235,13 +254,10 @@ struct tsdb_db {
      * relies on.
      *
      * Deliberately NOT claimed here: that every other read the GC thread makes
-     * is itself synchronised.  It is not.  db->dir_ok[] is read and written by
-     * trash_gc_main outside db->lock (see the re-probe below) while
-     * db_mark_dir_degraded writes it from the flush path under batch_mu, which
-     * is a separate unsynchronised pair — reachable only when n_data_dirs > 1,
-     * which is why the single-dir test suite never surfaces it under TSan.
-     * Recorded so the next reader does not mistake this flag's correctness for
-     * a general guarantee about the thread. */
+     * is itself synchronised.  This flag orders only itself.  The other field
+     * the GC thread shares with the write path — db->dir_ok[] — carries its own
+     * atomic discipline and its own memory-order argument, documented at that
+     * field; do not read this one as a general guarantee about the thread. */
     volatile int     trash_gc_running;
     uint64_t         trash_seq;
 
@@ -424,6 +440,22 @@ static uint64_t db_fnv1a(const char *s) {
     return h;
 }
 
+/* Where this node keeps the durable dedup frontier.  A top-level entry in the
+ * primary data dir, alongside the catalog and the wal dir — it describes the
+ * node, not any one table, and the primary is the dir every configuration has.
+ *
+ * DOT-PREFIXED on purpose, the same guard .trash relies on: every data-dir scan
+ * that enumerates tables filters by NAME, not by S_ISDIR (is_table_dir in
+ * tsdb_node_main.c, mf_is_table_dir in backup.c, resync_is_table_dir in
+ * db_cluster.c, is_table_dir_name in catalog_check.c, rst_is_table_dir in
+ * restore.c), and every one of them rejects a leading '.'.  A plain name would
+ * be reported as a table the catalog has forgotten.  Nothing can collide with
+ * it either: tsdb_name_is_one_path_component refuses table names starting
+ * with '.'. */
+static void db_dedup_ckpt_path(const tsdb_db_t *db, char *out, size_t n) {
+    snprintf(out, n, "%s/.dedup.ckpt", db->data_dir);
+}
+
 /* A data dir is writable-healthy when the filesystem answers statvfs AND
  * the dir itself grants write access.  An unmounted mountpoint typically
  * fails one of the two (dir missing, or a root-owned 0755 stub left at
@@ -454,11 +486,17 @@ static void db_mark_dir_degraded(tsdb_db_t *db, const char *path) {
             best_len = l;
         }
     }
-    if (best < 0 || !db->dir_ok[best]) return;
-    db->dir_ok[best] = 0;
+    if (best < 0 || !__atomic_load_n(&db->dir_ok[best], __ATOMIC_RELAXED)) return;
+    __atomic_store_n(&db->dir_ok[best], 0, __ATOMIC_RELAXED);
     tsdb_metric_inc("qengine_datadir_degraded_total");
+    /* Say what actually happens.  This used to promise "routing new tables
+     * away", which no code does: placement is a hash of the table name and
+     * never reads dir_ok, so a create landing here FAILS rather than moving.
+     * An operator who believes the old wording waits for a rebalance that is
+     * never coming. */
     fprintf(stderr, "[db] data dir [%d] %s degraded (flush I/O error) — "
-            "routing new tables away until it re-probes healthy\n",
+            "creates that hash to it will FAIL until a probe re-adopts it; "
+            "existing tables elsewhere are unaffected\n",
             best, db->data_dirs[best]);
 }
 
@@ -692,6 +730,35 @@ int tsdb_open(const char *data_dir, tsdb_db_t **out) {
             (unsigned long long)db->memtable_budget_rows,
             db->wal_only_commit);
 
+    /* Restore the dedup frontier this node persisted at its last clean close.
+     * Without it every restart forgets every batch id it ever applied, so a
+     * sender's retry of a batch whose ACK was lost is applied a SECOND time —
+     * the over-count the ledger exists to prevent, and one no count comparison
+     * can repair afterwards.  WAL replay cannot cover this alone: a flush
+     * TRUNCATES the log, so the redo records carrying the ids are gone exactly
+     * when their rows become durable, and the checkpoint is the state for
+     * precisely those seqs.
+     *
+     * Applied here, before any table can be opened and replayed, and that is
+     * safe because of what the save side guarantees (see tsdb_close): the file
+     * is written only at a point where every seq in the ledger already has its
+     * rows in a published partition, so a frontier restored from it can never
+     * cover a redo record whose rows still need applying.  A load failure is
+     * non-fatal: checkpoint_load restores NOTHING on damage, which degrades to
+     * the no-checkpoint behaviour rather than skipping a batch never applied. */
+    if (tsdb_dedup_is_enabled()) {
+        char ck[4200];
+        db_dedup_ckpt_path(db, ck, sizeof(ck));
+        tsdb_dedup_global_lock();
+        tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+        int lrc = led ? tsdb_dedup_checkpoint_load(led, ck) : TSDB_OK;
+        tsdb_dedup_global_unlock();
+        if (lrc != TSDB_OK)
+            fprintf(stderr, "[db] dedup checkpoint %s NOT restored (rc=%d) — "
+                    "a retried batch may re-apply until the next clean close\n",
+                    ck, lrc);
+    }
+
     /* Background reclaim of trashed (dropped) table dirs; also drains any
      * leftovers from a crash mid-reclaim. */
     __atomic_store_n(&db->trash_gc_running, 1, __ATOMIC_RELAXED);
@@ -712,6 +779,10 @@ void tsdb_close(tsdb_db_t *db) {
     }
 
     pthread_mutex_lock(&db->lock);
+
+    /* Cleared by any table whose final flush did not land, which is the
+     * precondition the dedup checkpoint below depends on. */
+    int all_rows_durable = 1;
 
     for (int i = 0; i < db->ntables; i++) {
         tsdb_table_internal_t *t = db->tables[i];
@@ -743,8 +814,14 @@ void tsdb_close(tsdb_db_t *db) {
         if (t->memtable) {
             pthread_mutex_lock(&t->compact_mtx);
             flush_wait_locked(t);
-            (void)flush_and_clear_locked(t, /*skip_replicate=*/1);
+            int frc = flush_and_clear_locked(t, /*skip_replicate=*/1);
             pthread_mutex_unlock(&t->compact_mtx);
+            /* Anything short of TSDB_OK means this table's rows are still only
+             * in its memtable and WAL — a failed flush retains them, and the
+             * frozen-log TSDB_ERR_BUSY path deliberately does not truncate.
+             * The dedup checkpoint below must not be written in that state; see
+             * there for why a frontier over non-durable rows loses them. */
+            if (frc != TSDB_OK) all_rows_durable = 0;
         }
 
         /* Stop group-commit bg thread before closing WAL. */
@@ -777,6 +854,41 @@ void tsdb_close(tsdb_db_t *db) {
         pthread_mutex_destroy(&t->compact_mtx);
         pthread_mutex_destroy(&t->batch_mu);
         free(t);
+    }
+
+    /* Persist the dedup frontier.  HERE and not on the flush path, because the
+     * loop above has just flushed every open table's memtable and truncated its
+     * WAL: this is the one moment where every seq the ledger holds has its rows
+     * in a published partition, which is exactly what lets tsdb_open apply the
+     * file BEFORE any WAL replay.  A save from a single table's flush would not
+     * have that property — the ledger is keyed by STREAM, not by table, so it
+     * would also persist frontiers for streams whose rows are still only in
+     * another table's memtable and WAL, and the next open's replay would then
+     * skip those redo records as already applied and lose the rows.
+     *
+     * The same reasoning is why all_rows_durable gates it: a table whose final
+     * flush failed (or was refused by the frozen-log guard) still holds acked
+     * rows in its WAL, and a frontier written over them would make the next
+     * open's replay skip those records and lose the rows.  Skipping the save
+     * only costs the fast path — the ids stay recoverable from the WAL that
+     * still holds them.
+     *
+     * What this therefore does NOT cover: ids for batches flushed since the
+     * last clean close when the node dies without one.  Those are forgotten and
+     * a retry re-applies them, exactly as today; closing that gap needs the
+     * ledger to know which table each stream belongs to, so a flush can persist
+     * just the streams it made durable. */
+    if (all_rows_durable && tsdb_dedup_is_enabled()) {
+        char ck[4200];
+        db_dedup_ckpt_path(db, ck, sizeof(ck));
+        tsdb_dedup_global_lock();
+        tsdb_dedup_ledger_t *led = tsdb_dedup_global();
+        int src = led ? tsdb_dedup_checkpoint_save(led, ck) : TSDB_OK;
+        tsdb_dedup_global_unlock();
+        if (src != TSDB_OK)
+            fprintf(stderr, "[close] dedup checkpoint %s save failed rc=%d — "
+                    "the next start forgets which batches were applied\n",
+                    ck, src);
     }
 
     if (db->udf)     tsdb_udf_catalog_close(db->udf);
@@ -1447,8 +1559,10 @@ static void *trash_gc_main(void *arg) {
              * flipped healthy once its fs answers statvfs + W_OK again
              * (e.g. operator remounted the disk).  Existing data was never
              * moved, so the dir serves reads/writes immediately. */
-            if (db->n_data_dirs > 1 && !db->dir_ok[i] && db_dir_healthy(dd)) {
-                db->dir_ok[i] = 1;
+            if (db->n_data_dirs > 1 &&
+                !__atomic_load_n(&db->dir_ok[i], __ATOMIC_RELAXED) &&
+                db_dir_healthy(dd)) {
+                __atomic_store_n(&db->dir_ok[i], 1, __ATOMIC_RELAXED);
                 fprintf(stderr, "[db] data dir [%d] %s healthy again — "
                         "re-adopted for new-table placement\n", i, dd);
             }

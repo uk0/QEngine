@@ -26,7 +26,32 @@
 static __thread tsdb_io_async_t *tl_wal_io_async   = NULL;
 static __thread int              tl_wal_io_async_inited = 0;
 
+/* Test-only deterministic fsync failure — the twin of TSDB_WAL_FAIL_APPEND in
+ * tsdb_wal_append_durable below.  Set to a non-empty, non-"0" value it makes
+ * every fsync routed through wal_async_fsync report EIO.  It exists because no
+ * portable fd makes a real fsync fail (verified on this platform: fsync
+ * SUCCEEDS on /dev/null and on a FIFO), so the interval flusher's error path is
+ * otherwise unreachable from a black-box test.
+ *
+ * Latched into a static rather than read per call: wal_async_fsync is the
+ * per-commit path in the default mode, and a getenv there would be paid by
+ * every commit.  The first-use initialisation may run concurrently on several
+ * threads; that is benign because every thread derives the same value from the
+ * same environment, and the __atomic accesses keep it from being a data race. */
+static int g_wal_fail_fsync = -1;   /* -1 = not read yet */
+
+static int wal_fail_fsync(void) {
+    int v = __atomic_load_n(&g_wal_fail_fsync, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char *e = getenv("TSDB_WAL_FAIL_FSYNC");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        __atomic_store_n(&g_wal_fail_fsync, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+
 static int wal_async_fsync(int fd) {
+    if (wal_fail_fsync()) { errno = EIO; return -1; }
     if (!tl_wal_io_async_inited) {
         tl_wal_io_async_inited = 1;
         const char *e = getenv("TSDB_WAL_IO_URING");
@@ -100,6 +125,15 @@ struct tsdb_wal {
     char path[4096];   /* for truncate / replay */
     int  dirty;        /* interval mode: 1 = appended since last fsync
                           (plain int, accessed via __atomic builtins) */
+    /* Interval mode: latched to 1 by the flusher when the fsync it OWED failed.
+     * Never cleared — see wal_sync_failed.  Accessed only through __atomic_*
+     * with RELAXED order: the flusher thread sets it and every writer thread
+     * reads it in tsdb_wal_sync under no common lock, so a plain access pair is
+     * a data race.  RELAXED suffices because the flag publishes NO MEMORY of
+     * its own: the only thing a reader does with it is refuse, and observing it
+     * one flusher tick late merely acks one more commit — the same window the
+     * mode already has.  (plain int, accessed via __atomic builtins) */
+    int  sync_failed;
 };
 
 /* ---- Interval fsync mode (TSDB_WAL_SYNC_MS) -----------------------------
@@ -133,6 +167,29 @@ static int wal_interval_ms(void) {
     return g_wal_sync_ms;
 }
 
+/* The interval fsync this WAL OWED has failed.  Latch the failure and say so
+ * once.
+ *
+ * There is no caller to return an error to: the records this fsync covered were
+ * acked up to TSDB_WAL_SYNC_MS ago, and they cannot be rolled back for the same
+ * reason.  Re-marking the WAL dirty and fsyncing again is NOT a recovery — on
+ * Linux the second fsync reports SUCCESS without the pages the first one lost
+ * ever reaching the device (fsync reports a writeback error once and then
+ * clears it, the post-4.13 semantics) — so a silent retry converts a durability
+ * failure into a clean-looking commit.  The honest response is to stop
+ * promising durability on this WAL: tsdb_wal_sync refuses from here on, so the
+ * commit path returns the error to the client instead of acking over a state it
+ * cannot vouch for.  Latched and never cleared, because nothing this process
+ * can do re-establishes what the lost pages held. */
+static void wal_sync_failed(tsdb_wal_t *w) {
+    if (__atomic_exchange_n(&w->sync_failed, 1, __ATOMIC_RELAXED)) return;
+    fprintf(stderr,
+            "[wal] %s: interval fsync FAILED (%s) — up to the last "
+            "TSDB_WAL_SYNC_MS of ACKED records may not be on stable storage, "
+            "and the retry cannot prove otherwise; this WAL stops acking\n",
+            w->path, strerror(errno));
+}
+
 static void *wal_flusher_main(void *arg) {
     (void)arg;
     const int ms = wal_interval_ms();
@@ -149,7 +206,7 @@ static void *wal_flusher_main(void *arg) {
                 if (wal_async_fsync(w->fd) == 0)
                     tsdb_metric_inc("qengine_wal_interval_fsync_total");
                 else
-                    __atomic_store_n(&w->dirty, 1, __ATOMIC_RELEASE);
+                    wal_sync_failed(w);
             }
         }
         pthread_mutex_unlock(&g_wal_reg_mu);
@@ -426,6 +483,11 @@ int tsdb_wal_append(tsdb_wal_t *w, const void *rec, size_t n) {
 
 int tsdb_wal_sync(tsdb_wal_t *w) {
     if (!w || w->fd < 0) return TSDB_ERR_INVAL;
+    /* A WAL whose owed interval fsync failed can no longer promise anything:
+     * records it already acked are in a state no further fsync can establish
+     * (wal_sync_failed).  Refuse instead of acking — the commit path turns this
+     * into "batch not acked" and the rows stay unacked in the memtable. */
+    if (__atomic_load_n(&w->sync_failed, __ATOMIC_RELAXED)) return TSDB_ERR_IO;
     if (wal_interval_ms() > 0) {
         /* Interval mode: ack now, the global flusher makes it stable within
          * TSDB_WAL_SYNC_MS.  Appends are already in the page cache, so a

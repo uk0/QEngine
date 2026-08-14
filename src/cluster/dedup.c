@@ -286,6 +286,19 @@ int tsdb_dedup_checkpoint_save(const tsdb_dedup_ledger_t *l, const char *path) {
     for (size_t i = 0; i < l->max_streams; i++)
         if (l->streams[i].stream != 0 && l->streams[i].frontier != 0) n++;
 
+    /* Nothing to persist: leave the filesystem alone rather than publish a
+     * checkpoint that restores nothing.  tsdb_close now saves on every shutdown,
+     * so without this a node that never received a replicated batch would create
+     * this file in its data dir every time, for no effect.
+     *
+     * Leaving an existing file in place cannot lose state, because a load is the
+     * only thing that puts frontiers into a ledger this save would then drop:
+     * whatever an older file holds was already applied to this ledger at open,
+     * and a frontier only ever moves forward, so an empty ledger here means the
+     * load restored nothing — a missing file, or a damaged one that by contract
+     * restores nothing either way. */
+    if (n == 0) return TSDB_OK;
+
     size_t body = DDP_HDR + n * 16;
     uint8_t *buf = malloc(body + 4);
     if (!buf) return TSDB_ERR_NOMEM;
